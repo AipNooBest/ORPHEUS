@@ -711,9 +711,13 @@ class Combat:
             if given <= 0.0:
                 continue
             healer.stats.add(stats.HEALING, given)
-            script = getattr(target.owner, "body_script", None)
-            if script is not None:
-                script.set_health(vitals.total, sum(vitals.most.values()))
+            self._sync_body_health(target.owner, vitals)
+
+    @staticmethod
+    def _sync_body_health(owner, vitals: Vitals) -> None:
+        script = getattr(owner, "body_script", None)
+        if script is not None:
+            script.set_health(vitals.total, sum(vitals.most.values()))
 
     def _collision(self):
         from ow174.game.collision import CollisionError
@@ -740,14 +744,12 @@ class Combat:
         flags = (CRITICAL if critical else 0) | (KILLING if killed else 0)
         self._tell_hit(shooter, target, dealt, flags, frame)
         shooter.stats.add(stats.HERO_DAMAGE, dealt)
-        if isinstance(target.owner, bots.Bot):
-            if killed:
-                self._bot_died(shooter, target.owner, critical, loadout)
-            return
         victim = target.owner
-        script = victim.body_script
-        if script is not None:
-            script.set_health(vitals.total, sum(vitals.most.values()))
+        if killed and isinstance(victim, bots.Bot):
+            # The NPC death script owns its terminal health change and death event ordering.
+            self._bot_died(shooter, victim, critical, loadout)
+            return
+        self._sync_body_health(victim, vitals)
         if killed:
             self._died(shooter, victim, critical, loadout)
 

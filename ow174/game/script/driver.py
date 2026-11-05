@@ -167,6 +167,10 @@ class ReplicatedBody:
     component: runtime.Component
     server_only: set[int]
 
+    def set_health(self, health: float, most: float) -> None:
+        """Update the shared health input. Player bodies also use the maximum for their HUD."""
+        self.component.set(OWNER_HEALTH, float(health))
+
     def initial_exclusions(self) -> set[int]:
         """Collect the existing entity-scope exclusions from the initialized graph tree."""
         return {
@@ -265,7 +269,7 @@ class BodyScript(ReplicatedBody):
         """The owner's health: #253e for the graphs (01CF st13: 0 or less is dead), #1732e/#1737e for the
         HUD panel's number (no graph writes them: current and maximum). The
         body's pools added up, health, armour and shields (unverified: as OW1's HUD showed one number)."""
-        self.component.set(OWNER_HEALTH, float(health))
+        super().set_health(health, most)
         self.component.set(HUD_HEALTH, float(health))
         self.component.set(HUD_MAX_HEALTH, float(most))
         self.component.owner_dead = health <= 0  # as the client sees its owner (comp 51, 0x7FF789ADBF00)

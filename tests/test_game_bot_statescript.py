@@ -3,15 +3,18 @@
 import unittest
 from unittest.mock import patch
 
+from test_game_combat import Run
 from test_game_graph_analysis import make_graph, node
 from test_game_packet_budget import connection, decoded
+from test_game_projectiles import ABILITY_2
 from test_game_repeated_lifecycles import wire_frame
 
-from ow174.game import bodytrace, bots, combat, movelog, statescript, world
+from ow174.game import bodytrace, bots, combat, movelog, projectiles, statescript, world
 from ow174.game.content import SOLDIER
 from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
 from ow174.game.script import decode, graph
-from ow174.game.script.driver import Snapshot
+from ow174.game.script.bot import BotScript
+from ow174.game.script.driver import OWNER_HEALTH, Snapshot
 from ow174.game.server import BOT_DESTROY_GRACE_TICKS, Client
 
 GRAPH = 0xF0FE
@@ -485,3 +488,59 @@ class BotStatescriptTests(unittest.TestCase):
         _, _, late_view = self.send(late)
         self.assertEqual(self.chunks(late_view, old), [])
         self.assertEqual(late.pulses, [])
+
+
+class BotHealthTests(unittest.TestCase):
+    def setUp(self):
+        for module in (bodytrace, movelog):
+            edit = patch.object(module, "ENABLED", False)
+            edit.start()
+            self.addCleanup(edit.stop)
+        with patch.object(bots, "make", return_value=[]):
+            self.run = Run(names=("Healer", "Attacker"))
+        self.healer, self.attacker = self.run.players
+        match = self.run.match
+        self.fight = match.combat
+        x, y, z = self.healer.mover.position
+        self.bot = bots.Bot(
+            bots.BOT_ENTITY,
+            {"hero": f"0x{SOLDIER:X}", "team": self.healer.team, "position": (x, y, z + 1),
+             "rotation": (0, 0, 0, 1), "graphs": []},
+            {"name": "Friendly bot", "body": "0x040000000000143E", "health": 225},
+            {},
+        )
+        match.bots = [self.bot]
+        definition = make_graph(GRAPH)
+        graph_of = graph.graph
+        with (
+            patch.object(graph, "entity_body", return_value={"graphs": [{"graph": GRAPH}]}),
+            patch.object(graph, "graph", side_effect=lambda index: definition if index == GRAPH else
+                         graph_of(index)),
+        ):
+            match._prepare_bot_script(self.bot)
+        self.script = self.bot.body_script
+        self.assertIsInstance(self.script, BotScript)
+        self.target = next(target for target in self.fight._targets() if target.owner is self.bot)
+        self.vitals = self.fight.vitals_of(self.target)
+
+    def test_nonlethal_damage_updates_scripted_bot_health_at_its_existing_frame(self):
+        start = self.script.component.now
+        self.fight._damage(self.attacker, self.target, 20, False, None, self.run.frame)
+        self.assertEqual(self.vitals.total, 205.0)
+        self.assertEqual(self.script.component.entity_var(OWNER_HEALTH).value(), self.vitals.total)
+        self.assertEqual(self.script.component.now, start)
+        self.assertFalse(self.script.component.owner_dead)
+
+    def test_biotic_field_keeps_healing_a_friendly_scripted_bot(self):
+        self.vitals.damage(20)
+        self.run.step({self.healer: (0, 0, ABILITY_2)})
+        for _ in range(60):
+            self.run.step({})
+
+        shots = self.fight.projectiles.shots
+        self.assertEqual(len(shots), 1, "healing an NPC must not remove the active field")
+        (field,) = shots
+        self.assertIsNotNone(field.field_tick)
+        one_heal = projectiles.HEAL_PER_SECOND * projectiles.FRAME_MS / 1000
+        self.assertGreater(self.vitals.total, 205.0 + one_heal)
+        self.assertEqual(self.script.component.entity_var(OWNER_HEALTH).value(), self.vitals.total)

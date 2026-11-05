@@ -20,7 +20,7 @@ class BotScript(ReplicatedBody):
         component = self.component = runtime.Component(entity, world=runtime.World(hero, mode))
         component.frame = frame
         component.now = frame * component.frame_ms
-        component.set(OWNER_HEALTH, float(health))
+        self.set_health(health, health)
         for instance in create_initial_graphs(component, record):
             instance.init()
         component.run_frame(frame)
