@@ -102,7 +102,9 @@ FIELDS = {
     notices.Notices: _names("match entered waiting notice_chunk sent_at sending"),
     stats.PlayerStats: _names("values"),
     statescript.Stream: _names("entity last delivered data_last cmfd next_ack"),
-    driver.BodyStream: _names("entity last cmfd base base_last pending lost_keys latest_lost full_update"),
+    driver.BodyStream: _names(
+        "entity last cmfd base base_last pending sent_reports lost_keys latest_lost full_update"
+    ),
     driver._CreateArrived: _names("script"),
     driver.BodyScript: _names(
         "hero entity record frame_ms world component frame buttons stream create_arrived "
@@ -130,7 +132,7 @@ DATACLASSES = (
     GameMap, Hero, Spawn, Handoff, LoadState, correction.SendToken, MoverData,
     heroselect.Controller, notices.Switch, combat.HitDef, combat.Target, combat.Rocket,
     projectiles.Shot, projectiles.ShotRecord, projectiles._ObservedProjectile, projectiles._ProjectileArrival,
-    driver.Snapshot, statescript.Graph,
+    driver.Snapshot, driver.OwnerReport, statescript.Graph,
     statescript.Bool, statescript.Int, statescript.Float, statescript.Asset, statescript.Entity,
     statescript.Instance, statescript.Binding, statescript.StateWire, statescript.EventWire,
     statescript.InstanceWire, expr.Asset, expr.Entity, expr.Vec3, expr.Handle, expr.Map,

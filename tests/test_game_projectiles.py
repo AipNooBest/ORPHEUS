@@ -293,14 +293,87 @@ class OwnerProjectileDeliveryTests(unittest.TestCase):
         self.assertTrue(frame.owner)
         self.assertLess(frame.cmfd, script.frame)
         self.assertIn(self.shot.state, frame.instances[self.shot.instance].states)
-        number, cmfd, last, keys = script.reports[-1]
-        self.assertEqual((number, cmfd, last), (before + 1, frame.cmfd, frame.last))
-        self.assertIn(("state", self.shot.instance, self.shot.state), keys)
+        report = script.reports[-1]
+        self.assertEqual((report.number, report.cmfd, report.last), (before + 1, frame.cmfd, frame.last))
+        self.assertIn(("state", self.shot.instance, self.shot.state), report.keys)
+        self.assertIsNone(report.received)
         self.assertFalse(self.shot.created)
         self.ack()
         self.advance()
-        self.assertEqual(self.shot.reports, [(cmfd, last)])
+        shot_report, = self.shot.reports
+        self.assertIs(shot_report, report)
+        self.assertIs(report.received, True)
         self.assertEqual(self.send(), [(OP_CREATE, False)])
+
+    def send_owner_report(self, steps, *, lose):
+        from test_game_repeated_lifecycles import wire_frame
+
+        script = self.player.body_script
+        known = {number: value[0] for number, value in script.stream.base.instances.items()}
+        self.player.take_commands([Command(self.tick + steps)])
+        for _ in range(steps):
+            self.advance()
+        self.assertEqual(self.send(lose=lose), [])
+        packet, _, _, _, _, _ = decoded(self, self.cipher, self.server.sock.sent[-1][0])
+        _, records = wire_frame(packet)
+        chunk, = [item.chunk for item, _ in records if item.entity == self.player.body and item.chunk]
+        frame = read_chunk(chunk.getvalue(), chunk.count, known)
+        self.assertTrue(frame.owner)
+        self.assertIn(self.shot.state, frame.instances[self.shot.instance].states)
+        return packet, frame
+
+    def confirm_owner_reports(self):
+        from test_game_repeated_lifecycles import wire_frame
+
+        self.advance()
+        self.assertEqual(self.send(), [(OP_CREATE, False)])
+        packet, _, _, _, _, _ = decoded(self, self.cipher, self.server.sock.sent[-1][0])
+        _, records = wire_frame(packet)
+        return {item.entity for item, _ in records if item.op == OP_CREATE}
+
+    def test_cumulative_owner_ack_confirms_only_the_delivered_report_frame(self):
+        lost_packet, lost = self.send_owner_report(2, lose=True)
+        arrived_packet, arrived = self.send_owner_report(3, lose=False)
+        self.assertLess(self.shot.frame, lost.cmfd)
+        self.assertLess(lost.cmfd, arrived.cmfd)
+        self.assertEqual((arrived.first, arrived.last), (lost.last, lost.last + 1))
+        self.assertEqual(arrived_packet.seq, lost_packet.seq + 1)
+        self.assertEqual(self.window.bits & 0b11, 0b01)
+        self.ack()
+        script = self.player.body_script
+        self.assertEqual(script.stream.base_last, arrived.last)
+
+        lost_lease = self.projectiles.lease_id(self.player, HELIX, lost.cmfd)
+        arrived_lease = self.projectiles.lease_id(self.player, HELIX, arrived.cmfd)
+        self.assertEqual(len({self.lease, lost_lease, arrived_lease}), 3)
+        self.assertEqual(self.confirm_owner_reports(), {self.lease, arrived_lease})
+
+    def test_one_ack_confirms_both_positively_delivered_owner_reports(self):
+        _, earlier = self.send_owner_report(2, lose=False)
+        _, later = self.send_owner_report(3, lose=False)
+        self.assertEqual(self.window.bits & 0b11, 0b11)
+        self.ack()
+
+        earlier_lease = self.projectiles.lease_id(self.player, HELIX, earlier.cmfd)
+        later_lease = self.projectiles.lease_id(self.player, HELIX, later.cmfd)
+        self.assertEqual(len({self.lease, earlier_lease, later_lease}), 3)
+        self.assertEqual(self.confirm_owner_reports(), {self.lease, earlier_lease, later_lease})
+
+    def test_all_lost_owner_reports_fall_back_to_the_shot_frame(self):
+        packet, lost = self.send_owner_report(2, lose=True)
+        for _ in range(3):
+            self.advance()
+        self.assertEqual(self.send(), [])  # A newer datagram with no new command frame.
+        self.ack()
+        self.assertNotIn(packet.seq, self.client.in_flight)
+        self.assertNotIn(lost.last, self.player.body_script.stream.pending)
+
+        deadline = self.shot.frame + projectiles.UNREPORTED_TICKS
+        while self.tick < deadline - 1:
+            self.advance()
+        self.assertFalse(self.shot.created)
+        self.assertEqual(self.confirm_owner_reports(), {self.lease})
+        self.assertEqual(self.tick, deadline)
 
     def test_late_volley_ack_still_creates_before_releasing_the_owner_rocket(self):
         self.late_volley_ack()

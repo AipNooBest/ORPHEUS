@@ -37,7 +37,7 @@ from ow174.game import bots, world
 from ow174.game.bits import BitWriter
 from ow174.game.commands import FRAME_MASK
 from ow174.game.script import graph as graphs_data
-from ow174.game.script.driver import Snapshot
+from ow174.game.script.driver import OwnerReport, Snapshot
 from ow174.game.statescript import InstanceWire, StateWire, Stream, remote_full_frame
 from ow174.game.world import OP_CREATE, OP_DESTROY, WITH_SCALE, WITH_TRANSFORM, EntityUpdate
 
@@ -215,7 +215,7 @@ class Shot:
     where: tuple = (0.0, 0.0, 0.0)  # the shooter's feet when it fired
     bound: int = 0  # frames the projectile lives at most (lifetime, range / speed)
     seen_reports: int = 0  # the number of the last owner frame looked at
-    reports: list = field(default_factory=list)  # (K, chunk last) of the owner frames that carried it
+    reports: list[OwnerReport] = field(default_factory=list)
     created: dict[int, _ProjectileArrival] = field(default_factory=dict)  # owner creates and their ACKs
     created_tick: int | None = None
     release_at: int | None = None  # the tick of the release and destroy
@@ -351,7 +351,7 @@ class Projectiles:
             return
         if shot.spawn is not None or shot.release_at is not None:
             return
-        start = max([shot.frame] + [k for k, _ in shot.reports[:1]])
+        start = next((report.cmfd for report in shot.reports if report.received is not False), shot.frame)
         due = start + math.ceil(seconds * 1000 / FRAME_MS) + RELEASE_MARGIN
         # A delayed scheduler can finish a flight after its input-frame deadline.
         # Start the delivery window no earlier than this simulation update.
@@ -377,18 +377,17 @@ class Projectiles:
         if not alive or script is None:
             self._end(shot, tick, explode=alive)
             return
-        for number, cmfd, last, keys in script.reports:
-            if number <= shot.seen_reports:
-                continue
+        shot.reports[:] = [report for report in shot.reports if report.received is not False]
+        key = ("state", shot.instance, shot.state)
+        for report in script.reports:
             if (
-                "state",
-                shot.instance,
-                shot.state,
-            ) in keys and shot.frame <= cmfd <= shot.frame + REPORT_WINDOW:
-                shot.reports.append((cmfd, last))
+                report.number > shot.seen_reports and report.received is not False and key in report.keys
+                and shot.frame <= report.cmfd <= shot.frame + REPORT_WINDOW
+            ):
+                shot.reports.append(report)
         shot.seen_reports = script.report_count
         if shot.spawn is not None:
-            self._confirm(shot, script, tick)
+            self._confirm(shot, tick)
             self._field(shot, tick, first_tick)
             return
         due = shot.release_at
@@ -397,21 +396,18 @@ class Projectiles:
         if due is not None and tick >= due + DELIVERY_GRACE_TICKS:
             self._end(shot, tick, explode=True)
             return
-        self._confirm(shot, script, tick)
+        self._confirm(shot, tick)
         # Queuing a destroy retires queued and in-flight creates, so even a late
         # confirmation must arrive before we send the explosion release.
         if (due is not None and tick >= due and shot.created
                 and all(arrival.received for arrival in shot.created.values())):
             self._end(shot, tick, explode=True)
 
-    def _confirm(self, shot: Shot, script, tick: int) -> None:
-        acked = script.stream.base_last
-        if shot.reports:
-            ready = [k for k, last in shot.reports if last <= acked]
-            if not ready:
-                return
+    def _confirm(self, shot: Shot, tick: int) -> None:
+        ready = [report.cmfd for report in shot.reports if report.received is True]
+        if ready:
             frames = [shot.frame, *ready]
-        elif tick >= shot.frame + UNREPORTED_TICKS and not shot.created:
+        elif not shot.reports and tick >= shot.frame + UNREPORTED_TICKS and not shot.created:
             frames = [shot.frame]
         else:
             return
@@ -438,7 +434,7 @@ class Projectiles:
             shot.player.name,
             shot.definition & 0xFFFF,
             shot.frame,
-            [k for k, _ in shot.reports],
+            ready,
             " ".join(f"{entity:08X}" for entity in new),
         )
 

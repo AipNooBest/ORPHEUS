@@ -178,6 +178,17 @@ class Snapshot:
     events: dict = field(default_factory=dict)  # instance -> ((time, state, finish, param), ...)
 
 
+@dataclass
+class OwnerReport:
+    """A transmitted body delta and the outcome of its own datagram."""
+
+    number: int
+    cmfd: int
+    last: int
+    keys: set
+    received: bool | None = None
+
+
 def _same_var(a, b) -> bool:
     a = a or (None, ())
     b = b or (None, ())
@@ -264,7 +275,7 @@ class BodyScript(ReplicatedBody):
         self.first_owner_frame: int | None = None
         self.ult_seconds = ult_seconds
         self.ultimates: list = []  # the Ability states that start on #342e (not charged while they run)
-        self.reports: list = []  # (number, CmFD, chunk last, keys) of the owner frames sent (projectiles.py)
+        self.reports: list[OwnerReport] = []
         self.report_count = 0  # owner frames sent so far
         self._spawn(start_frame, sum(pools.body_pools(hero)) if health is None else health)
 
@@ -555,12 +566,15 @@ class BodyScript(ReplicatedBody):
 
     def report_sent(self, last: int) -> None:
         """Record the owner delta actually transmitted for projectile confirmation."""
-        pending = self.stream.pending.get(last)
-        if pending is None:
+        stream = self.stream
+        pending = stream.pending.get(last)
+        if pending is None or last in stream.sent_reports:
             return
         snapshot, keys = pending
         self.report_count += 1
-        self.reports.append((self.report_count, snapshot.k, last, keys))
+        report = OwnerReport(self.report_count, snapshot.k, last, keys)
+        stream.sent_reports[last] = report
+        self.reports.append(report)
         del self.reports[:-MAX_REPORTS]
 
 
@@ -622,6 +636,7 @@ class BodyStream:
         self.base: Snapshot | None = None  # what the client has after the chunk ending at base_last
         self.base_last = 0
         self.pending: dict[int, tuple[Snapshot, set]] = {}  # last -> (snapshot, keys), not acknowledged
+        self.sent_reports: dict[int, OwnerReport] = {}  # sent owner deltas with unknown transport outcomes
         self.lost_keys: dict[tuple, int] = {}  # each key's newest lost owner chunk
         self.latest_lost: Snapshot | None = None  # newest owner projection, for kill-feed pulse freshness
         self.full_update = None  # the full frame's record (sent again when lost)
@@ -651,6 +666,7 @@ class BodyStream:
 
     def lost(self, last: int) -> None:
         """An owner delta's packet is retired without a positive ACK. Keep its keys cumulative."""
+        self._report_delivery(last, False)
         pending = self.pending.pop(last, None)
         if pending is None:
             return
@@ -701,12 +717,20 @@ class BodyStream:
 
     def arrived(self, last: int) -> None:
         """The client acknowledged the datagram with the chunk that ends at `last`."""
+        self._report_delivery(last, True)
         if last <= self.base_last or last not in self.pending:
             return
         self.base = self.pending[last][0]
         self.base_last = last
         self.pending = {key: value for key, value in self.pending.items() if key > last}
         self.lost_keys = {key: number for key, number in self.lost_keys.items() if number > last}
+
+    def _report_delivery(self, last: int, received: bool) -> None:
+        # A newer cumulative acknowledgement can discard a snapshot before the
+        # transport learns what happened to this report's own datagram.
+        report = self.sent_reports.pop(last, None)
+        if report is not None:
+            report.received = received
 
 
 __all__ = ["BodyScript", "BodyStream", "CommandEpochError", "Snapshot", "button_edges", "nodes", "warm_up"]
