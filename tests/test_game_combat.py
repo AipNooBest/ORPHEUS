@@ -14,7 +14,7 @@ from ow174.game import bots, combat, observers, stats, world
 from ow174.game.bits import BitReader, BitWriter
 from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.combat import Combat, HitDef, Target, Vitals
-from ow174.game.commands import FIRE, Command, read_commands
+from ow174.game.commands import FIRE, SUBFRAME, Command, read_commands
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
 from ow174.game.match import Match
 from ow174.game.script import expr, graph, runtime
@@ -205,6 +205,50 @@ class DamageTests(unittest.TestCase):
         self.assertEqual(vitals.now[ARMOUR_POOL], 0.0)
         self.assertEqual(vitals.now[HEALTH_POOL], 200.0 - (95.0 - 47.5))
         self.assertEqual(vitals.heal(1000.0), 47.5 + 50.0 + 25.0)
+
+    def test_missing_held_fire_uses_each_reconstructed_pose_and_aim(self):
+        def fight_after_gap(lost):
+            run = Run(KANEZAKA_DM, ("Shooter", "Target"))
+            run.match.bots.clear()
+            run.match._pending_bot_scripts.clear()
+            shooter, victim = run.players
+            x, y, z = shooter.mover.position
+            victim.mover.position = [x, y, z + 6.0]
+            for _ in range(20):
+                run.step({})
+            fight = run.match.combat
+            target = next(target for target in fight._targets() if target.owner is victim)
+            vitals = fight.vitals_of(target)
+            first = run.frame + 1
+            # The click aimed away. Held shots use the command's ordinary aim instead.
+            press = Command(
+                first, forward=127, pitch=1220, buttons=FIRE | SUBFRAME, subframe=128,
+                click_yaw=-32768, click_pitch=0,
+            )
+            held = [
+                Command(frame, forward=127, pitch=1220, buttons=FIRE)
+                for frame in range(first + 1, first + 30)
+            ]
+            turn = Command(first + 30, yaw=-32768)
+            shooter.take_commands([press])
+            self.assertEqual(vitals.total, 200.0)
+            shooter.take_commands([turn] if lost else [*held, turn])
+            rifle = next(instance for instance in shooter.body_script.component.instances.values()
+                         if instance.graph.index == 0x0254)
+
+            def result():
+                hits = shooter.client.messages(combat.HIT)
+                return vitals.total, rifle.vars[53].value(), [hit["+0x84"] - first for hit in hits]
+
+            outcome = result()
+            shooter.take_commands([press, held[-1], turn])
+            self.assertEqual(result(), outcome)
+            return outcome
+
+        control = fight_after_gap(False)
+        self.assertLess(control[0], 200.0)
+        self.assertTrue(all(0 < offset < 30 for offset in control[2]))
+        self.assertEqual(fight_after_gap(True), control)
 
 
 class ProjectileTimingTests(unittest.TestCase):

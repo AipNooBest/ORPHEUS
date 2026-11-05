@@ -62,7 +62,7 @@ from functools import cache
 
 from ow174.game import contacts
 from ow174.game.collision import MOVER, NOT_GROUND, Ground, World, flat_world
-from ow174.game.commands import CROUCH, JUMP, Command
+from ow174.game.commands import CROUCH, JUMP, SUBFRAME, Command
 from ow174.paths import DATA_DIR
 
 MOVERS_PATH = DATA_DIR / "game_movers_174.json"  # tools/extract_game_movers.py
@@ -603,7 +603,10 @@ class Mover:
             for frame in range(last.frame + 1, command.frame):
                 if frame - last.frame > REPEAT:
                     last = Command(last.frame, yaw=last.yaw, pitch=last.pitch)
-                missing = replace(last, frame=frame, action=0)
+                missing = replace(
+                    last, frame=frame, buttons=last.buttons & ~SUBFRAME, action=0,
+                    subframe=0xFF, click_yaw=None, click_pitch=None,
+                )
                 self._tick(missing, seconds, tick)
                 if after_missing is not None:
                     after_missing(missing)

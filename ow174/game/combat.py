@@ -673,8 +673,9 @@ class Combat:
         if direct is None or direct.amount <= 0.0:
             return
         reach = field("m_FEC435C6", RANGE) or RANGE
-        # Catch-up shots have no input sample of their own. Keep the received command's
-        # aim, eye and view rewind together, and use the volley clock for hit attribution.
+        # Within the mover's reconstruction window, this command supplies the pose and
+        # fallback aim for the current simulation frame. Script-only catch-up outside
+        # that window still uses the available command. Notices use the volley clock.
         view_tick = self.tick
         if command is not None:
             view_tick = command.frame - command.view_delay(shooter.quanta) * 1e6 / shooter.quanta
