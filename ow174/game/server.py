@@ -154,6 +154,7 @@ class Client:
         self.in_flight = {}  # datagram seq -> (reliable messages, entity updates) it carried
         # The current bot creates only. None means the peer acknowledged this create.
         self._bot_notices: dict[int, deque[tuple[int, bytes]] | None] = {}
+        self._bot_health: dict[int, world.EntityUpdate] = {}  # latest snapshot awaiting delivery per bot
         self.expected_in = 0  # the client's next reliable message
         self.parked_in = {}
         self.leaving_since: float | None = None  # when go_home sent 20304
@@ -193,10 +194,27 @@ class Client:
         else:
             pending.append((msg_id, messages.encode(msg_id, value)))
 
+    def queue_bot_health(self, entity: int, components: dict) -> None:
+        """Keep the latest complete pool snapshot for this connection's current bot."""
+        if entity not in self._bot_notices:
+            return
+        previous = self._bot_health.get(entity)
+        if previous is not None:
+            # Each viewer owns its record. Supersession must not disable another client's resend.
+            previous.resend = False
+            self.entities = [item for item in self.entities if item is not previous]
+        update = world.EntityUpdate(entity, world.OP_UPDATE, lambda origin: world.update(origin, components))
+        self._bot_health[entity] = update
+        if self.bot_create_acked(entity):
+            self.queue_entities([update])
+
     def _ack_bot_create(self, entity: int) -> None:
         pending = self._bot_notices.get(entity)
         if pending is not None:
             self._bot_notices[entity] = None
+            health = self._bot_health.get(entity)
+            if health is not None:
+                self.queue_entities([health])
             for msg_id, payload in pending:
                 self._queue_encoded_reliable(msg_id, payload)
 
@@ -228,6 +246,7 @@ class Client:
                     alive = item.op == world.OP_CREATE
                     lifecycles[item.entity] = (generation, alive)
                     self._bot_notices.pop(item.entity, None)
+                    self._bot_health.pop(item.entity, None)
                     if alive and any(bot.entity == item.entity for bot in self.player.match.bots):
                         self._bot_notices[item.entity] = deque(maxlen=MAX_PENDING_BOT_NOTICES)
                 generations[item] = generation
@@ -328,6 +347,8 @@ class Client:
                         continue
                     if item.op == world.OP_CREATE:
                         self._ack_bot_create(item.entity)
+                    elif self._bot_health.get(item.entity) is item:
+                        del self._bot_health[item.entity]
                     if item.stream is not None:
                         item.stream.arrived(item.chunk_last)
             else:
@@ -779,6 +800,7 @@ class GameServer:
             return
         client.closed = True
         client._bot_notices.clear()
+        client._bot_health.clear()
         if self.clients.get(client.conn) is client:
             del self.clients[client.conn]
         movelog.close(client.player)

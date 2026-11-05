@@ -71,18 +71,20 @@ FIELDS = {
                        "handoffs clients _dropped matches tick _next_conn _left_players _joined_players "
                        "_sent_home running"),
     Client: _names("server address conn cipher player window seq open closed heard next_reliable reliable "
-                   "unreliable entities in_flight _bot_notices expected_in parked_in leaving_since"),
+                   "unreliable entities in_flight _bot_notices _bot_health expected_in parked_in "
+                   "leaving_since"),
     Match: _names("environment id game_map card skin_of tick controller assemble_ends assembled players "
                   "started on_leave ended bots bots_shown notices combat collision_provider collision_state "
                   "collision_world _collision_failed"),
     Player: _names("match slot account_lo name rank role card card_sent card_again hero team quanta entity "
                    "body has_body skin client gone loaded_at steps_done spawned spawn mover commands "
-                   "body_script seen shown script mode_script next_countdown select_open controller_hero "
+                   "body_script body_script_failed seen shown script mode_script next_countdown "
+                   "select_open controller_hero "
                    "stats stats_sent next_stats"),
     ShownController: _names("script created pick card_again possession"),
     CommandQueue: _names("last_frame epoch wraps"),
     combat.Combat: _names(
-        "match vitals history rockets respawns bot_shown next_bot now tick melee_seen "
+        "match vitals history rockets respawns next_bot now tick melee_seen "
         "projectiles observers voice"
     ),
     combat.Vitals: _names("entity most now ids changed died_at killer"),

@@ -59,7 +59,7 @@ rejected. The live match handler retires that body's script; other players keep
 running. This prevents half-completed simulations from looking successful. It
 does not add automatic recovery or prove the cause of the reported live issues.
 
-The latest full Python regression ran 1070 tests, all passing. The formerly skipped
+The latest full Python regression ran 1086 tests, all passing. The formerly skipped
 King's Row physics case now runs with the locally built cache. A separate 62.448-second offline
 Soldier sequence applied/decoded 3903 owner chunks, observed ammo spending and
 seven refills, and ended with no active volley after release. This is a native

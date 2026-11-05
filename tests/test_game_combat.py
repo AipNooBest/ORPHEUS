@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ow174.game import bots, combat
+from ow174.game import bots, combat, world
 from ow174.game.bits import BitReader, BitWriter
 from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.combat import Combat, HitDef, Target, Vitals
@@ -32,6 +32,11 @@ class FakeClient:
 
     def queue_bot_notice(self, entity: int, msg_id: int, value: dict) -> None:
         self.queue_reliable(msg_id, value)  # this model acknowledges every create immediately
+
+    def queue_bot_health(self, entity: int, components: dict) -> None:
+        self.queue_entities([
+            world.EntityUpdate(entity, world.OP_UPDATE, lambda origin: world.update(origin, components))
+        ])
 
     def queue_entities(self, updates: list) -> None:
         self.entities.extend(updates)

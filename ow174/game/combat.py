@@ -403,7 +403,6 @@ class Combat:
         self.history: dict[int, deque] = {}  # entity -> (tick, feet, height, eye) of the last HISTORY ticks
         self.rockets: list[Rocket] = []
         self.respawns: list[tuple[float, object]] = []  # (when, a player or a bot)
-        self.bot_shown: dict[tuple[int, int], int] = {}  # (viewer slot, bot entity) -> tick of its create
         self.next_bot = bots.BOT_ENTITY + len(match.bots)
         self.now = 0.0
         self.tick = 0
@@ -829,41 +828,40 @@ class Combat:
                     match._bot_create_update(fresh),
                 ]
             )
-            self.bot_shown[(viewer.slot, fresh.entity)] = match.tick
         log.info("[game] %s: %s respawned as %08X", match.label(), fresh.name, fresh.entity)
 
     # --- what the clients get ----------------------------------------------------------------------
 
     def _send_health(self) -> None:
-        """An update of component 51 to every client that has the body, for the pools that changed."""
+        """Send player deltas and superseding bot pool snapshots through component 51."""
         match = self.match
+        bot_entities = {bot.entity for bot in match.bots}
         for entity, vitals in list(self.vitals.items()):
             if not vitals.changed:
                 continue
-            components = vitals.component(sorted(vitals.changed))
+            is_bot = entity in bot_entities
+            # A replacement bot snapshot must cover every current pool, even if only one changed.
+            components = vitals.component(vitals.ids if is_bot else sorted(vitals.changed))
             vitals.changed.clear()
             for viewer in match.players:
-                if viewer.client is None or not viewer.spawned or not self._has(viewer, entity):
+                client = viewer.client
+                if client is None or not viewer.spawned:
                     continue
-                viewer.client.queue_entities(
-                    [
-                        world.EntityUpdate(
-                            entity, OP_UPDATE, lambda origin, c=components: world.update(origin, c)
-                        )
-                    ]
-                )
+                if is_bot:
+                    client.queue_bot_health(entity, components)
+                elif self._has(viewer, entity):
+                    client.queue_entities(
+                        [
+                            world.EntityUpdate(
+                                entity, OP_UPDATE, lambda origin, c=components: world.update(origin, c)
+                            )
+                        ]
+                    )
 
-    def _has(self, viewer, entity: int) -> bool:
-        """Whether the viewer's client has the entity from an earlier frame."""
-        match = self.match
-        if viewer.has_body and viewer.body == entity:
-            return True
-        if viewer.seen.get(entity):
-            return True
-        if any(bot.entity == entity for bot in match.bots):
-            shown = self.bot_shown.get((viewer.slot, entity), match.bots_shown.get(viewer.slot))
-            return shown is not None and shown < match.tick
-        return False
+    @staticmethod
+    def _has(viewer, entity: int) -> bool:
+        """Whether this viewer has the player body from an earlier frame."""
+        return (viewer.has_body and viewer.body == entity) or bool(viewer.seen.get(entity))
 
 
 def match_record_delay() -> int:

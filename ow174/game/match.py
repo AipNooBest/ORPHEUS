@@ -43,7 +43,8 @@ from ow174.game.commands import Command, CommandQueue
 from ow174.game.content import SOLDIER, GameMap, Hero, heroes, spawn_point
 from ow174.game.environment import ExecutionEnvironment, SystemEnvironment
 from ow174.game.mover import CROUCHED, GRAVITY_SCALE, Mover, mover_data, statescript_mods
-from ow174.game.script.driver import BodyScript
+from ow174.game.script.driver import BodyScript, CommandEpochError
+from ow174.game.script.runtime import ScriptBudgetError
 from ow174.game.statescript import Stream, owner_ack
 from ow174.game.world import (
     NO_INPUT,
@@ -204,6 +205,7 @@ class Player:
         self.mover = self.new_mover()
         self.commands = CommandQueue()
         self.body_script: BodyScript | None = None  # the body's statescript, run from the commands
+        self.body_script_failed = False  # a hero reselect can replace this body's failed script
         # Other players' bodies this player's client has: body -> False in the frame of its create.
         self.seen: dict[int, bool] = {}
         self.shown: dict[int, ShownController] = {}  # other players' controller entities on this client
@@ -889,7 +891,8 @@ class Match:
                 mode=self.game_map.mode_guid,
                 health=HEALTH,
             )
-        except Exception:
+        except Exception as error:
+            player.body_script_failed = isinstance(error, ScriptBudgetError)
             log.exception("[game] %s: no body statescript for %s", self.label(), player.describe())
             return
         script.created(create)
@@ -897,11 +900,12 @@ class Match:
         bodytrace.started(player, script)
 
     @staticmethod
-    def stop_body_script(player: Player) -> None:
+    def stop_body_script(player: Player, *, failed: bool = False) -> None:
         if player.body_script is not None:
             bodytrace.stopped(player, player.body_script)
             player.body_script.retire()
             player.body_script = None
+        player.body_script_failed = failed
 
     def body_command(self, player: Player, command: Command) -> None:
         """One new command frame for the body's statescript. A failure turns it off for this body (logged)
@@ -913,7 +917,8 @@ class Match:
         except Exception as error:
             bodytrace.failed(script, error)
             log.exception("[game] %s: %s's body statescript failed", self.label(), player.name)
-            self.stop_body_script(player)
+            # Command epochs also involve the controller stream and movement history.
+            self.stop_body_script(player, failed=not isinstance(error, CommandEpochError))
         else:
             bodytrace.command(player, script, command, before_hash)
 
@@ -923,7 +928,7 @@ class Match:
             client.queue_entities(player.body_script.frames())
         except Exception:
             log.exception("[game] %s: %s's body statescript failed", self.label(), player.name)
-            self.stop_body_script(player)
+            self.stop_body_script(player, failed=True)
 
     def game_message(self, player: Player, value: dict, now: float) -> None:
         """21616: a game message a statescript action sends to the server, such as a hero pick."""
@@ -947,7 +952,8 @@ class Match:
                 log.warning("[game] %s: %s picked %s, not of the queued role", label, name, hero.name)
                 return
             skin = self.skin_of(player.account_lo, hero.guid)
-            if hero is not player.hero or skin != player.skin or not player.has_body:
+            needs_body = not player.has_body or player.body_script_failed
+            if needs_body or hero is not player.hero or skin != player.skin:
                 self.switch_hero(player, hero)
             if self.assembling():
                 return  # the screen stays open until the heroes are assembled, as in retail
