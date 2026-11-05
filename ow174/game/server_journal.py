@@ -391,7 +391,8 @@ class RecordingServerSession(_Session):
 
     sendto is an optional in-memory outcome source, not a live socket. Without it,
     all sends succeed with len(data). A scheduler root can dispatch explicit server
-    operations from its observed callbacks. Actual lobby handlers are external.
+    operations from its observed callbacks. A controlled lobby handler can record
+    a seat cancellation through expire_handoff; the surrounding lobby is external.
     """
 
     _recording = True
@@ -418,6 +419,10 @@ class RecordingServerSession(_Session):
         self._initialize_server()
         self._initial = replay_values.encode((self.server.tick, self._indices()))
         self._initial_state = self._stored_hash()
+
+    def expire_handoff(self, conn: int) -> bool:
+        """Route a controlled lobby cancellation through its game journal root."""
+        return self.apply("expire_handoff", {"conn": conn})
 
     def _observe(self, effect):
         if not self._active:

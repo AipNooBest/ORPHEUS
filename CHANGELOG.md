@@ -620,3 +620,9 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Retire the quick-melee activation counters with the player's body. A reused entity ID now starts its own history, while repeat frames for one activation still cause damage once.
 - The regression drives Soldier's authored melee graph twice across two body replacements, using the match allocator with its retained-ID constraint. Both activations deal 30 damage.
 - Passed 124 focused tests with each runtime data pack, Ruff and Git diff checks. Original-client acceptance remains pending.
+
+#### Lobby seat cancellation in controlled replay
+
+- Let the real matchmaker cancellation handler record its game-side handoff expiration when it runs against a controlled journal session.
+- Replayed both cancellation orders. Cancellation before authentication rejects the late SYN and releases the seat on the next tick. Cancellation after the connection opens leaves it connected. The journal preserves the join and leave callback order.
+- Passed 17 focused tests with each runtime data pack, Ruff and Git diff checks. Live lobby and game thread capture remains open.

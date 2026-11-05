@@ -6,6 +6,7 @@ import logging
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -25,6 +26,7 @@ from ow174.game.server_journal import (
     _ReplaySession,
     replay_server_session,
 )
+from ow174.lobby.matchmaker import Found, Matchmaker, Ticket
 
 REAPER = 0x02E0000000000002
 MAP = dataclasses.replace(
@@ -319,6 +321,63 @@ class ServerJournalTests(unittest.TestCase):
             [[replay_values.decode(effect)[1] for effect in row["effects"]] for row in callback_rows],
             [[], [{"kind": "left", "player": (first.match_id, 0)}]],
         )
+
+    def test_controlled_lobby_cancellation_replays_against_authentic_syn_order(self):
+        session, sent = self.make()
+        first, second = session.create_match(
+            MAP, [(1, "Alpha", SOLDIER, 0, False), (2, "Beta", SOLDIER, 1, False)],
+        )
+        alpha, beta = session.server.matches[0].players
+        # The real lobby handler uses the explicit game root while the
+        # surrounding lobby state and timing remain controlled inputs.
+        matchmaker = Matchmaker(SimpleNamespace(game=session, session_of=lambda _: None))
+
+        def cancel(account_lo, handoff):
+            account = SimpleNamespace(account_lo=account_lo)
+            lobby_session = SimpleNamespace(account=account, logged_in=False, log=lambda *_: None)
+            party = SimpleNamespace(members=[account])
+            ticket = Ticket(party, {}, 0, 100.0)
+            matchmaker.found[account_lo] = Found(lobby_session, ticket, handoff, MAP.name)
+            matchmaker.cancel(party)
+            self.assertNotIn(account_lo, matchmaker.found)
+
+        cancel(alpha.account_lo, first)
+        self.assertEqual(session.server.handoffs[first.conn], (first, alpha, 0.0))
+        Peer(session, first, sent, ("127.0.0.1", 43000)).send(flags=SYN)
+        self.assertNotIn(first.conn, session.server.clients)
+        self.assertEqual(sent, [])
+        self.assertFalse(alpha.gone)
+        session.report_callbacks()
+
+        connected = Peer(session, second, sent, ("127.0.0.1", 43000))
+        connected.send(flags=SYN)
+        connected.send()
+        cancel(beta.account_lo, second)
+        self.assertIs(session.server.clients[second.conn], beta.client)
+        self.assertTrue(beta.client.open)
+        session.report_callbacks()
+
+        session.tick(100.0)
+        session.report_callbacks()
+        document, replay, _ = self.verify(session)
+        cancellations = [row for row in document["roots"] if row["operation"] == "expire_handoff"]
+        self.assertEqual(
+            [
+                (replay_values.decode(row["arguments"]), replay_values.decode(row["result"]))
+                for row in cancellations
+            ],
+            [({"conn": first.conn}, True), ({"conn": second.conn}, False)],
+        )
+        callbacks = [row for row in document["roots"] if row["operation"] == "report_callbacks"]
+        self.assertEqual(
+            [[replay_values.decode(effect)[1] for effect in row["effects"]] for row in callbacks],
+            [[], [{"kind": "joined", "player": (first.match_id, 1)}],
+             [{"kind": "left", "player": (first.match_id, 0)}]],
+        )
+        for server in (session.server, replay.server):
+            self.assertEqual(server.handoffs, {})
+            self.assertEqual(set(server.clients), {second.conn})
+            self.assertTrue(server.clients[second.conn].open)
 
     def test_bounded_loop_replays_syn_before_the_due_tick_and_early_receives(self):
         deadline = 100.0 + HANDOFF_SECONDS
