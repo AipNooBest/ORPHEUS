@@ -437,3 +437,11 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Original Practice Range controls reproduce a sphere hit at 0.1549701543 m and remove a prism-only hit. On Practice Range and Kanezaka, 3,000 movement-category ray distances still match. All 95 original movement cache hashes matched after the local expanded builds.
 - Passed 199 targeted tests with each runtime data pack, Ruff and Git diff checks.
 - Existing ray caches retain the authored round primitives. Gameplay filter selection and original-client acceptance remain open.
+
+#### Local raycast filter and receiver metadata
+
+- Export build 104319 raycast filters and receivers from pinned OWLib XML. Preserve complete asset IDs, rule order, repeated references, unset results, explicit zero flags and source hashes.
+- Validate typed rules and linked filters before replacing the external JSON catalog. Public checks use synthetic XML fixtures.
+- The local build 104319 export contains 66 filters and 19 receivers, including 44 override rows and 146 reference slots. Repeated exports match byte for byte.
+- Passed 27 extractor tests, Ruff and Git diff checks.
+- Native filter execution, the meaning of receiver result flags and original-client acceptance remain open.

@@ -55,6 +55,16 @@ $roots = @(.\.venv\Scripts\python.exe tools\build_collision.py 0688 0CD3 --list-
 
 The exporter verifies the selected definitions and models against the local content manifest, including both the container and the slice for bundled records. The cache builder reopens those records through CASC and resolves authored root model references in placeable order. It records the placement content key and the catalog's SHA-256 so changed inputs trigger a rebuild. The runtime pack uses the resulting cache without the local catalog. Attached child geometry, server-generated and dynamic objects, and authored ability filtering still need verification. Keep catalogs and generated caches local.
 
+### Local raycast filter and receiver metadata
+
+Use the build 104319 DataTool XML dumps for asset types `097` and `098` and the same pinned OWLib checkout. Keep the dumps and the JSON catalog outside the repository.
+
+```powershell
+.\.venv\Scripts\python.exe tools\extract_raycast_metadata.py 'C:\path\to\xml' --owlib 'C:\path\to\owlib' --output 'C:\path\to\local-storage\raycast-metadata.json'
+```
+
+The export checks that receiver overrides reference present filters. It retains ordered rules and references, distinguishes unset results from zero flags, and records a SHA-256 for each source XML file. Runtime interpretation of the rules and receiver results still needs separate evidence.
+
 ### Local score event metadata
 
 Export the build 104319 `003F.054` settings from a DataTool `054` XML dump with the pinned OWLib checkout. Keep the output outside the repository.
