@@ -16,6 +16,7 @@ import ctypes
 import logging
 import os
 import socket
+import struct
 import threading
 import weakref
 from ctypes import wintypes
@@ -213,7 +214,7 @@ class Client:
     def send_control(self, flags: int) -> None:
         self._send(Packet(self.conn, KIND_CONTROL, flags=flags))
 
-    def _send(self, packet: Packet) -> None:
+    def _send(self, packet: Packet) -> bool:
         packet.seq = self.seq
         packet.ack = self.window.expected
         packet.ack_bits = self.window.bits
@@ -222,27 +223,57 @@ class Client:
             self.server.sock.sendto(self.cipher.seal(packet), self.address)
         except OSError as error:
             self.log(f"[!] send failed: {error}", logging.WARNING)
+            return False
+        return True
 
     def send_frame(self, tick: int, now: float) -> None:
         reliable = self.reliable[: messages.MAX_PER_KIND]
         unreliable = self.unreliable[: messages.MAX_PER_KIND]
-        entities = self.entities + self.player.match.remote_movements(self.player)
-        payload = self._payload(tick, reliable, unreliable, entities)
-        while len(payload) > MAX_PAYLOAD and len(entities) > 1:
-            entities = entities[: len(entities) // 2]
+        entities = (self.entities + self.player.match.remote_movements(self.player))[:127]
+        try:
             payload = self._payload(tick, reliable, unreliable, entities)
+            while len(payload) > MAX_PAYLOAD:
+                if entities:
+                    entities = entities[: len(entities) // 2]
+                elif unreliable:
+                    unreliable = unreliable[: len(unreliable) // 2]
+                elif len(reliable) > 1:
+                    reliable = reliable[: len(reliable) // 2]
+                else:
+                    self._frame_rejected("oldest reliable message exceeds datagram budget")
+                    return
+                payload = self._payload(tick, reliable, unreliable, entities)
+        except (ValueError, OverflowError, struct.error) as error:
+            self._frame_rejected(f"frame encoding failed: {type(error).__name__}")
+            return
+        if not reliable and not unreliable and not entities and (
+            self.reliable or self.unreliable or self.entities
+        ):
+            self._frame_rejected("oldest queued entity exceeds datagram budget; fragmentation required")
+            return
+        sent_seq = self.seq
+        if not self._send(Packet(self.conn, KIND_FRAME, flags=ACK, payload=payload)):
+            return
+        self._frame_budget_warning = None
         del self.reliable[: len(reliable)]
         del self.unreliable[: len(unreliable)]
-        sent_records = [item for item in entities if item.op or item.chunk is not None]
-        self.entities = [item for item in self.entities if item not in sent_records]
-        self.in_flight[self.seq] = (reliable, sent_records)
-        self._send(Packet(self.conn, KIND_FRAME, flags=ACK, payload=payload))
+        sent_records = [item for item in entities
+                        if item.op or item.chunk is not None or item.ch2 is not None]
+        self.entities = [item for item in self.entities if item not in entities]
+        self.in_flight[sent_seq] = (reliable, sent_records)
+        self.player.match.sent_updates(self.player, entities)
+
+    def _frame_rejected(self, reason: str) -> None:
+        # Do not repeatedly flood logs, consume queues or send an invalid oversized packet.
+        if getattr(self, "_frame_budget_warning", None) != reason:
+            self.log(f"[!] frame rejected: {reason}", logging.ERROR)
+            self._frame_budget_warning = reason
 
     def _payload(self, tick: int, reliable, unreliable, entities) -> bytes:
         # The command ack: the newest command frame we have. The client stops
         # sending the frames before it again; our tick could make it drop frames we never got. While
         # the owner gets records of its body, it stays near them (correction.command_ack).
-        ack = correction.command_ack(self.player, tick)
+        ack = correction.command_ack(self.player, tick, entities)
         return world.frame(tick, ack, reliable, unreliable, entities)
 
     def acked(self, ack: int, ack_bits: int) -> None:
@@ -359,8 +390,12 @@ class GameServer:
         on_join=None,
         *,
         environment: ExecutionEnvironment | None = None,
+        collision_provider_factory=None,
     ) -> None:
         self.environment = SystemEnvironment() if environment is None else environment
+        # None preserves the default per-match asynchronous provider. Explicit factories support
+        # controlled server replay and isolated scenes without patching global collision state.
+        self.collision_provider_factory = collision_provider_factory
         self.host = host
         self.port = port
         self.on_leave = on_leave  # called with each player who leaves a match
@@ -407,6 +442,9 @@ class GameServer:
                 skin_of=self.skin_of,
                 card=card,
                 environment=self.environment,
+                collision_provider=(
+                    None if self.collision_provider_factory is None else self.collision_provider_factory()
+                ),
             )
             handoffs = [self._add_player(match, entry) for entry in players]
             self.matches.append(match)

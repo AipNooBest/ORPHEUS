@@ -63,7 +63,8 @@ class LogTests(unittest.TestCase):
         self.player.take_commands(commands[:5])
         self.player.take_commands(commands[3:])  # overlapping windows: each frame once
         self.match.tick = 7005
-        self.match.remote_movements(self.player)
+        updates = self.match.remote_movements(self.player)
+        self.match.sent_updates(self.player, updates)  # model an actual successful send
         lines = self.lines()
         kinds = [line["k"] for line in lines]
         self.assertEqual(kinds[:2], ["begin", "body"])
@@ -171,10 +172,10 @@ class AckTests(unittest.TestCase):
     def test_at_most_two_past_the_newest_record(self):
         self.player.take_commands([Command(7000 + n) for n in range(10)])
         self.match.tick = 7003
-        self.match.remote_movements(self.player)
+        self.match.sent_updates(self.player, self.match.remote_movements(self.player))
         self.assertEqual(correction.command_ack(self.player, 7003), 7005)
         self.match.tick = 7020
-        self.match.remote_movements(self.player)  # the newest it has: 7009
+        self.match.sent_updates(self.player, self.match.remote_movements(self.player))  # newest: 7009
         self.assertEqual(correction.command_ack(self.player, 7020), 7009)
 
     def test_no_limit_without_records(self):

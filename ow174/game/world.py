@@ -504,6 +504,7 @@ class EntityUpdate:
         self.ch2 = None  # the projectile channel's bits after its own bit (projectiles.release), or None
         self.stream = None  # the statescript.Stream told when the chunk arrives
         self.resend = True  # send it again when its datagram is lost
+        self.correction = None  # optional correction.SendToken; committed only after a successful send
 
 
 def _write_entity(out: BitWriter, item: EntityUpdate, tick: int | None = None) -> None:

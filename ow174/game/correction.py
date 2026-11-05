@@ -35,6 +35,8 @@ Lucio's wall ride, Mercy's flight) would be pulled back by every record. Of thos
 the ones whose movement the server's mover follows.
 """
 
+from dataclasses import dataclass
+
 from ow174.game import movelog
 from ow174.game.content import SOLDIER
 from ow174.game.mover import Mover, Snapshot
@@ -43,6 +45,14 @@ from ow174.game.world import NO_INPUT, EntityUpdate, Movement
 CORRECTIONS = True  # False: the owner never gets its own body's state (each client then keeps its own)
 HEROES = {SOLDIER}  # the heroes whose movement abilities the mover follows
 ACK_LEAD = 2  # the client keeps the commands from ack - 1 on; a replay needs them from the record's frame + 1
+
+
+@dataclass(frozen=True)
+class SendToken:
+    mover: Mover
+    body: int
+    frame: int
+    tick: int
 
 
 def snapshot_for(mover: Mover, tick: int) -> Snapshot | None:
@@ -97,18 +107,39 @@ def own_record(player, tick: int) -> EntityUpdate | None:
     snapshot = snapshot_for(player.mover, tick)
     if snapshot is None:
         return None
-    player.mover.corrected = snapshot.frame
+    update = EntityUpdate(player.body, movement=movement(snapshot))
+    update.correction = SendToken(player.mover, player.body, snapshot.frame, tick)
+    return update
+
+
+def _current(player, token) -> bool:
+    return (isinstance(token, SendToken) and token.mover is player.mover
+            and token.body == player.body)
+
+
+def sent(player, update) -> None:
+    """Commit a selected correction only after the containing datagram was sent successfully."""
+    token = update.correction
+    if not _current(player, token):
+        return
+    previous = player.mover.corrected
+    if previous is not None and previous >= token.frame:
+        return
+    player.mover.corrected = token.frame
     if movelog.ENABLED:
-        movelog.sent(player, tick, snapshot.frame, command_ack(player, tick))
-    return EntityUpdate(player.body, movement=movement(snapshot))
+        movelog.sent(player, token.tick, token.frame, command_ack(player, token.tick))
 
 
-def command_ack(player, tick: int) -> int:
+def command_ack(player, tick: int, updates=()) -> int:
     """The command ack of a frame: the newest command frame the server has (the client stops sending the
     ones before it), but while the owner gets records at most ACK_LEAD past the newest one sent, so that
     the client still has the commands a correction runs again."""
     newest = player.commands.last_frame or tick
     sent = player.mover.corrected
+    for update in updates:
+        token = update.correction
+        if _current(player, token) and (sent is None or token.frame > sent):
+            sent = token.frame
     if sent is None or not correcting(player):
         return newest
     return min(newest, sent + ACK_LEAD)

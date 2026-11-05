@@ -115,6 +115,7 @@ class CadenceTests(unittest.TestCase):
         """The frame's records of the player's own body, read back."""
         self.match.tick = tick
         updates = self.match.remote_movements(self.player)
+        self.match.sent_updates(self.player, updates)  # this helper models a successful send
         return [read(update.movement, tick) for update in updates if update.entity == self.player.body]
 
     def test_one_record_per_frame_of_the_newest_state_not_after_the_packet_frame(self):

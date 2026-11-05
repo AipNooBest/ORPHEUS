@@ -22,7 +22,8 @@ KANEZAKA_DM = PRACTICE_RANGE.__class__(**{**PRACTICE_RANGE.__dict__, "mode_guid"
 
 
 class FakeClient:
-    def __init__(self) -> None:
+    def __init__(self, player=None) -> None:
+        self.player = player
         self.reliable: list = []
         self.entities: list = []
 
@@ -31,6 +32,8 @@ class FakeClient:
 
     def queue_entities(self, updates: list) -> None:
         self.entities.extend(updates)
+        if self.player is not None:
+            self.player.match.sent_updates(self.player, updates)  # the model delivers every queued record
         for item in updates:  # every datagram arrives
             if item.stream is not None:
                 item.stream.arrived(item.chunk_last)
@@ -40,7 +43,7 @@ class FakeClient:
 
 
 def in_world(match: Match, player) -> None:
-    player.client = FakeClient()
+    player.client = FakeClient(player)
     player.spawned = True
     player.steps_done = 4
     match.bots_shown[player.slot] = 0

@@ -567,8 +567,8 @@ class Match:
         if own and player.has_body:
             components.update(self._possession(player))
         if own:
-            player.stats_sent = self._board(player)
-            components[stats.GMP_STATS] = player.stats_sent
+            # Packet budget probes may serialize a candidate without sending it.
+            components[stats.GMP_STATS] = self._board(player)
         return world.create(origin, PLAYER_DEFINITION, components, flags=PLAYER_FLAGS)
 
     @staticmethod
@@ -638,7 +638,6 @@ class Match:
             if other is viewer or other.body not in viewer.seen:
                 continue
             if not viewer.seen[other.body]:
-                viewer.seen[other.body] = True
                 continue
             updates.append(EntityUpdate(other.body, movement=other.movement()))
         shown = self.bots_shown.get(viewer.slot)
@@ -652,6 +651,14 @@ class Match:
         if own is not None:
             updates.append(own)
         return updates
+
+    @staticmethod
+    def sent_updates(viewer: Player, updates) -> None:
+        """Commit only records selected for a successfully sent datagram, never budget candidates."""
+        for update in updates:
+            if update.op == OP_CREATE and update.entity in viewer.seen:
+                viewer.seen[update.entity] = True
+            correction.sent(viewer, update)
 
     def destroy_for_others(self, player: Player, body: int) -> None:
         for other in self.players:

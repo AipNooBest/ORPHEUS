@@ -20,6 +20,7 @@ from test_script_driver import ClientModel, server_on
 
 from ow174.game import messages, world
 from ow174.game.bits import BitReader, BitWriter
+from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.content import PRACTICE_RANGE, SOLDIER
 from ow174.game.link import ACK, FIN, KIND_FRAME, SYN, Packet, ReceiveWindow, peek_connection
 from ow174.game.script import decode
@@ -184,7 +185,12 @@ class ProtocolHarness:
 
     def __init__(self):
         self.left = []
-        self.server = GameServer("127.0.0.1", 0, on_leave=self.left.append)
+        # These are protocol/lifecycle scenarios. Do not race 120 explicit ticks against
+        # real-time map loading or depend on another test having warmed a global cache.
+        self.server = GameServer(
+            "127.0.0.1", 0, on_leave=self.left.append,
+            collision_provider_factory=lambda: StaticCollisionProvider(flat_world(1.0)),
+        )
         self.server.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.server.sock.bind(("127.0.0.1", 0))
         self.server.sock.settimeout(1.0)

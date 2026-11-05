@@ -1,0 +1,50 @@
+Game frame byte budget and send commitment
+
+The native datagram maximum is MAX_DATAGRAM=1264 bytes, with a34-byte encrypted
+link header and MAX_PAYLOAD=1230 bytes of world payload. The previous selection
+loop stopped at one entity even when reliable messages plus that entity still
+exceeded the limit. Controlled real handshake/spawn paths emitted1476/1314-byte
+datagrams that the production LinkCipher.open rejected. This is backend evidence,
+not confirmation of the user's real-client HUD symptom's cause.
+
+send_frame now selects ordered prefixes of at most MAX_PER_KIND messages and127
+entity candidates. It first reduces entities down to zero, then unreliable messages,
+then reliable messages while preserving the oldest reliable message. Each trial
+uses the actual world serializer, with its bit alignment and prospective command
+ACK. It never estimates size by adding raw message lengths or rebuilds VM/observer
+frame producers while trying candidates. Original EntityUpdate objects retain
+their stream/chunk identity and per-client lifecycle generations.
+
+Candidate serialization is observational: _player_create no longer writes
+stats_sent; _send_board retains its existing queued-board bookkeeping. The owner's
+movement candidate holds a SendToken bound to the current mover/body and snapshot
+frame. command_ack can account for a selected candidate without committing it.
+Only a successful send commits the token and movelog.sent. Old/duplicate tokens
+cannot move corrected backward, and a token from a replaced mover/body is ignored.
+
+Remote body visibility also waits for a successful create send. Merely producing
+remote_movements cannot turn seen[body] from False to True; this prevents a deferred
+create's first movement from being generated before its create goes out.
+
+Queues and in-flight records are committed after sendto succeeds. A known OSError
+retains pending messages/entities and does not commit corrections or visibility.
+The packet sequence is still consumed once encryption/send was attempted: it must
+not be rolled back and reused as an AES-GCM nonce. Successful selection consumes
+all selected queued records. OP/chunk/ch2 records enter the existing ACK/resend
+bookkeeping; pure movement/no-op records are consumed without reliable retransmit.
+The former op-or-chunk-only consumption omitted ch2-only projectile shot events.
+
+An individual oldest message/entity that cannot fit requires verified fragmentation
+support. This repair does not invent that encoding, drop it silently or send an
+oversized datagram. It logs a deduplicated explicit rejection and retains queues,
+sequence and in-flight state without a send. Known ValueError/OverflowError/
+struct.error encoding failures are isolated to that client, so later clients in
+the same tick can still send. Such a rejected queue can remain blocked until its
+cause is corrected; full fragment support and recovery remain open work.
+
+tests/test_game_packet_budget.py covers nine scenarios with actual frame encoding
+and AES-GCM decryption through an in-memory socket. It verifies byte limits,
+original record ACK identity, FIFO deferral, failed sends and nonce sequence,
+prospective/committed corrections, stale tokens, seen gates, ch2/movement queue
+consumption,127-record limits and per-client rejection. This is not proof of all
+client fragment/event semantics or the complete prediction-recovery contract.
