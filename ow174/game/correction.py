@@ -134,7 +134,8 @@ def command_ack(player, tick: int, updates=()) -> int:
     """The command ack of a frame: the newest command frame the server has (the client stops sending the
     ones before it), but while the owner gets records at most ACK_LEAD past the newest one sent, so that
     the client still has the commands a correction runs again."""
-    newest = player.commands.last_frame or tick
+    frame = player.commands.last_frame
+    newest = tick if frame is None else frame
     sent = player.mover.corrected
     for update in updates:
         token = update.correction

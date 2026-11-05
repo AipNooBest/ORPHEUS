@@ -56,7 +56,7 @@ from ow174.game.collision import AX, AY, AZ, BX, BY, BZ, CELL, CX, CY, CZ, MASK,
 from ow174.game.mover import mover_data
 from ow174.game.script import expr, graph, runtime
 from ow174.game.statescript import InstanceWire, body_full_frame
-from ow174.game.world import ARMOUR_POOL, HEALTH_POOL, OP_CREATE, OP_DESTROY, OP_UPDATE, POOLS, SHIELDS_POOL
+from ow174.game.world import ARMOUR_POOL, HEALTH_POOL, OP_DESTROY, OP_UPDATE, POOLS, SHIELDS_POOL
 
 log = logging.getLogger("ow174.game")
 
@@ -730,7 +730,7 @@ class Combat:
                 target.owner.died(self.tick)
                 self.respawns.append((self.now + BOT_RESPAWN, target.owner))
                 shooter.stats.add(stats.ELIMINATIONS)
-                self._kill_notice(shooter, target.entity)
+                self._kill_notice(shooter, target.entity, bot=True)
                 log.info("[game] %s: %s killed %s", self.match.label(), shooter.name, target.owner.name)
             return
         victim = target.owner
@@ -749,9 +749,12 @@ class Combat:
             "+0x78": {"+0x0": {"+0x0": target.entity}, "+0x4": max(1, round(dealt)), "+0x8": flags},
             "+0x84": frame & 0xFFFFFFFF,
         }
-        client.queue_reliable(HIT, value)
+        if isinstance(target.owner, bots.Bot):
+            client.queue_bot_notice(target.entity, HIT, value)
+        else:
+            client.queue_reliable(HIT, value)
 
-    def _kill_notice(self, killer, victim: int) -> None:
+    def _kill_notice(self, killer, victim: int, *, bot: bool = False) -> None:
         """25005 to the killer: "ELIMINATED: <name>" (1126.07C; +0x89 assist would be 01F0.07C, +0x88 a
         score shown when above 0). Its handler (0x7FF7895D2B50) reads only +0x84, +0x88 and +0x89."""
         if killer.client is None:
@@ -763,7 +766,10 @@ class Combat:
             "+0x88": 0,
             "+0x89": False,
         }
-        killer.client.queue_reliable(KILL_NOTICE, notice)
+        if bot:
+            killer.client.queue_bot_notice(victim, KILL_NOTICE, notice)
+        else:
+            killer.client.queue_reliable(KILL_NOTICE, notice)
 
     def _died(self, killer, victim, critical: bool, loadout) -> None:
         """A player died: the notices, his body script's "died" (the kill feed line), and the respawn."""
@@ -820,9 +826,7 @@ class Combat:
             viewer.client.queue_entities(
                 [
                     world.EntityUpdate(bot.entity, OP_DESTROY),
-                    world.EntityUpdate(
-                        fresh.entity, OP_CREATE, lambda origin, b=fresh: match._bot_create(origin, b)
-                    ),
+                    match._bot_create_update(fresh),
                 ]
             )
             self.bot_shown[(viewer.slot, fresh.entity)] = match.tick

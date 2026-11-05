@@ -249,6 +249,39 @@ class ServerJournalTests(unittest.TestCase):
                             for root in document["roots"] for effect in root["effects"]))
         self.assertGreater(result["roots"], 30)
 
+    def test_expired_handoff_leaves_on_the_next_tick_and_replays_the_callback(self):
+        session, sent = self.make()
+        entries = [(1, "Alpha", SOLDIER, 0, False), (2, "Beta", SOLDIER, 1, False)]
+        first, second = session.create_match(MAP, entries)
+        alpha, beta = session.server.matches[0].players
+        second_deadline = session.server.handoffs[second.conn][2]
+
+        self.assertTrue(session.apply("expire_handoff", {"conn": first.conn}))
+        self.assertEqual(session.server.handoffs[first.conn], (first, alpha, 0.0))
+        self.assertEqual(session.server.handoffs[second.conn][2], second_deadline)
+        self.assertFalse(alpha.gone)
+        session.report_callbacks()
+
+        session.tick(100.0)
+        self.assertTrue(alpha.gone)
+        self.assertFalse(beta.gone)
+        self.assertNotIn(first.conn, session.server.handoffs)
+        self.assertFalse(session.apply("expire_handoff", {"conn": first.conn}))
+        session.report_callbacks()
+
+        peer = Peer(session, second, sent, ("127.0.0.1", 43000))
+        peer.send(flags=SYN)
+        self.assertFalse(session.apply("expire_handoff", {"conn": second.conn}))
+
+        document, replay, _ = self.verify(session)
+        self.assertIn(second.conn, replay.server.clients)
+        self.assertNotIn(first.conn, replay.server.handoffs)
+        callback_rows = [row for row in document["roots"] if row["operation"] == "report_callbacks"]
+        self.assertEqual(
+            [[replay_values.decode(effect)[1] for effect in row["effects"]] for row in callback_rows],
+            [[], [{"kind": "left", "player": (first.match_id, 0)}]],
+        )
+
     def test_os_send_failure_is_replayed_as_an_attempt_not_as_packet_delivery(self):
         def refused(data, address):
             raise OSError(10054, "controlled send failure")

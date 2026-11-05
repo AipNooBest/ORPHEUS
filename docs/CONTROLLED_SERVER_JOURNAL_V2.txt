@@ -6,6 +6,10 @@ boundaries; v1 private documents are rejected rather than silently upgraded.
 
 schema = ow174.controlled-server-journal.v2
 
+The expire_handoff root takes a connection ID and returns whether a pending
+seat exists. It sets the deadline to zero. The next tick handles the leave
+and callback, while an already connected client is unaffected.
+
 RecordingServerSession(..., verify_stored_state=False) keeps the inexpensive
 controlled-roots-and-wire-only scope. Each root's state_before/state_after and
 header initial_state are None. Root tick/read-cursor boundaries are still checked.

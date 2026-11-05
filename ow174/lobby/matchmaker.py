@@ -687,12 +687,8 @@ class Matchmaker:
         for each (GameServer.handoffs); with the wait over, its next tick drops the player as one who did
         not connect (Match.leave), and LobbyServer.game_left places the parties that wait."""
         game = self.server.game
-        if game is None:
-            return
-        with game.lock:
-            waiting = game.handoffs.get(handoff.conn)
-            if waiting is not None:
-                game.handoffs[handoff.conn] = (waiting[0], waiting[1], 0.0)
+        if game is not None:
+            game.expire_handoff(handoff.conn)
 
     def _enter_game(self, players: list, map_name: str) -> None:
         """(session, ticket, handoff) each: out of General (a match has the team, match and group chats

@@ -274,7 +274,8 @@ class Projectiles:
         script = player.body_script
         if script is None:
             return None
-        frame = player.commands.last_frame or self.match.tick
+        newest = player.commands.last_frame
+        frame = self.match.tick if newest is None else newest
         start = frame - frame % LEASE_SPAN
         blocks = []
         for guid in definitions(script)[:DEFINITIONS_PER_BODY]:

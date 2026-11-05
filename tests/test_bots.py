@@ -2,6 +2,7 @@
 measured on the retail OW2 Practice Range."""
 
 import math
+import struct
 import sys
 import unittest
 from pathlib import Path
@@ -9,11 +10,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[0]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from test_game_repeated_lifecycles import wire_frame
 from test_game_world import read_record
 
 from ow174.game import bots, world
 from ow174.game.collision import StaticCollisionProvider, flat_world
+from ow174.game.combat import Vitals
 from ow174.game.content import PRACTICE_RANGE, SOLDIER
+from ow174.game.link import KIND_FRAME, Packet
 from ow174.game.match import BOT_RECORD_DELAY, Match, _rotation
 from ow174.game.world import NO_INPUT, OP_CREATE
 
@@ -359,6 +363,25 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(len(creates), 15)
         self.assertTrue(all(update.op == OP_CREATE for update in creates))
         self.assertGreater(len(world.frame(1000, 0, [], [], creates)), 15 * 50)
+
+    def test_late_viewer_bot_create_freezes_current_health_even_after_dirty_bits_clear(self):
+        bot = self.match.bots[0]
+        vitals = self.match.combat.vitals[bot.entity] = Vitals(bot.entity, bot.health)
+        vitals.damage(20.0)
+        # A previous server tick already consumed the delta for existing viewers.
+        self.match.combat._send_health()
+        self.assertFalse(vitals.changed)
+        create = next(item for item in self.match.spawn_updates(self.player) if item.entity == bot.entity)
+
+        def decoded_hp():
+            packet = Packet(0, KIND_FRAME, payload=world.frame(1000, 0, entities=[create]))
+            _, records = wire_frame(packet)
+            self.assertEqual(records[0][0].entity, bot.entity)
+            return struct.unpack_from("<Iff", records[0][1][51][0])[1:]
+
+        self.assertEqual(decoded_hp(), (bot.health, bot.health - 20.0))
+        vitals.damage(10.0)
+        self.assertEqual(decoded_hp(), (bot.health, bot.health - 20.0))
 
     def test_records_start_after_the_creates(self):
         self.match.tick = 1000

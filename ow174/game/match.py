@@ -475,10 +475,7 @@ class Match:
             EntityUpdate(viewer.entity, OP_CREATE, lambda origin: self._player_create(origin, viewer))
         )
         updates.append(EntityUpdate(GAME_MODE_ENTITY, OP_CREATE, self._game_mode_create))
-        for bot in self.bots:
-            updates.append(
-                EntityUpdate(bot.entity, OP_CREATE, lambda origin, bot=bot: self._bot_create(origin, bot))
-            )
+        updates.extend(self._bot_create_update(bot) for bot in self.bots)
         if self.bots:
             self.bots_shown[viewer.slot] = self.tick
         for other in self.players:
@@ -486,15 +483,21 @@ class Match:
                 updates.append(self.remote_body_create(viewer, other))
         return updates
 
+    def _bot_create_update(self, bot: bots.Bot) -> EntityUpdate:
+        # A later viewer cannot depend on the globally cleared health dirty bits.
+        # Freeze its initial pools here so retransmitting the create keeps the same baseline.
+        vitals = self.combat.vitals.get(bot.entity)
+        components = world.health(bot.health, bot.health) if vitals is None else vitals.component(vitals.ids)
+        components[26] = [TEAM_BIT << bot.team]
+        return EntityUpdate(bot.entity, OP_CREATE, lambda origin: self._bot_create(origin, bot, components))
+
     @staticmethod
-    def _bot_create(origin: int, bot: bots.Bot) -> world.RecordWriter:
+    def _bot_create(origin: int, bot: bots.Bot, components: dict) -> world.RecordWriter:
         """A training bot's body, as a player's body on another client: placed by its transform, moved
         by movement records from the next frame on. Without a player body's 123 (the hero): the bots'
         bodies have no such component, and the client fails the whole frame on one it cannot place
         (assert 0xD62712AE, "Failed to deserialize component update ... 143E ... /123"; 143E has 1, 3, 4,
         22, 24, 25, 26, 28, 31, 35, 39, 43, 47, 49, 51, 69, 76, 78, 83, 86, 90, 97, 115, 119, 122, 127)."""
-        components = world.health(bot.health, bot.health)
-        components[26] = [TEAM_BIT << bot.team]
         return world.create(
             origin, bot.body, components, flags=BODY_FLAGS, position=bot.position, rotation=_rotation(bot.yaw)
         )
@@ -838,7 +841,8 @@ class Match:
 
     def _newest_frame(self, player: Player) -> int:
         """The newest command frame we have from the client, or our tick before the first."""
-        return player.commands.last_frame or self.tick
+        frame = player.commands.last_frame
+        return self.tick if frame is None else frame
 
     def send_controller(self, player: Player) -> None:
         """A full frame of the controller's statescript, with hero select open or closed. The skin

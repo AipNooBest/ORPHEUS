@@ -19,6 +19,7 @@ import socket
 import struct
 import threading
 import weakref
+from collections import deque
 from ctypes import wintypes
 from dataclasses import dataclass
 
@@ -54,6 +55,7 @@ SILENCE_SECONDS = 10.0  # the client sends at least every 250 ms; after this lon
 # reach the game server's address): the player leaves the match, and the lobby takes them back.
 HANDOFF_SECONDS = 60.0
 MAX_PAYLOAD = MAX_DATAGRAM - HEADER_SIZE
+MAX_PENDING_BOT_NOTICES = 256  # per bot create, retain the newest notices during prolonged loss
 PING = 21610
 MAP_LOADED = (21601, 21602)
 GAME_MESSAGE = 21616
@@ -150,6 +152,8 @@ class Client:
         self.unreliable = []  # [encoded]
         self.entities = []  # [EntityUpdate] waiting to go out
         self.in_flight = {}  # datagram seq -> (reliable messages, entity updates) it carried
+        # The current bot creates only. None means the peer acknowledged this create.
+        self._bot_notices: dict[int, deque[tuple[int, bytes]] | None] = {}
         self.expected_in = 0  # the client's next reliable message
         self.parked_in = {}
         self.leaving_since: float | None = None  # when go_home sent 20304
@@ -167,10 +171,34 @@ class Client:
     # --- queues --------------------------------------------------------------------------------
 
     def queue_reliable(self, msg_id: int, value: dict) -> None:
-        self.reliable.append((self.next_reliable, messages.encode(msg_id, value)))
+        self._queue_encoded_reliable(msg_id, messages.encode(msg_id, value))
+
+    def _queue_encoded_reliable(self, msg_id: int, payload: bytes) -> None:
+        self.reliable.append((self.next_reliable, payload))
         self.next_reliable += 1
         if msg_id not in (20306,):
             self.log(f"[>>>] {msg_id} (reliable #{self.next_reliable - 1})")
+
+    def bot_create_acked(self, entity: int) -> bool:
+        """Whether this connection acknowledged the current create for a bot."""
+        return entity in self._bot_notices and self._bot_notices[entity] is None
+
+    def queue_bot_notice(self, entity: int, msg_id: int, value: dict) -> None:
+        """Keep references to a bot out of the reliable stream until its create is acknowledged."""
+        if entity not in self._bot_notices:
+            return
+        pending = self._bot_notices[entity]
+        if pending is None:
+            self.queue_reliable(msg_id, value)
+        else:
+            pending.append((msg_id, messages.encode(msg_id, value)))
+
+    def _ack_bot_create(self, entity: int) -> None:
+        pending = self._bot_notices.get(entity)
+        if pending is not None:
+            self._bot_notices[entity] = None
+            for msg_id, payload in pending:
+                self._queue_encoded_reliable(msg_id, payload)
 
     def queue_unreliable(self, msg_id: int, value: dict) -> None:
         self.unreliable.append(messages.encode(msg_id, value))
@@ -199,6 +227,9 @@ class Client:
                     generation += 1
                     alive = item.op == world.OP_CREATE
                     lifecycles[item.entity] = (generation, alive)
+                    self._bot_notices.pop(item.entity, None)
+                    if alive and any(bot.entity == item.entity for bot in self.player.match.bots):
+                        self._bot_notices[item.entity] = deque(maxlen=MAX_PENDING_BOT_NOTICES)
                 generations[item] = generation
             if generations[item] == generation and (alive or item.op == world.OP_DESTROY):
                 self.entities.append(item)
@@ -293,7 +324,11 @@ class Client:
             reliable, records = self.in_flight.pop(seq)
             if state:
                 for item in records:
-                    if current(item) and item.stream is not None:
+                    if not current(item):
+                        continue
+                    if item.op == world.OP_CREATE:
+                        self._ack_bot_create(item.entity)
+                    if item.stream is not None:
                         item.stream.arrived(item.chunk_last)
             else:
                 lost_reliable += reliable
@@ -499,6 +534,16 @@ class GameServer:
         deadline = self.environment.wall_time(callsite="server.handoff.deadline") + HANDOFF_SECONDS
         self.handoffs[conn] = (handoff, player, deadline)
         return handoff
+
+    def expire_handoff(self, conn: int) -> bool:
+        """Expire a pending handoff on the next tick. Return whether the seat still exists."""
+        with self.lock:
+            waiting = self.handoffs.get(conn)
+            if waiting is None:
+                return False
+            handoff, player, _ = waiting
+            self.handoffs[conn] = (handoff, player, 0.0)
+            return True
 
     def switch_hero(self, account_lo: int, hero) -> bool:
         with self.lock:
@@ -733,6 +778,7 @@ class GameServer:
         if client.closed:
             return
         client.closed = True
+        client._bot_notices.clear()
         if self.clients.get(client.conn) is client:
             del self.clients[client.conn]
         movelog.close(client.player)

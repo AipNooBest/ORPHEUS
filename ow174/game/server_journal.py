@@ -29,6 +29,7 @@ STORED_SCOPE = "controlled-roots-wire-and-registered-state"
 OPERATIONS = {
     "create_match": {"game_map", "players", "card"},
     "join_match": {"match_id", "players"},
+    "expire_handoff": {"conn"},
     "datagram": {"data", "address", "now"},
     "tick": {"now", "missed"},
     "switch_hero": {"account", "hero"},
@@ -172,6 +173,8 @@ class _Session:
             return result
         if operation == "join_match":
             return self.server.join_match(self._match(args["match_id"]), args["players"])
+        if operation == "expire_handoff":
+            return self.server.expire_handoff(_integer(args["conn"], "handoff connection", minimum=1))
         if operation == "datagram":
             if type(args["data"]) is not bytes:
                 self._fail("datagram must contain raw bytes")

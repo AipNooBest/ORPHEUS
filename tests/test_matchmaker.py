@@ -423,15 +423,22 @@ class GameFoundTests(unittest.TestCase):
                 made.append(handoff)
             return made
 
+        def expire_handoff(conn):
+            waiting = self.seats.get(conn)
+            if waiting is None:
+                return False
+            handoff, player, _ = waiting
+            self.seats[conn] = (handoff, player, 0.0)
+            return True
+
         self.server = SimpleNamespace(
             game=SimpleNamespace(
                 create_match=create_match,
+                expire_handoff=expire_handoff,
                 open_matches=lambda card: [],
                 in_match=lambda account_lo: False,
                 elsewhere=lambda account_lo, match_id: None,
                 port=3730,
-                lock=threading.RLock(),
-                handoffs=self.seats,
             ),
             session_of=self.sessions.get,
             social=SimpleNamespace(

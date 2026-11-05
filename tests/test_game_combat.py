@@ -30,6 +30,9 @@ class FakeClient:
     def queue_reliable(self, msg_id: int, value: dict) -> None:
         self.reliable.append((msg_id, value))
 
+    def queue_bot_notice(self, entity: int, msg_id: int, value: dict) -> None:
+        self.queue_reliable(msg_id, value)  # this model acknowledges every create immediately
+
     def queue_entities(self, updates: list) -> None:
         self.entities.extend(updates)
         if self.player is not None:
