@@ -360,6 +360,27 @@ class OwnerProjectileDeliveryTests(unittest.TestCase):
         self.assertEqual(len({self.lease, earlier_lease, later_lease}), 3)
         self.assertEqual(self.confirm_owner_reports(), {self.lease, earlier_lease, later_lease})
 
+    def test_deferred_owner_report_keeps_its_encode_baseline(self):
+        _, earlier = self.send_owner_report(2, lose=False)
+        script = self.player.body_script
+        self.player.take_commands([Command(self.tick + 3)])
+        for _ in range(3):
+            self.advance()
+        later, = [item for item in self.client.entities if item.stream is script.stream]
+        later_frame = script.stream.cmfd
+
+        # The earlier ACK moves the stream base before this projection reaches
+        # the wire. Both encoded reports introduced the activation to their base.
+        self.ack()
+        self.assertEqual(script.stream.base_last, earlier.last)
+        self.assertEqual(self.send(), [])
+        self.assertEqual(script.reports[-1].last, later.chunk_last)
+        self.ack()
+        earlier_lease = self.projectiles.lease_id(self.player, HELIX, earlier.cmfd)
+        later_lease = self.projectiles.lease_id(self.player, HELIX, later_frame)
+        self.assertEqual(len({self.lease, earlier_lease, later_lease}), 3)
+        self.assertEqual(self.confirm_owner_reports(), {self.lease, earlier_lease, later_lease})
+
     def test_all_lost_owner_reports_fall_back_to_the_shot_frame(self):
         packet, lost = self.send_owner_report(2, lose=True)
         for _ in range(3):
@@ -431,8 +452,8 @@ class OwnerProjectileDeliveryTests(unittest.TestCase):
         self.assertEqual(self.send(), [(OP_DESTROY, True)])
 
 
-class HanzoOwnerDeliveryTests(unittest.TestCase):
-    def test_rapid_arrows_use_only_their_own_delivered_volley_activation(self):
+class OwnerVolleyDeliveryTests(unittest.TestCase):
+    def play(self, hero, commands, *, weapon_switch_frame=None):
         from test_game_repeated_lifecycles import wire_frame
 
         for diagnostics in (bodytrace, movelog):
@@ -442,9 +463,14 @@ class HanzoOwnerDeliveryTests(unittest.TestCase):
         match = run.match
         match.bots.clear()
         match._pending_bot_scripts.clear()
-        match.switch_hero(player, heroes()[0x02E0000000000005])  # Hanzo
+        match.switch_hero(player, heroes()[hero])
         while run.frame < 1016:
-            run.step({})
+            if run.frame + 1 == weapon_switch_frame:
+                run.frame += 1
+                match.update(run.frame * combat.TICK, run.frame)
+                player.take_commands([Command(run.frame, action=2)])
+            else:
+                run.step({})
 
         server = GameServer()
         server.sock = MemorySocket()
@@ -457,10 +483,11 @@ class HanzoOwnerDeliveryTests(unittest.TestCase):
         window = ReceiveWindow()
         sequence = 0
         script = player.body_script
-        releases = (1022, 1058)
         reports = {}
+        created = []
 
-        for frame in range(1017, 1064):
+        for command in commands:
+            frame = command.frame
             now = frame * combat.TICK
             match.update(now, frame)
             if sends(frame):
@@ -468,32 +495,66 @@ class HanzoOwnerDeliveryTests(unittest.TestCase):
                 packet = decoded(self, cipher, server.sock.sent[-1][0])[0]
                 known = {index: record[0] for index, record in script.stream.base.instances.items()}
                 for item, _ in wire_frame(packet)[1]:
-                    if item.entity != player.body or item.chunk is None:
-                        continue
-                    owner = read_chunk(item.chunk.getvalue(), item.chunk.count, known)
-                    if owner.cmfd in releases:
+                    if item.op == OP_CREATE:
+                        created.append(item.entity)
+                    if item.entity == player.body and item.chunk is not None:
+                        owner = read_chunk(item.chunk.getvalue(), item.chunk.count, known)
                         self.assertTrue(owner.owner)
-                        reports[owner.cmfd] = owner.instances[11].states[4]
+                        reports[owner.cmfd] = owner
                 self.assertTrue(window.accept(packet.seq))
                 ack = Packet(client.conn, KIND_CONTROL, sequence, window.expected, window.bits, ACK)
                 sequence += 1
                 server._datagram(cipher.seal(ack), client.address, now)
-            holding = 1017 <= frame < 1022 or 1053 <= frame < 1058
-            player.take_commands([Command(frame, buttons=FIRE if holding else 0)])
+            player.take_commands([command])
+        return player, reports, created
 
-        delivery = match.combat.projectiles
+    def test_rapid_arrows_use_only_their_own_delivered_volley_activation(self):
+        releases = (1022, 1058)
+        commands = [
+            Command(frame, buttons=FIRE if 1017 <= frame < 1022 or 1053 <= frame < 1058 else 0)
+            for frame in range(1017, 1064)
+        ]
+        player, reports, _ = self.play(0x02E0000000000005, commands)  # Hanzo
+
+        delivery = player.match.combat.projectiles
         arrows = {shot.frame: shot for shot in delivery.shots}
         self.assertEqual(set(arrows), set(releases))
         for activation, frame in enumerate(releases, 1):
             with self.subTest(frame=frame):
                 shot = arrows[frame]
                 self.assertEqual((shot.definition, shot.instance, shot.state), (0x040000000000020B, 11, 4))
-                active, payload = reports[frame]
+                active, payload = reports[frame].instances[11].states[4]
                 self.assertFalse(active)
                 self.assertEqual((payload["counter"], payload["start"]), (activation, frame * 16))
                 lease = delivery.lease_id(player, shot.definition, frame)
                 self.assertIsNotNone(lease)
                 self.assertEqual(set(shot.created), {lease})
+
+    def test_mercy_stop_of_an_acknowledged_volley_adds_no_alternate_lease(self):
+        commands = [
+            Command(frame, buttons=FIRE if 1022 <= frame < 1090 else 0)
+            for frame in range(1017, 1115)
+        ]
+        player, reports, created = self.play(0x02E0000000000004, commands, weapon_switch_frame=1011)  # Mercy
+        start, stop = (reports[frame].instances[11].states[6] for frame in (1043, 1091))
+        self.assertTrue(start[0])
+        self.assertFalse(stop[0])
+        self.assertEqual(start[1], stop[1])
+
+        delivery = player.match.combat.projectiles
+        shots = delivery.shots
+        self.assertEqual([shot.frame for shot in shots], [1042, 1054, 1067, 1079])
+        self.assertEqual({shot.activation for shot in shots}, {(1, 16676)})
+        definition = 0x0400000000000158
+        leases = [delivery.lease_id(player, definition, shot.frame) for shot in shots]
+        start_lease = delivery.lease_id(player, definition, 1043)
+        stop_lease = delivery.lease_id(player, definition, 1091)
+        self.assertNotIn(stop_lease, created)
+        expected_leases = {*leases, start_lease}
+        self.assertCountEqual([item for item in created if item in expected_leases], expected_leases)
+        self.assertEqual([set(shot.created) for shot in shots], [
+            {leases[0], start_lease}, {leases[1]}, {leases[2]}, {leases[3]},
+        ])
 
 
 class ObserverProjectileDeliveryTests(unittest.TestCase):

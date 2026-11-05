@@ -100,6 +100,7 @@ POLLED_SWITCHES = {"STUStatescriptStateBooleanSwitch", "STU_DEBD057B"}
 ULT_CHARGE, ULT_COST = 342, 338
 ULT_SECONDS = 60.0
 VOLLEY = "STUStatescriptStateWeaponVolley"
+_VOLLEY_INTRODUCTION = "volley_introduction"  # report metadata, not a cumulative wire key
 THROTTLE_UNIT = f32(1 / 127)  # GetThrottle: x = right, y = forward (W is +y)
 
 
@@ -186,6 +187,7 @@ class OwnerReport:
     cmfd: int
     last: int
     volleys: dict[tuple[int, int], tuple[int, int]]  # (instance, state) -> (counter, start)
+    introductions: frozenset[tuple[int, int]]
     received: bool | None = None
 
 
@@ -489,11 +491,15 @@ class BodyScript(ReplicatedBody):
                 state = StateWire(now[0], now[1], dict(now[2]))
             keys.add(("state", *key))
             wire(owner).states[index] = state
+            if state.cls != VOLLEY:
+                continue
+            previous = dict(was[2]) if was is not None else {}
+            counter = state.payload["counter"]
+            if (counter, state.payload["start"]) != (previous.get("counter"), previous.get("start")):
+                # A single-shot volley can finish in the frame that introduces it.
+                keys.add((_VOLLEY_INTRODUCTION, *key))
             # The last acknowledged frame can still show a previous activation as on.
-            if (
-                state.active and state.cls == VOLLEY
-                and (was is None or not was[1] or dict(was[2])["counter"] != state.payload["counter"])
-            ):
+            if state.active and (was is None or not was[1] or previous["counter"] != counter):
                 self._volley_start(snap, owner, index, wire, entity_vars, keys)
         for item in snap.instances:
             wire(item).events = [EventWire(*event) for event in snap.events.get(item, ())]
@@ -581,7 +587,8 @@ class BodyScript(ReplicatedBody):
                 values = dict(state[2])
                 volleys[state_key] = (values["counter"], values["start"])
         self.report_count += 1
-        report = OwnerReport(self.report_count, snapshot.k, last, volleys)
+        introductions = frozenset(key[1:] for key in keys if key[0] == _VOLLEY_INTRODUCTION)
+        report = OwnerReport(self.report_count, snapshot.k, last, volleys, introductions)
         stream.sent_reports[last] = report
         self.reports.append(report)
         del self.reports[:-MAX_REPORTS]
@@ -681,7 +688,8 @@ class BodyStream:
             return
         snapshot, keys = pending
         for key in keys:
-            self.lost_keys[key] = max(last, self.lost_keys.get(key, 0))
+            if key[0] != _VOLLEY_INTRODUCTION:
+                self.lost_keys[key] = max(last, self.lost_keys.get(key, 0))
         if last == self.last:
             self.latest_lost = snapshot
 
@@ -689,7 +697,7 @@ class BodyStream:
         found = set(self.lost_keys)
         for _, keys in self.pending.values():
             found |= keys
-        return found
+        return {key for key in found if key[0] != _VOLLEY_INTRODUCTION}
 
     def kill_feed_snapshot(self, snap: Snapshot, *, allowed: bool) -> Snapshot:
         """Gate the first new death pulse and keep its wire value until acknowledged."""

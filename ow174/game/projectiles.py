@@ -407,9 +407,12 @@ class Projectiles:
             self._end(shot, tick, explode=True)
 
     def _confirm(self, shot: Shot, tick: int) -> None:
-        ready = [report.cmfd for report in shot.reports if report.received is True]
+        ready = [report for report in shot.reports if report.received is True]
         if ready:
-            frames = [shot.frame, *ready]
+            # A stop or repeat of an already acknowledged activation still
+            # confirms the original shot. Only an introduction supplies an alias.
+            key = (shot.instance, shot.state)
+            frames = [shot.frame, *(report.cmfd for report in ready if key in report.introductions)]
         elif not shot.reports and tick >= shot.frame + UNREPORTED_TICKS and not shot.created:
             frames = [shot.frame]
         else:
@@ -437,7 +440,7 @@ class Projectiles:
             shot.player.name,
             shot.definition & 0xFFFF,
             shot.frame,
-            ready,
+            [report.cmfd for report in ready],
             " ".join(f"{entity:08X}" for entity in new),
         )
 
