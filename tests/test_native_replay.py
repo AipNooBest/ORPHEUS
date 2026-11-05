@@ -293,9 +293,9 @@ class NativeReplayTests(unittest.TestCase):
         self.assertNotEqual(actual_order, initial_order)
         original = run.match.body_command
 
-        def observe(current, command):
+        def observe(current, command, **kwargs):
             before = snapshot_hash(current.body_script)
-            original(current, command)
+            original(current, command, **kwargs)
             seq = len(document["events"])
             document["events"].append(make_command_event(
                 current.body_script, command, seq=seq + 1, server_tick=run.match.tick,

@@ -1,0 +1,174 @@
+"""Run two authored fixed-target MoveTo states through the player's command and collision path."""
+
+import math
+import unittest
+from dataclasses import replace
+from unittest.mock import patch
+
+from test_game_mover import FLOOR, wall
+from test_game_notices import into_world
+
+from ow174.game import bodytrace, movelog
+from ow174.game.collision import StaticCollisionProvider, World, flat_world
+from ow174.game.commands import Command
+from ow174.game.content import PRACTICE_RANGE, Spawn, heroes
+from ow174.game.match import Match
+from ow174.game.mover import STEP
+from ow174.game.script import runtime
+from ow174.game.script.expr import INSTANCE, Vec3
+
+START = 100
+DESTINATION = Vec3(0.0, 1.0, 3.0)
+SCENE = replace(PRACTICE_RANGE, spawns=(Spawn(None, (0.0, 1.0, 0.0), 0.0),))
+AUTHORED_STATES = (
+    (0x02E0000000000029, 0x01DB, 1, 8041, 50.0),  # Genji Swift Strike
+    (0x02E0000000000004, 0x006E, 0, 431, 17.0),  # Mercy Guardian Angel's default speed branch
+)
+
+
+class FixedTargetMoveToTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(bodytrace, "ENABLED", False))
+        self.enterContext(patch.object(movelog, "ENABLED", False))
+
+    def start(self, case, geometry, destination=DESTINATION):
+        hero_guid, graph_id, state_index, target_var, speed = case
+        hero = heroes()[hero_guid]
+        match = Match(SCENE, collision_provider=StaticCollisionProvider(geometry))
+        player = match.add_player(1, hero.name, hero.guid, 0, False)
+        into_world(match, player, START)
+        self.assertTrue(match.switch_hero(player, hero))
+        script = player.body_script
+        component = script.component
+        instance = next(
+            instance for instance in component.instances.values() if instance.graph.index == graph_id
+        )
+        state = instance.state(state_index)
+        self.assertEqual(state.node.cls, "STUStatescriptStateMoveTo")
+        self.assertIsNone(state.node.fields["m_destinationEntity"])
+        self.assertIsNone(state.node.fields["m_destinationBone"])
+        original_native = script.world.native
+
+        def native(config, caller):
+            if caller is instance and config.get("$") == "STU_FDBB0B67":
+                return 1.0
+            return original_native(config, caller)
+
+        self.enterContext(patch.object(script.world, "native", side_effect=native))
+        # The ray and ally selection use independent engine queries. Supply only their resolved endpoint.
+        instance.write((INSTANCE, target_var), destination)
+        self.assertEqual(state.evaluate(state.node.fields["m_865F3D01"]), destination)
+        self.assertEqual(state.evaluate(state.node.fields["m_speed"]), speed)
+        ended = self.enterContext(patch.object(state, "on_end", wraps=state.on_end))
+        state.request(runtime.BEGIN)
+        component.run_now()
+        self.assertTrue(state.active)
+        self.assertEqual(player.mover.position, [0.0, 1.0, 0.0])
+        return player, state, ended
+
+    @staticmethod
+    def commands(player, frames):
+        for frame in frames:
+            player.match.tick = frame
+            player.take_commands([Command(frame)])
+        return list(player.mover.history)
+
+    def test_both_authored_states_reach_and_hold_the_resolved_endpoint(self):
+        for case in AUTHORED_STATES:
+            with self.subTest(graph=f"{case[1]:04X}"):
+                player, state, ended = self.start(case, flat_world(1.0))
+                path = self.commands(player, range(START + 1, START + 26))
+                self.assertGreater(path[0].position[2], 0.0)
+                maximum = case[-1] * player.quanta / 1_000_000 + STEP
+                last = 0.0
+                for pose in path:
+                    x, y, z = pose.position
+                    self.assertEqual((x, y), (0.0, 1.0))
+                    self.assertLessEqual(z, DESTINATION.z)
+                    self.assertGreaterEqual(z - last, 0.0)
+                    self.assertLessEqual(z - last, maximum)
+                    last = z
+                self.assertEqual([pose.position for pose in path[-4:]], [(0.0, 1.0, 3.0)] * 4)
+                self.assertEqual(path[-1].velocity, (0.0, 0.0, 0.0))
+                self.assertFalse(state.active)
+                ended.assert_called_once_with(True)
+
+    def test_both_authored_states_stop_at_the_same_wall(self):
+        geometry = World(FLOOR + wall(-5.0, 2.0, 5.0, 2.0))
+        for case in AUTHORED_STATES:
+            with self.subTest(graph=f"{case[1]:04X}"):
+                player, state, ended = self.start(case, geometry)
+                path = self.commands(player, range(START + 1, START + 26))
+                stop = path[-1].position
+                self.assertGreater(stop[2], 0.5)
+                self.assertLessEqual(stop[2] + player.mover.data.stand_radius, 2.0 + STEP)
+                self.assertEqual([pose.position for pose in path[-4:]], [stop] * 4)
+                self.assertEqual(path[-1].velocity, (0.0, 0.0, 0.0))
+                self.assertFalse(state.active)
+                ended.assert_called_once_with(False)
+
+    def test_world_target_can_be_above_the_ground(self):
+        destination = Vec3(0.0, 4.0, 0.0)
+        for case in AUTHORED_STATES:
+            with self.subTest(graph=f"{case[1]:04X}"):
+                player, state, ended = self.start(case, flat_world(1.0), destination)
+                finish = START + math.ceil(3.0 / (case[-1] * player.quanta / 1_000_000))
+                path = self.commands(player, range(START + 1, finish + 1))
+                self.assertEqual(path[-1].position, tuple(destination))
+                self.assertFalse(state.active)
+                ended.assert_called_once_with(True)
+                path = self.commands(player, (finish + 1,))
+                self.assertLess(path[-1].position[1], destination.y)
+
+    def test_unresolved_or_out_of_range_target_does_not_drive_a_pose(self):
+        case = AUTHORED_STATES[0]
+        for destination in (0.0, Vec3(0.0, 1.0, 65536.0)):
+            with self.subTest(destination=destination):
+                player, state, ended = self.start(case, flat_world(1.0), destination)
+                path = self.commands(player, range(START + 1, START + 5))
+                self.assertTrue(all(pose.position == (0.0, 1.0, 0.0) for pose in path))
+                self.assertTrue(state.active)
+                ended.assert_not_called()
+
+    def test_downward_target_cannot_put_feet_below_walkable_ground(self):
+        case = AUTHORED_STATES[0]
+        player, state, ended = self.start(case, flat_world(1.0), Vec3(0.0, -2.0, 0.0))
+        path = self.commands(player, range(START + 1, START + 5))
+        self.assertTrue(all(pose.position == (0.0, 1.0, 0.0) for pose in path))
+        self.assertFalse(state.active)
+        ended.assert_called_once_with(False)
+
+    def test_bounded_missing_commands_reproduce_the_same_path(self):
+        geometry = flat_world(1.0)
+        for case in AUTHORED_STATES:
+            with self.subTest(graph=f"{case[1]:04X}"):
+                contiguous, state, ended = self.start(case, geometry)
+                sparse, sparse_state, sparse_ended = self.start(case, geometry)
+                expected = self.commands(contiguous, range(START + 1, START + 19))
+                actual = self.commands(sparse, (START + 1, START + 8, START + 18))
+                self.assertEqual(actual, expected)
+                self.assertEqual(actual[-1].position, (0.0, 1.0, 3.0))
+                self.assertFalse(state.active or sparse_state.active)
+                ended.assert_called_once_with(True)
+                sparse_ended.assert_called_once_with(True)
+
+    def test_abort_stops_before_the_next_command_pose(self):
+        geometry = flat_world(1.0)
+        for case in AUTHORED_STATES:
+            with self.subTest(graph=f"{case[1]:04X}"):
+                player, state, ended = self.start(case, geometry)
+                path = self.commands(player, (START + 1, START + 2))
+                stopped = path[-1].position
+                self.assertGreater(stopped[2], 0.0)
+                self.assertLess(stopped[2], DESTINATION.z)
+                state.request(runtime.ABORT)
+                state.instance.component.run_now()
+                path = self.commands(player, range(START + 3, START + 9))
+                self.assertEqual([pose.position for pose in path[2:]], [stopped] * 6)
+                self.assertEqual(path[-1].velocity, (0.0, 0.0, 0.0))
+                self.assertFalse(state.active)
+                ended.assert_called_once_with(False)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -38,6 +38,7 @@ from ow174.game.script.runtime import (
     state_class,
     would_stack_to_top,
 )
+from ow174.game.world import MAX_MOVEMENT_AXIS
 
 MS = f32(0.001)  # 0.0010000000475, the client's float constant
 REEVALUATE = 1  # BooleanSwitch / Switch / Watch timer param
@@ -675,6 +676,38 @@ class WeaponVolley(State):
 
     def payload(self) -> dict:
         return {"start": self.start, "offset": self.offset, "volleys": self.volleys, "counter": self.counter}
+
+
+@state_class("STUStatescriptStateMoveTo")
+class MoveTo(State):
+    """Expose a resolved fixed world target and speed for one state activation."""
+
+    def __init__(self, *args) -> None:
+        super().__init__(*args)
+        self.movement: tuple[Vec3, float] | None = None
+
+    def on_begin(self) -> None:
+        speed_config = _field(self, "m_speed")
+        unsupported = ("m_destinationEntity", "m_destinationBone", "m_5BEFF040")
+        if _field(self, "m_B060F688") != 0 or speed_config is None or any(
+            _field(self, field) is not None for field in unsupported
+        ):
+            return
+        destination = self.evaluate(_field(self, "m_865F3D01"), watch=False)
+        speed = self.evaluate(speed_config, watch=False)
+        if not isinstance(destination, Vec3) or type(speed) not in (int, float):
+            return
+        # The world movement record must be able to carry the pose and velocity.
+        if 0 < speed <= MAX_MOVEMENT_AXIS and all(
+            -MAX_MOVEMENT_AXIS <= axis <= MAX_MOVEMENT_AXIS for axis in destination
+        ):
+            self.movement = destination, float(speed)
+
+    def move_request(self) -> tuple[Vec3, float] | None:
+        return self.movement if self.active else None
+
+    def on_end(self, finished: bool) -> None:
+        self.movement = None
 
 
 @state_class("STUStatescriptStateAnim")

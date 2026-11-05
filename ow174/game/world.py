@@ -93,6 +93,8 @@ SCALAR_FORMATS = {
 
 ANGLE_UNITS = 65536 / (2 * math.pi)  # s16 angle units per radian (the commands' yaw and pitch)
 POSITION_UNITS = 1024  # movement states hold positions and velocities on a 1/1024 m grid
+MOVEMENT_AXIS_BITS = 24
+MAX_MOVEMENT_AXIS = ((1 << (MOVEMENT_AXIS_BITS - 1)) - 1) / POSITION_UNITS
 
 
 class RecordWriter(BitWriter):
@@ -397,13 +399,13 @@ def write_movement(
         else:
             out.bit(0)
     for axis in state.position:  # always three; widths 8, 10, 24
-        _selector(out, round(axis * POSITION_UNITS), 2, 24)
+        _selector(out, round(axis * POSITION_UNITS), 2, MOVEMENT_AXIS_BITS)
     velocity = [round(axis * POSITION_UNITS) for axis in state.velocity]
     if any(velocity):
         out.bit(1)
         for axis in velocity:
             if axis:
-                _selector(out, axis, 2, 24)
+                _selector(out, axis, 2, MOVEMENT_AXIS_BITS)
             else:
                 out.bit(0)
     else:

@@ -25,7 +25,7 @@ from ow174.game.mover import Mod, Mover, MoverData, Snapshot
 SCHEMA = "ow174.physics-snapshot.v1"
 SCOPE = "stored-mover-physics-only"
 MOVER_FIELDS = (
-    "data", "values", "position", "on_map", "world", "category", "velocity", "yaw", "pitch",
+    "data", "values", "position", "on_map", "world", "category", "velocity", "driven", "yaw", "pitch",
     "flags_word", "air_ticks", "spring", "spring2", "spring_steps", "spring_speed", "fall", "landed",
     "crouch_end", "throttles", "input_throttles", "input_tick", "input_frame", "last_command", "mods",
     "history", "corrected", "body", "slope", "slope_cos", "slope_tan", "slope_cos32", "spring_low",

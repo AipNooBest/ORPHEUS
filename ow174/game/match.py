@@ -45,7 +45,7 @@ from ow174.game.content import PRACTICE_RANGE, SOLDIER, GameMap, Hero, heroes, s
 from ow174.game.environment import ExecutionEnvironment, SystemEnvironment
 from ow174.game.mover import CROUCHED, GRAVITY_SCALE, Mover, mover_data, statescript_mods
 from ow174.game.projectiles import MAX_LEASE_FRAME
-from ow174.game.script import expr, graph, runtime
+from ow174.game.script import expr, graph, nodes, runtime
 from ow174.game.script.bot import BotScript
 from ow174.game.script.driver import BodyScript, CommandEpochError
 from ow174.game.script.runtime import ScriptBudgetError
@@ -295,12 +295,15 @@ class Player:
                 dead = self.match.combat.is_dead(self)
                 first_pose = command.frame if dead else self.mover.first_step_frame(command.frame)
                 self._advance_body_gap(first_pose)
-                if not dead:  # a dead body lies where it fell
+                if not dead and self.body_script is not None:
                     self.mover.step(
                         command, seconds, self.match.tick,
-                        after_missing=self._advance_body_frame if self.body_script is not None else None,
+                        simulate_pose=self._step_body_pose,
                     )
-                self._advance_body_frame(command)
+                else:
+                    if not dead:  # a dead body lies where it fell
+                        self.mover.step(command, seconds, self.match.tick)
+                    self._advance_body_frame(command)
         if movelog.ENABLED:
             movelog.snapshots(self)
         return boundary
@@ -315,10 +318,35 @@ class Player:
         if first_missing < first_pose - 1:
             self._advance_body_frame(Command(first_pose - 1), posed=False)
 
-    def _advance_body_frame(self, command: Command, *, posed: bool = True) -> None:
+    def _step_body_pose(self, command: Command, seconds: float, tick: int) -> None:
+        script = self.body_script
+        requests = []
+        if script is not None:
+            requests = [
+                (state, movement)
+                for instance in script.component.instances.values()
+                for state in instance.states.values()
+                if isinstance(state, nodes.MoveTo) and (movement := state.move_request()) is not None
+            ]
+        # Arbitration between simultaneous world-target states is unresolved.
+        movement_end = None
+        if len(requests) == 1:
+            state, (target, speed) = requests[0]
+            outcome = self.mover.step_pose(
+                command, seconds, tick, move_to=((target.x, target.y, target.z), speed),
+            )
+            if outcome is not None:
+                movement_end = state, outcome
+        else:
+            self.mover.step_pose(command, seconds, tick)
+        self._advance_body_frame(command, movement_end=movement_end)
+
+    def _advance_body_frame(
+        self, command: Command, *, posed: bool = True, movement_end: tuple[nodes.MoveTo, bool] | None = None,
+    ) -> None:
         """Resolve body input and consume combat reports from this simulation step."""
         if self.body_script is not None:
-            self.match.body_command(self, command)
+            self.match.body_command(self, command, movement_end=movement_end)
             self.match.combat.command(self, command if posed else None)
         # Modifier changes take effect on the next movement frame.
         script = self.body_script
@@ -1008,12 +1036,18 @@ class Match:
             player.body_script = None
         player.body_script_failed = failed
 
-    def body_command(self, player: Player, command: Command) -> None:
+    def body_command(
+        self, player: Player, command: Command, *, movement_end: tuple[nodes.MoveTo, bool] | None = None,
+    ) -> None:
         """One new command frame for the body's statescript. A failure turns it off for this body (logged)
         instead of breaking the tick."""
         script = player.body_script
         before_hash = bodytrace.before(script)
         try:
+            if movement_end is not None:
+                state, arrived = movement_end
+                delay = command.frame * script.frame_ms - script.component.now
+                state.request(runtime.FINISH if arrived else runtime.ABORT, max(0, delay))
             script.command(command.frame, command.buttons, command.action, command.forward, command.right)
         except Exception as error:
             bodytrace.failed(script, error)

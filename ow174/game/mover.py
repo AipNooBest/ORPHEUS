@@ -453,6 +453,7 @@ class Mover:
         self.world = world if world is not None else flat_world(self.position[1])
         self.category = category  # the query category: the team's proxy bit
         self.velocity = (0.0, 0.0, 0.0)
+        self.driven = False  # the previous pose used a statescript world-target velocity
         self.yaw = int(yaw)
         self.pitch = 0  # the aim pitch (state +66), held to +-89 degrees
         self.flags_word = 0
@@ -599,12 +600,13 @@ class Mover:
 
     def step(
         self, command: Command, seconds: float, tick: int = 0,
-        *, after_missing: Callable[[Command], None] | None = None,
+        *, simulate_pose: Callable[[Command, float, int], None] | None = None,
     ) -> None:
         """One tick per command frame. Frames that never arrived are run first: the client ran them, most
         likely with the same keys (the last command again, and from the 33rd
-        missing one without throttles and buttons). A body script can follow each missing movement step
-        to keep its modifiers aligned with the fallback input."""
+        missing one without throttles and buttons). A player with a body script can drive each pose and
+        run its graph on the same frame, including recovered input."""
+        pose = self.step_pose if simulate_pose is None else simulate_pose
         last = self.last_command
         if last is not None:
             for frame in range(self.first_step_frame(command.frame), command.frame):
@@ -614,13 +616,20 @@ class Mover:
                     last, frame=frame, buttons=last.buttons & ~SUBFRAME, action=0,
                     subframe=0xFF, click_yaw=None, click_pitch=None,
                 )
-                self._tick(missing, seconds, tick)
-                if after_missing is not None:
-                    after_missing(missing)
+                pose(missing, seconds, tick)
         self.last_command = command
-        self._tick(command, seconds, tick)
+        pose(command, seconds, tick)
 
-    def _tick(self, command: Command, seconds: float, tick: int) -> None:
+    def step_pose(
+        self, command: Command, seconds: float, tick: int,
+        *, move_to: tuple[tuple[float, float, float], float] | None = None,
+    ) -> bool | None:
+        """Run one posed frame. A world-target move reports arrival (True) or blocking (False)."""
+        if move_to is not None and move_to[1] * seconds < STEP:
+            move_to = None  # no fractional world-target progress is kept between poses
+        if self.driven and move_to is None:
+            self.velocity = (0.0, 0.0, 0.0)
+        self.driven = move_to is not None
         dt = seconds
         frame = command.frame
         active = sorted((mod for mod in self.mods.values() if mod.acts(frame)), key=Mod.order)
@@ -631,7 +640,7 @@ class Mover:
             self.flags_word |= TURN_HELD
         right, right_byte = throttle_byte(command.right)
         forward, forward_byte = throttle_byte(command.forward)
-        jump = intent(active, JUMP_INTENT, 1.0 if command.buttons & JUMP else 0.0) > 0.5
+        jump = move_to is None and intent(active, JUMP_INTENT, 1.0 if command.buttons & JUMP else 0.0) > 0.5
         crouch = bool(command.buttons & CROUCH)
         stood_up = self.crouch_end
         if crouch and not self.crouched and stood_up is not None:
@@ -646,30 +655,34 @@ class Mover:
         if was_crouched and not self.crouched:
             self.crouch_end = frame
 
-        # The move context.
         grounded = not self.flags_word & IN_AIR
-        normal = ground.normal if (grounded and ground is not None) else (0.0, 1.0, 0.0)
-        vx, vy, vz = self.velocity
-        horizontal = (vx, 0.0, vz)
-        angle = self.yaw * TURN
-        axes = (math.sin(angle), math.cos(angle))  # forward (x, z); right is (-cos, sin)
-
-        self._spring(f32(dt), ground if grounded else None, start)
-        self._friction(dt, horizontal, vy, grounded)
-        self._accelerate(dt, right, forward, axes, grounded)
-        self._cap(horizontal, axes)
-        if not grounded:
-            vx, vy, vz = self.velocity
-            self.velocity = (vx, vy - WORLD_GRAVITY * data.gravity_scale * dt, vz)
-            self.fall = f32(self.fall + f32(f32(-WORLD_GRAVITY * data.gravity_scale) * f32(dt)))
-
+        self._spring(f32(dt), ground if grounded and move_to is None else None, start)
         self.throttles = (right_byte, forward_byte)
         if right_byte or forward_byte:
             self.input_throttles = self.throttles
             self.input_tick = tick
             self.input_frame = frame
-        self._fall_after(self._move(dt, normal))
+
+        outcome = None
+        if move_to is None:
+            normal = ground.normal if grounded and ground is not None else (0.0, 1.0, 0.0)
+            vx, vy, vz = self.velocity
+            horizontal = (vx, 0.0, vz)
+            angle = self.yaw * TURN
+            axes = (math.sin(angle), math.cos(angle))  # forward (x, z); right is (-cos, sin)
+            self._friction(dt, horizontal, vy, grounded)
+            self._accelerate(dt, right, forward, axes, grounded)
+            self._cap(horizontal, axes)
+            if not grounded:
+                vx, vy, vz = self.velocity
+                self.velocity = (vx, vy - WORLD_GRAVITY * data.gravity_scale * dt, vz)
+                self.fall = f32(self.fall + f32(f32(-WORLD_GRAVITY * data.gravity_scale) * f32(dt)))
+            self._fall_after(self._move(dt, normal))
+        else:
+            target, speed = move_to
+            outcome = self._move_to(dt, target, speed)
         self.history.append(self.snapshot(frame))
+        return outcome
 
     def _fall_after(self, vertical: float) -> None:
         """The state's +832 after the move (0x7FF789B4F530): gravity's part of the velocity, added up in the
@@ -1042,7 +1055,6 @@ class Mover:
             f32(f32(f32(0.0 * rise) + velocity[2]) * step) + 0.0,
         )
         final, planes, touching = body.move(displacement, step, ROUNDS)
-        self.flags_word = self.flags_word & ~TOUCHING | (TOUCHING if touching else 0)
         vx, vy, vz = contacts.clip_velocity(velocity, planes)
         if grounded:
             squared = vx * vx + vy * vy + vz * vz
@@ -1050,16 +1062,61 @@ class Mover:
             if squared >= EPSILON and flat >= EPSILON:
                 scale = math.sqrt(squared / flat)
                 vx, vy, vz = vx * scale, 0.0, vz * scale
+        if self._place(body, final, touching):
+            vy = 0.0
+        self.velocity = (quantise(vx), quantise(vy), quantise(vz))
+        return vy
+
+    def _move_to(self, dt: float, target, speed: float) -> bool | None:
+        """Sweep a speed-limited displacement toward a resolved world-space feet position."""
+        start = tuple(self.position)
+        dx, dy, dz = (end - axis for end, axis in zip(target, start, strict=True))
+        distance = math.hypot(dx, dy, dz)
+        if distance > STEP:
+            scale = min(1.0, speed * dt / distance)
+            x, y, z = start
+            body = self._engine_body()
+            bx, by, bz = body.position
+            displacement = contacts.v3(x + dx * scale - bx,
+                                       y + dy * scale + self._lift() - by,
+                                       z + dz * scale - bz)
+            final, _, touching = body.move(displacement, f32(dt), ROUNDS)
+            # The spring holds the capsule above the feet. On descent the feet must
+            # still stop at walkable ground even when the capsule could move lower.
+            lift = self._lift()
+            feet = final[1] - lift
+            if dy < 0.0 and feet < y:
+                ground = self.world.ground(final[0], final[2], y + STEP, feet, self.category)
+                if (
+                    ground is not None
+                    and ground.normal[1] > self.slope_cos
+                    and not ground.surface & NOT_GROUND
+                ):
+                    final = (final[0], f32(ground.y + lift), final[2])
+            self._place(body, final, touching)
+        remaining = math.dist(self.position, target)
+        self.fall = 0.0
+        if self.position[1] - start[1] > STEP and not self.airborne:
+            self.flags_word |= FELL
+            self.air_ticks = 0
+        if remaining <= STEP or distance - remaining < STEP / 2:
+            self.velocity = (0.0, 0.0, 0.0)
+            self.driven = False
+            return remaining <= STEP
+        self.velocity = tuple(
+            quantise((axis - old) / dt) for axis, old in zip(self.position, start, strict=True)
+        )
+        return None
+
+    def _place(self, body: contacts.CharacterBody, final, touching: bool) -> bool:
+        self.flags_word = self.flags_word & ~TOUCHING | (TOUCHING if touching else 0)
         lift = self._lift()
         feet = f32(final[1] - lift)
         floor = self.world.lowest - ABYSS
-        if feet < floor:  # fell out of the map: the client's player is dead by now (a mode's kill volume)
-            feet, vy = floor, 0.0
-        self.position = [quantise(final[0]), quantise(feet), quantise(final[2])]
-        self.velocity = (quantise(vx), quantise(vy), quantise(vz))
+        self.position = [quantise(final[0]), quantise(max(feet, floor)), quantise(final[2])]
         x, y, z = self.position
         body.teleport((x, f32(y + lift), z))  # the end of the tick (0x7FF789D11B60): on the grid
-        return vy
+        return feet < floor  # past the mover's abyss clamp (mode kill volumes are separate)
 
 
 def _along_ground(vx: float, vy: float, vz: float, normal) -> tuple[float, float, float]:
