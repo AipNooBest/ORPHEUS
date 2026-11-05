@@ -1,0 +1,150 @@
+Stored mover physics snapshot v1 — observation only, without restoration (M0.8)
+
+ow174/game/physics_snapshot.py exports the complete supported stored state reachable
+from one Mover. It does not advance, initialize or restore a Mover, CharacterBody,
+contact, GJK solver, query cache or command. It adds no default recorder and does
+not change mover.py, contacts.py, collision.py, Match, GameServer or a root journal.
+
+  from ow174.game.physics_snapshot import snapshot_mover
+  document = snapshot_mover(mover)
+
+  # A surrounding capture can validate the real static asset at its start and end:
+  document = snapshot_mover(mover, world_descriptor=validated_world_descriptor)
+
+The returned detached JSON-compatible dict contains schema
+"ow174.physics-snapshot.v1", scope "stored-mover-physics-only", world_descriptor,
+world_validation and state. state uses replay_values.encode, preserving exact
+scalar types, float64 bits and ordered mappings. It can be inspected with
+replay_values.decode(document['state']). This is a state observation artifact,
+not a deserializer, restore point or assertion that all server state is captured.
+
+snapshot_mover_with_identities(mover, world_descriptor=...) returns
+(the_same_document, tuple_of_(local_node_id, actual_object)). Both results come
+from one capture, with no second query or fingerprint calculation. This temporary
+identity table names existing dynamic nodes only; static assets and scalars are
+not entries. A surrounding domain exporter can use it to reject unsupported
+sharing of mutable bodies, contacts, caches or containers between separate Mover
+artifacts. The table contains live object references, is not JSON/replay data and
+must not be retained as a serialized artifact. No callback is executed to deliver
+identities. snapshot_mover continues to return only its unchanged detached document.
+
+World identity and delegated validation
+
+The default call computes world_fingerprint(mover.world) and reports
+world_validation="fingerprinted". A supplied descriptor is strictly validated
+for schema, digest syntax and collision cache version, but is not rehashed against
+all static geometry at every root. Such documents explicitly report
+world_validation="caller_supplied". The caller must verify that exact actual World
+against the descriptor around the complete capture interval. Supplying an unrelated
+but syntactically valid descriptor does not establish asset correctness.
+
+Every invocation still checks exact supported static classes/instance fields and
+closes references used by the dynamic physics state. Shape references use unique
+first-seen numbering in World.engine.shapes, including repeated object aliases.
+Geometry uses first-seen numbering while visiting those unique shapes. These are
+the same numbering rules as collision_fingerprint.py. Existing MeshShape.cache
+Triangle objects use the owning geometry number and stored triangle index. Mesh
+contact candidates additionally name their geometry/triangle number even when a
+Triangle object has not yet been allocated in the lazy mesh cache.
+
+World, StaticWorld, StaticShape and static geometry references are represented by
+small {static: kind, index: ...} records in state, with a shared descriptor at the
+document boundary. A CharacterBody may have world=None, but a non-null world must
+be the mover's actual engine. Every contact must name an actual shape in that
+World; MeshContact.mesh must be its shape's actual geometry. Equal coordinates,
+shape.order values or another asset with similar geometry cannot repair a foreign
+reference. Unlisted external static objects fail instead of being guessed.
+
+Object graph and complete stored fields
+
+state decodes to {root: {node: 0}, nodes: [...]}. Dynamic objects and containers
+receive first-seen node numbers. References use {node: number}; ordinary stored
+dict/list/tuple values are themselves explicit nodes, so a user's literal dict
+containing a key named "node" cannot be mistaken for a graph reference. No native
+address, repr, hash() or user serializer is emitted.
+
+The exporter preserves list/tuple distinction, dict entry order and arbitrary
+supported typed keys (including the mods' tuple keys), repeated object/container
+aliases, graph cycles, deque order and maxlen. Mover.data and values remain
+distinct references when separate objects have equal field values. Contact list
+order and shared Manifold/Point references are retained. Static pure query-cache
+occupancy is part of the surrounding asset validation contract, not a replacement
+for dynamic contact state.
+
+Explicit class/field whitelists cover:
+
+- All Mover instance fields, including body, world/on_map/category, data/values,
+  pose/velocity/flags, both springs and their stored steps/speed/limits, fall,
+  input tick/frame/throttles, last_command, mods, full history, corrected, all
+  slope values and landing/crouch state. Public computed properties are not used.
+- Every MoverData field; every Mod field (index/op/value/start/end/priority/key);
+  every stored Command field, including subframe/click aim; every Snapshot field.
+- CharacterBody radius/top/capsule/world/category/position/aabb/fat/moved/contacts
+  and adaptive solver budget. The capsule's complete stored geometry is retained.
+- MeshContact shape/mesh/category/box and ordered candidate lists. Both current
+  two-field [triangle, GJK-cache] and five-field [triangle, cache-out, last capsule
+  key, cache-in, Manifold] layouts are retained exactly. The class sign is recorded.
+- ConvexContact shape/cache/first/sign/memo. Its memo preserves capsule key,
+  cache-in, ordered cached manifolds and gap, with all nested aliases.
+- Manifold normal/points/gap and Point id/position/separation. Stored numerical
+  GJK tuples, support-index tuples and cached capsule keys are not recomputed or
+  omitted as derivatives.
+- Known Ground, Triangle, Constraint and Distance storage adapters, if reachable.
+  Ground mask/normal/plane/surface/y, Triangle stored corners/wings/has/index/mask/
+  surface/normal/sides/top/bottom, Constraint cap/impulse/normal/offset/soft, and
+  Distance cache/distance/exit/iterations/lower/normal/point_a/point_b are retained.
+
+Ground, Constraint and Distance are normally local variables inside a completed
+physics step and therefore are not invented as Mover fields. This exporter cannot
+recover already-discarded locals or serialize a suspended Python call stack.
+Uncached temporary Triangle objects, if reachable in stored data, retain their
+complete fields rather than falsely claiming an identity in a static mesh cache.
+
+Whitelist validation rejects unknown instance fields, subclasses, uninitialized
+slot fields, unknown value types, unsupported candidate layouts and unresolved
+static references. It does not invoke physics step/move/sweep/query/triangle,
+Mover.snapshot, object repr or user methods. The default static fingerprint keeps
+its own existing pure asset-validation contract; callers can supply a previously
+validated descriptor to avoid all large-geometry work here. Structural budgets
+fail explicitly rather than truncating a large stored graph.
+
+Known nonfinite sentinel and probe evidence
+
+replay_values continues to reject NaN and infinity globally. contacts.gjk with a
+finite reach can legitimately return Distance.distance=+inf to mean that shapes
+are beyond that reach (contacts.py's explicit far-distance return). Only that
+exact class/field and positive infinite value uses this explicit stored marker:
+
+  {ieee754_sentinel: "gjk.distance.beyond_reach",
+   float64_bits: "7ff0000000000000"}
+
+No global float coercion is introduced. Negative infinity, NaN, and nonfinite
+values in other fields remain failures. This Distance result normally stays
+local to the narrowphase; manifold gap and GJK caches retain their actual stored
+finite values rather than copying a transient infinite distance into them.
+
+work/physics_snapshot_probe.json records 25 successful observation-only exports
+after explicit fixture setup: standing, wall, jump and step scenes plus a real
+preexisting 0688 collision cache at command frames 0/1/4/16/64. Their reachable
+dynamic stored fields contained no nonfinite values. The report also records the
+actual separate GJK reach producer's positive-infinity bits. It starts no game,
+UDP listener or UI and writes no cache assets; fixture setup runs real physics,
+whereas each snapshot only reads the state left by that setup.
+
+Quiescent capture requirement and validation
+
+The caller must prevent concurrent mutation throughout an export. This function
+does not acquire GameServer.lock, stop another game thread or provide a live
+mutation barrier. Static fingerprint validation remains necessary if assets may
+change. A caller-supplied descriptor is a performance delegation, not permission
+to skip that validation or claim all live server state was captured.
+
+  .venv/Scripts/python.exe -B -m unittest discover -s tests -p test_physics_snapshot.py
+  .venv/Scripts/python.exe -m ruff check ow174/game/physics_snapshot.py tests/test_physics_snapshot.py
+
+Dedicated tests verify cold/no-body and warmed real contacts, complete field
+coverage, independent deterministic scenes, no physics method or query calls,
+contact budget/box/GJK/memo/gap sensitivity without pose changes, data and cached
+manifold/point aliases, static reference numbering, mods/history/order/maxlen,
+foreign reference and unknown-field failures, exact float types/-0.0, detached
+outputs, the field-specific GJK sentinel and strict descriptor validation.
