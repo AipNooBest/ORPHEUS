@@ -1424,8 +1424,7 @@ def contains(instance: Instance, node, caller) -> bool:
     """The container m_814F8EC3 has an element equal to m_value (eval 0x7FF78AA85A30)."""
     container = instance.evaluate(node.fields.get("m_814F8EC3"), caller)
     value = instance.evaluate(node.fields.get("m_value"), caller)
-    items = container if isinstance(container, tuple) else (() if container is None else (container,))
-    return branch(instance, node, caller, any(equal(item, value) for item in items))
+    return branch(instance, node, caller, expr.contains_value(container, value))
 
 
 @handler("STU_7DEB522D")

@@ -233,6 +233,13 @@ def equal(a, b) -> bool:
     return type(a) is type(b) and a == b
 
 
+def contains_value(container, value) -> bool:
+    """Test membership in a tuple or a singleton using VM equality."""
+    if isinstance(container, tuple):
+        return any(equal(item, value) for item in container)
+    return container is not None and equal(container, value)
+
+
 def same(a, b) -> bool:
     """Exactly the same value and type: what makes a variable "changed" for the wire and watchers."""
     if type(a) is not type(b):
@@ -386,6 +393,10 @@ def evaluate(cfg, ctx: Context):
         return CONSTANTS[cls](cfg)
     if cls in EXPRESSIONS:
         return run(cfg, ctx)
+    if cls == "STU_45EDF12D" and cfg.get("m_key") is None:
+        container = evaluate(cfg.get("m_814F8EC3"), ctx)
+        value = evaluate(cfg.get("m_value"), ctx)
+        return contains_value(container, value)
     if cls in RESOURCES:
         return Asset(guid_of(cfg.get(RESOURCES[cls])))
     if cls == "STU_B5A0CAF0":  # GetOwner

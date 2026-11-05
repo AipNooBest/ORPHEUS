@@ -47,6 +47,7 @@ jobs:
             'test_replay_values.py',
             'test_casc_bundle.py',
             'test_script_expr_budget.py',
+            'test_script_membership.py',
             'test_script_raycast.py',
             'test_extract_game_graphs.py',
             'test_extract_raycast_metadata.py'
