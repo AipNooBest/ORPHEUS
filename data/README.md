@@ -39,7 +39,21 @@ In the prepared research checkout, use the local 104319 installation to generate
 
 The tool reads the installation from `game_path.txt` or an executable path given with `--game`. It writes `0688.rays.col` and `0CD3.rays.col` beside the existing movement caches. Runtime preparation copies each selected map's optional ray cache into the external pack and records its SHA-256.
 
-Explicit static queries can use `collision.RayWorld.load(map_guid, mode_guid)`. It verifies the map and original chunk key, then selects props for the requested mode. A missing or mismatched cache produces a load error. Coverage includes the core chunk and the supported static shapes in the existing prop index. Full prop indexing, dynamic objects and authored ability filter evaluation remain open. Keep the generated caches local.
+Explicit static queries can use `collision.RayWorld.load(map_guid, mode_guid)`. It verifies the map and original chunk key, then selects props for the requested mode. A missing or mismatched cache produces a load error. Base coverage includes the core chunk and the supported static shapes in the existing prop index.
+
+For a wider static query, use PowerShell 7 and the built DataTool from OWLib revision `7afe5f52706e7002ed8c2717299cd60846f3fa3a`. List unindexed client-made root definitions, export their local records and build the selected ray caches.
+
+```powershell
+$game = 'C:\path\to\Overwatch'
+$dataTool = 'C:\path\to\owlib\DataTool\bin\Release\net6.0'
+$records = 'C:\path\to\local-storage\ray-props.json'
+$roots = @(.\.venv\Scripts\python.exe tools\build_collision.py 0688 0CD3 --list-unindexed-props | ConvertFrom-Json)
+& ./tools/export_casc_records.ps1 -GameRoot $game -DataToolDir $dataTool -AssetGuid $roots -IncludeRootModels |
+    Set-Content -LiteralPath $records -Encoding utf8
+.\.venv\Scripts\python.exe tools\build_collision.py 0688 0CD3 --ray-geometry --prop-records $records
+```
+
+The exporter verifies the selected definitions and models against the local content manifest, including both the container and the slice for bundled records. The cache builder reopens those records through CASC and resolves authored root model references in placeable order. It records the placement content key and the catalog's SHA-256 so changed inputs trigger a rebuild. The runtime pack uses the resulting cache without the local catalog. Attached child geometry, server-generated and dynamic objects, and authored ability filtering still need verification. Keep catalogs and generated caches local.
 
 ### Local score event metadata
 

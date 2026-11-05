@@ -152,16 +152,24 @@ class Structured:
             raise PropError("bad structured data")
         return [offset + stride * k for k in range(count)]
 
-    def _fields(self, position: int) -> dict:
+    def _fields(self, position: int, *, end: int | None = None) -> dict:
         found = {}
+        if end is not None and (not 0 <= position <= end - 4 or end > len(self.body)):
+            raise PropError("inline instance runs past its field")
         bag = struct.unpack_from("<i", self.body, position)[0]
         position += 4
         if not 0 <= bag < len(self.bags):
+            if end is not None and bag != -1:
+                raise PropError("invalid inline instance field bag")
             return found
         for field, size in self.bags[bag]:
             if size == 0:
+                if end is not None and position + 4 > end:
+                    raise PropError("inline field size runs past its instance")
                 size = struct.unpack_from("<i", self.body, position)[0]
                 position += 4
+            if end is not None and not 0 <= size <= end - position:
+                raise PropError("inline field runs past its instance")
             found[field] = (position, size)
             position += size
         return found
@@ -191,6 +199,97 @@ class Structured:
     def inline(self, instance: int, field: int) -> dict | None:
         place = self.fields[instance].get(field)
         return None if place is None else self._fields(place[0])
+
+
+def _header_checksum(data: bytes) -> int:
+    """The STUv2 header CRC64, using the reflected Jones polynomial."""
+    crc = 0
+    for value in data[:36]:
+        crc ^= value
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x95AC9329AC4BC9B5 if crc & 1 else 0)
+    return crc ^ 0xFFFFFFFFFFFFFFFF
+
+
+def _asset_ref(stu: Structured, fields: dict, field: int, checksum: int) -> int:
+    raw = stu.raw(fields, field)
+    value = 0 if raw is None else struct.unpack("<Q", raw)[0]
+    if not value:
+        return 0
+    encoded = (value ^ (field | field << 32) ^ checksum).to_bytes(8, "little")
+    return int.from_bytes(bytes(encoded[index] for index in (3, 7, 6, 0, 5, 4, 2, 1)), "little")
+
+
+def _component_indices(stu: Structured, root: dict) -> list[int]:
+    raw = stu.raw(root, 0x8AF8F4F5)  # STUEntityDefinition.m_componentMap
+    offset = -1 if raw is None else struct.unpack("<i", raw)[0]
+    if offset == -1:
+        return []
+    if not 0 <= offset <= len(stu.dynamic) - 4:
+        raise PropError("invalid entity component map offset")
+    buckets = struct.unpack_from("<I", stu.dynamic, offset)[0]
+    if not buckets:
+        return []
+    bucket_start, value_start = struct.unpack_from("<qq", stu.dynamic, offset + 8)
+    if not 0 <= bucket_start <= len(stu.dynamic) - 4 * buckets:
+        raise PropError("invalid entity component map buckets")
+    count = struct.unpack_from("<I", stu.dynamic, bucket_start + 4 * (buckets - 1))[0]
+    if not 0 <= value_start <= len(stu.dynamic) - 16 * count:
+        raise PropError("invalid entity component map entries")
+    return [struct.unpack_from("<i", stu.dynamic, value_start + 16 * index + 8)[0] for index in range(count)]
+
+
+def _child_refs(stu: Structured, root: dict, checksum: int) -> list[tuple[int, int, int]]:
+    array = root.get(0xF29E4995)  # STUEntityDefinition.m_childEntityData
+    if array is None:
+        return []
+    position, size = array
+    end = position + size
+    if not 0 <= position <= end - 4 or end > len(stu.body):
+        raise PropError("invalid child entity array field")
+    count = struct.unpack_from("<i", stu.body, position)[0]
+    position += 4
+    if not 0 <= count <= (end - position) // 4:
+        raise PropError("invalid child entity array count")
+    children = []
+    for _ in range(count):
+        fields = stu._fields(position, end=end)
+        position = max((start + size for start, size in fields.values()), default=position + 4)
+        definition = _asset_ref(stu, fields, 0x436BEFE6, checksum)
+        hardpoint = _asset_ref(stu, fields, 0x2D3CDFA9, checksum)
+        identifier = _asset_ref(stu, fields, 0x49F782CE, checksum)
+        children.append((definition, hardpoint, identifier))
+    return children
+
+
+def entity_model_refs(data: bytes) -> tuple[list[tuple[int, bool]], list[tuple[int, int, int]]]:
+    """Read a 003 STUv2 entity's direct (model GUID, client-only) and (child, hardpoint, identifier) refs."""
+    try:
+        if len(data) < 36 or data.startswith(b"STUD"):
+            raise PropError("expected an STUv2 entity definition")
+        stu = Structured(data)
+        if not stu.hashes or stu.hashes[0] != 0x73BB2F3A:
+            raise PropError("expected an STUEntityDefinition root")
+        root = stu.fields[0]
+        checksum = _header_checksum(data)
+        models = []
+        for index in _component_indices(stu, root):
+            if index == -1:
+                continue
+            if not 0 <= index < len(stu.hashes):
+                raise PropError("invalid entity component index")
+            if stu.hashes[index] != 0x191835F9:  # STUModelComponent
+                continue
+            fields = stu.fields[index]
+            model = _asset_ref(stu, fields, 0x2D124BE2, checksum)
+            if model and model >> 48 != 0x0D00:
+                raise PropError("invalid root model GUID")
+            breakable = fields.get(0xDEB1159A)
+            config = {} if breakable is None else stu._fields(breakable[0], end=sum(breakable))
+            models.append((model, _byte(stu, config, 0xE1B0C07F, 0) == 1))
+        return models, _child_refs(stu, root, checksum)
+    except struct.error as error:
+        raise PropError("truncated entity definition data") from error
 
 
 def _vector(raw: bytes | None) -> tuple:
@@ -484,24 +583,59 @@ def place(point, translation, scale, rotation) -> tuple:
     return (x + translation[0], y + translation[1], z + translation[2])
 
 
-def map_shapes(map_guid: int, read, category: int = MOVER) -> tuple[list, list]:
+def placement_record(map_guid: int) -> dict | None:
+    return props_data()["maps"].get(f"0x{map_guid:016X}")
+
+
+def unindexed_definitions(map_guid: int, read) -> set[int]:
+    entry = placement_record(map_guid)
+    if entry is None:
+        raise PropError(f"no placement record for map {map_guid:#x}")
+    indexed = props_data()["defs"]
+    return {definition for definition, *_ in placements(read(entry)) if f"0x{definition:016X}" not in indexed}
+
+
+def _catalog_record(records: dict, guid: int) -> dict:
+    if guid not in records:
+        raise PropError(f"missing CASC record for {guid:#018x}")
+    return records[guid]
+
+
+def map_shapes(
+    map_guid: int, read, category: int = MOVER, *, records: dict[int, dict] | None = None,
+) -> tuple[list, list]:
     """A map's props: (models: each model's shapes (model_shapes), placements: [(model index, identifier
     (0 or the one the game mode must list), translation, scale, rotation)] in placeable order).
-    `read(keys)` returns a file's bytes."""
+    `read(keys)` returns a file's bytes. Optional local records resolve unindexed root models."""
     data = props_data()
-    entry = data["maps"].get(f"0x{map_guid:016X}")
+    entry = placement_record(map_guid)
     if entry is None:
+        if records is not None:
+            raise PropError(f"no placement record for map {map_guid:#x}")
         return [], []
     models: list = []
     index: dict[str, int] = {}
+    roots: dict[int, tuple[str, ...]] = {}
     placed = []
     for definition, identifier, translation, scale, rotation in placements(read(entry)):
-        model = data["defs"].get(f"0x{definition:016X}")
-        if model is None:
-            continue
-        if model not in index:
-            index[model] = len(models)
-            models.append(model_shapes(read(data["models"][model]), category))
-        if models[index[model]]:
-            placed.append((index[model], identifier, translation, scale, rotation))
+        if definition not in roots:
+            model = data["defs"].get(f"0x{definition:016X}")
+            if model is not None:
+                roots[definition] = (model,)
+            elif records is None:
+                roots[definition] = ()
+            else:
+                refs, _children = entity_model_refs(read(_catalog_record(records, definition)))
+                roots[definition] = tuple(
+                    f"0x{guid:016X}" for guid, client_only in refs if guid and not client_only
+                )
+        for model in roots[definition]:
+            if model not in index:
+                record = data["models"].get(model)
+                if record is None:
+                    record = _catalog_record(records or {}, int(model, 16))
+                index[model] = len(models)
+                models.append(model_shapes(read(record), category))
+            if models[index[model]]:
+                placed.append((index[model], identifier, translation, scale, rotation))
     return models, placed

@@ -13,17 +13,105 @@ size and the asset's offset in a nested `bundle` record. Both contents are check
 """
 
 import hashlib
+import json
+import re
 import struct
 import zlib
+from dataclasses import dataclass
 from pathlib import Path
 
 INDEX_VERSION = 7
 ENTRY = 18  # bytes per index entry
 KEY = 9  # bytes of the encoding key the index keeps
+RECORD_CATALOG_SCHEMA = "orpheus-casc-records-v1"
+RECORD_CATALOG_BUILD = "1.74.0.0.104319"
 
 
 class CascError(Exception):
     pass
+
+
+def _unique_object(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise CascError(f"duplicate record catalog key {key}")
+        result[key] = value
+    return result
+
+
+def _record_layout(record: dict) -> tuple:
+    if not isinstance(record, dict):
+        raise CascError("invalid storage record")
+    bundled = "bundle" in record
+    if bundled and "ekey" in record:
+        raise CascError("bundled storage record cannot have an outer encoding key")
+    source = record["bundle"] if bundled else record
+    if not isinstance(source, dict):
+        raise CascError("invalid storage record")
+    try:
+        ekey = bytes.fromhex(source["ekey"])
+        source_ckey = bytes.fromhex(source["ckey"])
+        ckey = bytes.fromhex(record["ckey"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise CascError("invalid storage record keys") from error
+    if any(len(key) != 16 for key in (ekey, source_ckey, ckey)):
+        raise CascError("storage record keys must be 16 bytes")
+
+    def size(value, label: str) -> int:
+        if type(value) is not int or value < 0:
+            raise CascError(f"invalid {label}: expected a non-negative integer")
+        return value
+
+    if bundled:
+        return (ekey, source_ckey, ckey, size(source.get("size"), "bundle size"),
+                size(source.get("offset"), "bundle offset"), size(record.get("size"), "slice size"))
+    expected = size(record["size"], "file size") if "size" in record else None
+    return ekey, source_ckey, ckey, expected, None, None
+
+
+@dataclass(frozen=True)
+class RecordCatalog:
+    """Local build-specific definition and model records for the offline geometry builder."""
+
+    records: dict[int, dict]
+    sha256: str
+
+    @classmethod
+    def load(cls, path: str | Path) -> "RecordCatalog":
+        raw = Path(path).read_bytes()
+        try:
+            data = json.loads(raw, object_pairs_hook=_unique_object)
+        except ValueError as error:
+            raise CascError("invalid record catalog JSON") from error
+        if (
+            type(data) is not dict
+            or set(data) != {"schema", "build", "records"}
+            or data["schema"] != RECORD_CATALOG_SCHEMA
+            or data["build"] != RECORD_CATALOG_BUILD
+            or type(data["records"]) is not dict
+        ):
+            raise CascError("record catalog must describe build 1.74.0.0.104319")
+        records = {}
+        for text, record in data["records"].items():
+            if not re.fullmatch(r"0x(?:0400|0D00)[0-9A-F]{12}", text):
+                raise CascError(f"invalid definition or model GUID {text}")
+            if type(record) is not dict or "size" not in record:
+                raise CascError(f"invalid storage record for {text}")
+            if "bundle" in record:
+                if (
+                    set(record) != {"bundle", "ckey", "size"}
+                    or type(record["bundle"]) is not dict
+                    or set(record["bundle"]) != {"ekey", "ckey", "size", "offset"}
+                ):
+                    raise CascError(f"invalid bundled storage record for {text}")
+            elif set(record) != {"ekey", "ckey", "size"}:
+                raise CascError(f"invalid direct storage record for {text}")
+            _, _, _, size, offset, length = _record_layout(record)
+            if offset is not None and (offset > size or length > size - offset):
+                raise CascError(f"asset slice for {text} runs past its bundle")
+            records[int(text, 16)] = record
+        return cls(records, hashlib.sha256(raw).hexdigest())
 
 
 def game_root(executable: str | Path) -> Path:
@@ -123,38 +211,11 @@ class Storage:
         own `ckey` and `size`, and `bundle` holds the container's `ekey`, `ckey`, `size` and `offset`.
         The bundle's encoding key never stands in for an encoding key of the asset itself.
         """
-        if not isinstance(record, dict):
-            raise CascError("invalid storage record")
-        bundled = "bundle" in record
-        if bundled and "ekey" in record:
-            raise CascError("bundled storage record cannot have an outer encoding key")
-        source = record["bundle"] if bundled else record
-        if not isinstance(source, dict):
-            raise CascError("invalid storage record")
-        try:
-            ekey = bytes.fromhex(source["ekey"])
-            source_ckey = bytes.fromhex(source["ckey"])
-            ckey = bytes.fromhex(record["ckey"])
-        except (KeyError, TypeError, ValueError) as error:
-            raise CascError("invalid storage record keys") from error
-        if any(len(key) != 16 for key in (ekey, source_ckey, ckey)):
-            raise CascError("storage record keys must be 16 bytes")
-
-        def size(value, label: str) -> int:
-            if type(value) is not int or value < 0:
-                raise CascError(f"invalid {label}: expected a non-negative integer")
-            return value
-
-        expected = size(source.get("size"), "bundle size") if bundled else None
-        if not bundled and "size" in record:
-            expected = size(record["size"], "file size")
-        if bundled:
-            offset = size(source.get("offset"), "bundle offset")
-            length = size(record.get("size"), "slice size")
+        ekey, source_ckey, ckey, expected, offset, length = _record_layout(record)
         content = self.read(ekey, source_ckey)
         if expected is not None and len(content) != expected:
             raise CascError(f"storage record size {expected}, read {len(content)} bytes")
-        if bundled:
+        if offset is not None:
             if offset > len(content) or length > len(content) - offset:
                 raise CascError("asset slice runs past its bundle")
             content = content[offset : offset + length]

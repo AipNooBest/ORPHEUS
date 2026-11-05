@@ -41,6 +41,8 @@ jobs:
             'test_game_link.py',
             'test_collision_ray.py',
             'test_collision_ray_cache.py',
+            'test_collision_prop_catalog.py',
+            'test_prop_entity_model_refs.py',
             'test_replay_values.py',
             'test_casc_bundle.py',
             'test_script_expr_budget.py',

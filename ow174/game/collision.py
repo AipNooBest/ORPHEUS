@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Protocol
 
 from ow174.game import contacts, props
-from ow174.game.casc import CascError, Storage, game_root
+from ow174.game.casc import CascError, RecordCatalog, Storage, game_root
 from ow174.paths import COLLISION_CACHE_DIR, DATA_DIR, GAME_PATH_FILE
 
 log = logging.getLogger("ow174.game")
@@ -62,6 +62,7 @@ VERSION = 5  # 2: props with their identifiers; 3: no client-only breakables; 4:
 # 5: only the props' static shapes, at their nodes (props.static_part, props.at_node)
 RAY_GEOMETRY = "expanded-static-rays"
 RAY_PROP_SCOPE = "indexed-static-models"
+RAY_ROOT_PROP_SCOPE = "indexed-and-authenticated-roots"
 ALL_CATEGORIES = 0xFFFF  # original per-triangle and per-shape masks are u16
 MAX_CACHE_HEADER = 1 << 20
 CELL = 2.0  # metres per grid column
@@ -747,22 +748,36 @@ def _check_ray_header(header: dict, map_guid: int) -> None:
         not key
         or header.get("geometry") != RAY_GEOMETRY
         or header.get("category_mask") != ALL_CATEGORIES
-        or header.get("prop_scope") != RAY_PROP_SCOPE
+        or header.get("prop_scope") not in (RAY_PROP_SCOPE, RAY_ROOT_PROP_SCOPE)
         or header.get("map") != f"0x{map_guid:016X}"
         or header.get("chunk") != f"0x{chunk_guid(map_guid):016X}"
         or header.get("ckey") != key["ckey"]
     ):
         raise CollisionError(f"expanded ray geometry does not match map {map_guid:#x}")
+    if header["prop_scope"] == RAY_ROOT_PROP_SCOPE:
+        placement = props.placement_record(map_guid)
+        digest = header.get("prop_records_sha256")
+        if (
+            not placement
+            or header.get("prop_placement_ckey") != placement["ckey"]
+            or type(digest) is not str
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+        ):
+            raise CollisionError(f"expanded ray prop provenance does not match map {map_guid:#x}")
 
 
-def ray_cache_ready(map_guid: int) -> bool:
+def ray_cache_ready(map_guid: int, *, prop_records: RecordCatalog | None = None) -> bool:
     """Whether the side cache header identifies the expected expanded geometry."""
     try:
         with ray_cache_path(map_guid).open("rb") as file:
-            _check_ray_header(_read_cache_header(file), map_guid)
+            header = _read_cache_header(file)
+            _check_ray_header(header, map_guid)
     except (OSError, CollisionError, ValueError):
         return False
-    return True
+    return prop_records is None or (
+        header["prop_scope"] == RAY_ROOT_PROP_SCOPE and header["prop_records_sha256"] == prop_records.sha256
+    )
 
 
 def installed_game() -> Path | None:
@@ -775,9 +790,14 @@ def installed_game() -> Path | None:
         return None
 
 
-def build(map_guid: int, storage: Storage, name: str = "", *, ray_geometry: bool = False) -> Path:
+def build(
+    map_guid: int, storage: Storage, name: str = "", *,
+    ray_geometry: bool = False, prop_records: RecordCatalog | None = None,
+) -> Path:
     """Read a map's collision chunk and its props from the game and write its cache file; returns the
     path."""
+    if prop_records is not None and not ray_geometry:
+        raise CollisionError("supplemental prop records require an expanded ray cache")
     keys = collision_keys().get(map_guid)
     if keys is None:
         raise CollisionError(f"no collision chunk known for map {map_guid:#x}")
@@ -785,7 +805,9 @@ def build(map_guid: int, storage: Storage, name: str = "", *, ray_geometry: bool
     category = ALL_CATEGORIES if ray_geometry else MOVER
     meshes, hulls = parse_chunk(data, category)
     try:
-        models, placed = props.map_shapes(map_guid, storage.read_record, category)
+        models, placed = props.map_shapes(
+            map_guid, storage.read_record, category, records=prop_records.records if prop_records else None,
+        )
     except (props.PropError, struct.error, IndexError, KeyError) as error:
         raise CollisionError(f"the props of map {map_guid:#x}: {error}") from error
     identifiers = sorted({identifier for _, identifier, *_ in placed if identifier})
@@ -801,6 +823,12 @@ def build(map_guid: int, storage: Storage, name: str = "", *, ray_geometry: bool
     }
     if ray_geometry:
         source.update(geometry=RAY_GEOMETRY, category_mask=category, prop_scope=RAY_PROP_SCOPE)
+    if prop_records is not None:
+        source.update(
+            prop_scope=RAY_ROOT_PROP_SCOPE,
+            prop_records_sha256=prop_records.sha256,
+            prop_placement_ckey=props.placement_record(map_guid)["ckey"],
+        )
     blob = pack(name, meshes, hulls, source, models, placements, identifiers)
     path = ray_cache_path(map_guid) if ray_geometry else cache_path(map_guid)
     path.parent.mkdir(parents=True, exist_ok=True)
