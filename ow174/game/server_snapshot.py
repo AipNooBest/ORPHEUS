@@ -119,7 +119,9 @@ FIELDS = {
     runtime.World: _names("hero mode"),
     LinkCipher: _names("key_in key_out salt_in salt_out"),
     ReceiveWindow: _names("expected bits"),
-    world.EntityUpdate: _names("entity op build movement chunk chunk_last ch2 stream resend correction"),
+    world.EntityUpdate: _names(
+        "entity op build movement chunk chunk_last ch2 stream resend correction controller_close"
+    ),
     BitWriter: _names("value count"),
     world.RecordWriter: _names("value count origin"),
     world.Movement: _names("position yaw pitch velocity flags throttles input_frame input_throttles "

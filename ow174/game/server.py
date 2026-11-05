@@ -663,7 +663,12 @@ class Client:
             for item in self.entities
             if generations.get(item, 0) == lifecycles.get(item.entity, (0, True))[0]
             and (lifecycles.get(item.entity, (0, True))[1] or item.op == world.OP_DESTROY)
+            and self._current_controller_close(item)
         ]
+
+    def _current_controller_close(self, item: world.EntityUpdate) -> bool:
+        # A newer full frame replaces a deferred close, including an explicit reopen.
+        return not item.controller_close or item.chunk_last == self.player.script.data_last
 
     def _queue_current_entity(self, item: world.EntityUpdate) -> None:
         script = getattr(self.player, "body_script", None)
@@ -737,6 +742,8 @@ class Client:
                 if not created:
                     continue
                 bound = True
+            elif item.controller_close and not bound:
+                continue
             elif item.op == world.OP_CREATE:
                 if item.entity == body:
                     created = True
@@ -849,7 +856,11 @@ class Client:
 
         def current(item) -> bool:
             generation, alive = lifecycles.get(item.entity, (0, True))
-            return generations.get(item, 0) == generation and (alive or item.op == world.OP_DESTROY)
+            return (
+                generations.get(item, 0) == generation
+                and (alive or item.op == world.OP_DESTROY)
+                and self._current_controller_close(item)
+            )
 
         lost_reliable, lost_records = [], []
         for seq in list(self.in_flight):

@@ -14,13 +14,14 @@ from test_game_server import REAPER, pick
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ow174.game import messages, world
+from ow174.game import heroselect, messages, world
 from ow174.game.bits import BitWriter
 from ow174.game.content import SOLDIER, heroes
 from ow174.game.environment import SystemEnvironment
 from ow174.game.link import ACK, KIND_CONTROL, KIND_FRAME, LinkCipher, Packet, ReceiveWindow
 from ow174.game.match import Match, card_message
 from ow174.game.observers import Observers
+from ow174.game.script import decode, expr
 from ow174.game.script.driver import BodyScript
 from ow174.game.server import MAX_PAYLOAD, Client
 from ow174.game.world import OP_CREATE, OP_DESTROY, OP_UPDATE, EntityUpdate, Movement
@@ -354,6 +355,20 @@ class PossessionDeliveryTests(unittest.TestCase):
             body = actor.body
             return (actor.entity, OP_UPDATE, {0: body, 1: body, 2: body}, {0: hero, 3: hero})
 
+        def controller_frames(records):
+            return [
+                (position, decode.read_chunk(item.chunk.getvalue(), item.chunk.count))
+                for position, (item, _) in enumerate(records) if item.entity == actor.entity and item.chunk
+            ]
+
+        def assert_menu(records, hero, opened):
+            (position, frame), = controller_frames(records)
+            self.assertTrue(frame.full and frame.owner)
+            self.assertEqual(frame.entity_vars[heroselect.OPEN_SELECT], (opened, ()))
+            self.assertEqual(frame.entity_vars[heroselect.SELECT_SHOWN], (opened, ()))
+            self.assertEqual(frame.entity_vars[heroselect.CURRENT_HERO], (expr.Asset(hero), ()))
+            return position
+
         peer.queue_entities([
             EntityUpdate(actor.entity, OP_CREATE, lambda origin: match._player_create(origin, actor)),
         ])
@@ -362,40 +377,115 @@ class PossessionDeliveryTests(unittest.TestCase):
         for hero in (SOLDIER, REAPER):
             old = actor.body if actor.has_body else None
             self.assertTrue(match.switch_hero(actor, heroes()[hero]))
+            actor.select_open = False
+            match.send_controller(actor)
             packet, _, records = emit()
             ordered = [(actor.body, OP_CREATE, None, None), expected(hero)]
             if old is not None:
                 ordered.append((old, OP_DESTROY, None, None))
             self.assertEqual(relevant(records, old), ordered)
+            binding = next(index for index, (_, fields) in enumerate(records) if 44 in fields)
+            self.assertGreater(assert_menu(records, hero, False), binding)
             acknowledge(packet)
 
         old = actor.body
         self.assertTrue(match.switch_hero(actor, heroes()[SOLDIER]))
+        match.send_controller(actor)
         create = next(item for item in peer.entities if item.entity == actor.body and item.op == OP_CREATE)
         components = match._possession(actor)
         possession = EntityUpdate(actor.entity, OP_UPDATE, lambda origin: world.update(origin, components))
         self.queue_split_budget(peer, create, possession)
         _, _, records = emit()  # drop the actual budget-split create datagram
         self.assertEqual(relevant(records, old), [(actor.body, OP_CREATE, None, None)])
+        self.assertEqual(controller_frames(records), [])
 
         peer.queue_reliable(20308, card_message(actor))
         packet, ids, records = emit()
         self.assertIn(20308, ids)
         self.assertEqual(relevant(records, old), [])
+        self.assertEqual(controller_frames(records), [])
         acknowledge(packet)  # confirms another packet and reports the create missing
         retry, _, records = emit()
         self.assertEqual(relevant(records, old), [(actor.body, OP_CREATE, None, None)])
+        self.assertEqual(controller_frames(records), [])
         self.assertTrue(window.accept(retry.seq))
         self.assertFalse(actor.body_script.create_arrived)
         packet, _, records = emit()
         self.assertEqual(relevant(records, old), [])
+        self.assertEqual(controller_frames(records), [])
         acknowledge(packet)  # includes a positive ACK for the exact create retry
         self.assertTrue(actor.body_script.create_arrived)
+
+        # Now lose the binding itself under a second budget split. The close also
+        # waits if its prerequisite was only selected for an earlier datagram.
+        _, binding = peer._pending_possessions[actor.entity]
+        (close,) = [item for item in peer.entities if item.stream is actor.script]
+        self.queue_split_budget(peer, binding, close)
+        _, _, records = emit()
+        self.assertEqual(relevant(records, old), [expected(SOLDIER)])
+        self.assertEqual(controller_frames(records), [])
         packet, _, records = emit()
-        self.assertEqual(relevant(records, old), [expected(SOLDIER), (old, OP_DESTROY, None, None)])
+        self.assertEqual(relevant(records, old), [])
+        self.assertEqual(controller_frames(records), [])
+        acknowledge(packet)
+        packet, _, records = emit()
+        self.assertEqual(relevant(records, old), [expected(SOLDIER)])
+        self.assertEqual(controller_frames(records), [])
+        acknowledge(packet)
+        packet, _, records = emit()
+        self.assertEqual(relevant(records, old), [(old, OP_DESTROY, None, None)])
+        assert_menu(records, SOLDIER, False)
         acknowledge(packet)
         _, _, records = emit()
         self.assertEqual(relevant(records, old), [])
+
+        # Reopening must reach the peer even while the selected body is absent.
+        self.assertTrue(match.switch_hero(actor, heroes()[REAPER]))
+        match.send_controller(actor)
+        intermediate = actor.body
+        create = next(item for item in peer.entities if item.entity == intermediate and item.op == OP_CREATE)
+        _, binding = peer._pending_possessions[actor.entity]
+        self.queue_split_budget(peer, create, binding)
+        _, _, records = emit()
+        self.assertEqual(relevant(records), [(intermediate, OP_CREATE, None, None)])
+        actor.select_open = True
+        match.send_controller(actor)
+        packet, _, records = emit()
+        assert_menu(records, REAPER, True)
+        acknowledge(packet)
+        self.assertFalse(peer.bot_create_acked(intermediate))
+
+        # A later pick replaces the open menu only after its own new binding.
+        self.assertTrue(match.switch_hero(actor, heroes()[SOLDIER]))
+        actor.select_open = False
+        match.send_controller(actor)
+        binding_arrived = False
+        for _ in range(4):
+            packet, _, records = emit()
+            self.assertFalse(any(item.entity == intermediate and item.op == OP_CREATE for item, _ in records))
+            binding = next((index for index, (_, fields) in enumerate(records) if 44 in fields), None)
+            if controller_frames(records):
+                position = assert_menu(records, SOLDIER, False)
+                self.assertTrue(binding_arrived or (binding is not None and binding < position))
+                break
+            acknowledge(packet)
+            binding_arrived |= binding is not None
+        else:
+            self.fail("the latest selection did not close")
+
+        # The close above was sent but not received. Positively acknowledging
+        # a newer reopen reports that old packet lost without retrying its close.
+        actor.select_open = True
+        match.send_controller(actor)
+        packet, _, records = emit()
+        assert_menu(records, SOLDIER, True)
+        acknowledge(packet)
+        self.assertEqual(actor.script.delivered, actor.script.data_last)
+        packet, _, records = emit()
+        self.assertEqual(controller_frames(records), [])
+        if not binding_arrived:
+            self.assertIn(expected(SOLDIER), relevant(records))
+        acknowledge(packet)
 
     def check_superseded_possession(self, *, own, lose_current=False):
         server, observer_client, observer, observer_cipher = connection()

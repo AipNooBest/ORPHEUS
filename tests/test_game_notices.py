@@ -284,11 +284,14 @@ class SwitchTests(unittest.TestCase):
 
     def test_the_player_and_his_teammates_get_the_switch(self):
         self.switch(self.beta, REAPER, 10.0)
+        self.beta.select_open = False
         self.switch(self.beta, SOLDIER, 11.0)
         expected = {OLD: expr.Asset(REAPER), NEW: expr.Asset(SOLDIER), WHO: expr.Entity(self.beta.entity)}
         for player in (self.alpha, self.beta):
             (values,) = controller_vars(player)
             self.assertEqual({var: values[var] for var in (OLD, NEW, WHO)}, expected)
+            (notice,) = [item for item in player.client.entities if item.stream is player.script]
+            self.assertFalse(notice.controller_close)
         self.assertEqual(controller_vars(self.gamma), [])  # an enemy
 
     def test_switch_notice_waits_for_the_local_controller_and_its_initial_frame(self):

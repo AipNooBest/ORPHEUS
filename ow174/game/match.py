@@ -966,7 +966,10 @@ class Match:
         frame = heroselect.controller_frame(
             self.controller, cmfd, player.select_open, skins, practice, presence=switch, hero=hero
         )
-        player.client.queue_entities([player.script.full_frame(frame)])
+        update = player.script.full_frame(frame)
+        # A switch notice is a separate event, even when the menu is already closed.
+        update.controller_close = player.has_body and not player.select_open and not switch
+        player.client.queue_entities([update])
         state = "open" if player.select_open else "closed"
         log.info("[game] %s: %s's controller sent (hero select %s)", self.label(), player.name, state)
 
