@@ -7,11 +7,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from test_game_packet_budget import connection, decoded
+from test_game_repeated_lifecycles import wire_frame
+from test_game_server import REAPER
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ow174.game.bits import BitWriter
 from ow174.game.content import SOLDIER, heroes
 from ow174.game.environment import SystemEnvironment
+from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
 from ow174.game.match import Match
 from ow174.game.observers import Observers
 from ow174.game.script.driver import BodyScript
@@ -204,6 +209,116 @@ class ReliableLifecycleTests(unittest.TestCase):
         self.assertEqual(len(frames), 1)
         self.assertTrue(frames[0].resend)
         self.assertIs(frames[0].stream, script.stream)
+
+
+class PossessionDeliveryTests(unittest.TestCase):
+    def check_superseded_possession(self, *, own, lose_current=False):
+        server, observer_client, observer, observer_cipher = connection()
+        match = observer.match
+        actor = match.add_player(2, "Target", SOLDIER, 1, False)
+        key_in, key_out = b"p" * 32, b"q" * 32
+        actor_client = Client(server, ("memory.test", 40002), 2, LinkCipher(key_in, key_out), actor)
+        actor.client = server.clients[2] = actor_client
+        actor_client.open = actor.spawned = observer.spawned = True
+        viewer = actor if own else observer
+        peer = actor_client if own else observer_client
+        cipher = LinkCipher(key_out, key_in) if own else observer_cipher
+        window = ReceiveWindow()
+        sequence = 0
+        match.tick = 100
+        if own:
+            peer.queue_entities([
+                EntityUpdate(actor.entity, OP_CREATE, lambda origin: match._player_create(origin, actor)),
+            ])
+        else:
+            match._show_players(observer)
+
+        def emit():
+            match.tick += 1
+            if not own:
+                match._show_players(viewer)
+            peer.send_frame(match.tick, 10.0)
+            packet = decoded(self, cipher, server.sock.sent[-1][0])[0]
+            return packet, wire_frame(packet)[1]
+
+        def acknowledge(packet):
+            nonlocal sequence
+            self.assertTrue(window.accept(packet.seq))
+            ack = Packet(peer.conn, KIND_CONTROL, sequence, window.expected, window.bits, ACK)
+            sequence += 1
+            server._datagram(cipher.seal(ack), peer.address, 10.0)
+
+        def possessions(records):
+            return [
+                (fields[44], fields[75])
+                for update, fields in records if update.entity == actor.entity and 44 in fields
+            ]
+
+        def expected_possession(body, hero):
+            return [({0: body, 1: body, 2: body}, {0: hero, 3: hero})]
+
+        def switch(hero, *, deliver, lose_create=False):
+            self.assertTrue(match.switch_hero(actor, heroes()[hero]))
+            body = actor.body
+            if not own:
+                match.ensure_remote_body(viewer, actor)
+            if lose_create:
+                # A later packet reports both the old possession and the newest body
+                # create missing. Only the current body create may retry at this point.
+                _, records = emit()
+                self.assertIn((body, OP_CREATE), [(item.entity, item.op) for item, _ in records])
+                self.assertEqual(possessions(records), [])
+                packet, records = emit()
+                self.assertEqual(possessions(records), [])
+                acknowledge(packet)
+                packet, records = emit()
+                self.assertIn((body, OP_CREATE), [(item.entity, item.op) for item, _ in records])
+                self.assertEqual(possessions(records), [])
+                acknowledge(packet)
+            for _ in range(10):
+                packet, records = emit()
+                updates = possessions(records)
+                if updates:
+                    self.assertEqual(updates, expected_possession(body, hero))
+                    if deliver:
+                        acknowledge(packet)
+                    return body
+                acknowledge(packet)
+            self.fail("the current possession was never sent")
+
+        packet, records = emit()
+        names = [
+            fields[29][1] for update, fields in records
+            if update.entity == actor.entity and update.op == OP_CREATE
+        ]
+        self.assertEqual(names, ["Target"])
+        acknowledge(packet)
+        old = switch(REAPER, deliver=False)
+        fresh = switch(SOLDIER, deliver=not lose_current, lose_create=lose_current)
+        self.assertNotEqual(old, fresh)
+        if lose_current:
+            packet, records = emit()
+            self.assertEqual(possessions(records), [])
+            acknowledge(packet)
+            packet, records = emit()
+            self.assertEqual(possessions(records), expected_possession(fresh, SOLDIER))
+            acknowledge(packet)
+
+        # The newest ACK reports the older packet missing. Its old 44/75 must not
+        # go out again on the still-current controller after the body has changed.
+        for _ in range(3):
+            packet, records = emit()
+            self.assertNotIn(old, [possessor[0] for possessor, _ in possessions(records)])
+            acknowledge(packet)
+
+    def test_old_remote_possession_does_not_retry_after_a_new_body_is_acknowledged(self):
+        self.check_superseded_possession(own=False)
+
+    def test_old_owner_possession_does_not_retry_after_a_new_body_is_acknowledged(self):
+        self.check_superseded_possession(own=True)
+
+    def test_current_remote_possession_retries_after_its_body_create_is_acknowledged(self):
+        self.check_superseded_possession(own=False, lose_current=True)
 
 
 if __name__ == "__main__":

@@ -156,10 +156,13 @@ class ShownController:
 
     def __init__(self, entity: int, created: int) -> None:
         self.script = Stream(entity)  # its statescript on that client: plain (H=0) full frames
-        self.created = created  # the server tick of its create; its frames go from the next one on
+        self.create_acked = False
         self.pick: int | None = None  # the hero its last frame carried
         self.card_again: int | None = created + CARD_AGAIN_TICKS  # when its card goes once more
         self.possession: tuple | None = None  # the (body, hero, skin theme) its last 44 and 75 named
+
+    def arrived(self, last: int) -> None:
+        self.create_acked = True
 
 
 class Player:
@@ -719,6 +722,10 @@ class Match:
             if other is not player and body in other.seen:
                 del other.seen[body]
                 if other.client is not None:
+                    shown = other.shown.get(player.entity)
+                    if shown is not None and shown.possession is not None and shown.possession[0] == body:
+                        shown.possession = None
+                        other.client.cancel_possession(player.entity)
                     other.client.queue_entities([EntityUpdate(body, OP_DESTROY)])
 
     # --- the other players, for the hero select team list ---------------------------------------
@@ -730,7 +737,7 @@ class Match:
 
     def _show_players(self, viewer: Player) -> None:
         """Keep the viewer's client up to date on the players in the world: their cards (its own one
-        too), each other player's entity, created with his id, and from the next tick on a frame with
+        too), each other player's entity, created with his id, and after its acknowledgement a frame with
         the team list entry and his pick, sent again when the pick changes. A player who left goes.
         Every player, teammate or enemy, as retail does: 288D keeps enemies out of the list. A few new
         players per tick, so that their cards fit in one datagram with the rest. Each card goes once
@@ -757,17 +764,14 @@ class Match:
                 if cards == NEW_PLAYERS_PER_TICK:
                     continue
                 cards += 1
-                viewer.shown[other.entity] = ShownController(other.entity, self.tick)
+                shown = viewer.shown[other.entity] = ShownController(other.entity, self.tick)
                 client.queue_reliable(PLAYER_CARD, self.notices.card(viewer, other))
-                client.queue_entities(
-                    [
-                        EntityUpdate(
-                            other.entity,
-                            OP_CREATE,
-                            lambda origin, other=other: self._player_create(origin, other, own=False),
-                        )
-                    ]
+                create = EntityUpdate(
+                    other.entity, OP_CREATE,
+                    lambda origin, other=other: self._player_create(origin, other, own=False),
                 )
+                create.stream = shown
+                client.queue_entities([create])
                 continue
             again = shown.card_again
             if again is not None and self.tick >= again and cards < NEW_PLAYERS_PER_TICK:
@@ -775,7 +779,7 @@ class Match:
                 shown.card_again = None
                 client.queue_reliable(PLAYER_CARD, card_message(other))
             pick = other.hero.guid if other.has_body else None
-            if self.tick > shown.created and (not shown.script.last or pick != shown.pick):
+            if shown.create_acked and (not shown.script.last or pick != shown.pick):
                 shown.pick = pick
                 client.queue_entities([shown.script.full_frame(heroselect.team_entry_frame(pick))])
             self._show_possession(viewer, other, shown)
@@ -788,16 +792,18 @@ class Match:
         finds his On Fire flag (0x7FF789BE2370). The hook's re-possess (0x7FF789AB2CF0) resets the input
         and the mover only for a possessor with component 59, which only the local player has; a ch3
         record of the body likewise feeds a possessor's 59 only (0x7FF7896DAA95)."""
-        if self.tick <= shown.created or not other.has_body or other.body not in viewer.seen:
+        if (
+            not shown.create_acked or not other.has_body
+            or other.body not in viewer.seen or not viewer.client.bot_create_acked(other.body)
+        ):
             return
         possession = (other.body, other.hero.guid, other.skin[0])
         if possession == shown.possession:
             return
         shown.possession = possession
         components = self._possession(other)
-        viewer.client.queue_entities(
-            [EntityUpdate(other.entity, OP_UPDATE, lambda origin: world.update(origin, components))]
-        )
+        update = EntityUpdate(other.entity, OP_UPDATE, lambda origin: world.update(origin, components))
+        viewer.client.queue_possession(update)
 
     # --- lifetime ------------------------------------------------------------------------------
 
@@ -1107,13 +1113,12 @@ class Match:
         player.has_body = True
         if player.client is not None and player.spawned:
             components = self._possession(player)
-            updates = self.own_body_updates(player)
-            updates.append(
+            player.client.queue_entities(self.own_body_updates(player))
+            player.client.queue_possession(
                 EntityUpdate(player.entity, OP_UPDATE, lambda origin: world.update(origin, components))
             )
             if old is not None:
-                updates.append(EntityUpdate(old, OP_DESTROY))
-            player.client.queue_entities(updates)
+                player.client.queue_entities([EntityUpdate(old, OP_DESTROY)])
         if old is not None:
             self.destroy_for_others(player, old)
         self.notices.hero_switched(player, old_hero)

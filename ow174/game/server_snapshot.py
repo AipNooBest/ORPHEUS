@@ -75,7 +75,7 @@ FIELDS = {
     Client: _names("server address conn cipher player window seq open closed heard next_reliable reliable "
                    "unreliable entities in_flight _combat_notices _bot_health _combat_notice_tail "
                    "_body_destroy_wait _player_body_reuse_after _bot_scripts expected_in parked_in "
-                   "leaving_since _mode_create_acked _pending_mode_frame _mode_notices"),
+                   "leaving_since _mode_create_acked _pending_mode_frame _mode_notices _pending_possessions"),
     _BotScriptDelivery: _names("stream source live volleys death_frames death_snapshot"),
     Match: _names("environment id game_map card skin_of tick controller assemble_ends assembled players "
                   "_body_messages started on_leave ended bots _pending_bot_scripts bots_shown notices combat "
@@ -85,7 +85,7 @@ FIELDS = {
                    "body_script body_script_failed seen shown script mode_script next_countdown "
                    "select_open controller_hero "
                    "stats stats_sent next_stats"),
-    ShownController: _names("script created pick card_again possession"),
+    ShownController: _names("script create_acked pick card_again possession"),
     CommandQueue: _names("last_frame epoch wraps"),
     combat.Combat: _names(
         "match vitals history rockets respawns next_bot now tick melee_seen "

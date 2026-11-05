@@ -177,6 +177,7 @@ class Client:
         self._bot_scripts: dict[int, _BotScriptDelivery] = {}
         self._body_destroy_wait: dict[int, tuple[world.EntityUpdate, int]] = {}
         self._player_body_reuse_after: dict[int, float | None] = {}  # None until destroy ACK
+        self._pending_possessions: dict[int, world.EntityUpdate] = {}  # one pending write per controller
         self._mode_create_acked = False
         self._pending_mode_frame: BitWriter | None = None
         self._mode_notices: deque[tuple[int | None, int, bytes]] = deque(maxlen=MAX_PENDING_COMBAT_NOTICES)
@@ -200,6 +201,7 @@ class Client:
         """Discard obsolete world data while preserving reliable ordinals and packet ACKs."""
         self.unreliable.clear()
         self.entities.clear()
+        self._pending_possessions.clear()
         for _, records in self.in_flight.values():
             records.clear()
         self.go_home(now)
@@ -218,7 +220,7 @@ class Client:
         return ordinal
 
     def bot_create_acked(self, entity: int) -> bool:
-        """Whether this connection acknowledged the current create for a bot."""
+        """Whether this connection acknowledged the current create for a combat body."""
         return entity in self._combat_notices and self._combat_notices[entity] is None
 
     def bot_stream(self, entity: int) -> BodyStream | None:
@@ -467,6 +469,17 @@ class Client:
         update.resend = False
         self.entities = [item for item in self.entities if item is not update]
 
+    def cancel_possession(self, controller: int) -> None:
+        previous = self._pending_possessions.pop(controller, None)
+        if previous is not None:
+            self.cancel_entity_record(previous)
+
+    def queue_possession(self, update: world.EntityUpdate) -> None:
+        """Replace an unacknowledged component 44/75 write for this controller."""
+        self.cancel_possession(update.entity)
+        self._pending_possessions[update.entity] = update
+        self.queue_entities([update])
+
     def queue_entities(self, updates: list) -> None:
         # A destroy retires all older records of this entity for this client, including
         # reliable creates/chunks awaiting ACK. A later reuse of the id is a new generation.
@@ -493,6 +506,7 @@ class Client:
                     generation += 1
                     alive = item.op == world.OP_CREATE
                     lifecycles[item.entity] = (generation, alive)
+                    self._pending_possessions.pop(item.entity, None)
                     self._forget_body(item.entity)
                     if alive:
                         self._track_body_create(item.entity)
@@ -625,6 +639,8 @@ class Client:
                         self._player_body_reuse_after[item.entity] = now + PLAYER_BODY_REUSE_SECONDS
                     elif self._bot_health.get(item.entity) is item:
                         del self._bot_health[item.entity]
+                    elif self._pending_possessions.get(item.entity) is item:
+                        del self._pending_possessions[item.entity]
                     if item.stream is not None:
                         first_mode = (
                             item.entity == world.GAME_MODE_ENTITY
@@ -1182,6 +1198,7 @@ class GameServer:
         client._bot_scripts.clear()
         client._body_destroy_wait.clear()
         client._player_body_reuse_after.clear()
+        client._pending_possessions.clear()
         client._pending_mode_frame = None
         client._mode_notices.clear()
         if self.clients.get(client.conn) is client:

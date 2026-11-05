@@ -73,6 +73,15 @@ class FakeClient:
     def queue_mode_frame(self, frame: BitWriter) -> None:
         self.queue_entities([self.player.mode_script.full_frame(frame)])
 
+    def queue_possession(self, update: world.EntityUpdate) -> None:
+        self.queue_entities([update])
+
+    def cancel_possession(self, controller: int) -> None:
+        pass  # the fixture keeps a record of delivered updates
+
+    def bot_create_acked(self, entity: int) -> bool:
+        return self.player.seen.get(entity, False)
+
     def body_id_available(self, entity: int) -> bool:
         return True  # the lobby notification model has no transport reservations
 
@@ -91,7 +100,8 @@ def show_everyone(match: Match) -> None:
     for viewer in match.players:
         for other in match.players:
             if other is not viewer:
-                viewer.shown[other.entity] = ShownController(other.entity, match.tick)
+                shown = viewer.shown[other.entity] = ShownController(other.entity, match.tick)
+                shown.arrived(0)
 
 
 def controller_vars(player) -> list[dict]:

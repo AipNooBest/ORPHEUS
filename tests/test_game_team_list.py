@@ -143,6 +143,7 @@ class Game(PretendGame):
             reader.bits(4 + 1 + 1 + 1)
             seen_messages += [(msg_id, value) for _, msg_id, value in reliable]
             seen_entities += read_entities(reader, reader.bits(7))
+            self.send(ACK)
             if wanted(seen_messages, seen_entities):
                 return seen_messages, seen_entities
         raise AssertionError(f"not seen in time: {[m for m, _ in seen_messages]}")
@@ -258,7 +259,7 @@ class Recorder:
 
 
 class ShowPlayersTests(unittest.TestCase):
-    def test_new_players_come_a_few_per_tick_and_their_frames_a_tick_later(self):
+    def test_new_players_come_a_few_per_tick_and_their_frames_follow_create_acks(self):
         match = Match(PVP, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         players = [match.add_player(number, f"P{number}", 0, number % 2, False) for number in range(1, 6)]
         for player in players:
@@ -268,12 +269,17 @@ class ShowPlayersTests(unittest.TestCase):
         match._show_players(players[0])
         self.assertEqual([msg_id for msg_id, _ in viewer.reliable], [PLAYER_CARD] * 4)  # its own and 3
         self.assertEqual([update.op for update in viewer.entities], [OP_CREATE] * 3)
+        for update in viewer.entities:
+            update.stream.arrived(0)
         viewer.entities.clear()
         match.tick = 11
         match._show_players(players[0])
         # the fourth player's create, and the frames of the three created a tick before
         self.assertEqual([update.op for update in viewer.entities].count(OP_CREATE), 1)
         self.assertEqual(len([update for update in viewer.entities if update.chunk is not None]), 3)
+        for update in viewer.entities:
+            if update.op == OP_CREATE:
+                update.stream.arrived(0)
         viewer.entities.clear()
         match.tick = 12
         match._show_players(players[0])

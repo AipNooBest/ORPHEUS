@@ -43,6 +43,12 @@ class FakeClient:
     def body_id_available(self, entity: int) -> bool:
         return True  # this model retains no retired entities
 
+    def queue_possession(self, update: world.EntityUpdate) -> None:
+        self.queue_entities([update])
+
+    def cancel_possession(self, controller: int) -> None:
+        pass  # possession records are acknowledged immediately
+
     def queue_bot_live(self, entity: int, snapshot) -> None:
         pass  # the combat model leaves NPC body decoding to the link tests
 

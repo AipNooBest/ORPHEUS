@@ -414,7 +414,9 @@ class RepeatedLifecycleTests(unittest.TestCase):
                 soldier, _ = self.initialize(link, player, SOLDIER, pick=False)
                 self.assertIsNot(soldier, old_soldier)
                 self.assertIsNot(soldier.component, old_soldier.component)
-                self.run.until(lambda: observer.shown[player.entity].possession[0] == player.body)
+                self.run.until(
+                    lambda: observer_link.fields.get(player.entity, {}).get(44, {}).get(0) == player.body
+                )
                 self.assertNotIn(reaper_body, link.models)
                 self.assertNotIn(reaper_body, observer_link.models)
                 self.assertNotIn(reaper_body, observer.seen)
