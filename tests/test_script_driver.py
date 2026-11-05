@@ -560,6 +560,45 @@ class BodyTests(unittest.TestCase):
         self.assertEqual(client.on(), server_on(body) - UNSENDABLE)
         self.assertNotIn((11, 10), client.on())  # the volley began and ended in the lost frame's time
 
+    def test_removal_of_an_instance_whose_create_was_not_acknowledged(self):
+        body, received = spawned()
+        lost = ClientModel()
+        lost.apply(body.stream.full_update)
+        body.command(START + 1, 0)
+        baseline, = body.frames()
+        for client in (received, lost):
+            client.apply(baseline)
+        body.stream.arrived(baseline.chunk_last)
+
+        child = body.component.create(graphs.graph(0x0D24), init=False)
+        frame_number = START + 1 + SETTLE_FRAMES
+        body.command(frame_number, 0)
+        create, = body.frames()
+        self.assertTrue(received.apply(create).instances[child.id].descriptor)
+        self.assertIn(child.id, received.instances)
+        self.assertNotIn(child.id, lost.instances)
+
+        body.component.destroy(child)
+        body.command(frame_number + 1, 0)
+        gone, = body.frames()
+        self.assertTrue(received.apply(gone).instances[child.id].gone)
+        self.assertNotIn(child.id, received.instances)
+
+        body.command(frame_number + 2, 0)
+        repeated, = body.frames()
+        for client in (received, lost):
+            frame = client.apply(repeated)
+            self.assertEqual(frame.first, create.chunk_last)
+            self.assertTrue(frame.instances[child.id].gone)
+            self.assertNotIn(child.id, client.instances)
+        body.stream.arrived(repeated.chunk_last)
+
+        body.command(frame_number + 3, FIRE)
+        continued, = body.frames()
+        for client in (received, lost):
+            self.assertNotIn(child.id, client.apply(continued).instances)
+            self.assertIn((11, 10), client.on())
+
     def test_new_volley_carries_starting_ammo_when_the_stop_was_not_acknowledged(self):
         body, client = spawned()
         body.command(START + 1, 0)

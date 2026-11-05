@@ -445,3 +445,9 @@ This log records tested changes and their acceptance status. Entries are grouped
 - The local build 104319 export contains 66 filters and 19 receivers, including 44 override rows and 146 reference slots. Repeated exports match byte for byte.
 - Passed 27 extractor tests, Ruff and Git diff checks.
 - Native filter execution, the meaning of receiver result flags and original-client acceptance remain open.
+
+#### Owner graph removal before create acknowledgement
+
+- Send graphless removal records when a transient body subgraph has already been sent and disappears before its create is acknowledged. Keep the removal in cumulative frames until it is acknowledged.
+- The Soldier body regression covers receivers that applied or lost the create. Both continue applying owner frames and enter the rifle volley after the removal. The previous server threw an exception while building the removal frame.
+- Passed 89 targeted tests with each runtime data pack, Ruff and Git diff checks. The original-client effect and the cause of the earlier live weapon symptoms still need separate verification.

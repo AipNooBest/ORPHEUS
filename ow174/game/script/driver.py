@@ -424,7 +424,7 @@ class BodyScript(ReplicatedBody):
 
         def wire(item: int) -> InstanceWire:
             if item not in wires:
-                graph_index, parent = snap.instances.get(item) or base.instances[item]
+                graph_index, parent = snap.instances[item]
                 wires[item] = InstanceWire(item, graphs.get(item) or graph.graph(graph_index), parent=parent)
             return wires[item]
 
@@ -435,7 +435,7 @@ class BodyScript(ReplicatedBody):
                 keys.add(("inst", item))
         for item in set(base.instances) | {key[1] for key in touched if key[0] == "inst"}:
             if item not in snap.instances:  # gone, or made and gone again since the base
-                wire(item).gone = True
+                wires[item] = InstanceWire(item, None, gone=True)
                 keys.add(("inst", item))
         entity_vars = {}
         touched_vars = {key[1:] for key in touched if key[0] == "var"}
