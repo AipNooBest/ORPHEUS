@@ -253,6 +253,7 @@ class BodyScript:
         Raise before changing anything, so the caller can establish a fresh lifecycle;
         resetting self.frame would silently keep incompatible timers and client history.
         """
+        self.component.ensure_valid()
         if type(frame) is not int or not 0 <= frame <= FRAME_MASK:
             raise ValueError("command frame must be uint32")
         distance = frame_distance(frame, self.frame)
@@ -275,6 +276,7 @@ class BodyScript:
     def _report_shots(self) -> None:
         """The shots the active volleys fired up to the end of the frame go on the component's shot list
         (a volley that ended put its own there); combat.py takes them, the oldest go past MAX_SHOTS."""
+        self.component.ensure_valid()
         shots = self.component.shots
         for instance in self.component.instances.values():
             for state in instance.states.values():
@@ -303,6 +305,7 @@ class BodyScript:
 
     def snapshot(self) -> Snapshot:
         """The body as the client should have it after the last frame run."""
+        self.component.ensure_valid()
         snap = Snapshot(self.frame)
         for instance in self.component.instances.values():
             parent = (instance.parent.id, instance.parent_state) if instance.parent is not None else None
@@ -468,6 +471,7 @@ class BodyScript:
         """This tick's body frames: the full frame once the body's create arrived (see `created`), the first
         owner frame (C = 0) once the full frame arrived, then, after SETTLE_FRAMES, a C = 1 frame whenever the
         client's command frame moved on."""
+        self.component.ensure_valid()
         stream = self.stream
         if self.retired:
             return []

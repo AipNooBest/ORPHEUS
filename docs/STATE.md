@@ -45,6 +45,19 @@ Command decoding handles uint32 wrap. The native body driver explicitly rejects
 a forward wrap before changing its old-epoch timers/state; automatic live epoch
 recovery is not implemented.
 
+Runtime event/update exhaustion and immediate plug cycles now fail the entire
+component with `ScriptBudgetError` (entity, frame and time included). Pending
+shots/events are discarded and later command/snapshot/frame generation is
+rejected. The live match handler retires that body's script; other players keep
+running. This prevents half-completed simulations from looking successful. It
+does not add automatic recovery or prove the cause of the reported live issues.
+
+The latest full Python regression ran 818 tests: 817 passed and one was skipped
+for an unavailable King's Row collision cache. A separate 62.448-second offline
+Soldier sequence applied/decoded 3903 owner chunks, observed ammo spending and
+seven refills, and ended with no active volley after release. This is a native
+driver/local decoder model check, not real-client HUD or combat acceptance.
+
 The Practice Range collision cache was built from this user's local CASC data:
 `0688.col`, format 5, 470397 bytes, SHA-256
 `dfdb71fbe9ad079d9d0b56fe12bd7c992a76c6ec942084d86f6388827f36a169`.

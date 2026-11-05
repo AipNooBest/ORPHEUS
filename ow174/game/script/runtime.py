@@ -26,6 +26,7 @@ Node classes (nodes.py) subclass State and register their action handlers here.
 import bisect
 import itertools
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from ow174.game.script import expr
@@ -39,6 +40,10 @@ STATE_OP, TIMER, CHECK, ENTRY, BUTTON, CHANGED, MESSAGE = 0, 1, 2, 3, 8, 9, 10
 BEGIN, FINISH, ABORT = 0, 1, 2
 NO_BUTTON = 171
 EVENTS_PER_TIME = 1000  # the client stops an instance that queues more at one time
+MAX_INSTANCE_UPDATES = 1000
+MAX_COMPONENT_UPDATES = 10000
+MAX_SCRIPT_WORK = 100000  # shared across all instances within one frame/update/plug operation
+MAX_FOLLOW_DEPTH = 64  # stop immediate action cycles before Python's recursion limit
 ABORT_PLUG = "m_F198FD3A"
 SUBGRAPH_STATES = "m_FF3DAF1E"
 
@@ -46,6 +51,10 @@ STATE_CLASSES: dict[str, type["State"]] = {}  # node class -> runtime state clas
 HANDLERS: dict[str, object] = {}  # node class -> handler(instance, node, caller) -> accepted
 ENTRY_CLASSES = {"STUStatescriptEntry", "STU_571CC72E"}  # run at Init (EntryClientOnlySharedVars agrees too)
 MESSAGE_ENTRIES = {"STUStatescriptEntryGameMessage"}
+
+
+class ScriptBudgetError(RuntimeError):
+    """The component could not complete its simulation within a work/recursion limit."""
 
 
 def state_class(*names: str):
@@ -262,6 +271,63 @@ class Component:
         self.destroyed: list[Instance] = []
         self.shots: list = []  # (volley state, shot number, time) of the shots fired, for combat.py
         self.owner_dead = False  # the body's health is 0 (combat.py): presses and shots stop
+        self.fault: ScriptBudgetError | None = None
+        self._operation_depth = 0
+        self._follow_depth = 0
+        self._work_left = MAX_SCRIPT_WORK
+
+    def ensure_valid(self) -> None:
+        if self.fault is not None:
+            raise self.fault
+
+    def budget_exceeded(self, message: str) -> None:
+        """Fail the whole body, without running more graph callbacks or retaining shots."""
+        if self.fault is None:
+            self.fault = ScriptBudgetError(
+                f"entity {self.entity:08X}, frame {self.frame}, time {self.now} ms: {message}"
+            )
+            self.shots.clear()
+            self.held.clear()
+            for instance in self.instances.values():
+                instance.stopped = True
+                instance.queue.clear()
+                instance.deferred.clear()
+                instance.ticking.clear()
+                for state in instance.states.values():
+                    state.active = False
+        raise self.fault
+
+    @contextmanager
+    def operation(self):
+        """Nested calls and cross-instance events share one bounded operation."""
+        self.ensure_valid()
+        if self._operation_depth == 0:
+            self._work_left = MAX_SCRIPT_WORK
+        self._operation_depth += 1
+        try:
+            yield
+        except RecursionError:
+            self.budget_exceeded("script recursion limit exceeded")
+        finally:
+            self._operation_depth -= 1
+
+    def consume_work(self, where: str) -> None:
+        self.ensure_valid()
+        if self._work_left <= 0:
+            self.budget_exceeded(f"script work budget {MAX_SCRIPT_WORK} exhausted during {where}")
+        self._work_left -= 1
+
+    @contextmanager
+    def follow_scope(self):
+        with self.operation():
+            self._follow_depth += 1
+            try:
+                if self._follow_depth > MAX_FOLLOW_DEPTH:
+                    self.budget_exceeded(f"plug depth budget {MAX_FOLLOW_DEPTH} exhausted")
+                self.consume_work("plug traversal")
+                yield
+            finally:
+                self._follow_depth -= 1
 
     # --- variables ---------------------------------------------------------------------------------
 
@@ -276,6 +342,7 @@ class Component:
 
     def set(self, var: int, value) -> None:
         """Set an entity variable from outside the graphs (the server's own code)."""
+        self.ensure_valid()
         target = self.entity_var(var)
         before = target.value()
         target.base = value
@@ -347,32 +414,42 @@ class Component:
     def run_frame(self, frame: int, buttons: list[tuple[int, bool]] = ()) -> None:
         """Command frame `frame`: its edges at 16F, then an update at every due event time in [16F, 16F+15]
         and one at 16F+15."""
-        self.frame = frame
-        self.now = frame * self.frame_ms
-        end = self.now + self.frame_ms - 1
-        self.edges(list(buttons))
-        for _ in range(10000):
-            due = self.next_event_time()
-            self.now = end if due is None or due > end else max(due, self.now)
-            self.update()
-            if self.now >= end:
+        with self.operation():
+            self.frame = frame
+            self.now = frame * self.frame_ms
+            end = self.now + self.frame_ms - 1
+            self.edges(list(buttons))
+            for _ in range(MAX_COMPONENT_UPDATES):
                 due = self.next_event_time()
-                if due is None or due > end:
-                    break
-        self.now = end
+                self.now = end if due is None or due > end else max(due, self.now)
+                self.update()
+                if self.now >= end:
+                    due = self.next_event_time()
+                    if due is None or due > end:
+                        break
+            else:
+                self.budget_exceeded(f"component frame update budget {MAX_COMPONENT_UPDATES} exhausted")
+            self.now = end
 
     def run_now(self) -> None:
         """Update every instance at the current time until nothing more is due now (spawn)."""
-        for _ in range(10000):
-            self.update()
-            due = self.next_event_time()
-            if due is None or due > self.now:
-                break
+        with self.operation():
+            for _ in range(MAX_COMPONENT_UPDATES):
+                self.update()
+                due = self.next_event_time()
+                if due is None or due > self.now:
+                    break
+            else:
+                self.budget_exceeded(
+                    f"component current-time update budget {MAX_COMPONENT_UPDATES} exhausted"
+                )
 
     def update(self) -> None:
-        for instance in list(self.instances.values()):
-            if instance.id in self.instances:
-                instance.update()
+        with self.operation():
+            self.consume_work("component update")
+            for instance in list(self.instances.values()):
+                if instance.id in self.instances:
+                    instance.update()
 
 
 class Instance:
@@ -490,28 +567,36 @@ class Instance:
 
     def update(self) -> None:
         """One update at the component's now (0x7FF78AAA27C0)."""
-        if self.stopped or not self.initialized:
-            return
-        for _ in range(1000):
-            self.drain()
-            for state in list(self.ticking):
-                if state.active and state.ticked_at != self.component.now:
-                    state.ticked_at = self.component.now
-                    state.tick()
-            if not self.run_deferred():
-                break
+        with self.component.operation():
+            if self.stopped or not self.initialized:
+                return
+            for _ in range(MAX_INSTANCE_UPDATES):
+                self.drain()
+                for state in list(self.ticking):
+                    if state.active and state.ticked_at != self.component.now:
+                        self.component.consume_work("state tick")
+                        state.ticked_at = self.component.now
+                        state.tick()
+                if not self.run_deferred():
+                    break
+            else:
+                self.component.budget_exceeded(
+                    f"instance {self.id} update budget {MAX_INSTANCE_UPDATES} exhausted"
+                )
 
     def drain(self) -> None:
-        now = self.component.now
-        count = 0
-        while self.queue and self.queue[0].time <= now and not self.stopped:
-            event = self.queue.pop(0)
-            count += 1
-            if count > EVENTS_PER_TIME:
-                log.warning("[script] instance %d: too many events at %d ms", self.id, now)
-                self.stopped = True
-                return
-            self.dispatch(event)
+        with self.component.operation():
+            now = self.component.now
+            count = 0
+            while self.queue and self.queue[0].time <= now and not self.stopped:
+                if count >= EVENTS_PER_TIME:
+                    self.component.budget_exceeded(
+                        f"instance {self.id} event budget {EVENTS_PER_TIME} exhausted at {now} ms"
+                    )
+                count += 1
+                self.component.consume_work("event dispatch")
+                event = self.queue.pop(0)
+                self.dispatch(event)
 
     def dispatch(self, event: Event) -> None:
         state = event.state
@@ -574,11 +659,16 @@ class Instance:
 
     def follow(self, node: Node, path: str, caller: "State | None" = None) -> bool:
         """Follow a plug of a node (0x7FF78AA83FA0). Returns whether a link was taken."""
+        with self.component.follow_scope():
+            return self._follow(node, path, caller)
+
+    def _follow(self, node: Node, path: str, caller: "State | None") -> bool:
         plug = node.field(path)
         if not is_plug(plug):
             return False
         taken = False
         for position, input_path in plug["links"]:
+            self.component.consume_work("plug target")
             if self.stopped:
                 break
             target = self.graph.node(position) if position is not None else None
@@ -620,6 +710,11 @@ class Instance:
 
     def run_node(self, node: Node, caller: "State | None") -> bool:
         """Run an action, condition or entry now; returns whether it took a path."""
+        with self.component.operation():
+            self.component.consume_work("node execution")
+            return self._run_node(node, caller)
+
+    def _run_node(self, node: Node, caller: "State | None") -> bool:
         function = HANDLERS.get(node.cls)
         if function is None:
             if node.cls not in ENTRY_CLASSES and node.cls not in MESSAGE_ENTRIES:

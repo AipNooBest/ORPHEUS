@@ -83,10 +83,20 @@ G. Additional public 1.74 implementation located during this work
     7940ab23fe9cb8c99858a0e2335f7aacb1f029d865bc6906f711b664b956c580
 
   A separate robustness investigation reproduced an unbounded expression jump loop with
-  expr.run([1, 0]). This case is not covered by the original 75 passing tests. An instruction
-  budget and malformed/truncated/jump-target validation are being repaired and tested in the
-  isolated copy. Do not treat the baseline pass as evidence that interpreter inputs are bounded.
-  Controlled main-project integration and live-client acceptance are still in progress.
+  expr.run([1, 0]). This case was not covered by the original 75 passing tests. An instruction
+  budget and malformed/truncated/jump-target validation were repaired and integrated with
+  eight focused regressions in local commit f074003. That commit also integrates the pinned
+  upstream implementation and local lifecycle/command repairs. Live-client acceptance remains
+  separate and incomplete; see docs/STATE.md.
+
+  Further local tests reproduced event-limit exhaustion that stopped only a weapon instance
+  while the driver continued reporting its active volley, cross-instance event cycles that
+  exhausted outer loops without an error, and immediate plug recursion. The follow-up repair
+  fails the whole component explicitly, clears pending shots/events and prevents later frames.
+  It preserves ordered immediate links and queued state begins. No original-server recovery
+  behavior is inferred, and these reproductions do not establish the cause of live kill bugs.
+  Full follow-up regression: 818 tests, 817 passed, one missing-cache skip. A separate
+  62.448-second native-driver/local-decoder sequence completed 3903 owner chunks with no fault.
 
 H. AipNooBest protocol/HUD notes and retracted conclusions
   Earlier weapon/snapshot POC, fixed commit f8426859c3195691d379f2fb291a475dfa40139e:
