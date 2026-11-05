@@ -22,6 +22,7 @@ chunks sent after it carried (the client may have applied them), so a lost datag
 import logging
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from ow174.game import pools
 from ow174.game.bits import BitWriter
@@ -41,6 +42,9 @@ from ow174.game.statescript import (
     owner_delta,
     sendable,
 )
+
+if TYPE_CHECKING:
+    from ow174.game.match import Match
 
 log = logging.getLogger("ow174.script")
 
@@ -116,6 +120,7 @@ class BodyWorld(runtime.World):
         super().__init__(hero, mode)
         self.body = body
         self.throttles = (0, 0)  # the command being run: (forward, right), -127..127
+        self.match: Match | None = None
 
     def native(self, cfg: dict, instance):
         cls = cfg.get("$")
@@ -132,6 +137,13 @@ class BodyWorld(runtime.World):
             expr.warn_once(cls, "entity filters (STU_AC829876) answer false")
             return False
         return super().native(cfg, instance)
+
+    def send_message(self, target: int, message: int, params: dict, sender: int) -> None:
+        match = self.match
+        if (match is not None and sender == self.body
+                and match.queue_body_message(target, message, params, sender)):
+            return
+        super().send_message(target, message, params, sender)
 
 
 @dataclass
@@ -469,6 +481,7 @@ class BodyScript(ReplicatedBody):
         """The body is gone (a hero switch, the player left): no more frames, and a lost full frame is not
         sent again."""
         self.retired = True
+        self.world.match = None
         if self.stream.full_update is not None:
             self.stream.full_update.resend = False
 

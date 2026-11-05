@@ -77,7 +77,7 @@ FIELDS = {
                    "_bot_destroy_wait _bot_scripts expected_in parked_in leaving_since"),
     _BotScriptDelivery: _names("stream death_frames"),
     Match: _names("environment id game_map card skin_of tick controller assemble_ends assembled players "
-                  "started on_leave ended bots _pending_bot_scripts bots_shown notices combat "
+                  "_body_messages started on_leave ended bots _pending_bot_scripts bots_shown notices combat "
                   "collision_provider collision_state collision_world _collision_failed"),
     Player: _names("match slot account_lo name rank role card card_sent card_again hero team quanta entity "
                    "body has_body skin client gone loaded_at steps_done spawned spawn mover commands "
@@ -106,7 +106,7 @@ FIELDS = {
         "hero entity record frame_ms world component frame buttons stream create_arrived "
         "retired first_owner_frame server_only ult_seconds ultimates reports report_count"
     ),
-    driver.BodyWorld: _names("hero mode body throttles"),
+    driver.BodyWorld: _names("hero mode body throttles match"),
     BotScript: _names("component frame server_only initial death_frame _produced"),
     runtime.World: _names("hero mode"),
     LinkCipher: _names("key_in key_out salt_in salt_out"),

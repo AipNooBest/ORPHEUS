@@ -343,9 +343,10 @@ class _Export:
         if kind in (runtime.World, BodyWorld):
             if obj is not self.component.world:
                 raise BodyVMSnapshotError("foreign VM world reference")
-            fields = {"hero", "mode"} | ({"body", "throttles"} if kind is BodyWorld else set())
+            fields = {"hero", "mode"} | ({"body", "throttles", "match"} if kind is BodyWorld else set())
+            # The match and its pending deliveries belong to the enclosing server snapshot.
             return {"class": _name(kind), "fields_identity": self.identity(vars(obj)),
-                    "fields": self.fields(obj, fields)}
+                    "fields": self.fields(obj, fields, exclude={"match"})}
         if kind is random.Random:
             if obj is not self.component.rng:
                 raise BodyVMSnapshotError("foreign RNG reference")

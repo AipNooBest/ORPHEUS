@@ -118,7 +118,9 @@ def _snapshot(script: BodyScript, encode) -> dict:
     return {
         "hero": script.hero, "entity": script.entity, "frame": script.frame,
         "frame_ms": script.frame_ms, "buttons": script.buttons, "retired": script.retired,
-        "world": encode(vars(script.world)), "server_only": sorted(script.server_only),
+        # Cross-body routing belongs to the full match replay, outside this command trace.
+        "world": encode({key: value for key, value in vars(script.world).items() if key != "match"}),
+        "server_only": sorted(script.server_only),
         "ult_seconds": encode(script.ult_seconds), "instances": instances,
         "component": {
             "frame": component.frame, "now": component.now, "held": list(component.held),

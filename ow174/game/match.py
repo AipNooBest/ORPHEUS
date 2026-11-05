@@ -45,7 +45,7 @@ from ow174.game.content import SOLDIER, GameMap, Hero, heroes, spawn_point
 from ow174.game.environment import ExecutionEnvironment, SystemEnvironment
 from ow174.game.mover import CROUCHED, GRAVITY_SCALE, Mover, mover_data, statescript_mods
 from ow174.game.projectiles import MAX_LEASE_FRAME
-from ow174.game.script import graph
+from ow174.game.script import expr, graph, runtime
 from ow174.game.script.bot import BotScript
 from ow174.game.script.driver import BodyScript, CommandEpochError
 from ow174.game.script.runtime import ScriptBudgetError
@@ -87,6 +87,7 @@ HEALTH: float | None = None
 # The heroes whose body statescript the server runs (ow174/game/script): their weapons and
 # abilities work and the client keeps its predictions. None = every hero.
 BODY_SCRIPT_HEROES: set[int] | None = None
+MAX_BODY_MESSAGES = 256  # bound the match's deferred cross-body work per tick
 
 # ClientInGame 20308 {4 flags, card}: a player's card for the client's player list, keyed by the id in
 # his entity's component 29 (0x7FF7896E88B0). With the first and fourth flag on it also posts "<name>
@@ -361,6 +362,7 @@ class Match:
         self.assemble_ends: float | None = None  # PvP: when "assemble your team" ends
         self.assembled = False
         self.players: list[Player] = []
+        self._body_messages: list[tuple[BodyScript, Player, BodyScript, int, dict]] = []
         self.started = self.environment.wall_time(callsite="match.started")
         self.on_leave = on_leave  # called with each player who leaves
         self.ended = False
@@ -904,6 +906,44 @@ class Match:
 
     # --- the body's statescript (ow174/game/script) ------------------------------------------------
 
+    def _message_player(self, entity: int) -> Player | None:
+        shown = (player for player in self.players if player.body == entity and self._shown(player))
+        return next(shown, None)
+
+    def queue_body_message(self, target: int, message: int, params: dict, sender: int) -> bool:
+        """Capture the source and recipient scripts before either entity ID can be reused."""
+        source, recipient = self._message_player(sender), self._message_player(target)
+        if source is None or recipient is None:
+            return False
+        source_script, script = source.body_script, recipient.body_script
+        if source_script is None or source_script.retired or script is None or script.retired:
+            return False
+        if len(self._body_messages) >= MAX_BODY_MESSAGES:
+            expr.warn_once("body-message-limit", "match body message queue reached %d", MAX_BODY_MESSAGES)
+            return False
+        self._body_messages.append((source_script, recipient, script, message, dict(params)))
+        return True
+
+    def deliver_body_messages(self) -> None:
+        """Drain one match batch without advancing recipients' command frames."""
+        if not self._body_messages:
+            return
+        pending, self._body_messages = self._body_messages, []
+        # Messages emitted by a receiver enter the next batch, outside its VM call stack.
+        for source, player, script, message, params in pending:
+            if source.retired or source.component.fault is not None:
+                continue
+            if player.body_script is not script or script.retired or not self._shown(player):
+                continue
+            try:
+                component = script.component
+                # An earlier message can start or stop a later message's entry state.
+                if runtime.send_message(component, message, params, source.entity):
+                    component.run_now()
+            except Exception:
+                log.exception("[game] %s: %s's body message handling failed", self.label(), player.name)
+                self.stop_body_script(player, failed=True)
+
     def start_body_script(self, player: Player, create: EntityUpdate) -> None:
         """The statescript of the player's new body; the old body's stops. It runs from
         the newest command frame on, and its full frame goes out once the client acknowledged the create."""
@@ -924,6 +964,7 @@ class Match:
             log.exception("[game] %s: no body statescript for %s", self.label(), player.describe())
             return
         script.created(create)
+        script.world.match = self
         player.body_script = script
         bodytrace.started(player, script)
 

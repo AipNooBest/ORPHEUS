@@ -493,6 +493,7 @@ class Combat:
         for rocket in list(self.rockets):
             self._fly(rocket)
         self.projectiles.update(tick)
+        self.match.deliver_body_messages()
         if frames:
             self.observers.update()
         for when, who in list(self.respawns):
