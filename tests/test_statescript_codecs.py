@@ -37,7 +37,10 @@ SAMPLES = {
         {"flags": 2, "cur": 3.5, "rate": 1.0, "last": FRAME_TIME - 40},
         {"flags": 7, "cur": 1.25, "rate": 0.5, "last": FRAME_TIME + 16},
     ],
-    "targets": [{}],
+    "targets": [
+        {},
+        {"targets": tuple((0xA0000101 + i, age) for i, age in enumerate((0, 255, 256, 65535, 65536)))},
+    ],
     "subscript": [{"child": 13}, {"child": 300}],
     "message": [{"stacked": True}, {"stacked": False}],
     "send": [{}],
@@ -80,7 +83,7 @@ def expected(kind: str, payload: dict) -> dict:
             out.update(rate=f32(get("rate", 1.0)), last=get("last", FRAME_TIME + FRAME_MS))
         return out
     if kind == "targets":
-        return {"targets": ()}
+        return {"targets": get("targets", ())}
     if kind == "subscript":
         return {"child": get("child", 0)}
     if kind == "message":
@@ -186,6 +189,19 @@ class EncoderTests(unittest.TestCase):
                 self.assertEqual(got, expected(kind, payload), (cls, payload))
                 checked[kind] += 1
         self.assertEqual(set(checked), set(statescript.WRITERS))
+
+    def test_visor_target_list_survives_an_owner_delta(self):
+        visor = graphs.graph(0x0259)
+        cls = visor.state(7).cls
+        for targets in (((0xA0000201, 0), (0xA0000301, 256)), ()):
+            with self.subTest(targets=targets):
+                wire = statescript.StateWire(cls, True, {"targets": targets})
+                instance = statescript.InstanceWire(7, visor, states={7: wire})
+                payload = statescript.owner_delta(1000, True, [instance], {}, {7: visor})
+                chunk = statescript.chunk(payload, 32, 0)
+                frame = decode.read_chunk(chunk.getvalue(), chunk.count, {7: visor.index})
+                self.assertTrue(frame.owner)
+                self.assertEqual(frame.instances[7].states[7], (True, {"targets": targets}))
 
     def test_unwritable_classes_are_never_sent_on(self):
         self.assertFalse(statescript.sendable("STU_9935FBC8", True))

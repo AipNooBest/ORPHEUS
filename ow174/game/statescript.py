@@ -509,8 +509,12 @@ def write_payload(out: BitWriter, cls: str, payload: dict, frame_time: int, fram
     elif kind == "ability":
         _write_ability(out, payload, frame_time + frame_ms)
     elif kind == "targets":
-        out.bit(1)  # an empty target list
-        out.w_u16(0)
+        targets = payload.get("targets", ())
+        out.bit(1)  # an explicit target list, including when empty
+        out.w_u16(len(targets))
+        for entity, age in targets:
+            out.bits(entity, 32)
+            out.var_b(age)
     elif kind == "subscript":
         out.w_u16(payload.get("child", 0))
         out.bit(0)
