@@ -11,11 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from test_game_combat import KANEZAKA_DM, Run
+from test_game_world import read_movement
 
 from ow174.game import combat, projectiles, world
 from ow174.game.bits import BitReader
 from ow174.game.commands import Command
-from ow174.game.content import SOLDIER
+from ow174.game.content import SOLDIER, heroes
 from ow174.game.script.decode import ClientBody, read_chunk
 from ow174.game.world import HEALTH_POOL, OP_CREATE, OP_DESTROY
 
@@ -196,6 +197,67 @@ class ProjectileRangeTests(unittest.TestCase):
 
 
 class BioticFieldTests(unittest.TestCase):
+    def test_the_default_field_create_keeps_its_wire_bytes(self):
+        # These pre-theme records cover both paths, with the same non-zero observer position.
+        for parent, size, expected in (
+            (
+                0xA0100042, 547,
+                "728f030000000000000000000000000000000000000000000000000000e00f0000e00f0000"
+                "e00f0000e04f0c7000800400004800008004000000a010000428000000000000",
+            ),
+            (
+                None, 350,
+                "720f030000e80f00000830000010100000000000000000000000000000e00f0000e00f0000"
+                "e00f0000e00f00",
+            ),
+        ):
+            with self.subTest(parent=parent):
+                record = projectiles.field_create(parent, (1.25, -2.5, 3.0))(0)
+                self.assertEqual((record.count, record.getvalue().hex()), (size, expected))
+
+    def test_the_skin_theme_reaches_the_owner_and_observer_field(self):
+        run = Run(KANEZAKA_DM, ("Owner", "Observer"))
+        owner, observer = run.players
+        grillmaster = 0x0A50000000001BC8  # replaces the field's 0B06.00D ring
+        run.match.skin_of = lambda account, _hero: (
+            (grillmaster, True) if account == owner.account_lo else (0, False)
+        )
+        run.match.switch_hero(owner, heroes()[SOLDIER])
+        self.assertEqual(owner.skin, (grillmaster, True))
+        for _ in range(20):
+            run.step({})
+        run.step({owner: (0, 0, ABILITY_2)})
+        for _ in range(60):
+            run.step({})
+        [shot] = run.match.combat.projectiles.shots
+        self.assertTrue(shot.created)
+        for viewer, parents in ((owner, shot.created), (observer, [None])):
+            with self.subTest(viewer=viewer.name):
+                creates = [
+                    item for item in viewer.client.entities
+                    if item.op == OP_CREATE and item.entity >> 16 == 0xA008
+                ]
+                self.assertEqual(len(creates), len(parents))
+                for item, parent in zip(creates, parents, strict=True):
+                    record = item.build(0)
+                    reader = bits_of(record)
+                    self.assertEqual((reader.bit(), reader.bit(), reader.bits(12)), (0, 1, 0x03DC))
+                    flags = world.WITH_TRANSFORM | world.WITH_SCALE | world.WITH_SKIN | world.SKIN_THEME
+                    if parent is not None:
+                        flags |= world.WITH_MOVEMENT
+                    self.assertEqual(reader.bits(8), flags)
+                    self.assertEqual((reader.bits(32), reader.bit()), (0x1BC8, 0))
+                    position = struct.unpack("<3f", reader.bits(96).to_bytes(12, "little"))
+                    reader.bits(7 * 32)  # rotation and scale
+                    if parent is None:
+                        self.assertEqual(position, shot.where)
+                    else:
+                        self.assertEqual(position, (0.0, 0.0, 0.0))
+                        movement = read_movement(reader, world.CREATE_BASE, parent=parent)
+                        self.assertEqual(movement["flags"], projectiles.KEEP_ROTATION)
+                    self.assertEqual(reader.bits(8), 0)  # no components
+                    self.assertEqual(reader.pos, record.count)
+
     def test_the_canister_the_field_entity_its_frame_and_the_heal(self):
         run = Run(KANEZAKA_DM, ("A", "B"))
         a, b = run.players

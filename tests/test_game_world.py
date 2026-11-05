@@ -63,7 +63,7 @@ def _floats(reader: BitReader) -> tuple:
                  for _ in range(3))  # fmt: skip
 
 
-def read_movement(reader: BitReader, frame: int) -> dict:
+def read_movement(reader: BitReader, frame: int, *, parent: int | None = None) -> dict:
     """A movement-state block in packet frame `frame`, against the reference state, in the client's
     order (0x7FF789B6F680)."""
     state = {"flags": 0}
@@ -93,7 +93,10 @@ def read_movement(reader: BitReader, frame: int) -> dict:
         state["velocity"] = tuple(_field(reader, (8, 10, 24)) / 1024 for _ in range(3))
     else:
         state["velocity"] = (0.0, 0.0, 0.0)
-    assert reader.bits(9) == 0 and reader.bit() == 0  # no optional parts, no parent
+    assert reader.bits(9) == 0  # no optional parts
+    assert reader.bit() == (parent is not None)
+    if parent is not None:
+        assert reader.bits(32) == parent and reader.bits(32) == 0  # parent's scene-node matrix
     first = _field(reader, (8, 12, 17))  # +52
     state["spring_speed"] = _field(reader, (8, 10, 24)) / 1024  # +60
     state["spring"] = (first, _field(reader, (8, 12, 17)))  # +56

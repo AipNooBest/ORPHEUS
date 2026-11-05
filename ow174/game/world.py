@@ -345,9 +345,17 @@ def _steps(out: BitWriter, steps: int) -> None:
         out.bit(0)
 
 
-def write_movement(out: BitWriter, state: Movement, frame_back: int | None, base: int | None = None) -> None:
+def write_movement(
+    out: BitWriter,
+    state: Movement,
+    frame_back: int | None,
+    base: int | None = None,
+    *,
+    parent: int | None = None,
+) -> None:
     """The movement-state block. Its frame is `frame_back` frames before the base (0x7FF789B76D00: the
-    packet frame on ch3, CREATE_BASE on the create path; None: not known); None or 0 is the base itself."""
+    packet frame on ch3, CREATE_BASE on the create path; None: not known); None or 0 is the base itself.
+    A parent puts the position relative to its scene-node matrix."""
     frame = None if base is None else (base - (frame_back or 0)) & 0xFFFFFFFF
     flags = state.flags & 0xFFFFFFFF
     if flags:
@@ -400,7 +408,10 @@ def write_movement(out: BitWriter, state: Movement, frame_back: int | None, base
     else:
         out.bit(0)
     out.bits(0, 9)  # nine optional parts
-    out.bit(0)  # no parent: world space
+    out.bit(parent is not None)
+    if parent is not None:
+        out.bits(parent & 0xFFFFFFFF, 32)  # +0x360: parent entity
+        out.bits(0, 32)  # +0x364: the parent's scene-node matrix
     _steps(out, state.spring[0])  # +52
     speed = round(state.spring_speed * POSITION_UNITS)
     if speed:
@@ -429,9 +440,11 @@ def create(
     movement: Movement | None = None,
     frame_back: int = 1,
     skin: tuple[int, bool] = (0, False),
+    *,
+    movement_parent: int | None = None,
 ) -> RecordWriter:
     """A create record for an entity of a 003 definition. `skin` is (skin theme GUID, golden weapon);
-    theme 0 leaves the definition's own look."""
+    theme 0 leaves the definition's own look. `movement_parent` applies when a movement block is present."""
     if movement is not None:
         flags |= WITH_MOVEMENT
     theme, golden = skin
@@ -451,7 +464,7 @@ def create(
         for _ in range(3):
             out.f32(1.0)
     if movement is not None:
-        write_movement(out, movement, frame_back, CREATE_BASE)
+        write_movement(out, movement, frame_back, CREATE_BASE, parent=movement_parent)
     _write_components(out, components)
     return out
 

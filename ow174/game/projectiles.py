@@ -37,7 +37,7 @@ from ow174.game import world
 from ow174.game.bits import BitWriter
 from ow174.game.script import graph as graphs_data
 from ow174.game.statescript import InstanceWire, StateWire, Stream, remote_full_frame
-from ow174.game.world import OP_CREATE, OP_DESTROY, WITH_MOVEMENT, WITH_SCALE, WITH_TRANSFORM, EntityUpdate
+from ow174.game.world import OP_CREATE, OP_DESTROY, WITH_SCALE, WITH_TRANSFORM, EntityUpdate
 
 log = logging.getLogger("ow174.game")
 
@@ -97,43 +97,6 @@ def release(frame: int, count: int = 1) -> BitWriter:
 # --- the field entity's create (the Biotic Field) ---------------------------------------------------------
 
 KEEP_ROTATION = 0x01000000  # movement state +0 bit 24: the block's own rotation, not the parent's
-
-
-def parented_movement(out: BitWriter, parent: int, flags: int = KEEP_ROTATION) -> None:
-    """A create's movement-state block that puts the entity at its parent (world.write_movement's layout
-    for a state at the origin with no motion, frame CREATE_BASE - 1, then the parent part: a bit, the
-    parent's id +0x360 and the mode +0x364, 0 = the parent's scene-node matrix; reader
-    0x7FF789B6F680)."""
-    out.bit(1)  # +0: four optional bytes, low first
-    for k in range(4):
-        byte = (flags >> (8 * k)) & 0xFF
-        out.bit(1 if byte else 0)
-        if byte:
-            out.bits(byte, 8)
-    out.bit(0)  # +4
-    out.bit(1)  # +8: one frame back from the create's base
-    out.bit(1)
-    out.bits(1, 4)
-    out.bit(0)  # +12
-    out.bit(0)  # pitch
-    out.bits(0, 4)  # +16, +20, +24, +28
-    out.bit(0)  # +36: the state's own frame
-    out.bit(0)  # +40
-    out.bits(0, 2)  # throttles
-    out.bits(0, 3)  # Euler angles
-    for _ in range(3):  # the position, (0, 0, 0) from the parent
-        out.bit(1)
-        out.bits(0, 2)
-        out.bit(1)
-        out.bits(0, 24)
-    out.bit(0)  # no velocity
-    out.bits(0, 9)  # nine optional parts
-    out.bit(1)  # a parent
-    out.bits(parent & 0xFFFFFFFF, 32)
-    out.bits(0, 32)
-    out.bits(0, 3)  # +52, +60, +56
-    out.bit(0)  # +384
-    out.bit(0)  # +832
 
 
 # --- the server's part ------------------------------------------------------------------------------------
@@ -467,6 +430,7 @@ class Projectiles:
     def _open_field(self, shot: Shot) -> None:
         """The field entity on every client: on the owner's parented to each canister id (its client puts it
         on its own canister), on the others at the shooter's feet (unverified: the canister falls there)."""
+        theme, _ = shot.player.skin
         for viewer in self.match.players:
             if viewer.client is None or not viewer.spawned:
                 continue
@@ -475,7 +439,7 @@ class Projectiles:
                 entity = FIELD_FIRST + self.next_field % FIELD_SPAN
                 self.next_field += 1
                 shot.field_ids.append((viewer.slot, entity))
-                create = EntityUpdate(entity, OP_CREATE, field_create(parent, shot.where))
+                create = EntityUpdate(entity, OP_CREATE, field_create(parent, shot.where, theme))
                 create.stream = FieldArrived(shot, viewer, Stream(entity))
                 viewer.client.queue_entities([create])
         log.info("[game] %s: %s's Biotic Field opened", self.match.label(), shot.player.name)
@@ -517,22 +481,19 @@ def confirm_record(definition: int):
     return build
 
 
-def field_create(parent: int | None, where: tuple):
+def field_create(parent: int | None, where: tuple, theme: int = 0):
     """03DC.003's create: with the movement block that names its parent (the owner's canister), else placed
-    at `where`."""
+    at `where`. The caster's skin theme supplies the field's cosmetic substitutions."""
+
+    skin = (theme, False)
 
     def build(origin: int):
         if parent is None:
-            return world.create(origin, FIELD_ENTITY, {}, flags=WITH_TRANSFORM | WITH_SCALE, position=where)
-        out = world.RecordWriter(origin)
-        out.bit(0)
-        out.guid_index(FIELD_ENTITY)
-        out.bits(WITH_TRANSFORM | WITH_SCALE | WITH_MOVEMENT, 8)
-        for value in (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0):  # position, rotation, scale
-            out.f32(value)
-        parented_movement(out, parent)
-        out.bits(0, 8)  # no components
-        return out
+            return world.create(origin, FIELD_ENTITY, {}, position=where, skin=skin)
+        return world.create(
+            origin, FIELD_ENTITY, {}, movement=world.Movement((0.0, 0.0, 0.0), flags=KEEP_ROTATION),
+            skin=skin, movement_parent=parent,
+        )
 
     return build
 
