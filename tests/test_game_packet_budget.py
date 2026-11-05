@@ -14,9 +14,10 @@ from ow174.game.bits import BitReader
 from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.commands import FIRE, Command
 from ow174.game.content import PRACTICE_RANGE, SOLDIER
-from ow174.game.link import KIND_FRAME, MAX_DATAGRAM, LinkCipher
+from ow174.game.link import ACK, KIND_CONTROL, KIND_FRAME, MAX_DATAGRAM, LinkCipher, Packet, ReceiveWindow
 from ow174.game.match import Match, card_message
 from ow174.game.script import decode
+from ow174.game.script.driver import SETTLE_FRAMES
 from ow174.game.server import MAX_PAYLOAD, Client, GameServer
 from ow174.game.world import OP_CREATE, OP_DESTROY, OP_UPDATE, EntityUpdate, Movement
 
@@ -144,6 +145,100 @@ class PacketBudgetTests(unittest.TestCase):
         self.assertIn(owner, client.in_flight[packet.seq][1])
         client.acked(packet.seq + 1, 1)
         self.assertEqual(script.stream.base_last, owner.chunk_last)
+
+    def test_budget_delayed_owner_frames_coalesce_and_keep_initial_mode(self):
+        from test_game_repeated_lifecycles import wire_frame
+
+        server, client, player, peer = connection()
+        prepare_corrections(player)
+        script = player.body_script
+        stream = script.stream
+        model = decode.ClientBody.for_hero(SOLDIER)
+        received = ReceiveWindow()
+        sequence = 0
+
+        def send(tick, *, defer_entities=False):
+            nonlocal sequence
+            player.match.tick = tick
+            now = tick * 0.016
+            if defer_entities:
+                client.queue_reliable(
+                    20302, {"+0x78": {"+0x0": player.entity}, "+0x7C": False, "+0x80": 0},
+                )
+                budget = len(client._payload(tick, client.reliable, [], []))
+                with mock.patch.object(server_module, "MAX_PAYLOAD", budget):
+                    client.send_frame(tick, now)
+            else:
+                client.send_frame(tick, now)
+            packet, _, _, _, _, count = decoded(self, peer, server.sock.sent[-1][0])
+            if defer_entities:
+                self.assertEqual(count, 0)
+            _, records = wire_frame(packet)
+            frames = [
+                model.apply(item)
+                for item, _ in records
+                if item.entity == player.body and item.chunk is not None
+            ]
+            self.assertTrue(received.accept(packet.seq))
+            ack = Packet(client.conn, KIND_CONTROL, sequence, received.expected, received.bits, ACK)
+            sequence += 1
+            server._datagram(peer.seal(ack), client.address, now)
+            return frames
+
+        player.match._body_frames(player, client)
+        full, = send(110)
+        self.assertTrue(full.full)
+        self.assertEqual(stream.base_last, full.last)
+
+        first_frame = 111
+        player.take_commands([Command(first_frame)])
+        player.match._body_frames(player, client)
+        first, = client.entities
+        self.assertEqual(send(first_frame, defer_entities=True), [])
+        after_first = first_frame + SETTLE_FRAMES + 2
+        player.take_commands([Command(after_first)])
+        player.match._body_frames(player, client)
+        self.assertEqual(send(after_first, defer_entities=True), [])
+        latest, = client.entities
+        self.assertIsNot(latest, first)
+        self.assertEqual(tuple(stream.pending), (latest.chunk_last,))
+        self.assertEqual(script.report_count, 0)
+
+        initial, = send(after_first)
+        self.assertTrue(initial.owner)
+        self.assertFalse(initial.correction)
+        self.assertEqual((initial.cmfd, initial.last), (after_first, latest.chunk_last))
+        player.take_commands([Command(after_first + SETTLE_FRAMES - 1)])
+        player.match._body_frames(player, client)
+        self.assertEqual(client.entities, [])
+
+        before, after = placeable(0x80000077), placeable(0x80000078)
+        client.queue_entities([before])
+        start = after_first + SETTLE_FRAMES + 1
+        release = start + 15
+        for frame in (start, start + 7, start + 14, release):
+            player.take_commands([Command(frame, buttons=FIRE if frame < release else 0)])
+            player.match._body_frames(player, client)
+            if frame == start:
+                client.queue_entities([after])
+            self.assertEqual(send(frame, defer_entities=True), [])
+            left, pending, right = client.entities
+            self.assertIs(left, before)
+            self.assertIs(pending.stream, stream)
+            self.assertIs(right, after)
+            self.assertEqual(tuple(stream.pending), (pending.chunk_last,))
+            self.assertEqual(stream.pending[pending.chunk_last][0].k, frame)
+            self.assertEqual(script.report_count, 1)
+
+        current, = send(release)
+        self.assertTrue(current.owner)
+        self.assertTrue(current.correction)
+        self.assertEqual(current.cmfd, release)
+        self.assertNotIn((11, 10), model.on())
+        self.assertEqual(script.component.instances[11].vars[53].value(), 27)
+        self.assertEqual(model.vars[(11, 53)], 27)
+        self.assertEqual(stream.base_last, current.last)
+        self.assertEqual(tuple(stream.pending), ())
 
     def test_legal_messages_defer_create_then_ack_original_record_once(self):
         server, client, player, peer = connection()

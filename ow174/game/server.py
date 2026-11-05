@@ -552,13 +552,26 @@ class Client:
                         self._track_body_create(item.entity)
                 generations[item] = generation
             if generations[item] == generation and (alive or item.op == world.OP_DESTROY):
-                self.entities.append(item)
+                self._queue_current_entity(item)
         self.entities = [
             item
             for item in self.entities
             if generations.get(item, 0) == lifecycles.get(item.entity, (0, True))[0]
             and (lifecycles.get(item.entity, (0, True))[1] or item.op == world.OP_DESTROY)
         ]
+
+    def _queue_current_entity(self, item: world.EntityUpdate) -> None:
+        script = getattr(self.player, "body_script", None)
+        if item.chunk is not None and not item.resend and script is not None and item.stream is script.stream:
+            for index, queued in enumerate(self.entities):
+                if queued.stream is item.stream and not queued.resend:
+                    if item.chunk_last > queued.chunk_last:
+                        # The replacement already includes the cumulative keys. The
+                        # queued record never went to the wire or registered a report.
+                        self.entities[index] = item
+                        item.stream.pending.pop(queued.chunk_last, None)
+                    return
+        self.entities.append(item)
 
     def _track_body_create(self, entity: int) -> None:
         match = self.player.match

@@ -86,6 +86,13 @@ class ClientOnlyPulserTests(unittest.TestCase):
         wire = read_chunk(update.chunk.getvalue(), update.chunk.count, known)
         self.assertEqual(wire.instances[instance.id].states[108], (True, {"fresh": True, "count": 1}))
 
+        script.command(START + 33, 0)
+        replacement, = script.frames(kill_feed=False, replace_initial=True)
+        wire = read_chunk(replacement.chunk.getvalue(), replacement.chunk.count, known)
+        self.assertFalse(wire.correction)
+        self.assertEqual(wire.cmfd, START + 33)
+        self.assertEqual(wire.instances[instance.id].states[108], (True, {"fresh": True, "count": 1}))
+
     def test_old_observer_snapshot_can_clear_a_state_after_the_live_instance_is_gone(self):
         script = BodyScript(SOLDIER, BODY, START, ult_seconds=0)
         before = observers.snapshot(script)

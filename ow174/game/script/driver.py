@@ -540,10 +540,10 @@ class BodyScript(ReplicatedBody):
         frame, base = self.tree_frame()
         return [self.stream.full(frame, base)]
 
-    def frames(self, *, kill_feed: bool | None = None) -> list:
+    def frames(self, *, kill_feed: bool | None = None, replace_initial: bool = False) -> list:
         """This tick's body frames: the full frame once the body's create arrived (see `created`), the first
         owner frame (C = 0) once the full frame arrived, then, after SETTLE_FRAMES, a C = 1 frame whenever the
-        client's command frame moved on."""
+        client's command frame moved on. An unsent first frame can be replaced without starting correction."""
         self.component.ensure_valid()
         stream = self.stream
         if self.retired:
@@ -552,7 +552,7 @@ class BodyScript(ReplicatedBody):
             return self.spawn_frames() if self.create_arrived else []
         if stream.base is None or self.frame <= stream.cmfd:
             return []
-        if self.first_owner_frame is None:
+        if self.first_owner_frame is None or replace_initial:
             self.first_owner_frame = self.frame
             correction = False
         elif self.frame < self.first_owner_frame + SETTLE_FRAMES:

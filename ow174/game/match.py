@@ -1077,10 +1077,17 @@ class Match:
     def _body_frames(self, player: Player, client) -> None:
         """This tick's frames of the body's statescript: the full frame, then owner frames."""
         try:
+            script = player.body_script
+            # A newer unsent projection stays non-correcting until the first
+            # owner frame goes out. Its command frame starts the settle interval.
+            replace_initial = (
+                script.first_owner_frame is not None and not script.report_count
+                and bool(script.stream.pending)
+            )
             kill_feed = None
             if self.combat.is_dead(player):
                 kill_feed = self.combat.kill_feed_allowed(player, player.body)
-            client.queue_entities(player.body_script.frames(kill_feed=kill_feed))
+            client.queue_entities(script.frames(kill_feed=kill_feed, replace_initial=replace_initial))
         except Exception:
             log.exception("[game] %s: %s's body statescript failed", self.label(), player.name)
             self.stop_body_script(player, failed=True)
