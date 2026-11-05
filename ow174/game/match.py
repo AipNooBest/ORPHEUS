@@ -665,6 +665,12 @@ class Match:
         self.combat.observers.created(viewer, other, update)  # its statescript once it arrived (observers.py)
         return update
 
+    def ensure_remote_body(self, viewer: Player, other: Player) -> None:
+        """Queue the current visible body's create once, including before the next match update."""
+        if (viewer is not other and viewer.spawned and viewer.client is not None
+                and self._shown(other) and other.body not in viewer.seen):
+            viewer.client.queue_entities([self.remote_body_create(viewer, other)])
+
     def remote_movements(self, viewer: Player) -> list[EntityUpdate]:
         """A movement record for every other player's body in every frame, standing or not, as the
         retail server sent them (OW2's live traffic); the first in the frame after the body's create. And
@@ -824,8 +830,7 @@ class Match:
                 continue
             self._show_players(viewer)
             for other in self.players:
-                if other is not viewer and self._shown(other) and other.body not in viewer.seen:
-                    viewer.client.queue_entities([self.remote_body_create(viewer, other)])
+                self.ensure_remote_body(viewer, other)
 
     def _spawn_steps(self, player: Player, client, now: float) -> None:
         waited = now - player.loaded_at

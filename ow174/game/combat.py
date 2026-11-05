@@ -824,34 +824,32 @@ class Combat:
 
     def _tell_hit(self, shooter, target: Target, dealt: float, flags: int, frame: int) -> None:
         """25001 to the shooter: the hit marker and the target's health bar (frame: the shot's)."""
-        client = getattr(shooter, "client", None)
-        if client is None:
-            return
         value = {
             "+0x78": {"+0x0": {"+0x0": target.entity}, "+0x4": max(1, round(dealt)), "+0x8": flags},
             "+0x84": frame & 0xFFFFFFFF,
         }
-        if isinstance(target.owner, bots.Bot):
-            client.queue_bot_notice(target.entity, HIT, value)
-        else:
-            client.queue_reliable(HIT, value)
+        self._queue_notice(shooter, target.owner, target.entity, HIT, value)
 
-    def _kill_notice(self, killer, victim: int, *, bot: bool = False) -> None:
+    def _kill_notice(self, killer, victim) -> None:
         """25005 to the killer: "ELIMINATED: <name>" (1126.07C; +0x89 assist would be 01F0.07C, +0x88 a
         score shown when above 0). Its handler (0x7FF7895D2B50) reads only +0x84, +0x88 and +0x89."""
-        if killer.client is None:
-            return
+        entity = _source_entity(victim)
         notice = {
             "+0x78": 0,
             "+0x80": {"+0x0": killer.body},
-            "+0x84": {"+0x0": victim},
+            "+0x84": {"+0x0": entity},
             "+0x88": 0,
             "+0x89": False,
         }
-        if bot:
-            killer.client.queue_bot_notice(victim, KILL_NOTICE, notice)
-        else:
-            killer.client.queue_reliable(KILL_NOTICE, notice)
+        self._queue_notice(killer, victim, entity, KILL_NOTICE, notice)
+
+    def _queue_notice(self, viewer, actor, entity: int, msg_id: int, value: dict) -> None:
+        client = getattr(viewer, "client", None)
+        if client is None:
+            return
+        if not isinstance(actor, bots.Bot) and actor.body == entity:
+            self.match.ensure_remote_body(viewer, actor)
+        client.queue_combat_notice(entity, msg_id, value)
 
     @staticmethod
     def _death_parameters(killer, critical: bool, loadout) -> dict:
@@ -867,7 +865,7 @@ class Combat:
         self.respawns.append((self.now + BOT_RESPAWN, bot))
         if not isinstance(killer, bots.Bot):
             killer.stats.add(stats.ELIMINATIONS)
-            self._kill_notice(killer, bot.entity, bot=True)
+            self._kill_notice(killer, bot)
         log.info("[game] %s: %s killed %s", self.match.label(), killer.name, bot.name)
         script = bot.body_script
         if script is None:
@@ -909,13 +907,13 @@ class Combat:
         source = _source_entity(killer)
         if killer is not victim and not bot_killer:
             killer.stats.add(stats.ELIMINATIONS)
-            self._kill_notice(killer, victim.body)
+            self._kill_notice(killer, victim)
         if victim.client is not None:
             how = KILLED_BY if killer is not victim else 0
             notice = {"+0x78": how, "+0x7C": {"+0x0": source}}
-            if bot_killer:
-                victim.client.queue_bot_notice(source, DEATH_NOTICE, notice)
-            else:
+            if how == KILLED_BY:
+                self._queue_notice(victim, killer, source, DEATH_NOTICE, notice)
+            else:  # the native "you died" event does not resolve a killer
                 victim.client.queue_reliable(DEATH_NOTICE, notice)
         script = victim.body_script
         if script is not None:

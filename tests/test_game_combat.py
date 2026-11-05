@@ -43,7 +43,7 @@ class FakeClient:
     def queue_bot_live(self, entity: int, snapshot) -> None:
         pass  # the combat model leaves NPC body decoding to the link tests
 
-    def queue_bot_notice(self, entity: int, msg_id: int, value: dict) -> None:
+    def queue_combat_notice(self, entity: int, msg_id: int, value: dict) -> None:
         self.queue_reliable(msg_id, value)
 
     def queue_bot_health(self, entity: int, components: dict) -> None:
@@ -367,7 +367,9 @@ class BotTests(unittest.TestCase):
         loadout = 0x09E000000000008D
         with (
             patch.object(runtime, "send_message", wraps=runtime.send_message) as sent,
-            patch.object(player.client, "queue_bot_notice", wraps=player.client.queue_bot_notice) as notices,
+            patch.object(
+                player.client, "queue_combat_notice", wraps=player.client.queue_combat_notice
+            ) as notices,
         ):
             fight._damage(bot, target, 200.0, True, loadout, run.frame)
         params = {

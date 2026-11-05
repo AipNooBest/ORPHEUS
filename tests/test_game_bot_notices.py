@@ -1,4 +1,4 @@
-"""NPC notice and health ordering through the encrypted game link, without a listening socket."""
+"""Combat notice and NPC health ordering over the encrypted game link, without a listening socket."""
 
 import struct
 import unittest
@@ -8,7 +8,7 @@ from test_game_packet_budget import connection, decoded, large_messages
 from test_game_repeated_lifecycles import wire_frame
 
 from ow174.game import bodytrace, bots, combat, movelog, world
-from ow174.game.content import PRACTICE_RANGE, SOLDIER
+from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
 from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
 from ow174.game.match import BOT_RECORD_DELAY
 from ow174.game.script import graph
@@ -38,6 +38,24 @@ class BotNoticeTests(unittest.TestCase):
         self.client.queue_entities(updates)
         self.window = ReceiveWindow()
         self.seq = 0
+
+    def prepare_player_target(self):
+        self.server, self.client, self.player, self.peer = connection()
+        self.match = self.player.match
+        self.match.tick = 100
+        self.player.spawned = self.player.has_body = True
+        self.victim = self.match.add_player(2, "Target", SOLDIER, 1, False)
+        key_in, key_out = b"t" * 32, b"u" * 32
+        cipher = LinkCipher(key_in, key_out)
+        victim_client = Client(self.server, ("memory.test", 40002), 2, cipher, self.victim)
+        self.server.clients[2] = self.victim.client = victim_client
+        self.victim.spawned = self.victim.has_body = victim_client.open = True
+        self.target = next(target for target in self.match.combat._targets() if target.owner is self.victim)
+        self.entity = self.target.entity
+        self.client.queue_entities([self.match.remote_body_create(self.player, self.victim)])
+        self.window = ReceiveWindow()
+        self.seq = 0
+        return LinkCipher(key_out, key_in)
 
     def send(self, tick, *, deliver=True):
         self.match.tick = tick
@@ -124,6 +142,98 @@ class BotNoticeTests(unittest.TestCase):
         self.ack()
         reliable, _ = self.send(110)
         self.assert_kill_notices(reliable)
+
+    def test_player_hit_and_elimination_wait_for_a_lost_target_create(self):
+        self.prepare_player_target()
+        self.assertIn((self.entity, world.OP_CREATE), self.send(100, deliver=False)[1])
+        self.match.combat._damage(self.player, self.target, 200, False, None, 101)
+        self.assertEqual(self.notices(self.send(104)[0]), [])
+        self.ack()
+        reliable, records = self.send(107)
+        self.assertEqual(self.notices(reliable), [])
+        self.assertIn((self.entity, world.OP_CREATE), records)
+        self.ack()
+        self.ack()
+        self.assertEqual(self.notices(self.send(110)[0]), [
+            (combat.HIT, {"+0x78": {"+0x0": {"+0x0": self.entity}, "+0x4": 200, "+0x8": combat.KILLING},
+                          "+0x84": 101}),
+            (combat.KILL_NOTICE, {"+0x78": 0, "+0x80": {"+0x0": self.player.body},
+                                  "+0x84": {"+0x0": self.entity}, "+0x88": 0, "+0x89": False}),
+        ])
+        self.ack()
+        self.assertEqual(self.notices(self.send(113)[0]), [])
+
+    def test_player_victim_notice_waits_for_a_lost_attacker_create(self):
+        peer = self.prepare_player_target()
+        self.client, self.peer = self.victim.client, peer
+        source = self.player.body
+        self.client.queue_entities([self.match.remote_body_create(self.victim, self.player)])
+        self.assertIn((source, world.OP_CREATE), self.send(100, deliver=False)[1])
+        self.match.combat._damage(self.player, self.target, 200, False, None, 101)
+        self.assertEqual(self.send(104)[0], [])
+        self.ack()
+        reliable, records = self.send(107)
+        self.assertEqual(reliable, [])
+        self.assertIn((source, world.OP_CREATE), records)
+        self.ack()
+        self.assertEqual(self.send(110)[0], [
+            (0, combat.DEATH_NOTICE, {"+0x78": combat.KILLED_BY, "+0x7C": {"+0x0": source}}),
+        ])
+
+    def test_hit_after_a_body_switch_waits_for_the_new_body_create(self):
+        self.prepare_player_target()
+        self.send(100)
+        self.ack()
+        self.match.switch_hero(self.victim, heroes()[SOLDIER])
+        self.target = next(target for target in self.match.combat._targets() if target.owner is self.victim)
+        self.entity = self.target.entity
+        self.assertNotIn(self.entity, self.player.seen)
+        self.match.combat._damage(self.player, self.target, 20, False, None, 101)
+        reliable, records = self.send(101)
+        self.assertEqual(self.notices(reliable), [])
+        self.assertIn((self.entity, world.OP_CREATE), records)
+        self.ack()
+        self.assertEqual(self.notices(self.send(104)[0]), [
+            (combat.HIT, {"+0x78": {"+0x0": {"+0x0": self.entity}, "+0x4": 20, "+0x8": 0}, "+0x84": 101}),
+        ])
+
+    def test_old_player_create_ack_cannot_release_notices_for_a_reused_body(self):
+        self.prepare_player_target()
+        self.send(100)
+        fight = self.match.combat
+        fight._tell_hit(self.player, self.target, 20, 0, 101)
+        self.client.queue_entities([
+            world.EntityUpdate(self.entity, world.OP_DESTROY),
+            self.match.remote_body_create(self.player, self.victim),
+        ])
+        fight._tell_hit(self.player, self.target, 40, 0, 105)
+        self.ack()  # acknowledge only the original lifetime
+        reliable, records = self.send(107)
+        self.assertEqual(self.notices(reliable), [])
+        self.assertIn((self.entity, world.OP_CREATE), records)
+        self.ack()
+        notices = self.notices(self.send(110)[0])
+        self.assertEqual([(number, value["+0x84"]) for number, value in notices], [(combat.HIT, 105)])
+
+    def test_promoted_player_notices_hold_the_old_destroy_across_a_body_switch(self):
+        self.prepare_player_target()
+        self.send(100)
+        self.ack()
+        self.match.combat._damage(self.player, self.target, 200, False, None, 101)
+        lost = self.notices(self.send(101, deliver=False)[0])
+        self.assertEqual([number for number, _ in lost], [combat.HIT, combat.KILL_NOTICE])
+        self.match.switch_hero(self.victim, heroes()[SOLDIER])
+        fresh = self.victim.body
+        self.client.queue_entities([self.match.remote_body_create(self.player, self.victim)])
+        _, records = self.send(104)
+        self.assertIn((fresh, world.OP_CREATE), records)
+        self.assertNotIn((self.entity, world.OP_DESTROY), records)
+        self.ack()
+        retry, records = self.send(107)
+        self.assertEqual(self.notices(retry), lost)
+        self.assertNotIn((self.entity, world.OP_DESTROY), records)
+        self.ack()
+        self.assertIn((self.entity, world.OP_DESTROY), self.send(110)[1])
 
     def assert_movement_waits_for_create_ack(self, bot, tick):
         bot.moved_tick = tick  # make the production movement record due on each send tick
@@ -230,7 +340,7 @@ class BotNoticeTests(unittest.TestCase):
         self.server.drop(self.client)
         self.ack()
         self.assertFalse(self.client.bot_create_acked(fresh))
-        self.assertFalse(self.client._bot_notices)
+        self.assertFalse(self.client._combat_notices)
         self.assertFalse(self.client._bot_health)
         self.assertFalse(self.client.reliable)
 
@@ -295,7 +405,7 @@ class BotNoticeTests(unittest.TestCase):
         self.assertNotIn(self.entity, observer._bot_scripts)
         self.kill_bot()
         self.assertEqual(self.bot_health(send(101, lose=True)), [(world.OP_UPDATE, 0.0)])
-        self.assertNotIn(self.entity, observer._bot_notice_tail)
+        self.assertNotIn(self.entity, observer._combat_notice_tail)
 
         fresh = self.match.combat.next_bot
         with patch.object(graph, "entity_body", return_value=None):
@@ -376,9 +486,9 @@ class BotNoticeTests(unittest.TestCase):
         self.kill_bot()
         self.send(101, deliver=False)
         self.client.queue_entities([world.EntityUpdate(self.entity, world.OP_DESTROY)])
-        self.assertIn(self.entity, self.client._bot_destroy_wait)
+        self.assertIn(self.entity, self.client._body_destroy_wait)
         self.client.queue_entities([world.EntityUpdate(self.entity, world.OP_CREATE, build)])
-        self.assertNotIn(self.entity, self.client._bot_destroy_wait)
+        self.assertNotIn(self.entity, self.client._body_destroy_wait)
         self.assertIn((self.entity, world.OP_CREATE), self.send(104)[1])
         self.assertEqual(self.health, [(world.OP_CREATE, 200)])
         self.ack()
@@ -391,14 +501,14 @@ class BotNoticeTests(unittest.TestCase):
         self.ack()
         self.kill_bot()
         self.respawn_target(289)
-        self.assertIn(self.entity, self.client._bot_destroy_wait)
+        self.assertIn(self.entity, self.client._body_destroy_wait)
         self.server.drop(self.client)
-        self.assertFalse(self.client._bot_destroy_wait)
-        self.assertFalse(self.client._bot_notice_tail)
+        self.assertFalse(self.client._body_destroy_wait)
+        self.assertFalse(self.client._combat_notice_tail)
         self.assertFalse(self.client._bot_health)
 
     def test_long_wait_keeps_only_bounded_latest_notices(self):
-        with patch("ow174.game.server.MAX_PENDING_BOT_NOTICES", 2):
+        with patch("ow174.game.server.MAX_PENDING_COMBAT_NOTICES", 2):
             self.prepare(single=True)
         self.send(100)
         for frame in (101, 102, 103):
