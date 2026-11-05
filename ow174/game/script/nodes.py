@@ -1120,10 +1120,9 @@ class ClientOnlyPulser(State):
     (0x7FF78990D872). Its payload (reader 0x7FF78990D760) is a bit and the 8-bit count of pulses: a count
     that moved on pulses the client as often (mod 256); a state the client reads for the first time pulses
     once only with the bit set (or the node's m_C85E2CBA, node +0xF0), else it takes the count as seen.
-    The server sends its own pulse count, and the bit while a pulse is FRESH_MS old or younger and came
-    FRESH_MS or more after the instance began, so that a pulser a later frame begins (01CF st108 at a death)
-    pulses on the client and the ones on since the spawn do not (unverified: the server's writer is not in the
-    client)."""
+    The server marks recent pulses after the instance's first simulation frame as fresh. Pulses during
+    that first frame keep their count without requesting playback beyond what the node's flag allows.
+    The original server's freshness policy is unverified."""
 
     FRESH_MS = 500
 
@@ -1140,7 +1139,8 @@ class ClientOnlyPulser(State):
 
     def pulse(self) -> None:
         self.pulses = (self.pulses + 1) & 0xFF
-        if self.now - self.instance.start >= self.FRESH_MS:
+        frame_ms = self.instance.component.frame_ms
+        if self.now // frame_ms > self.instance.start // frame_ms:
             self.pulsed_at = self.now
 
     def payload(self) -> dict:
