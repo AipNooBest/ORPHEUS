@@ -410,9 +410,9 @@ class Combat:
         if self.is_dead(player):
             return
         if command is not None:
-            for state, number, time in shots:
+            for state, number, time, activation in shots:
                 try:
-                    self._shoot(player, command, state, number, time)
+                    self._shoot(player, command, state, number, time, activation)
                 except Exception:
                     log.exception("[game] %s: %s's shot failed", self.match.label(), player.name)
         try:
@@ -573,8 +573,10 @@ class Combat:
             try:
                 snapshot = script.advance_live(tick, bot.position)
                 shots, script.component.shots[:] = list(script.component.shots), []
-                for state, number, time in shots:
-                    self._shoot(bot, None, state, number, time, snapshot=snapshot or script.initial[1])
+                for state, number, time, activation in shots:
+                    self._shoot(
+                        bot, None, state, number, time, activation, snapshot=snapshot or script.initial[1],
+                    )
                 if snapshot is not None:
                     for viewer in self.match.players:
                         if viewer.spawned and viewer.client is not None:
@@ -590,7 +592,8 @@ class Combat:
         return (x, y + height, z)
 
     def _shoot(
-        self, shooter, command, state, number: int, time: int, *, snapshot: Snapshot | None = None,
+        self, shooter, command, state, number: int, time: int, activation: tuple[int, int],
+        *, snapshot: Snapshot | None = None,
     ) -> None:
         node = state.node
         shot_frame = time // state.instance.component.frame_ms
@@ -620,7 +623,7 @@ class Combat:
             if isinstance(definition, expr.Asset):
                 shot = self.projectiles.fired(
                     shooter, state, shot_frame, definition.guid, lifetime, origin, direction,
-                    snapshot=snapshot,
+                    activation=activation, snapshot=snapshot,
                 )
             damaging = (direct is not None and direct.amount > 0.0) or (
                 blast is not None and blast.amount > 0.0

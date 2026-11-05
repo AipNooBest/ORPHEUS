@@ -159,8 +159,8 @@ def snapshot_hash(script: BodyScript) -> str:
 def shot_summary(script: BodyScript) -> list[dict]:
     return [
         {"instance": state.instance.id, "graph": state.instance.graph.index, "state": state.index,
-         "activation": state.counter, "shot": number, "time_ms": stamp}
-        for state, number, stamp in script.component.shots
+         "activation": activation[0], "shot": number, "time_ms": stamp}
+        for state, number, stamp, activation in script.component.shots
     ]
 
 

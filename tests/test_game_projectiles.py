@@ -18,9 +18,10 @@ from test_game_world import read_movement
 
 from ow174.game import bodytrace, bots, combat, movelog, observers, projectiles, world
 from ow174.game.bits import BitReader
-from ow174.game.commands import Command
+from ow174.game.commands import FIRE, Command
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
 from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
+from ow174.game.match import sends
 from ow174.game.script.decode import ClientBody, read_chunk
 from ow174.game.script.driver import Snapshot
 from ow174.game.server import Client, GameServer
@@ -295,7 +296,7 @@ class OwnerProjectileDeliveryTests(unittest.TestCase):
         self.assertIn(self.shot.state, frame.instances[self.shot.instance].states)
         report = script.reports[-1]
         self.assertEqual((report.number, report.cmfd, report.last), (before + 1, frame.cmfd, frame.last))
-        self.assertIn(("state", self.shot.instance, self.shot.state), report.keys)
+        self.assertEqual(report.volleys[(self.shot.instance, self.shot.state)], self.shot.activation)
         self.assertIsNone(report.received)
         self.assertFalse(self.shot.created)
         self.ack()
@@ -428,6 +429,71 @@ class OwnerProjectileDeliveryTests(unittest.TestCase):
         self.ack()
         self.advance()
         self.assertEqual(self.send(), [(OP_DESTROY, True)])
+
+
+class HanzoOwnerDeliveryTests(unittest.TestCase):
+    def test_rapid_arrows_use_only_their_own_delivered_volley_activation(self):
+        from test_game_repeated_lifecycles import wire_frame
+
+        for diagnostics in (bodytrace, movelog):
+            self.enterContext(patch.object(diagnostics, "ENABLED", False))
+        run = Run()
+        player, = run.players
+        match = run.match
+        match.bots.clear()
+        match._pending_bot_scripts.clear()
+        match.switch_hero(player, heroes()[0x02E0000000000005])  # Hanzo
+        while run.frame < 1016:
+            run.step({})
+
+        server = GameServer()
+        server.sock = MemorySocket()
+        key_in, key_out = b"i" * 32, b"o" * 32
+        client = Client(server, ("memory.test", 40001), 1, LinkCipher(key_in, key_out), player)
+        server.clients[client.conn] = client
+        client.open = True
+        player.client = client
+        cipher = LinkCipher(key_out, key_in)
+        window = ReceiveWindow()
+        sequence = 0
+        script = player.body_script
+        releases = (1022, 1058)
+        reports = {}
+
+        for frame in range(1017, 1064):
+            now = frame * combat.TICK
+            match.update(now, frame)
+            if sends(frame):
+                client.send_frame(frame, now)
+                packet = decoded(self, cipher, server.sock.sent[-1][0])[0]
+                known = {index: record[0] for index, record in script.stream.base.instances.items()}
+                for item, _ in wire_frame(packet)[1]:
+                    if item.entity != player.body or item.chunk is None:
+                        continue
+                    owner = read_chunk(item.chunk.getvalue(), item.chunk.count, known)
+                    if owner.cmfd in releases:
+                        self.assertTrue(owner.owner)
+                        reports[owner.cmfd] = owner.instances[11].states[4]
+                self.assertTrue(window.accept(packet.seq))
+                ack = Packet(client.conn, KIND_CONTROL, sequence, window.expected, window.bits, ACK)
+                sequence += 1
+                server._datagram(cipher.seal(ack), client.address, now)
+            holding = 1017 <= frame < 1022 or 1053 <= frame < 1058
+            player.take_commands([Command(frame, buttons=FIRE if holding else 0)])
+
+        delivery = match.combat.projectiles
+        arrows = {shot.frame: shot for shot in delivery.shots}
+        self.assertEqual(set(arrows), set(releases))
+        for activation, frame in enumerate(releases, 1):
+            with self.subTest(frame=frame):
+                shot = arrows[frame]
+                self.assertEqual((shot.definition, shot.instance, shot.state), (0x040000000000020B, 11, 4))
+                active, payload = reports[frame]
+                self.assertFalse(active)
+                self.assertEqual((payload["counter"], payload["start"]), (activation, frame * 16))
+                lease = delivery.lease_id(player, shot.definition, frame)
+                self.assertIsNotNone(lease)
+                self.assertEqual(set(shot.created), {lease})
 
 
 class ObserverProjectileDeliveryTests(unittest.TestCase):
@@ -613,7 +679,7 @@ class ObserverProjectileDeliveryTests(unittest.TestCase):
         self.shot_frame = self.tick + 1
         return self.fight.projectiles.fired(
             bot, state, self.shot_frame, HELIX, 2.0, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0),
-            snapshot=snapshot,
+            activation=(state.counter, state.start), snapshot=snapshot,
         )
 
     def npc_snapshot(self, state, value=None):

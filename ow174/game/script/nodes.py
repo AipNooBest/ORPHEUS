@@ -591,12 +591,13 @@ class WeaponVolley(State):
             # unverified (PS4 build): a dead owner's volley shoots no more (allowShotsWhileDead: not read)
             return
         start = self.start + self.offset
+        activation = (self.counter, self.start)
         planned = self.shots_planned()
         while self.reported < planned:
             time = start + shot_time(self.reported, self.rate)
             if time > until:
                 break
-            self.instance.component.shots.append((self, self.reported, time))
+            self.instance.component.shots.append((self, self.reported, time, activation))
             self.reported += 1
 
     def _config(self, name: str, default):

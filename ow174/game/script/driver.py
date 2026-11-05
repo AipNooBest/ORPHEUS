@@ -185,7 +185,7 @@ class OwnerReport:
     number: int
     cmfd: int
     last: int
-    keys: set
+    volleys: dict[tuple[int, int], tuple[int, int]]  # (instance, state) -> (counter, start)
     received: bool | None = None
 
 
@@ -571,8 +571,17 @@ class BodyScript(ReplicatedBody):
         if pending is None or last in stream.sent_reports:
             return
         snapshot, keys = pending
+        volleys = {}
+        for key in keys:
+            if key[0] != "state":
+                continue
+            state_key = key[1:]
+            state = snapshot.states.get(state_key)
+            if state is not None and state[0] == VOLLEY:
+                values = dict(state[2])
+                volleys[state_key] = (values["counter"], values["start"])
         self.report_count += 1
-        report = OwnerReport(self.report_count, snapshot.k, last, keys)
+        report = OwnerReport(self.report_count, snapshot.k, last, volleys)
         stream.sent_reports[last] = report
         self.reports.append(report)
         del self.reports[:-MAX_REPORTS]

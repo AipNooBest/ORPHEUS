@@ -98,8 +98,9 @@ class RifleTests(unittest.TestCase):
         reports = []
         for _ in range(delays[-1] // component.frame_ms + 5):
             session.run(1, FIRE)
-            for volley, shot, when in component.shots:
+            for volley, shot, when, activation in component.shots:
                 self.assertEqual((volley.instance.id, volley.index), (RIFLE, 10))
+                self.assertEqual(activation, (1, first_time))
                 reports.append((shot, when - first_time, body.frame))
             component.shots.clear()
 

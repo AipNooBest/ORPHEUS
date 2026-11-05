@@ -142,7 +142,7 @@ class NativeReplayTests(unittest.TestCase):
         for script, instance in ((forward, first), (reverse, second)):
             script.component.now += 15
             script._report_shots()
-            orders.append([state.index for state, _, _ in script.component.shots
+            orders.append([state.index for state, _, _, _ in script.component.shots
                            if state.instance is instance])
         self.assertEqual(orders, [[0, 1], [1, 0]])
 

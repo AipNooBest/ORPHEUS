@@ -97,7 +97,7 @@ class AIFireWeaponTests(unittest.TestCase):
             control = BotScript(*args)
             control.component.edges([(20, True)])
             control.advance_live(101)
-            [(shot, _, _)] = control.component.shots
+            [(shot, _, _, _)] = control.component.shots
             self.assertEqual((shot.node.cls, shot.index), (volley, 1))
 
             script = BotScript(*args, firing_position=(0.0, 0.0, 3.0))

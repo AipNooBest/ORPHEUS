@@ -335,7 +335,8 @@ class Component:
         self.seq = EventSequence()
         self.next_id = 1
         self.destroyed: list[Instance] = []
-        self.shots: list = []  # (volley state, shot number, time) of the shots fired, for combat.py
+        # Volley state, shot number, time, and the frozen activation counter and start.
+        self.shots: list[tuple[State, int, int, tuple[int, int]]] = []
         self.owner_dead = False  # the body's health is 0 (combat.py): presses and shots stop
         self.fault: ScriptBudgetError | None = None
         self._operation_depth = 0

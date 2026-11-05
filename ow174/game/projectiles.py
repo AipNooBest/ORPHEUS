@@ -211,6 +211,7 @@ class Shot:
     frame: int  # f: the command frame the VM fired it in
     instance: int
     state: int
+    activation: tuple[int, int]  # full volley counter and start time at emission
     spawn: int | None = None  # the entity it leaves where it lands (03DC.003), else None
     where: tuple = (0.0, 0.0, 0.0)  # the shooter's feet when it fired
     bound: int = 0  # frames the projectile lives at most (lifetime, range / speed)
@@ -274,7 +275,7 @@ class Projectiles:
 
     def fired(
         self, player, state, frame: int, definition: int, bound_seconds: float, origin=None, direction=None,
-        *, snapshot: Snapshot | None = None,
+        *, activation: tuple[int, int], snapshot: Snapshot | None = None,
     ) -> Shot | None:
         """Register a volley projectile on the owner and observer paths that apply to its source."""
         npc = isinstance(player, bots.Bot)
@@ -290,6 +291,7 @@ class Projectiles:
             frame,
             state.instance.id,
             state.index,
+            activation,
             spawn=spawned[0] if spawned else None,
             where=tuple(player.position if npc else player.mover.position),
             bound=math.ceil(bound_seconds * 1000 / FRAME_MS),
@@ -318,7 +320,7 @@ class Projectiles:
                 shot.frame,
                 shot.instance,
                 shot.state,
-                state.counter,
+                shot.activation[0],
                 tuple(origin),
                 tuple(direction),
                 (entity,),
@@ -378,11 +380,12 @@ class Projectiles:
             self._end(shot, tick, explode=alive)
             return
         shot.reports[:] = [report for report in shot.reports if report.received is not False]
-        key = ("state", shot.instance, shot.state)
+        key = (shot.instance, shot.state)
         for report in script.reports:
             if (
-                report.number > shot.seen_reports and report.received is not False and key in report.keys
+                report.number > shot.seen_reports and report.received is not False
                 and shot.frame <= report.cmfd <= shot.frame + REPORT_WINDOW
+                and report.volleys.get(key) == shot.activation
             ):
                 shot.reports.append(report)
         shot.seen_reports = script.report_count
