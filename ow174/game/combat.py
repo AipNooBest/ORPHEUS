@@ -78,7 +78,7 @@ EYE_CROUCHED = {0x04000000000003CF: 1.085}  # Soldier's m_816B830F (DATA); other
 EYE_CROUCHED_DEFAULT = 1.15
 HEAD_BELOW = 0.2  # m under the eye where the head starts (unverified)
 HISTORY = 64  # ticks of body positions kept for the shots' view time (about 1 s; unverified: retail's limit)
-NPC_CATCH_UP = 64  # at most about a second of NPC weapon and projectile simulation per update
+COMBAT_CATCH_UP = 64  # at most about a second of retained combat frames per update
 RANGE = 200.0  # m a hitscan shot reaches when its volley names none (unverified)
 RESPAWN = 10.0  # s a hero waits in the PvP modes (0F4A and 0EC2 send 06FD.025 {10}: DATA)
 PRACTICE_RESPAWN = 3.0  # s in the Practice Range (13C0 sends 06FD.025 {3}: DATA)
@@ -456,11 +456,12 @@ class Combat:
         other players' body frames only on the ticks that send (`frames`)."""
         if self.match.collision_world is None:
             return
+        retained = max(self.tick + 1, tick - COMBAT_CATCH_UP + 1)
         first = tick
         if self.tick and tick > self.tick + 1 and any(
             bot.firing and not bot.dead and isinstance(bot.body_script, BotScript) for bot in self.match.bots
         ):
-            first = max(self.tick + 1, tick - NPC_CATCH_UP + 1)
+            first = retained
         for target in self._targets():
             history = self.history.setdefault(target.entity, deque(maxlen=HISTORY))
             history.append((tick, target.feet, target.height, target.eye))
@@ -472,7 +473,7 @@ class Combat:
                 if at == tick or rocket.last_tick is not None:
                     self._fly(rocket)
             self._bot_weapons(at)
-        self.projectiles.update(tick)
+        self.projectiles.update(tick, first_tick=retained)
         self.match.deliver_body_messages()
         if frames:
             self.observers.update()

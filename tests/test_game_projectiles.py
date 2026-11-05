@@ -680,6 +680,40 @@ class ObserverProjectileDeliveryTests(unittest.TestCase):
 
 
 class BioticFieldTests(unittest.TestCase):
+    def test_active_field_heals_elapsed_ticks_once_and_stops_at_expiry(self):
+        run = Run(KANEZAKA_DM)
+        player, = run.players
+        fight = run.match.combat
+        target = next(target for target in fight._targets() if target.owner is player)
+        vitals = fight.vitals_of(target)
+        vitals.damage(199.0)
+        run.step({player: (0, 0, ABILITY_2)})
+        for _ in range(80):
+            run.step({})
+            if fight.projectiles.shots and fight.projectiles.shots[0].field_tick is not None:
+                break
+        field, = fight.projectiles.shots
+        self.assertEqual(field.field_tick, run.frame)
+        started = run.frame
+        healing = projectiles.HEAL_PER_SECOND * combat.TICK
+
+        def update(offset):
+            tick = started + offset
+            run.match.update(tick * combat.TICK, tick)
+
+        update(5)
+        self.assertAlmostEqual(vitals.total, 1.0 + 5 * healing)
+        update(5)
+        self.assertAlmostEqual(vitals.total, 1.0 + 5 * healing)
+        for offset in range(6, 310):
+            update(offset)
+        self.assertAlmostEqual(vitals.total, 1.0 + 309 * healing)
+        update(315)
+        self.assertEqual(fight.projectiles.shots, [])
+        self.assertAlmostEqual(vitals.total, 1.0 + 312 * healing)
+        update(316)
+        self.assertAlmostEqual(vitals.total, 1.0 + 312 * healing)
+
     def test_canister_confirmation_uses_the_cast_timer_frame_after_a_gap(self):
         run = Run()
         player = run.players[0]

@@ -104,6 +104,7 @@ KEEP_ROTATION = 0x01000000  # movement state +0 bit 24: the block's own rotation
 # --- the server's part ------------------------------------------------------------------------------------
 
 PREDICTED = 1  # a volley's sync after LET_GAME_DECIDE: SHOTS_AND_PROJECTILES, the lease's kind
+FRAME_MS = 16
 LEASE_FIRST = 0x00100000  # the first lease id; the server's own ids stay below
 LEASE_SPAN = 1 << 22  # frames (= ids) of one window: 18.6 hours
 LEASE_WINDOWS = 2
@@ -124,6 +125,7 @@ FIELD_FIRST, FIELD_SPAN = 0xA0080000, 0x00040000  # the field entities' ids
 SEEN_FIRST, SEEN_SPAN = 0xA00C0000, 0x00040000  # the server projectiles the other clients see
 FIELD_DELAY = 12  # ticks after the canister's create (0.2 s; it lands in 1-2 frames)
 FIELD_SECONDS = 5.0  # 0258: #567 = 5, st1 Wait #567 - 0.5 then st4 Wait 0.5, then DestroyEntity (DATA)
+FIELD_TICKS = math.ceil(FIELD_SECONDS * 1000 / FRAME_MS)
 FADE_SECONDS = 4.5  # 0258 st1 ends: st5 (its DataFlowMapping) goes off
 HEAL_PER_SECOND = 35.0  # 0258 #420 = 35 a player, ApplyAura 025F.053's 002A (DATA; per second: unverified)
 HEAL_RADIUS = 5.0  # 0258 #422 = 5: st0 TrackTargets m_radius (DATA)
@@ -355,10 +357,11 @@ class Projectiles:
         # Start the delivery window no earlier than this simulation update.
         shot.release_at = max(due, self.match.tick)
 
-    def update(self, tick: int) -> None:
+    def update(self, tick: int, *, first_tick: int | None = None) -> None:
+        first_tick = tick if first_tick is None else first_tick
         for shot in list(self.shots):
             try:
-                self._step(shot, tick)
+                self._step(shot, tick, first_tick)
             except Exception:
                 log.exception("[game] %s: projectile %X failed", self.match.label(), shot.definition & 0xFFFF)
                 for delivery in shot.observers:
@@ -367,7 +370,7 @@ class Projectiles:
                     self.shots.remove(shot)
         self.observed = [delivery for delivery in self.observed if delivery.advance(tick)]
 
-    def _step(self, shot: Shot, tick: int) -> None:
+    def _step(self, shot: Shot, tick: int, first_tick: int) -> None:
         player = shot.player
         script = player.body_script
         alive = player.client is not None and player.has_body and player.body == shot.body
@@ -386,7 +389,7 @@ class Projectiles:
         shot.seen_reports = script.report_count
         if shot.spawn is not None:
             self._confirm(shot, script, tick)
-            self._field(shot, tick)
+            self._field(shot, tick, first_tick)
             return
         due = shot.release_at
         if due is None and shot.created_tick is not None:
@@ -462,7 +465,7 @@ class Projectiles:
 
     # --- the Biotic Field -----------------------------------------------------------------------------
 
-    def _field(self, shot: Shot, tick: int) -> None:
+    def _field(self, shot: Shot, tick: int, first_tick: int) -> None:
         if shot.created_tick is None:
             return
         if shot.field_tick is None:
@@ -470,15 +473,21 @@ class Projectiles:
                 shot.field_tick = tick
                 self._open_field(shot)
             return
-        seconds = (tick - shot.field_tick) * FRAME_MS / 1000
-        if seconds >= FIELD_SECONDS:
+        expires = shot.field_tick + FIELD_TICKS
+        # The opening tick has no heal, and the field ends before the expiry tick.
+        # As with skipped NPC frames, only the most recent body poses are available.
+        steps = min(tick, expires - 1) - max(first_tick - 1, shot.field_tick)
+        if steps > 0:
+            amount = HEAL_PER_SECOND * FRAME_MS / 1000 * steps
+            self.combat.heal_area(shot.player, field_centre(shot), HEAL_RADIUS, amount)
+        if tick >= expires:
             self._end(shot, tick, explode=False)
             return
+        seconds = (tick - shot.field_tick) * FRAME_MS / 1000
         if not shot.faded and seconds >= FADE_SECONDS:
             shot.faded = True
             for arrival in shot.arrivals:
                 arrival.send()
-        self.combat.heal_area(shot.player, field_centre(shot), HEAL_RADIUS, HEAL_PER_SECOND * FRAME_MS / 1000)
 
     def _open_field(self, shot: Shot) -> None:
         """The field entity on every client: on the owner's parented to each canister id (its client puts it
@@ -496,9 +505,6 @@ class Projectiles:
                 create.stream = FieldArrived(shot, viewer, Stream(entity))
                 viewer.client.queue_entities([create])
         log.info("[game] %s: %s's Biotic Field opened", self.match.label(), shot.player.name)
-
-
-FRAME_MS = 16
 
 
 def field_centre(shot: Shot) -> tuple:
