@@ -26,7 +26,7 @@ The release (reader chain: ch2 0x7FF789A4A490 -> state 0x7FF789A34600 -> record 
   m_delayCollisionEffectsBasedOnLatency). A ch2 projectile state for a frame ahead of the rocket's, alive,
   with an impact count, in the same entity block as the destroy, makes the destructor play it at the
   client's own impact point. So the server destroys a rocket a little after it would hit (combat.py flies
-  it) with that state.
+  it) with that state, once the client's create confirmation has arrived.
 """
 
 import logging
@@ -113,7 +113,7 @@ DEFINITIONS_PER_BODY = 4  # leased definitions per slot (Soldier: 072C, 1C86, 07
 REPORT_WINDOW = 64  # frames after the shot in which an owner frame may report it
 CONFIRM_TICKS = 3  # at least this after the report (0.05 s)
 UNREPORTED_TICKS = 32  # a shot no owner frame reported gets lease(f) after this
-OBSERVER_GRACE_TICKS = 64  # server cleanup limit for pending observer delivery after a shot ends
+DELIVERY_GRACE_TICKS = 64  # server cleanup limit for pending projectile delivery after a shot ends
 RELEASE_MARGIN = (
     6  # frames after the server's rocket ended before the release (unverified: the client's flies the same)
 )
@@ -192,6 +192,14 @@ def definitions(script) -> list[int]:
 
 
 @dataclass
+class _ProjectileArrival:
+    received: bool = False
+
+    def arrived(self, last: int) -> None:
+        self.received = True
+
+
+@dataclass
 class Shot:
     """One projectile's authority and observer deliveries, with lease state for player shots."""
 
@@ -206,7 +214,7 @@ class Shot:
     bound: int = 0  # frames the projectile lives at most (lifetime, range / speed)
     seen_reports: int = 0  # the number of the last owner frame looked at
     reports: list = field(default_factory=list)  # (K, chunk last) of the owner frames that carried it
-    created: list = field(default_factory=list)  # the ids confirmed
+    created: dict[int, _ProjectileArrival] = field(default_factory=dict)  # owner creates and their ACKs
     created_tick: int | None = None
     release_at: int | None = None  # the tick of the release and destroy
     field_ids: list = field(default_factory=list)  # (viewer slot, field entity id)
@@ -316,7 +324,7 @@ class Projectiles:
             )
             launch = EntityUpdate(shot.body)
             launch.ch2 = shot_events([record])
-            deadline = self.match.tick + shot.bound + OBSERVER_GRACE_TICKS
+            deadline = self.match.tick + shot.bound + DELIVERY_GRACE_TICKS
             delivery = _ObservedProjectile(viewer, viewer.client, stream, record, launch, deadline, npc=npc)
             activation = delivery.matching_volley(snapshot) if npc else None
             if activation is not None:
@@ -342,7 +350,10 @@ class Projectiles:
         if shot.spawn is not None or shot.release_at is not None:
             return
         start = max([shot.frame] + [k for k, _ in shot.reports[:1]])
-        shot.release_at = start + math.ceil(seconds * 1000 / FRAME_MS) + RELEASE_MARGIN
+        due = start + math.ceil(seconds * 1000 / FRAME_MS) + RELEASE_MARGIN
+        # A delayed scheduler can finish a flight after its input-frame deadline.
+        # Start the delivery window no earlier than this simulation update.
+        shot.release_at = max(due, self.match.tick)
 
     def update(self, tick: int) -> None:
         for shot in list(self.shots):
@@ -373,14 +384,21 @@ class Projectiles:
             ) in keys and shot.frame <= cmfd <= shot.frame + REPORT_WINDOW:
                 shot.reports.append((cmfd, last))
         shot.seen_reports = script.report_count
-        self._confirm(shot, script, tick)
         if shot.spawn is not None:
+            self._confirm(shot, script, tick)
             self._field(shot, tick)
             return
         due = shot.release_at
         if due is None and shot.created_tick is not None:
             due = shot.created_tick + shot.bound + RELEASE_MARGIN  # no flight from the server: the bound
-        if due is not None and tick >= due and shot.created:
+        if due is not None and tick >= due + DELIVERY_GRACE_TICKS:
+            self._end(shot, tick, explode=True)
+            return
+        self._confirm(shot, script, tick)
+        # Queuing a destroy retires queued and in-flight creates, so even a late
+        # confirmation must arrive before we send the explosion release.
+        if (due is not None and tick >= due and shot.created
+                and all(arrival.received for arrival in shot.created.values())):
             self._end(shot, tick, explode=True)
 
     def _confirm(self, shot: Shot, script, tick: int) -> None:
@@ -401,13 +419,18 @@ class Projectiles:
                 new.append(entity)
         if not new:
             return
-        shot.created += new
         if shot.created_tick is None:
             shot.created_tick = tick
         build = confirm_record(shot.definition)
-        shot.player.client.queue_entities([EntityUpdate(entity, OP_CREATE, build) for entity in new])
+        updates = []
+        for entity in new:
+            arrival = shot.created[entity] = _ProjectileArrival()
+            update = EntityUpdate(entity, OP_CREATE, build)
+            update.stream = arrival
+            updates.append(update)
+        shot.player.client.queue_entities(updates)
         log.info(
-            "[game] %s: %s's projectile %04X (frame %d, reported at %s) confirmed as %s",
+            "[game] %s: %s's projectile %04X (frame %d, reported at %s) queued confirmation as %s",
             self.match.label(),
             shot.player.name,
             shot.definition & 0xFFFF,
@@ -430,9 +453,9 @@ class Projectiles:
         if client is None or not shot.created:
             return
         updates = []
-        for entity in shot.created:
+        for entity, arrival in shot.created.items():
             update = EntityUpdate(entity, OP_DESTROY)
-            if explode and shot.spawn is None:
+            if explode and shot.spawn is None and arrival.received:
                 update.ch2 = release(tick + RELEASE_AHEAD)
             updates.append(update)
         client.queue_entities(updates)
@@ -631,14 +654,6 @@ class ShotRecord:
 
 
 @dataclass
-class _ProjectileArrival:
-    received: bool = False
-
-    def arrived(self, last: int) -> None:
-        self.received = True
-
-
-@dataclass
 class _ObservedProjectile:
     """One connection's create, shooter event and retirement for a remote projectile."""
 
@@ -660,7 +675,7 @@ class _ObservedProjectile:
     def finish(self, tick: int, explode: bool, *, drain: bool = False) -> None:
         self.finished = True
         self.explode = explode
-        grace = OBSERVER_GRACE_TICKS if explode or drain else 0
+        grace = DELIVERY_GRACE_TICKS if explode or drain else 0
         self.deadline = min(self.deadline, tick + grace)
 
     def advance(self, tick: int) -> bool:

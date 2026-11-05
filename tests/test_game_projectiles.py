@@ -202,6 +202,116 @@ class ProjectileRangeTests(unittest.TestCase):
                 self.assertAlmostEqual(rocket.flown * rocket.speed, min(contact, reach))
 
 
+class OwnerProjectileDeliveryTests(unittest.TestCase):
+    def setUp(self):
+        run = Run()
+        self.match = run.match
+        self.match.bots.clear()
+        for _ in range(24):
+            run.step({})
+        self.player, = run.players
+        self.tick = run.frame
+        self.server = GameServer()
+        self.server.sock = MemorySocket()
+        key_in, key_out = b"i" * 32, b"o" * 32
+        self.client = Client(
+            self.server, ("memory.test", 40001), 1, LinkCipher(key_in, key_out), self.player,
+        )
+        self.server.clients[1] = self.client
+        self.client.open = True
+        self.player.client = self.client
+        self.cipher = LinkCipher(key_out, key_in)
+        self.window = ReceiveWindow()
+        self.seq = 0
+        self.projectiles = self.match.combat.projectiles
+        frame = self.tick + 1
+        # A near-floor impact becomes due while the owner volley ACK is delayed.
+        self.player.take_commands([Command(frame, pitch=16384, buttons=SECONDARY)])
+        self.shot, = self.projectiles.shots
+        self.lease = self.projectiles.lease_id(self.player, HELIX, frame)
+
+    def advance(self):
+        self.tick += 1
+        self.match.update(self.tick * combat.TICK, self.tick)
+
+    def send(self, *, lose=False):
+        self.client.send_frame(self.tick, self.tick * combat.TICK)
+        packet, _, _, _, _, _ = decoded(self, self.cipher, self.server.sock.sent[-1][0])
+        if not lose:
+            self.assertTrue(self.window.accept(packet.seq))
+        return [(item.op, item.ch2 is not None) for item in self.client.in_flight[packet.seq][1]
+                if item.entity == self.lease]
+
+    def ack(self):
+        packet = Packet(self.client.conn, KIND_CONTROL, self.seq, self.window.expected, self.window.bits, ACK)
+        self.seq += 1
+        self.server._datagram(self.cipher.seal(packet), self.client.address, self.tick * combat.TICK)
+
+    def late_volley_ack(self):
+        for _ in range(13):
+            self.advance()
+            self.assertEqual(self.send(), [])
+        self.assertLess(self.shot.release_at, self.tick)
+        self.assertTrue(self.shot.reports)
+        self.assertFalse(self.shot.created)
+        self.ack()
+        self.advance()
+
+    def test_late_volley_ack_still_creates_before_releasing_the_owner_rocket(self):
+        self.late_volley_ack()
+        self.assertEqual(self.send(), [(OP_CREATE, False)])
+        self.ack()
+        self.advance()
+        self.assertEqual(self.send(), [(OP_DESTROY, True)])
+        self.assertFalse(self.projectiles.shots)
+
+    def test_lost_confirmation_retries_before_releasing_the_owner_rocket(self):
+        self.late_volley_ack()
+        self.assertEqual(self.send(lose=True), [(OP_CREATE, False)])
+        self.advance()
+        self.assertEqual(self.send(), [])
+        self.ack()  # the next packet exposes the missing create
+        self.advance()
+        self.assertEqual(self.send(), [(OP_CREATE, False)])
+        self.ack()
+        self.advance()
+        self.assertEqual(self.send(), [(OP_DESTROY, True)])
+
+    def test_unacknowledged_confirmation_expires_without_releasing_an_explosion(self):
+        self.late_volley_ack()
+        self.assertEqual(self.send(lose=True), [(OP_CREATE, False)])
+        deadline = self.shot.release_at + projectiles.DELIVERY_GRACE_TICKS
+        while self.tick < deadline:
+            self.advance()
+        self.assertFalse(self.projectiles.shots)
+        self.assertEqual(self.send(), [(OP_DESTROY, False)])
+        self.ack()
+        self.assertEqual(self.send(), [])
+
+    def test_body_replacement_retires_a_pending_confirmation(self):
+        self.late_volley_ack()
+        self.assertEqual(self.send(), [(OP_CREATE, False)])
+        self.match.switch_hero(self.player, self.player.hero)
+        self.advance()
+        self.assertFalse(self.projectiles.shots)
+        self.assertEqual(self.send(), [(OP_DESTROY, False)])
+        self.ack()
+        self.assertEqual(self.send(), [])
+
+    def test_old_command_frame_does_not_consume_grace_before_impact(self):
+        # The scheduler reached a later tick before the accepted shot could fly.
+        self.tick += 90
+        for _ in range(4):
+            self.advance()
+            if self.shot.release_at is not None:
+                break
+        self.assertEqual(self.shot.release_at, self.tick)
+        self.assertEqual(self.send(), [(OP_CREATE, False)])
+        self.ack()
+        self.advance()
+        self.assertEqual(self.send(), [(OP_DESTROY, True)])
+
+
 class ObserverProjectileDeliveryTests(unittest.TestCase):
     def setUp(self):
         for module in (bodytrace, movelog):
@@ -475,7 +585,7 @@ class ObserverProjectileDeliveryTests(unittest.TestCase):
         shot = self.fire_npc(bot, state, snapshot=self.npc_snapshot(state))
         self.assertIsNotNone(shot)
         self.fight.projectiles.flown(shot, 0.08)
-        self.advance_delivery(projectiles.OBSERVER_GRACE_TICKS)
+        self.advance_delivery(projectiles.DELIVERY_GRACE_TICKS)
         for _ in range(3):
             records = self.send()
             self.assertEqual(self.projectile_ops(records), [])
@@ -500,7 +610,7 @@ class ObserverProjectileDeliveryTests(unittest.TestCase):
         self.fight.projectiles.flown(shot, 0.08)
         state.counter = 2
         self.client.queue_bot_live(bot.entity, self.npc_snapshot(state))
-        self.advance_delivery(projectiles.OBSERVER_GRACE_TICKS)
+        self.advance_delivery(projectiles.DELIVERY_GRACE_TICKS)
         retired = self.send()
         self.assertEqual(self.projectile_ops(retired), [OP_DESTROY])
         self.assertFalse(any(item.ch2 is not None for item in retired))
