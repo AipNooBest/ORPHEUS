@@ -170,13 +170,20 @@ class GraphFacts(unittest.TestCase):
         self.assertIn("  0255 rid3 ActionSetVar  m_out_Var = 0.5", run("var", "1002", "--graph", "0255"))
 
     def test_movement_mod_count(self):
-        # 171 MovementMod states (STU_316CFEF2) in the 1.74 graphs.
+        # The bundled 1.74 graphs contain 171; an extended runtime can add more.
+        cls = "STU_316CFEF2"
+        count = sum(
+            node.cls == cls
+            for index in ssq.graphs.graph_indexes()
+            for node in ssq.graphs.graph(index).nodes
+        )
+        self.assertGreaterEqual(count, 171)
         lines = run("class", "MovementMod")
         self.assertTrue(
             lines[0].startswith("STU_316CFEF2  alias MovementMod (from research catalog)  hash 316CFEF2")
         )
-        self.assertTrue(any(line.startswith("nodes: 171 in ") for line in lines))
-        self.assertIn("  STU_316CFEF2  MovementMod  171 nodes", run("find", "316CFEF2"))
+        self.assertTrue(any(line.startswith(f"nodes: {count} in ") for line in lines))
+        self.assertIn(f"  {cls}  MovementMod  {count} nodes", run("find", "316CFEF2"))
 
     def test_aliases_are_unique(self):
         classes = set(INDEX["objects"]) | set(INDEX["class_nodes"])
