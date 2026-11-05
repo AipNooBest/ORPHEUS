@@ -1,0 +1,108 @@
+Controlled server journal v1 — root and wire baseline, not full battle replay
+
+Scope
+
+server_journal.py explicitly constructs a fresh GameServer and drives its actual
+create_match, join_match, _datagram, _tick and administrative entry points. It
+does not bind sockets, start _run, launch a game, replay simplified combat or use
+the earlier FlatMover/research VM. Incoming encrypted bytes use the same router,
+AES-GCM, ACK/reliable-message handling and command decoder as the running server.
+Outgoing attempts use the actual frame builder and encryption through an in-memory
+socket. CollisionProvider is explicitly injected per match through the optional
+GameServer collision_provider_factory; None retains normal asynchronous loading.
+
+Nothing records by default. This is an explicitly controlled offline harness, not
+automatic interception of an already running server. Directly mutating session.server
+or calling methods outside the session is outside the contract. Source/data/config
+must remain stable from construction through finish; a changed manifest fails capture.
+
+Use
+
+  session = RecordingServerSession(
+      environment=SystemEnvironment(),
+      collision_provider=explicit_provider,
+  )
+  handoffs = session.create_match(game_map, entries)
+  session.datagram(raw_datagram, ipv4_address_tuple, exact_now_float)
+  session.tick(exact_now_float, missed=0)
+  session.report_callbacks()
+  private_document = session.finish()
+  result = replay_server_session(private_document, resolver=session.registry.resolve)
+
+The explicit collision provider can use real materialized map geometry, a controlled
+asynchronous source or a labelled artificial test scene. The collision tape fingerprints
+and rechecks the complete supported static World. A replay resolver must return the
+matching registered content; a flat stand-in cannot satisfy a wall/map descriptor.
+Fingerprinting is expensive and belongs in this explicit offline path.
+
+The optional sendto argument is an in-memory send-outcome source. Without it, send
+attempts return len(data). Recorded OSError arguments are reproduced as a failed
+attempt; a send result does not prove client delivery. Later recorded raw ACKs drive
+the original delivery/stream callbacks. No network callback is contacted on replay.
+
+Protocol
+
+Header fields are schema=ow174.controlled-server-journal.v1,
+build=1.74.0.0.104319, scope=controlled-roots-and-wire-only, manifest,
+initial, environment, collision, roots and end. end must equal
+{seq: len(roots), status: complete}. Roots have contiguous integer seq from zero.
+Each row contains operation, arguments, before, after, result and ordered effects.
+
+replay_values.py encodes exact plain types, finite float64 bits, arbitrary-width
+integers, bytes, tuple/list distinction and dictionary entry order. It rejects
+unknown object types, cycles, duplicate keys and structural-budget exhaustion.
+It does not introspect arbitrary gameplay objects or restore shared identity.
+
+before/after contain server.tick and both read-tape cursors. Each effect also carries
+both cursors, so skin queries, collision polls, send attempts and joined/left callback
+observations must occur in their original order relative to external reads.
+Each independent read tape validates its own complete typed sequence and explicit end.
+
+Roots supported now:
+  create_match: complete GameMap/Spawn fields, player entries and queue card.
+  join_match: recorded match id and player entries, including rejection after end.
+  datagram: unchanged bytes, IPv4 socket address and exact now.
+  tick: exact now and missed count. The harness applies the original scheduler's
+        skipped-tick increment before calling the original _tick. It does not replay
+        _run's recvfrom, timeout/monotonic scheduling or real worker interleavings.
+  switch_hero, skin_changed, send_home, take_out: the actual server methods.
+  report_callbacks: drain actual joined/left queues. Callback targets are observed
+        stubs. Real lobby callbacks and reentrant mutations are not reproduced.
+
+Archived match references remain usable for join/take_out rejection checks. Player
+references are (match id, slot), not account/address alone. Raw connections retain
+their original distinct keys/ids, including old/new links on the same address.
+
+Equipped skins are external reads. The journal records account, hero and exact
+(theme, golden) returned by skin_of, then supplies only that matching result on
+replay. Catalog/profile internals are not included in the game/jam manifest.
+
+Failures
+
+Unsupported/reentrant roots, invalid values, source errors, read/effect order
+mismatches, unconsumed effects or incomplete tails cannot return a matching result.
+The session retains the first fault; catching an underlying production exception
+does not make finish/run successful. No missing read or asset uses a live fallback.
+Core manifest/tape validation exceptions retain their specific diagnostic types.
+
+Results and missing work
+
+status=matched_controlled_roots_and_wire means the captured root interval,
+read positions, API returns, ordered send bytes/addresses/outcomes and callback
+observations matched this model. complete_battle_replay and full_state_verified
+are ALWAYS False. This format has no general live-state checkpoint/exporter and
+does not compare every mover contact/GJK cache, VM allocation, projectile, vitals,
+stats, replication/stream or transport queue field. Finite regression scenarios
+also inspect selected outcomes; those checks are not a full state equivalence proof.
+
+Next full-replay work must add strict typed state adapters and effect checkpoints,
+all production external mutation entry points, live _run/callback scheduling capture
+and bounded recording fault handling. A matching wire trace does not establish
+original server mechanics or real-client visual/input/physics acceptance.
+
+Privacy
+
+Private documents include handoff encryption keys, account data, skin reads and
+raw datagrams. They are explicitly returned in memory, with no default file writer
+or logging. Keep them private; share redacted summaries, not the raw document.
+The evidence_hash is a digest of the private recording, not a public decoder mode.

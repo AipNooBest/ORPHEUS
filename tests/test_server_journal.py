@@ -1,0 +1,319 @@
+"""Controlled roots replay the actual encrypted server and combat paths, without sockets."""
+
+import copy
+import dataclasses
+import logging
+import sys
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from ow174.game import messages, replay_values
+from ow174.game.bits import BitWriter
+from ow174.game.collision import StaticCollisionProvider, World, flat_world
+from ow174.game.content import PRACTICE_RANGE, SOLDIER, Spawn
+from ow174.game.environment import SystemEnvironment
+from ow174.game.link import ACK, FIN, KIND_FRAME, SYN, LinkCipher, Packet, ReceiveWindow, peek_connection
+from ow174.game.server import GameServer
+from ow174.game.server_journal import (
+    RecordingServerSession,
+    ServerJournalError,
+    _ReplaySession,
+    replay_server_session,
+)
+
+REAPER = 0x02E0000000000002
+MAP = dataclasses.replace(
+    PRACTICE_RANGE, name="controlled two-team scene", map_guid=0x0800000000FFF901,
+    placeables=(), spawns=(Spawn(0, (0.0, 0.0, 0.0), 0.0), Spawn(1, (0.0, 0.0, 5.0), 180.0)),
+    team_sizes=(1, 1),
+)
+
+
+class FixedSource:
+    def __init__(self):
+        self.counter = 0
+
+    def wall_time(self, *, callsite):
+        return 100.0
+
+    def wall_time_ns(self, *, callsite):
+        self.counter += 1
+        return 100_000_000_000 + self.counter
+
+    def monotonic(self, *, callsite):
+        return 100.0
+
+    def randbits(self, bits, *, callsite):
+        self.counter += 1
+        return self.counter & ((1 << bits) - 1)
+
+    def randbelow(self, upper, *, callsite):
+        self.counter += 1
+        return self.counter % upper
+
+    def token_bytes(self, length, *, callsite):
+        self.counter += 1
+        return bytes([self.counter % 256]) * length
+
+
+def wall_world():
+    return World([
+        (-20, 0, -20, -20, 0, 20, 20, 0, 20), (-20, 0, -20, 20, 0, 20, 20, 0, -20),
+        (-10, 0, 2, 10, 0, 2, 10, 5, 2), (-10, 0, 2, 10, 5, 2, -10, 5, 2),
+    ], name="controlled floor and wall")
+
+
+class Peer:
+    def __init__(self, session, handoff, sent, address):
+        self.session, self.handoff, self.sent, self.address = session, handoff, sent, address
+        self.cipher = LinkCipher(handoff.key_out, handoff.key_in)
+        self.window = ReceiveWindow()
+        self.seq = self.reliable = self.cursor = 0
+        self.last_raw = None
+
+    def drain(self, *, lose=False):
+        for data, address in self.sent[self.cursor:]:
+            if peek_connection(data) != self.handoff.conn:
+                continue
+            if not lose:
+                packet = self.cipher.open(data)
+                assert packet is not None and address == self.address, (len(data), address, self.address)
+                self.window.accept(packet.seq)
+        self.cursor = len(self.sent)
+
+    def send(self, *, flags=ACK, payload=b"", now=100.0, address=None):
+        packet = Packet(self.handoff.conn, KIND_FRAME if payload else 0, self.seq,
+                        self.window.expected, self.window.bits, flags, payload)
+        self.seq += 1
+        self.last_raw = self.cipher.seal(packet)
+        self.session.datagram(self.last_raw, self.address if address is None else address, now)
+        self.drain()
+
+    def message(self, identifier, value, now=100.0):
+        payload = BitWriter()
+        messages.write_channel(payload, [(self.reliable, messages.encode(identifier, value))])
+        self.reliable += 1
+        self.send(payload=payload.getvalue(), now=now)
+
+    def commands(self, first, count, buttons, *, forward=0, now=100.8):
+        if count > 32:
+            self.commands(first, 32, buttons, forward=forward, now=now)
+            return self.commands(first + 32, count - 32, buttons, forward=forward, now=now)
+        body, payload = BitWriter(), BitWriter()
+        body.bits(0, 24)
+        body.bits(count, 8)
+        body.bits(first, 32)
+        body.bit(bool(forward))
+        if forward:
+            body.bit(0)  # arbitrary throttles
+            body.bit(0)  # unchanged right
+            body.bit(1)  # forward follows
+            body.signed(forward, 8)
+        body.bits(0, 32)
+        body.bits(buttons, 24)
+        body.bits(0, 24)
+        for _ in range(count - 1):
+            body.bit(0)
+            body.bit(0)
+        messages.write_channel(payload)
+        payload.bit(1)
+        payload.bits(body.count, 32)
+        payload.append(body)
+        self.send(payload=payload.getvalue(), now=now)
+
+
+def pick(entity, hero):
+    return {"+0x78": {"+0x0": entity},
+            "+0x80": bytes.fromhex("0000000001c15d04") + hero.to_bytes(8, "little") + bytes(8),
+            "+0xA8": 0x0240000000001361, "+0xB0": 3}
+
+
+class ServerJournalTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        logging.getLogger("ow174.script").setLevel(logging.ERROR)
+
+    def make(self, world=None, *, source=None, skin_of=None, sendto=None):
+        sent = []
+
+        def send(data, address):
+            sent.append((data, address))
+            return len(data)
+
+        args = {"environment": FixedSource() if source is None else source,
+                "collision_provider": StaticCollisionProvider(flat_world(0.0) if world is None else world),
+                "sendto": send if sendto is None else sendto}
+        if skin_of is not None:
+            args["skin_of"] = skin_of
+        return RecordingServerSession(**args), sent
+
+    def connected(self, session, sent, *, two=True):
+        entries = [(1, "Alpha", SOLDIER, 0, False), (2, "Beta", SOLDIER, 1, False)]
+        handoffs = session.create_match(MAP, entries if two else entries[:1])
+        peers = [Peer(session, h, sent, ("127.0.0.1", 42000 + i)) for i, h in enumerate(handoffs)]
+        for peer in peers:
+            peer.send(flags=SYN)
+            peer.send()
+            peer.message(21601, {})
+        session.report_callbacks()
+        session.tick(100.8)
+        players = session.server.matches[0].players
+        self.assertTrue(all(player.spawned for player in players))
+        for peer, player in zip(peers, players, strict=True):
+            peer.message(21616, pick(player.entity, SOLDIER), now=100.8)
+            self.assertIsNotNone(player.body_script)
+        # Actual create/full ACK processing goes through the raw datagram router.
+        for tick in range(8):
+            session.tick(100.816 + tick * 0.016)
+            for peer in peers:
+                peer.drain()
+                peer.send(now=100.816 + tick * 0.016)
+        return peers, players
+
+    def verify(self, session):
+        document = session.finish()
+        replay = _ReplaySession(document, session.registry.resolve)
+        result = replay.run()
+        self.assertEqual(result["status"], "matched_controlled_roots_and_wire")
+        self.assertFalse(result["complete_battle_replay"])
+        self.assertFalse(result["full_state_verified"])
+        return document, replay, result
+
+    def test_factory_is_per_match_and_defaults_remain_optional(self):
+        provider = StaticCollisionProvider(flat_world(0.0))
+        factory = mock.Mock(return_value=provider)
+        server = GameServer(environment=FixedSource(), collision_provider_factory=factory)
+        server.create_match(MAP, [])
+        server.create_match(MAP, [])
+        self.assertEqual(factory.call_count, 2)
+        self.assertTrue(all(match.collision_world is provider.state.world for match in server.matches))
+
+    def test_encrypted_input_ack_loss_duplicate_and_wall_replay_without_socket_or_game(self):
+        with mock.patch("socket.socket", side_effect=AssertionError("must not create sockets")):
+            session, sent = self.make(wall_world())
+            peers, players = self.connected(session, sent)
+            shooter, victim = players
+            peers[0].commands(shooter.body_script.frame + 1, 50, 1, forward=127)
+            self.assertLess(shooter.mover.position[2], 2.0)
+            health = session.server.matches[0].combat.vitals[victim.body].total
+            self.assertEqual(health, 200.0)
+            newest = shooter.commands.last_frame
+            session.datagram(peers[0].last_raw, peers[0].address, 101.0)  # duplicate wire seq
+            self.assertEqual(shooter.commands.last_frame, newest)
+            for index in range(6):
+                session.tick(101.016 + index * 0.016)
+                peers[0].drain(lose=True)
+                peers[1].drain()
+            peers[0].send(now=101.2)  # loss ACK triggers ordinary reliable retransmission
+            session.tick(101.216, missed=3)
+            document, replay, result = self.verify(session)
+        self.assertGreater(result["send_attempts"], 10)
+        copied = replay.server.matches[0].players
+        self.assertEqual(copied[0].mover.position, shooter.mover.position)
+        self.assertEqual(replay.server.matches[0].combat.vitals[copied[1].body].total, health)
+        self.assertEqual(replay.server.tick, session.server.tick)
+        self.assertEqual(document["scope"], "controlled-roots-and-wire-only")
+
+    def test_death_respawn_hero_skin_and_same_address_reentry_use_production_paths(self):
+        skins = {}
+        session, sent = self.make(skin_of=lambda account, hero: skins.get((account, hero), (0, False)))
+        peers, players = self.connected(session, sent)
+        shooter, victim = players
+        peers[0].commands(shooter.body_script.frame + 1, 60, 1)
+        fight = victim.match.combat
+        self.assertTrue(fight.is_dead(victim))
+        old_body = victim.body
+        session.tick(105.0, missed=200)
+        self.assertNotEqual(victim.body, old_body)
+        self.assertFalse(fight.is_dead(victim))
+        self.assertTrue(session.apply("switch_hero", {"account": 1, "hero": REAPER}))
+        skins[(1, REAPER)] = (0x123, True)
+        self.assertTrue(session.apply("skin_changed", {"account": 1, "hero": REAPER}))
+        old = peers[0]
+        old.send(flags=FIN, now=105.01)
+        session.report_callbacks()
+        (handoff,) = session.create_match(MAP, [(1, "Alpha", SOLDIER, 0, False)])
+        new = Peer(session, handoff, sent, old.address)
+        new.send(flags=SYN, now=105.02)
+        new.send(now=105.02)
+        # A late, authenticated old packet cannot affect the new connection on that address.
+        session.datagram(old.last_raw, old.address, 105.03)
+        session.report_callbacks()
+        document, replay, result = self.verify(session)
+        self.assertIn(handoff.conn, replay.server.clients)
+        self.assertNotIn(old.handoff.conn, replay.server.clients)
+        self.assertTrue(any(replay_values.decode(effect)[1]["kind"] == "left"
+                            for root in document["roots"] for effect in root["effects"]))
+        self.assertGreater(result["roots"], 30)
+
+    def test_os_send_failure_is_replayed_as_an_attempt_not_as_packet_delivery(self):
+        def refused(data, address):
+            raise OSError(10054, "controlled send failure")
+
+        session, sent = self.make(sendto=refused)
+        (handoff,) = session.create_match(MAP, [(1, "Alpha", SOLDIER, 0, False)])
+        peer = Peer(session, handoff, sent, ("127.0.0.1", 43000))
+        with self.assertLogs("ow174.game", level="WARNING"):
+            peer.send(flags=SYN)
+        with self.assertLogs("ow174.game", level="WARNING"):
+            _, _, result = self.verify(session)
+        self.assertEqual(result["send_attempts"], 1)
+        self.assertFalse(session.server.clients[handoff.conn].open)
+
+    def test_wire_result_root_sequence_read_positions_and_closed_tail_tampering_fail(self):
+        session, sent = self.make()
+        self.connected(session, sent, two=False)
+        document = session.finish()
+        variants = []
+        changed = copy.deepcopy(document)
+        changed["roots"][0]["seq"] = 2
+        variants.append(changed)
+        changed = copy.deepcopy(document)
+        changed["roots"][0]["after"] = replay_values.encode((999, (0, 0)))
+        variants.append(changed)
+        changed = copy.deepcopy(document)
+        changed["roots"][0]["result"] = replay_values.encode([])
+        variants.append(changed)
+        changed = copy.deepcopy(document)
+        send_root = next(row for row in changed["roots"] if any(
+            replay_values.decode(effect)[1]["kind"] == "send" for effect in row["effects"]
+        ))
+        index = next(i for i, effect in enumerate(send_root["effects"])
+                     if replay_values.decode(effect)[1]["kind"] == "send")
+        position, effect = replay_values.decode(send_root["effects"][index])
+        effect["data"] = b"tampered wire"
+        send_root["effects"][index] = replay_values.encode((position, effect))
+        variants.append(changed)
+        changed = copy.deepcopy(document)
+        del changed["end"]
+        variants.append(changed)
+        for changed in variants:
+            with self.subTest(case=len(changed)), self.assertRaises(ServerJournalError):
+                replay_server_session(changed, resolver=session.registry.resolve)
+
+    def test_unsupported_or_failed_roots_permanently_prevent_successful_finish(self):
+        for operation, args in (("start", {}), ("datagram", {"data": b"", "address": [], "now": 1.0})):
+            session, _ = self.make()
+            with self.assertRaises(ServerJournalError):
+                session.apply(operation, args)
+            first = session.fault
+            self.assertIsInstance(first, ServerJournalError)
+            with self.assertRaises(ServerJournalError) as caught:
+                session.finish()
+            self.assertIs(caught.exception, first)
+
+    def test_real_secure_environment_is_opt_in_and_tape_is_private_in_memory(self):
+        session, _ = self.make(source=SystemEnvironment())
+        session.create_match(MAP, [])
+        document, _, result = self.verify(session)
+        self.assertIn("environment", document)
+        self.assertEqual(result["send_attempts"], 0)
+        document["roots"].clear()
+        self.assertEqual(len(session.finish()["roots"]), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

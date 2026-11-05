@@ -59,7 +59,7 @@ rejected. The live match handler retires that body's script; other players keep
 running. This prevents half-completed simulations from looking successful. It
 does not add automatic recovery or prove the cause of the reported live issues.
 
-The latest full Python regression ran 930 tests, all passing. The formerly skipped
+The latest full Python regression ran 994 tests, all passing. The formerly skipped
 King's Row physics case now runs with the locally built cache. A separate 62.448-second offline
 Soldier sequence applied/decoded 3903 owner chunks, observed ammo spending and
 seven refills, and ended with no active volley after release. This is a native
@@ -94,6 +94,26 @@ example still matches. The real Match's projectile-lease discovery also allocate
 states after body creation; a body-only trace without that external operation now
 correctly reports an incomplete boundary instead of hiding the difference. Full
 Match capture must include that operation and its causal order.
+
+An explicit controlled-server journal now replays real encrypted ingress through
+the same GameServer router and captures API results, external-read positions,
+send bytes/outcomes and callback order. Collision reads verify the materialized
+World content; a source/table/runtime/config manifest rejects mismatched models.
+A real Practice Range cache scenario moved out of spawn, eliminated a visible
+training bot and observed its replacement after respawn; all86 controlled roots
+and13 send attempts matched replay, with the largest datagram1189 bytes. No
+game or network socket was started. This verifies controlled roots and wire;
+complete_battle_replay and full_state_verified remain False.
+
+The new scenario exposed oversized native datagrams at spawn: the old budget
+loop stopped at one entity although messages plus that entity exceeded1264 bytes.
+Frame selection now permits zero entities, preserves ordered pending prefixes
+and commits queues, correction tokens and remote-create visibility only after a
+successful send. Known send errors retain queues while still consuming the nonce
+sequence. Ch2-only projectile events no longer remain forever in the pending
+queue. Nine dedicated packet-budget regressions pass. Individual records needing
+unimplemented fragmentation are explicitly rejected and retained; see
+[PACKET_BUDGET.txt](PACKET_BUDGET.txt) for this remaining limitation.
 
 ## Research and regression boundary
 
