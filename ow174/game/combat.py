@@ -56,6 +56,7 @@ from ow174.game.collision import AX, AY, AZ, BX, BY, BZ, CELL, CX, CY, CZ, MASK,
 from ow174.game.mover import mover_data
 from ow174.game.script import expr, graph, runtime
 from ow174.game.script.bot import DIED, BotScript
+from ow174.game.script.driver import Snapshot
 from ow174.game.statescript import InstanceWire, StateWire, remote_full_frame
 from ow174.game.world import ARMOUR_POOL, HEALTH_POOL, OP_DESTROY, OP_UPDATE, POOLS, SHIELDS_POOL
 
@@ -608,13 +609,13 @@ class Combat:
                 continue
             try:
                 snapshot = script.advance_live(tick, bot.position)
+                shots, script.component.shots[:] = list(script.component.shots), []
+                for state, number, time in shots:
+                    self._shoot(bot, None, state, number, time, snapshot=snapshot or script.initial[1])
                 if snapshot is not None:
                     for viewer in self.match.players:
                         if viewer.spawned and viewer.client is not None:
                             viewer.client.queue_bot_live(bot.entity, snapshot)
-                shots, script.component.shots[:] = list(script.component.shots), []
-                for state, number, time in shots:
-                    self._shoot(bot, None, state, number, time)
             except Exception:
                 bot.body_script = None
                 log.exception("[game] %s: %s's weapon script failed", self.match.label(), bot.name)
@@ -625,7 +626,9 @@ class Combat:
         height = EYE_CROUCHED.get(player.hero.body, EYE_CROUCHED_DEFAULT) if crouched else EYE
         return (x, y + height, z)
 
-    def _shoot(self, shooter, command, state, number: int, time: int) -> None:
+    def _shoot(
+        self, shooter, command, state, number: int, time: int, *, snapshot: Snapshot | None = None,
+    ) -> None:
         node = state.node
         shot_frame = time // state.instance.component.frame_ms
 
@@ -653,7 +656,8 @@ class Combat:
             shot = None
             if isinstance(definition, expr.Asset):
                 shot = self.projectiles.fired(
-                    shooter, state, shot_frame, definition.guid, lifetime, origin, direction
+                    shooter, state, shot_frame, definition.guid, lifetime, origin, direction,
+                    snapshot=snapshot,
                 )
             damaging = (direct is not None and direct.amount > 0.0) or (
                 blast is not None and blast.amount > 0.0

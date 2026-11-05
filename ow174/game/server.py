@@ -22,7 +22,7 @@ import threading
 import weakref
 from collections import deque
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 from ow174.game import correction, messages, movelog, observers, world
 from ow174.game.bits import BitReader, BitWriter
@@ -43,7 +43,7 @@ from ow174.game.link import (
     peek_connection,
 )
 from ow174.game.match import SEND_EVERY, Match, Player, no_skin, pong, sends
-from ow174.game.projectiles import MAX_LEASE_FRAME
+from ow174.game.projectiles import MAX_LEASE_FRAME, _ObservedProjectile
 from ow174.game.script.driver import BodyStream, Snapshot, warm_up
 from ow174.jam.codec import DecodeError
 from ow174.jam.values import to_jsonable
@@ -148,6 +148,7 @@ class _BotScriptDelivery:
     stream: BodyStream
     source: object
     live: Snapshot | None = None  # newest snapshot waiting behind an unacknowledged frame
+    volleys: deque[_ObservedProjectile] = field(default_factory=deque)
     death_frames: deque[_BotDeathPayload] | None = None  # None until this viewer is registered for death
 
 
@@ -251,6 +252,20 @@ class Client:
         script.live = snapshot
         self._flush_bot_frames(script)
 
+    def retain_bot_volley(self, delivery: _ObservedProjectile) -> None:
+        script = self._bot_scripts.get(delivery.stream.entity)
+        if script is not None and script.stream is delivery.stream:
+            script.volleys.append(delivery)
+
+    def release_bot_volley(self, delivery: _ObservedProjectile) -> None:
+        script = self._bot_scripts.get(delivery.stream.entity)
+        if script is None or script.stream is not delivery.stream:
+            return
+        first = script.volleys[0] is delivery
+        script.volleys.remove(delivery)
+        if first and self.player.client is self:
+            self._flush_bot_frames(script)
+
     def queue_bot_death(self, entity: int, payload: _BotDeathPayload | None) -> None:
         """Register this lifetime's death, even when the first statescript changes are delayed."""
         script = self._bot_scripts.get(entity)
@@ -270,6 +285,30 @@ class Client:
     def _flush_bot_frames(self, script: _BotScriptDelivery) -> None:
         stream = script.stream
         if stream.base is None or stream.pending:
+            return
+        if script.volleys:
+            delivery = script.volleys[0]
+            if stream.entity in self._bot_destroy_wait or self.player.match.tick >= delivery.deadline:
+                return  # projectile cleanup cancels its launch before advancing the stream
+            if delivery.matching_volley(stream.base) is not None:
+                return  # keep this activation installed until its ch2 launch is acknowledged
+            latest = script.live or stream.base
+            if delivery.record.instance not in latest.instances:
+                return  # the old activation expires without recreating a removed instance
+            states = dict(latest.states)
+            # Later dependent states stay at their acknowledged value. Everything else
+            # still comes from the latest snapshot, without replaying old live state.
+            for later in script.volleys:
+                key = later.volley_key
+                if key in stream.base.states:
+                    states[key] = stream.base.states[key]
+                else:
+                    states.pop(key, None)
+            states[delivery.volley_key] = delivery.activation
+            snapshot = replace(latest, states=states)
+            frame, keys = observers.delta(script.source, stream, snapshot)
+            if frame is not None:
+                self._queue_bot_frame(stream, frame, snapshot, keys)
             return
         if script.live is not None:
             snapshot = script.live

@@ -37,6 +37,7 @@ from ow174.game import bots, world
 from ow174.game.bits import BitWriter
 from ow174.game.commands import FRAME_MASK
 from ow174.game.script import graph as graphs_data
+from ow174.game.script.driver import Snapshot
 from ow174.game.statescript import InstanceWire, StateWire, Stream, remote_full_frame
 from ow174.game.world import OP_CREATE, OP_DESTROY, WITH_SCALE, WITH_TRANSFORM, EntityUpdate
 
@@ -262,7 +263,8 @@ class Projectiles:
     # --- shots ----------------------------------------------------------------------------------------
 
     def fired(
-        self, player, state, frame: int, definition: int, bound_seconds: float, origin=None, direction=None
+        self, player, state, frame: int, definition: int, bound_seconds: float, origin=None, direction=None,
+        *, snapshot: Snapshot | None = None,
     ) -> Shot | None:
         """Register a volley projectile on the owner and observer paths that apply to its source."""
         npc = isinstance(player, bots.Bot)
@@ -286,10 +288,10 @@ class Projectiles:
         if not npc:
             self.shots.append(shot)
         if shot.spawn is None and origin is not None and direction is not None:
-            self._show_others(shot, state, origin, direction)
+            self._show_others(shot, state, origin, direction, snapshot)
         return shot
 
-    def _show_others(self, shot: Shot, state, origin, direction) -> None:
+    def _show_others(self, shot: Shot, state, origin, direction, snapshot: Snapshot | None) -> None:
         """Every other client with the shooter's body: a server entity of the projectile's definition (under
         the map until a record starts it) and the shot record in the shooter's ch2 naming it."""
         observers = self.combat.observers
@@ -316,6 +318,11 @@ class Projectiles:
             launch.ch2 = shot_events([record])
             deadline = self.match.tick + shot.bound + OBSERVER_GRACE_TICKS
             delivery = _ObservedProjectile(viewer, viewer.client, stream, record, launch, deadline, npc=npc)
+            activation = delivery.matching_volley(snapshot) if npc else None
+            if activation is not None:
+                cls, active, payload = activation
+                delivery.activation = cls, active, tuple(sorted(dict(payload).items()))
+                viewer.client.retain_bot_volley(delivery)
             create = EntityUpdate(entity, OP_CREATE, confirm_record(shot.definition))
             create.stream = delivery.creation
             launch.stream = delivery.launch_arrival
@@ -643,6 +650,7 @@ class _ObservedProjectile:
     deadline: int
     npc: bool = False
     pending_create: EntityUpdate | None = None  # queued only once the source baseline arrives
+    activation: tuple | None = None  # an exact H=0 volley retained until launch ACK
     creation: _ProjectileArrival = field(default_factory=_ProjectileArrival)
     launch_arrival: _ProjectileArrival = field(default_factory=_ProjectileArrival)
     launch_queued: bool = False
@@ -657,21 +665,25 @@ class _ObservedProjectile:
 
     def advance(self, tick: int) -> bool:
         if self.viewer.client is not self.client:
+            self._release_volley()
             return False
         observers = self.viewer.match.combat.observers
         current = observers.projectile_stream(self.viewer, self.launch.entity, npc=self.npc)
         source_live = current is self.stream
         launched = self.launch_arrival.received
         if not source_live or tick >= self.deadline or (self.finished and launched):
-            if self.pending_create is not None:
-                return False  # nothing about this projectile reached the client
             if self.launch_queued and not launched:
                 self.client.cancel_entity_record(self.launch)
+            self._release_volley()
+            if self.pending_create is not None:
+                return False  # nothing about this projectile reached the client
             update = EntityUpdate(self.record.ids[0], OP_DESTROY)
             if source_live and self.explode and launched:
                 update.ch2 = release(tick + RELEASE_AHEAD)
             self.client.queue_entities([update])
             return False
+        if launched:
+            self._release_volley()
         if self.pending_create is not None and self.stream.base is not None:
             self.client.queue_entities([self.pending_create])
             self.pending_create = None
@@ -680,14 +692,25 @@ class _ObservedProjectile:
             self.client.queue_entities([self.launch])
         return True
 
-    def _volley_arrived(self) -> bool:
-        base = self.stream.base
-        state = base.states.get((self.record.instance, self.record.state)) if base is not None else None
+    @property
+    def volley_key(self) -> tuple[int, int]:
+        return self.record.instance, self.record.state
+
+    def matching_volley(self, snapshot: Snapshot | None) -> tuple | None:
+        state = snapshot.states.get(self.volley_key) if snapshot is not None else None
         if state is None:
-            return False
+            return None
         payload = dict(state[2])
         key = (payload.get("counter"), payload.get("volleys", 0) & 0xFF)
-        return key == (self.record.activation, self.record.volleys)
+        return state if key == (self.record.activation, self.record.volleys) else None
+
+    def _volley_arrived(self) -> bool:
+        return self.matching_volley(self.stream.base) is not None
+
+    def _release_volley(self) -> None:
+        if self.activation is not None:
+            self.client.release_bot_volley(self)
+            self.activation = None
 
 
 def write_shot(out: BitWriter, shot: ShotRecord) -> None:

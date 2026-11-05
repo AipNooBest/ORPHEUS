@@ -381,19 +381,23 @@ class ObserverProjectileDeliveryTests(unittest.TestCase):
         self.client.queue_entities([self.match._bot_create_update(bot)])
         return bot, state
 
-    def fire_npc(self, bot, state):
+    def fire_npc(self, bot, state, *, snapshot=None):
         self.shot_frame = self.tick + 1
         return self.fight.projectiles.fired(
             bot, state, self.shot_frame, HELIX, 2.0, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0),
+            snapshot=snapshot,
+        )
+
+    def npc_snapshot(self, state, value=None):
+        instance = state.instance
+        return Snapshot(
+            self.tick, instances={instance.id: (instance.graph.index, None)},
+            vars={(instance.id, 32): (value, ())} if value is not None else {},
+            states={(instance.id, state.index): (state.node.cls, False, state.payload())},
         )
 
     def npc_volley(self, bot, state):
-        instance = state.instance
-        snapshot = Snapshot(
-            self.tick, instances={instance.id: (instance.graph.index, None)},
-            states={(instance.id, state.index): (state.node.cls, False, state.payload())},
-        )
-        self.client.queue_bot_live(bot.entity, snapshot)
+        self.client.queue_bot_live(bot.entity, self.npc_snapshot(state))
 
     def advance_delivery(self, count=1):
         self.tick += count
@@ -447,7 +451,9 @@ class ObserverProjectileDeliveryTests(unittest.TestCase):
 
     def test_retired_npc_source_cannot_launch_against_a_reused_entity(self):
         bot, state = self.npc_source()
-        self.assertIsNotNone(self.fire_npc(bot, state))
+        snapshot = self.npc_snapshot(state)
+        self.assertIsNotNone(self.fire_npc(bot, state, snapshot=snapshot))
+        self.client.queue_bot_live(bot.entity, snapshot)
         replacement = bots.respawned(bot, bot.entity, self.tick)
         replacement.body_script = bot.body_script
         self.match.bots = [replacement]
@@ -466,7 +472,7 @@ class ObserverProjectileDeliveryTests(unittest.TestCase):
 
     def test_npc_shot_expires_before_source_ack_without_creating_a_projectile(self):
         bot, state = self.npc_source()
-        shot = self.fire_npc(bot, state)
+        shot = self.fire_npc(bot, state, snapshot=self.npc_snapshot(state))
         self.assertIsNotNone(shot)
         self.fight.projectiles.flown(shot, 0.08)
         self.advance_delivery(projectiles.OBSERVER_GRACE_TICKS)
@@ -477,6 +483,90 @@ class ObserverProjectileDeliveryTests(unittest.TestCase):
             self.ack()
             self.advance_delivery()
         self.assertFalse(self.fight.projectiles.observed)
+
+    def test_expired_npc_launch_unpins_the_latest_state_and_never_retries(self):
+        bot, state = self.npc_source()
+        for _ in range(2):
+            self.send()  # source create, then source full
+            self.ack()
+        snapshot = self.npc_snapshot(state)
+        shot = self.fire_npc(bot, state, snapshot=snapshot)
+        self.client.queue_bot_live(bot.entity, snapshot)
+        self.assertEqual(self.projectile_ops(self.send()), [OP_CREATE])
+        self.ack()
+        self.advance_delivery()
+        self.assertTrue(any(item.ch2 is not None for item in self.send(lose=True)))
+
+        self.fight.projectiles.flown(shot, 0.08)
+        state.counter = 2
+        self.client.queue_bot_live(bot.entity, self.npc_snapshot(state))
+        self.advance_delivery(projectiles.OBSERVER_GRACE_TICKS)
+        retired = self.send()
+        self.assertEqual(self.projectile_ops(retired), [OP_DESTROY])
+        self.assertFalse(any(item.ch2 is not None for item in retired))
+        [chunk] = [item.chunk for item in retired if item.entity == bot.entity and item.chunk is not None]
+        delta = read_chunk(chunk.getvalue(), chunk.count, self.known)
+        self.assertEqual(delta.instances[state.instance.id].states[state.index][1]["counter"], 2)
+        self.ack()  # reports loss of the canceled launch
+        self.assertFalse(any(item.ch2 is not None for item in self.send()))
+
+    def test_npc_launch_acks_order_volley_activations_through_backlog(self):
+        bot, state = self.npc_source()
+        self.send()  # NPC create
+        self.ack()
+        self.send()  # full frame remains unacknowledged while three shots are fired
+        frames = []
+        for counter in (1, 2, 3):
+            self.advance_delivery(19)
+            state.counter = counter
+            snapshot = self.npc_snapshot(state, float(counter))
+            self.assertIsNotNone(self.fire_npc(bot, state, snapshot=snapshot))
+            self.client.queue_bot_live(bot.entity, snapshot)
+            frames.append(self.shot_frame)
+        self.client.queue_bot_live(bot.entity, self.npc_snapshot(state, 4.0))  # ordinary state coalesces
+
+        def volley(records):
+            [chunk] = [item.chunk for item in records if item.entity == bot.entity and item.chunk is not None]
+            frame = read_chunk(chunk.getvalue(), chunk.count, self.known)
+            return frame.instances[state.instance.id]
+
+        def launch(records, counter):
+            [item] = [item for item in records if item.ch2 is not None]
+            self.assertEqual(item.entity, bot.entity)
+            bits = bits_of(item.ch2)
+            self.assertEqual((bits.bit(), bits.bit(), bits.var_b()), (1, 1, frames[counter - 1]))
+            record = read_shot(bits)
+            self.assertEqual(
+                (record["activation"], record["ids"]), (counter, [projectiles.SEEN_FIRST + counter - 1]),
+            )
+            return item.ch2.getvalue()
+
+        self.ack()
+        self.advance_delivery()
+        first = self.send()
+        self.assertEqual(volley(first).states[state.index][1]["counter"], 1)
+        self.assertEqual(volley(first).vars, {32: (4.0, ())})
+        self.assertFalse(any(item.ch2 is not None for item in first))
+        self.ack()
+        self.advance_delivery()
+        lost_launch = launch(self.send(lose=True), 1)
+        self.advance_delivery()
+        self.assertFalse(any(item.chunk is not None or item.ch2 is not None for item in self.send()))
+        self.ack()  # loss report does not unlock activation 2
+        retried = self.send()
+        self.assertFalse(any(item.chunk is not None for item in retried))
+        self.assertEqual(launch(retried, 1), lost_launch)
+        self.ack()
+
+        for counter in (2, 3):
+            self.advance_delivery()
+            installed = self.send()
+            self.assertEqual(volley(installed).states[state.index][1]["counter"], counter)
+            self.assertFalse(any(item.ch2 is not None for item in installed))
+            self.ack()
+            self.advance_delivery()
+            launch(self.send(), counter)
+            self.ack()
 
 
 class BioticFieldTests(unittest.TestCase):
