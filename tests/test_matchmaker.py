@@ -7,6 +7,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -27,6 +28,7 @@ from ow174.lobby.matchmaker import (
     game_address,
     load_rules,
 )
+from ow174.lobby.server import LobbyServer
 
 TANK, DAMAGE, SUPPORT = 2, 1, 3
 ROLE_QUEUE = 0x06300000000001B3  # season 32's competitive role queue card
@@ -185,6 +187,7 @@ class PracticeTests(unittest.TestCase):
                 tournament=False,
                 profile=None,
                 ident=None,
+                logged_in=True,
                 send=lambda *message: sent.append((owner.name, message[1])),
                 log=lambda text: None,
                 sock=SimpleNamespace(getsockname=lambda: ("127.0.0.1", 3724)),
@@ -298,6 +301,7 @@ class OpenMatchTests(unittest.TestCase):
                 elsewhere=lambda account_lo, match_id: None,
                 join_match=join_match,
                 create_match=create_match,
+                handoff_pending=lambda conn: True,
                 port=3730,
             ),
             session_of=self.sessions.get,
@@ -431,12 +435,17 @@ class GameFoundTests(unittest.TestCase):
             self.seats[conn] = (handoff, player, 0.0)
             return True
 
+        def handoff_pending(conn):
+            waiting = self.seats.get(conn)
+            return waiting is not None and waiting[2] > time.time()
+
         self.server = SimpleNamespace(
             game=SimpleNamespace(
                 create_match=create_match,
                 expire_handoff=expire_handoff,
+                handoff_pending=handoff_pending,
                 open_matches=lambda card: [],
-                in_match=lambda account_lo: False,
+                in_match=handoff_pending,
                 elsewhere=lambda account_lo, match_id: None,
                 port=3730,
             ),
@@ -457,6 +466,7 @@ class GameFoundTests(unittest.TestCase):
             match_lobbies={},
         )
         self.matchmaker = Matchmaker(self.server, minimum_players=2)
+        self.server.matchmaker = self.matchmaker
         self.matchmaker.schedule = lambda seconds, function: self.later.append((seconds, function))
 
     def party(self):
@@ -540,6 +550,87 @@ class GameFoundTests(unittest.TestCase):
         self.matchmaker.practice(self.sessions[1])
         self.assertEqual(self.ids("P1"), [20404, 20402, 20600])
         self.assertEqual(self.later, [])
+
+    def test_clock_drain_keeps_queue_tickets_until_a_new_match_is_reserved(self):
+        create = self.server.game.create_match
+        self.server.game.create_match = lambda *args: None
+        first, second = self.pop()
+        self.assertEqual([ticket.party for ticket in self.matchmaker.tickets], [first, second])
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.seats, {})
+        self.assertEqual(self.later, [])
+
+        self.server.game.create_match = create
+        LobbyServer.game_clock_ready(self.server)
+        self.assertEqual(self.matchmaker.tickets, [])
+        self.assertEqual([self.ids(name) for name in ("P1", "P2")], [[44202, 53000, 53003]] * 2)
+        self.hand_over()
+        self.assertEqual([self.ids(name).count(20600) for name in ("P1", "P2")], [1, 1])
+
+    def test_clock_ready_retries_only_the_original_live_practice_session_once(self):
+        create = self.server.game.create_match
+        self.server.game.create_match = lambda *args: None
+        for _ in range(3):
+            self.party()
+        for session in self.sessions.values():
+            self.matchmaker.practice(session)
+        self.matchmaker.practice(self.sessions[1])
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.seats, {})
+
+        self.sessions[2] = SimpleNamespace(**vars(self.sessions[2]))  # a new session for the same account
+        self.sessions[3].logged_in = False
+        self.matchmaker.cancel(self.parties[3])
+        self.server.game.create_match = create
+        LobbyServer.game_clock_ready(self.server)
+        LobbyServer.game_clock_ready(self.server)
+        self.assertEqual(self.ids("P1"), [20404, 20402, 20600])
+        self.assertEqual(self.ids("P2"), [])
+        self.assertEqual(self.ids("P3"), [])
+        self.assertEqual(set(self.seats), {1})
+        self.assertEqual(self.matchmaker._deferred_practice, {})
+
+    def test_clock_ready_tries_every_complete_roster_accumulated_during_drain(self):
+        create = self.server.game.create_match
+        self.server.game.create_match = lambda *args: None
+        self.matchmaker._pick_map = lambda rules: (PRACTICE_RANGE, Ruleset(team_sizes=(1, 1)))
+        for _ in range(5):
+            self.matchmaker.search(self.party(), KEY, QUICK_PLAY)
+
+        self.server.game.create_match = create
+        LobbyServer.game_clock_ready(self.server)
+        self.assertEqual(self.matchmaker.waiting(), 1)
+        self.assertEqual(len(self.later), 2)
+        self.assertEqual(len(self.seats), 4)
+
+    def test_clock_ready_prefers_a_queued_match_over_deferred_practice(self):
+        create = self.server.game.create_match
+        self.server.game.create_match = lambda *args: None
+        self.pop()
+        self.matchmaker.practice(self.sessions[1])
+        self.server.game.create_match = create
+        LobbyServer.game_clock_ready(self.server)
+        self.assertEqual(self.ids("P1"), [44202, 53000, 53003])
+        self.assertEqual(self.matchmaker._deferred_practice, {})
+        self.hand_over()
+        self.assertEqual(self.ids("P1").count(20600), 1)
+
+    def test_expired_found_handoff_is_skipped_while_the_valid_one_still_goes(self):
+        self.pop()
+        self.server.game.expire_handoff(1)
+        self.hand_over()
+        self.assertEqual(self.ids("P1"), [44202, 53000, 53003])
+        self.assertEqual(self.ids("P2"), [44202, 53000, 53003, 20404, 20402, 20600])
+        self.assertEqual(self.matchmaker.found, {})
+
+    def test_lobby_passes_its_ready_callback_to_the_game_server(self):
+        lobby = LobbyServer.__new__(LobbyServer)
+        lobby.settings = SimpleNamespace(host="127.0.0.1", game_port=0, build_missing_collision=False)
+        with patch("ow174.game.server.GameServer") as game:
+            lobby.start_game_server()
+            self.assertEqual(game.call_args.kwargs["on_clock_ready"], lobby.game_clock_ready)
+            self.assertIs(lobby.game, game.return_value)
+            game.return_value.start.assert_called_once_with()
 
     def test_a_player_who_quits_during_game_found_gives_the_seat_back(self):
         _, second = self.pop()

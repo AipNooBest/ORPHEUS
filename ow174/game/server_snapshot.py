@@ -68,8 +68,9 @@ def _names(text):
 # Exact registered classes. Field names are explicit: a newly introduced runtime
 # attribute must be reviewed, rather than silently omitted from a passing hash.
 FIELDS = {
-    GameServer: _names("environment collision_provider_factory host port on_leave on_join skin_of sock lock "
-                       "handoffs clients _dropped matches tick _next_conn _left_players _joined_players "
+    GameServer: _names("environment collision_provider_factory host port on_leave on_join on_clock_ready "
+                       "skin_of sock lock handoffs clients _dropped matches tick _next_conn _left_players "
+                       "_joined_players _reporting_players _clock_ticks_left _clock_ready_pending "
                        "_sent_home running"),
     Client: _names("server address conn cipher player window seq open closed heard next_reliable reliable "
                    "unreliable entities in_flight _bot_notices _bot_health _bot_notice_tail "
@@ -396,6 +397,7 @@ def export_server_state(server, *, archives=(), collision_provider=None, assets=
     boundaries = {
         "environment": server.environment, "socket": server.sock, "domain_lock": server.lock,
         "skin": server.skin_of, "joined_callback": server.on_join, "left_callback": server.on_leave,
+        "clock_ready_callback": server.on_clock_ready,
         "collision_factory": server.collision_provider_factory, "collision_provider": collision_provider,
     }
     graph = _Graph(boundaries, WorldRegistry() if assets is None else assets)

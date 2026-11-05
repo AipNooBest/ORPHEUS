@@ -220,8 +220,9 @@ class _Session:
     def _dispatch(self, operation, args):
         if operation == "create_match":
             result = self.server.create_match(_game_map(args["game_map"]), args["players"], args["card"])
-            match = self.server.matches[-1]
-            self._matches[match.id] = match
+            if result is not None:
+                match = self.server.matches[-1]
+                self._matches[match.id] = match
             return result
         if operation == "join_match":
             return self.server.join_match(self._match(args["match_id"]), args["players"])
@@ -233,10 +234,7 @@ class _Session:
             _address(args["address"])
             return self.server._datagram(args["data"], args["address"], args["now"])
         if operation == "tick":
-            # Exactly the scheduler's skipped-tick adjustment, followed by the real _tick.
-            # Recorded now is explicit; this controlled harness does not reproduce _run clocks.
-            self.server.tick += _integer(args["missed"], "missed ticks")
-            return self.server._tick(args["now"])
+            return self.server._tick(args["now"], missed=_integer(args["missed"], "missed ticks"))
         if operation == "switch_hero":
             hero = heroes().get(_integer(args["hero"], "hero"))
             if hero is None:

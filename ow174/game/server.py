@@ -14,6 +14,7 @@ follows its newest datagram.
 
 import ctypes
 import logging
+import math
 import os
 import socket
 import struct
@@ -41,7 +42,8 @@ from ow174.game.link import (
     delivery,
     peek_connection,
 )
-from ow174.game.match import Match, Player, no_skin, pong, sends
+from ow174.game.match import SEND_EVERY, Match, Player, no_skin, pong, sends
+from ow174.game.projectiles import MAX_LEASE_FRAME
 from ow174.game.script.driver import BodyStream, Snapshot, warm_up
 from ow174.jam.codec import DecodeError
 from ow174.jam.values import to_jsonable
@@ -65,6 +67,9 @@ LEAVE_GAME = 20304
 # A game sent to the menu (20304) closes its link within ~30 ms; one that does
 # not is dropped after this long, so that its match still ends.
 LEAVE_GRACE_SECONDS = 3.0
+# Leave room for the latest authenticated handoff and its reliable leave.
+CLOCK_DRAIN_TICKS = math.ceil((HANDOFF_SECONDS + LEAVE_GRACE_SECONDS) / TICK_SECONDS) + SEND_EVERY
+MAX_SIMULATION_TICK = MAX_LEASE_FRAME - CLOCK_DRAIN_TICKS
 DROPPED_LOG_SECONDS = 5.0  # datagrams we drop: one line per address, connection and reason in this time
 SIO_UDP_CONNRESET = 0x9800000C
 
@@ -182,6 +187,14 @@ class Client:
         if self.leaving_since is None:
             self.queue_reliable(LEAVE_GAME, {"+0x78": 0, "+0x79": False})
             self.leaving_since = now
+
+    def drain_clock(self, now: float) -> None:
+        """Discard obsolete world data while preserving reliable ordinals and packet ACKs."""
+        self.unreliable.clear()
+        self.entities.clear()
+        for _, records in self.in_flight.values():
+            records.clear()
+        self.go_home(now)
 
     # --- queues --------------------------------------------------------------------------------
 
@@ -380,11 +393,14 @@ class Client:
             return False
         return True
 
-    def send_frame(self, tick: int, now: float) -> None:
-        self._release_bot_destroys(tick)
+    def send_frame(self, tick: int, now: float, *, reliable_only: bool = False) -> None:
+        if reliable_only:
+            unreliable, entities = [], []
+        else:
+            self._release_bot_destroys(tick)
+            unreliable = self.unreliable[: messages.MAX_PER_KIND]
+            entities = (self.entities + self.player.match.remote_movements(self.player))[:127]
         reliable = self.reliable[: messages.MAX_PER_KIND]
-        unreliable = self.unreliable[: messages.MAX_PER_KIND]
-        entities = (self.entities + self.player.match.remote_movements(self.player))[:127]
         try:
             payload = self._payload(tick, reliable, unreliable, entities)
             while len(payload) > MAX_PAYLOAD:
@@ -401,7 +417,7 @@ class Client:
         except (ValueError, OverflowError, struct.error) as error:
             self._frame_rejected(f"frame encoding failed: {type(error).__name__}")
             return
-        if not reliable and not unreliable and not entities and (
+        if not reliable_only and not reliable and not unreliable and not entities and (
             self.reliable or self.unreliable or self.entities
         ):
             self._frame_rejected("oldest queued entity exceeds datagram budget; fragmentation required")
@@ -563,6 +579,7 @@ class GameServer:
         *,
         environment: ExecutionEnvironment | None = None,
         collision_provider_factory=None,
+        on_clock_ready=None,
     ) -> None:
         self.environment = SystemEnvironment() if environment is None else environment
         # None preserves the default per-match asynchronous provider. Explicit factories support
@@ -572,6 +589,7 @@ class GameServer:
         self.port = port
         self.on_leave = on_leave  # called with each player who leaves a match
         self.on_join = on_join  # called with each player whose game connected to its match
+        self.on_clock_ready = on_clock_ready
         self.skin_of = skin_of  # (account, hero) -> the equipped (skin theme, golden weapon); no locks
         self.sock: socket.socket | None = None
         self.lock = threading.RLock()
@@ -584,6 +602,9 @@ class GameServer:
         self._next_conn = self.environment.randbelow(0x100000, callsite="server.next_conn") + 1
         self._left_players: list[Player] = []  # told to on_leave once the lock is released
         self._joined_players: list[Player] = []  # told to on_join once the lock is released
+        self._reporting_players = 0
+        self._clock_ticks_left: int | None = None
+        self._clock_ready_pending = False
         self._sent_home: weakref.WeakSet[Player] = weakref.WeakSet()  # taken out by the server (take_out)
         self.running = False
 
@@ -603,11 +624,13 @@ class GameServer:
 
     # --- matches -------------------------------------------------------------------------------
 
-    def create_match(self, game_map, players, card: int = 0) -> list[Handoff]:
+    def create_match(self, game_map, players, card: int = 0) -> list[Handoff] | None:
         """A match for these players: [(account_lo, name, hero GUID, team, tournament[, card])], card
         being the player's card as the lobby shows it (content.player.record). `card` is the queue card
-        the match is for (0: none). Returns the 20600 data of each, in the same order."""
+        the match is for (0: none). Returns each 20600 in order, or None during clock rollover."""
         with self.lock:
+            if self._clock_ticks_left is not None:
+                return None
             match = Match(
                 game_map,
                 on_leave=self._left,
@@ -627,6 +650,8 @@ class GameServer:
     def open_matches(self, card: int) -> list[OpenMatch]:
         """The queue card's matches that still have free places, oldest first."""
         with self.lock:
+            if self._clock_ticks_left is not None:
+                return []
             rooms = []
             for match in self.matches:
                 if not card or match.card != card or match.ended:
@@ -641,7 +666,7 @@ class GameServer:
     def join_match(self, match: Match, players) -> list[Handoff] | None:
         """More players for a match that is on, as create_match takes them; None once it has ended."""
         with self.lock:
-            if match.ended or match not in self.matches:
+            if self._clock_ticks_left is not None or match.ended or match not in self.matches:
                 return None
             handoffs = [self._add_player(match, entry) for entry in players]
             names = ", ".join(player.describe() for player in match.players[-len(players) :])
@@ -682,8 +707,18 @@ class GameServer:
             self.handoffs[conn] = (handoff, player, 0.0)
             return True
 
+    def handoff_pending(self, conn: int) -> bool:
+        """Whether a reserved ticket can still authenticate, including during clock rollover."""
+        with self.lock:
+            waiting = self.handoffs.get(conn)
+            if waiting is None:
+                return False
+            return self.environment.wall_time(callsite="server.handoff.pending") < waiting[2]
+
     def switch_hero(self, account_lo: int, hero) -> bool:
         with self.lock:
+            if self._clock_ticks_left is not None:
+                return False
             for match in self.matches:
                 for player in match.players:
                     if player.account_lo == account_lo and player.client is not None:
@@ -696,6 +731,8 @@ class GameServer:
         new skin (Match.skin_changed). Hero select equips skins through the lobby, even in a match, and
         picks nothing again."""
         with self.lock:
+            if self._clock_ticks_left is not None:
+                return False
             for match in self.matches:
                 for player in match.players:
                     if player.account_lo == account_lo and player.client is not None and not player.gone:
@@ -779,13 +816,27 @@ class GameServer:
         with self.lock:
             joined, self._joined_players = self._joined_players, []
             left, self._left_players = self._left_players, []
-        for callback, players in ((self.on_join, joined), (self.on_leave, left)):
-            for player in players:
-                if callback is not None:
-                    try:
-                        callback(player)
-                    except Exception:
-                        log.exception("[game] the lobby's join or leave handler failed")
+            reporting = bool(joined or left)
+            if reporting:
+                self._reporting_players += 1
+            ready, self._clock_ready_pending = self._clock_ready_pending, False
+        try:
+            for callback, players in ((self.on_join, joined), (self.on_leave, left)):
+                for player in players:
+                    if callback is not None:
+                        try:
+                            callback(player)
+                        except Exception:
+                            log.exception("[game] the lobby's join or leave handler failed")
+        finally:
+            if reporting:
+                with self.lock:
+                    self._reporting_players -= 1
+        if ready and self.on_clock_ready is not None:
+            try:
+                self.on_clock_ready()
+            except Exception:
+                log.exception("[game] the lobby's clock-ready handler failed")
 
     # --- the loop ------------------------------------------------------------------------------
 
@@ -811,8 +862,7 @@ class GameServer:
                         next_tick, missed = next_tick_after(
                             next_tick, self.environment.monotonic(callsite="server.run.next_tick")
                         )
-                        self.tick += missed
-                        self._tick(self.environment.wall_time(callsite="server.run.tick"))
+                        self._tick(self.environment.wall_time(callsite="server.run.tick"), missed=missed)
             except Exception as error:
                 if on_iteration_error is not None:
                     on_iteration_error(error)
@@ -858,6 +908,8 @@ class GameServer:
             player.client = client
         self.clients[conn] = client
         client.log(f"[+] SYN for {player.match.label()}, connection {conn}{self._others_at(address, client)}")
+        if self._clock_ticks_left is not None:
+            client.go_home(now)
         client.received(packet, now)
 
     def _others_at(self, address, client=None) -> str:
@@ -893,12 +945,49 @@ class GameServer:
         )
         self._dropped[key] = [0, now]
 
-    def _tick(self, now: float) -> None:
-        self.tick += 1
+    def _expire_handoffs(self, now: float, *, force: bool = False) -> None:
         for conn, (_, player, deadline) in list(self.handoffs.items()):
-            if now >= deadline:
+            if force or now >= deadline:
                 del self.handoffs[conn]
-                player.match.leave(player, "did not connect")
+                player.match.leave(player, "game clock rollover" if force else "did not connect")
+
+    def _drain_clock(self, now: float) -> None:
+        if self._clock_ticks_left is None:
+            self._clock_ticks_left = min(CLOCK_DRAIN_TICKS, max(0, MAX_LEASE_FRAME - self.tick))
+            for _, player, _ in self.handoffs.values():
+                self._sent_home.add(player)
+            for client in self.clients.values():
+                self._sent_home.add(client.player)
+                client.drain_clock(now)
+        force = self._clock_ticks_left == 0
+        if not force and (self.clients or self.handoffs):
+            self._clock_ticks_left -= 1
+            self.tick += 1
+        self._expire_handoffs(now, force=force)
+        for client in list(self.clients.values()):
+            if force or now - client.leaving_since >= LEAVE_GRACE_SECONDS:
+                self.drop(client)
+            elif client.open and sends(self.tick):
+                client.send_frame(self.tick, now, reliable_only=True)
+        if self.clients or self.handoffs:
+            return
+        for match in self.matches:
+            for player in match.players:
+                match.leave(player, "game clock rollover")
+        self.matches.clear()
+        if not (self._joined_players or self._left_players or self._reporting_players):
+            self.tick = FIRST_TICK
+            self._clock_ticks_left = None
+            self._clock_ready_pending = True
+            log.info("[game] renewed the server frame clock")
+
+    def _tick(self, now: float, *, missed: int = 0) -> None:
+        candidate = self.tick + missed + 1
+        if self._clock_ticks_left is not None or candidate > MAX_SIMULATION_TICK:
+            self._drain_clock(now)
+            return
+        self.tick = candidate
+        self._expire_handoffs(now)
         for match in list(self.matches):
             match.update(now, self.tick)
         for client in list(self.clients.values()):

@@ -62,6 +62,7 @@ class FakeServer:
 
         self.game = SimpleNamespace(
             create_match=create_match,
+            handoff_pending=lambda conn: True,
             lineup=lineup_of,
             open_matches=lambda card: [],
             in_match=lambda account_lo: False,

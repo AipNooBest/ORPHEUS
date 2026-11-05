@@ -353,6 +353,7 @@ class Matchmaker:
         self.tickets: list[Ticket] = []
         self.found_seconds = FOUND_SECONDS  # 0: queue matches go to the game at once
         self.found: dict[int, Found] = {}  # account -> its player in "Game Found!"
+        self._deferred_practice: dict[int, object] = {}  # account -> original live session
         self.schedule = _later  # (seconds, function): runs the function later on its own thread
         self.lock = threading.RLock()
 
@@ -389,6 +390,21 @@ class Matchmaker:
             for waiting in sorted({ticket.card for ticket in self.tickets if card in (None, ticket.card)}):
                 self._try_match(waiting)
 
+    def clock_ready(self) -> None:
+        """Retry waiting matches and Practice Range requests after the game clock reopens."""
+        with self.lock:
+            while self.tickets:
+                waiting = len(self.tickets)
+                self.retry()
+                if len(self.tickets) >= waiting:
+                    break
+            game = self.server.game
+            if game is None:
+                return
+            for account, session in list(self._deferred_practice.items()):
+                if not self._online(session) or game.in_match(account) or self._practice(session):
+                    del self._deferred_practice[account]
+
     # --- the queue -----------------------------------------------------------------------------
 
     def search(self, party: Party, key: dict, card: int) -> None:
@@ -406,8 +422,12 @@ class Matchmaker:
         with self.lock:
             self.tickets = [ticket for ticket in self.tickets if ticket.party is not party]
             members = {member.account_lo for member in party.members}
+            for account in members:
+                session = self._deferred_practice.get(account)
+                if session is not None and not self._online(session):
+                    del self._deferred_practice[account]
             for account_lo, found in list(self.found.items()):
-                if account_lo in members and not self._online(found):
+                if account_lo in members and not self._online(found.session):
                     del self.found[account_lo]
                     self._free_seat(found.handoff)
                     found.session.log('[MM] Left during "Game Found!": the seat in the match is free')
@@ -448,8 +468,6 @@ class Matchmaker:
             needed = min(minimum, full) if minimum else full
             log.info("[MM] Card 0x%X (%s): %d of %d players waiting", card, rules.name, count, needed)
             return
-        used = {id(ticket) for team in roster.teams for ticket, _, _ in team}
-        self.tickets = [ticket for ticket in self.tickets if id(ticket) not in used]
         self._start(chosen_map, roster, card=card)
 
     def _join_open_matches(self, card: int, rules: QueueRules) -> None:
@@ -534,6 +552,16 @@ class Matchmaker:
     def practice(self, session) -> None:
         """Training > Practice Range: the player's group goes in together, up to six on one team as in
         retail; alone, the player has it to himself. Members already in a match stay where they are."""
+        with self.lock:
+            if not self._online(session):
+                return
+            account = session.account.account_lo
+            if self._practice(session) or self.server.game is None:
+                self._deferred_practice.pop(account, None)
+            else:
+                self._deferred_practice[account] = session
+
+    def _practice(self, session) -> bool:
         party = self.server.social.party_of(session.account)
         game = self.server.game
         members = [session.account] + [
@@ -544,14 +572,15 @@ class Matchmaker:
         ]
         ticket = Ticket(party, {}, 0, time.time(), [(member, []) for member in members])
         practice_range = replace(PRACTICE_RANGE, team_sizes=(len(members), 0))
-        self._start(practice_range, Roster([[(ticket, member, 0) for member in members]]), popped=False)
+        roster = Roster([[(ticket, member, 0) for member in members]])
+        return self._start(practice_range, roster, popped=False)
 
-    def _start(self, game_map, roster: Roster, popped: bool = True, card: int = 0) -> None:
+    def _start(self, game_map, roster: Roster, popped: bool = True, card: int = 0) -> bool:
         server = self.server
         game = server.game
         if game is None:
             log.warning("[MM] The game server is off (--game-port 0)")
-            return
+            return False
         entries = []  # (session, ticket, team, role)
         for team, members in enumerate(roster.teams):
             for ticket, account, role in members:
@@ -559,9 +588,15 @@ class Matchmaker:
                 if session is not None:
                     entries.append((session, ticket, team, role))
         if not entries:
-            return
+            return False
         handoffs = game.create_match(game_map, self._game_players(entries, card), card)
+        if handoffs is None:
+            return False
+        if popped:
+            used = {id(ticket) for team in roster.teams for ticket, _, _ in team}
+            self.tickets = [ticket for ticket in self.tickets if id(ticket) not in used]
         self._send_to_game(entries, handoffs, game_map.name, popped)
+        return True
 
     def _game_players(self, entries: list, card: int) -> list:
         """What the game server takes for each (session, ticket, team, role). Each player's card goes to
@@ -662,24 +697,28 @@ class Matchmaker:
 
     def _found_over(self, batch: list) -> None:
         """After "Game Found!" the players still there go to the game. One whose lobby connection closed
-        in between gets no 20600, and its seat in the match is freed."""
+        or whose reservation expired gets no 20600."""
         with self.server.state_lock, self.lock:
             going = []
+            game = self.server.game
             for found in batch:
                 account_lo = found.session.account.account_lo
                 if self.found.get(account_lo) is not found:
                     continue  # cancel() freed its seat
                 del self.found[account_lo]
-                if self._online(found):
+                if (
+                    game is not None
+                    and self._online(found.session)
+                    and game.handoff_pending(found.handoff.conn)
+                ):
                     going.append((found.session, found.ticket, found.handoff))
                 else:
                     self._free_seat(found.handoff)
             if going:
                 self._enter_game(going, batch[0].map_name)
 
-    def _online(self, found: Found) -> bool:
-        """Whether the player's lobby connection is still the one that got "Game Found!"."""
-        session = found.session
+    def _online(self, session) -> bool:
+        """Whether this is still the account's logged-in lobby connection."""
         return self.server.session_of(session.account.account_lo) is session and session.logged_in
 
     def _free_seat(self, handoff) -> None:

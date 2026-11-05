@@ -230,6 +230,7 @@ class LobbyServer:
             on_leave=self.game_left,
             skin_of=self.skin_of,
             on_join=self.game_joined,
+            on_clock_ready=self.game_clock_ready,
             collision_provider_factory=lambda: AsyncCollisionProvider(
                 build_missing=self.settings.build_missing_collision,
             ),
@@ -277,6 +278,11 @@ class LobbyServer:
         game server."""
         with self.state_lock:
             self.matchmaker.retry(card)
+
+    def game_clock_ready(self) -> None:
+        """Retry deferred requests under the lobby's usual lock order."""
+        with self.state_lock:
+            self.matchmaker.clock_ready()
 
     # --- connections ---------------------------------------------------------------------------
 
