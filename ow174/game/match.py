@@ -27,14 +27,13 @@ How a player gets into the world:
 
 import logging
 import math
-import secrets
-import time
 from copy import deepcopy
 
 from ow174.game import bodytrace, bots, combat, correction, heroselect, movelog, notices, pools, stats, world
 from ow174.game.collision import MOVER, TEAM0, TEAM1, world_when_ready
 from ow174.game.commands import Command, CommandQueue
 from ow174.game.content import SOLDIER, GameMap, Hero, heroes, spawn_point
+from ow174.game.environment import ExecutionEnvironment, SystemEnvironment
 from ow174.game.mover import CROUCHED, GRAVITY_SCALE, Mover, mover_data, statescript_mods
 from ow174.game.script.driver import BodyScript
 from ow174.game.statescript import Stream, owner_ack
@@ -317,8 +316,20 @@ def card_message(player: Player) -> dict:
 
 
 class Match:
-    def __init__(self, game_map: GameMap, on_leave=None, skin_of=no_skin, card: int = 0) -> None:
-        self.id = (secrets.randbits(63), secrets.randbits(63))
+    def __init__(
+        self,
+        game_map: GameMap,
+        on_leave=None,
+        skin_of=no_skin,
+        card: int = 0,
+        *,
+        environment: ExecutionEnvironment | None = None,
+    ) -> None:
+        self.environment = SystemEnvironment() if environment is None else environment
+        self.id = (
+            self.environment.randbits(63, callsite="match.id.low"),
+            self.environment.randbits(63, callsite="match.id.high"),
+        )
         self.game_map = game_map
         self.card = card  # the queue card it was made for; 0 = none (the Practice Range)
         # (account, hero GUID) -> (skin theme, golden weapon) the player has equipped, from the lobby.
@@ -329,7 +340,7 @@ class Match:
         self.assemble_ends: float | None = None  # PvP: when "assemble your team" ends
         self.assembled = False
         self.players: list[Player] = []
-        self.started = time.time()
+        self.started = self.environment.wall_time(callsite="match.started")
         self.on_leave = on_leave  # called with each player who leaves
         self.ended = False
         self.bots = bots.make(game_map.map_guid)  # the map's training bots (bots.py)
@@ -483,8 +494,14 @@ class Match:
 
         def build(origin: int) -> world.RecordWriter:
             return world.create(
-                origin, definition, components, flags=BODY_FLAGS, position=position,
-                rotation=rotation, movement=state, skin=skin,
+                origin,
+                definition,
+                components,
+                flags=BODY_FLAGS,
+                position=position,
+                rotation=rotation,
+                movement=state,
+                skin=skin,
             )
 
         return build
@@ -835,9 +852,7 @@ class Match:
         script = player.body_script
         before_hash = bodytrace.before(script)
         try:
-            script.command(
-                command.frame, command.buttons, command.action, command.forward, command.right
-            )
+            script.command(command.frame, command.buttons, command.action, command.forward, command.right)
         except Exception as error:
             bodytrace.failed(script, error)
             log.exception("[game] %s: %s's body statescript failed", self.label(), player.name)
@@ -988,7 +1003,8 @@ class Match:
         }
 
 
-def pong(ping: dict, received_ns: int) -> dict:
+def pong(ping: dict, received_ns: int, *, environment: ExecutionEnvironment | None = None) -> dict:
     """20306 for a 21610 ping: its index and stamps, plus when we got it and when we answer."""
-    stamps = [*ping.get("+0x80", []), received_ns, time.time_ns()]
+    environment = SystemEnvironment() if environment is None else environment
+    stamps = [*ping.get("+0x80", []), received_ns, environment.wall_time_ns(callsite="match.pong.sent_ns")]
     return {"+0x78": ping.get("+0x78", 0), "+0x80": stamps}

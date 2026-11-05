@@ -15,10 +15,8 @@ follows its newest datagram.
 import ctypes
 import logging
 import os
-import secrets
 import socket
 import threading
-import time
 import weakref
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -26,6 +24,7 @@ from dataclasses import dataclass
 from ow174.game import correction, messages, movelog, world
 from ow174.game.bits import BitReader
 from ow174.game.commands import InputError, read_commands
+from ow174.game.environment import ExecutionEnvironment, SystemEnvironment
 from ow174.game.link import (
     ACK,
     FIN,
@@ -144,7 +143,7 @@ class Client:
         self.seq = 0  # of our next datagram
         self.open = False
         self.closed = False
-        self.heard = time.time()
+        self.heard = server.environment.wall_time(callsite="client.heard")
         self.next_reliable = 0
         self.reliable = []  # [(seq, encoded)] waiting to go out, oldest first
         self.unreliable = []  # [encoded]
@@ -203,7 +202,8 @@ class Client:
             if generations[item] == generation and (alive or item.op == world.OP_DESTROY):
                 self.entities.append(item)
         self.entities = [
-            item for item in self.entities
+            item
+            for item in self.entities
             if generations.get(item, 0) == lifecycles.get(item.entity, (0, True))[0]
             and (lifecycles.get(item.entity, (0, True))[1] or item.op == world.OP_DESTROY)
         ]
@@ -252,9 +252,7 @@ class Client:
 
         def current(item) -> bool:
             generation, alive = lifecycles.get(item.entity, (0, True))
-            return generations.get(item, 0) == generation and (
-                alive or item.op == world.OP_DESTROY
-            )
+            return generations.get(item, 0) == generation and (alive or item.op == world.OP_DESTROY)
 
         lost_reliable, lost_records = [], []
         for seq in list(self.in_flight):
@@ -332,7 +330,15 @@ class Client:
 
     def _message(self, msg_id: int, value: dict, now: float) -> None:
         if msg_id == PING:
-            self.queue_reliable(20306, pong(value, time.time_ns()))
+            environment = self.server.environment
+            self.queue_reliable(
+                20306,
+                pong(
+                    value,
+                    environment.wall_time_ns(callsite="client.ping.received_ns"),
+                    environment=environment,
+                ),
+            )
             return
         if msg_id in MAP_LOADED:
             self.player.match.map_loaded(self.player, now)
@@ -345,8 +351,16 @@ class Client:
 
 class GameServer:
     def __init__(
-        self, host: str = "127.0.0.1", port: int = 3730, on_leave=None, skin_of=no_skin, on_join=None
+        self,
+        host: str = "127.0.0.1",
+        port: int = 3730,
+        on_leave=None,
+        skin_of=no_skin,
+        on_join=None,
+        *,
+        environment: ExecutionEnvironment | None = None,
     ) -> None:
+        self.environment = SystemEnvironment() if environment is None else environment
         self.host = host
         self.port = port
         self.on_leave = on_leave  # called with each player who leaves a match
@@ -360,7 +374,7 @@ class GameServer:
         self._dropped: dict[tuple, list] = {}  # (address, conn, why) -> [count not logged yet, last line]
         self.matches: list[Match] = []
         self.tick = FIRST_TICK
-        self._next_conn = secrets.randbelow(0x100000) + 1
+        self._next_conn = self.environment.randbelow(0x100000, callsite="server.next_conn") + 1
         self._left_players: list[Player] = []  # told to on_leave once the lock is released
         self._joined_players: list[Player] = []  # told to on_join once the lock is released
         self._sent_home: weakref.WeakSet[Player] = weakref.WeakSet()  # taken out by the server (take_out)
@@ -387,7 +401,13 @@ class GameServer:
         being the player's card as the lobby shows it (content.player.record). `card` is the queue card
         the match is for (0: none). Returns the 20600 data of each, in the same order."""
         with self.lock:
-            match = Match(game_map, on_leave=self._left, skin_of=self.skin_of, card=card)
+            match = Match(
+                game_map,
+                on_leave=self._left,
+                skin_of=self.skin_of,
+                card=card,
+                environment=self.environment,
+            )
             handoffs = [self._add_player(match, entry) for entry in players]
             self.matches.append(match)
         names = ", ".join(player.describe() for player in match.players)
@@ -432,8 +452,14 @@ class GameServer:
         player = match.add_player(account_lo, name, hero, team, tournament, card[0] if card else None)
         conn = self._next_conn
         self._next_conn = (self._next_conn % 0x0FFFFFFF) + 1
-        handoff = Handoff(conn, secrets.token_bytes(32), secrets.token_bytes(32), match.id)
-        self.handoffs[conn] = (handoff, player, time.time() + HANDOFF_SECONDS)
+        handoff = Handoff(
+            conn,
+            self.environment.token_bytes(32, callsite="server.handoff.key_in"),
+            self.environment.token_bytes(32, callsite="server.handoff.key_out"),
+            match.id,
+        )
+        deadline = self.environment.wall_time(callsite="server.handoff.deadline") + HANDOFF_SECONDS
+        self.handoffs[conn] = (handoff, player, deadline)
         return handoff
 
     def switch_hero(self, account_lo: int, hero) -> bool:
@@ -464,7 +490,7 @@ class GameServer:
             for client in list(self.clients.values()):
                 if account_lo is None or client.player.account_lo == account_lo:
                     self._sent_home.add(client.player)
-                    client.go_home(time.time())
+                    client.go_home(self.environment.wall_time(callsite="server.send_home"))
                     count += 1
         return count
 
@@ -497,7 +523,7 @@ class GameServer:
             self._sent_home.add(player)
             client = player.client
             if client is not None and not client.closed:
-                client.go_home(time.time())
+                client.go_home(self.environment.wall_time(callsite="server.take_out"))
                 return "sent to the menu"
             player.match.leave(player, reason)
             return "left before its game connected"
@@ -542,9 +568,9 @@ class GameServer:
     # --- the loop ------------------------------------------------------------------------------
 
     def _run(self) -> None:
-        next_tick = time.monotonic()
+        next_tick = self.environment.monotonic(callsite="server.run.start")
         while self.running:
-            timeout = max(0.0, next_tick - time.monotonic())
+            timeout = max(0.0, next_tick - self.environment.monotonic(callsite="server.run.timeout"))
             self.sock.settimeout(timeout or 0.0001)
             try:
                 data, address = self.sock.recvfrom(4096)
@@ -556,11 +582,15 @@ class GameServer:
             try:
                 with self.lock:
                     if data is not None:
-                        self._datagram(data, address, time.time())
-                    if time.monotonic() >= next_tick:
-                        next_tick, missed = next_tick_after(next_tick, time.monotonic())
+                        self._datagram(
+                            data, address, self.environment.wall_time(callsite="server.run.datagram")
+                        )
+                    if self.environment.monotonic(callsite="server.run.due") >= next_tick:
+                        next_tick, missed = next_tick_after(
+                            next_tick, self.environment.monotonic(callsite="server.run.next_tick")
+                        )
                         self.tick += missed
-                        self._tick(time.time())
+                        self._tick(self.environment.wall_time(callsite="server.run.tick"))
             except Exception:
                 log.exception("[game] tick failed")
             self._report_leaves()

@@ -59,7 +59,7 @@ rejected. The live match handler retires that body's script; other players keep
 running. This prevents half-completed simulations from looking successful. It
 does not add automatic recovery or prove the cause of the reported live issues.
 
-The latest full Python regression ran 874 tests, all passing. The formerly skipped
+The latest full Python regression ran 903 tests, all passing. The formerly skipped
 King's Row physics case now runs with the locally built cache. A separate 62.448-second offline
 Soldier sequence applied/decoded 3903 owner chunks, observed ammo spending and
 seven refills, and ended with no active volley after release. This is a native
@@ -69,6 +69,17 @@ The Practice Range collision cache was built from this user's local CASC data:
 `0688.col`, format 5, 470397 bytes, SHA-256
 `dfdb71fbe9ad079d9d0b56fe12bd7c992a76c6ec942084d86f6388827f36a169`.
 This proves cache extraction and loading inputs, not complete map collision fidelity.
+
+All 95 catalog maps now have locally extracted, integrity-checked format-5 collision
+caches. Workshop Green Screen uses a checked slice of its original CASC bundle;
+both the container and asset content keys are verified. Disk cache availability
+does not yet guarantee that an asynchronously loaded World is ready before play.
+
+Server and Match clocks and secure entropy now share an explicitly injectable
+execution environment. The default still reads the original time/secrets sources
+at each call. Ordered-read tests cover initialization, handoffs, pings and the
+network loop. This is a boundary for full battle replay, not a complete recorder
+or deterministic Match replay.
 
 ## Research and regression boundary
 

@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ow174.game.bits import BitWriter
 from ow174.game.content import SOLDIER, heroes
+from ow174.game.environment import SystemEnvironment
 from ow174.game.match import Match
 from ow174.game.observers import Observers
 from ow174.game.script.driver import BodyScript
@@ -19,7 +20,8 @@ from ow174.game.world import OP_CREATE, OP_DESTROY, EntityUpdate, Movement
 
 
 def client() -> Client:
-    return Client(SimpleNamespace(), ("127.0.0.1", 1), 1, None, SimpleNamespace(name="Test"))
+    server = SimpleNamespace(environment=SystemEnvironment())
+    return Client(server, ("127.0.0.1", 1), 1, None, SimpleNamespace(name="Test"))
 
 
 def sent(connection, sequence, records, reliable=()):
