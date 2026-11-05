@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 import test_server_journal as journal_tests
+from test_game_repeated_lifecycles import wire_frame
 from test_script_driver import ClientModel
 
 from ow174.game import bodytrace, movelog
@@ -11,7 +12,7 @@ from ow174.game.bits import BitWriter
 from ow174.game.commands import FIRE
 from ow174.game.link import KIND_FRAME
 from ow174.game.match import SEND_EVERY
-from ow174.game.script.driver import BodyStream, Snapshot
+from ow174.game.script.driver import SETTLE_FRAMES, BodyStream, Snapshot
 
 
 class OwnerDeltaLossTests(unittest.TestCase):
@@ -24,7 +25,12 @@ class OwnerDeltaLossTests(unittest.TestCase):
         client, script = player.client, player.body_script
         stream = script.stream
         model = ClientModel()
-        model.apply(stream.full_update)
+        for raw, _ in sent:
+            packet = peer.cipher.open(raw)
+            if packet.kind == KIND_FRAME:
+                for update, _ in wire_frame(packet)[1]:
+                    if update.entity == player.body and update.chunk is not None:
+                        model.apply(update)
         now = 101.0
 
         def next_frame(*, receive):
@@ -46,9 +52,9 @@ class OwnerDeltaLossTests(unittest.TestCase):
                 peer.send(now=now)
             return packet.seq, owner_chunks
 
-        for count in (1, 24):
-            peer.commands(script.frame + 1, count, 0, now=now)
-            _, (baseline,) = next_frame(receive=True)
+        self.assertIsNotNone(script.first_owner_frame)
+        peer.commands(script.frame + 1, SETTLE_FRAMES, 0, now=now)
+        _, (baseline,) = next_frame(receive=True)
         self.assertEqual(stream.base_last, baseline.chunk_last)
 
         for _ in range(120):

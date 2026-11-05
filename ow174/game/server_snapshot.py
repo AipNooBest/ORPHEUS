@@ -72,7 +72,8 @@ FIELDS = {
                        "skin_of sock lock handoffs clients _dropped matches tick _next_conn _left_players "
                        "_joined_players _reporting_players _clock_ticks_left _clock_ready_pending "
                        "_sent_home running"),
-    Client: _names("server address conn cipher player window seq open closed heard next_reliable reliable "
+    Client: _names("server address conn cipher player window seq open closed heard next_reliable "
+                   "_ownership_ordinal reliable "
                    "unreliable entities in_flight _combat_notices _bot_health _combat_notice_tail "
                    "_body_destroy_wait _player_body_reuse_after _bot_scripts expected_in parked_in "
                    "leaving_since _mode_create_acked _pending_mode_frame _display_notices "

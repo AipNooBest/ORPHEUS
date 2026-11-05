@@ -931,6 +931,10 @@ class BotStatescriptTests(unittest.TestCase):
                     self.assertEqual(player.steps_done, 2)
                     self.assertFalse(player.spawned)
                     self.assertFalse(client.entities)
+                if offset == 0:
+                    sequence = client.seq
+                    client.send_frame(match.tick, 11.0)
+                    client.acked(sequence + 1, 1)
             self.assertEqual((player.spawned, player.steps_done), (True, 4))
             self.assertEqual(
                 [item.entity for item in client.entities

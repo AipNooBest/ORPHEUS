@@ -12,6 +12,7 @@ import socket
 import struct
 import time
 import unittest
+from unittest.mock import patch
 
 import test_game_server as server_tests
 import test_game_to_game as transition_tests
@@ -24,8 +25,9 @@ from ow174.game.bits import BitReader, BitWriter
 from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.content import PRACTICE_RANGE, SOLDIER
 from ow174.game.link import ACK, FIN, KIND_FRAME, SYN, Packet, ReceiveWindow, peek_connection
+from ow174.game.match import SEND_EVERY, SEND_WORLD
 from ow174.game.script import decode
-from ow174.game.server import GameServer
+from ow174.game.server import PING, GameServer
 from ow174.game.world import OP_CREATE, OP_DESTROY, EntityUpdate
 
 REAPER = server_tests.REAPER
@@ -298,6 +300,110 @@ class RepeatedLifecycleTests(unittest.TestCase):
         old_level = self.script_log.level
         self.script_log.setLevel(logging.ERROR)
         self.addCleanup(self.script_log.setLevel, old_level)
+
+    def start_loading(self):
+        (handoff,) = self.run.server.create_match(PRACTICE_RANGE, [(1, "Alpha", 0, 0, False)])
+        link = self.run.link(handoff)
+        self.run.send(link, SYN)
+        self.run.send(link)
+        self.run.until(lambda: 20300 in link.messages)
+        self.run.message(link, 21601, {})
+        return link, self.run.server.clients[link.conn].player
+
+    @staticmethod
+    def reliable_messages(packet):
+        if packet.kind != KIND_FRAME:
+            return []
+        reader = BitReader(packet.payload)
+        reader.var_a()
+        return messages.read_channel(reader)[0]
+
+    def assert_world_not_admitted(self, link, player):
+        self.assertFalse(any(item.op == OP_CREATE for _, item in link.records))
+        self.assertFalse(player.spawned)
+
+    def test_lost_ownership_waits_for_its_actual_retry_ack_before_world_create(self):
+        link, player = self.start_loading()
+        apply = link.apply
+        dropped = []
+
+        def lose_ownership(packet):
+            if not dropped and any(kind == 20302 for _, kind, _ in self.reliable_messages(packet)):
+                dropped.append(packet)
+            else:
+                apply(packet)
+
+        with patch.object(link, "apply", side_effect=lose_ownership):
+            self.run.until(lambda: dropped, ack_except=(link,))
+        self.run.until(lambda: self.run.now - player.loaded_at > SEND_WORLD + SEND_EVERY * 0.016,
+                       ack_except=(link,))
+        self.assert_world_not_admitted(link, player)
+        self.assertNotIn(20302, link.messages)
+
+        self.run.send(link)  # later datagrams acknowledge the hole in the receive window
+        self.run.until(lambda: 20302 in link.messages, ack_except=(link,))
+        self.assert_world_not_admitted(link, player)
+        self.run.send(link)  # ACK the packet that actually delivered ownership
+        self.run.until(lambda: player.steps_done == 4 and player.entity in link.fields)
+        self.assertIn(world.GAME_MODE_ENTITY, link.fields)
+
+    def test_ownership_packet_ack_still_waits_for_an_earlier_reliable_ordinal(self):
+        link, player = self.start_loading()
+        self.run.message(link, PING, {"+0x78": 9, "+0x80": [11, 22]})
+        apply = link.apply
+        missing = []
+
+        def lose_pong(packet):
+            pong = next(
+                (ordinal for ordinal, kind, _ in self.reliable_messages(packet) if kind == 20306), None
+            )
+            if pong is None:
+                apply(packet)
+            else:
+                missing.append(pong)
+
+        with patch.object(link, "apply", side_effect=lose_pong):
+            self.run.until(lambda: 20302 in link.messages, ack_except=(link,))
+            self.assertEqual(len(missing), 1)
+            (ordinal, kind, value), = self.reliable_messages(link.got[-1])
+            self.assertEqual((kind, value["+0x78"]["+0x0"]), (20302, player.entity))
+            self.assertLess(missing[0], ordinal)
+            owner_seq = link.got[-1].seq
+            self.run.send(link)
+            self.assertNotIn(owner_seq, player.client.in_flight)  # actual positive ownership ACK
+            self.run.until(lambda: self.run.now - player.loaded_at > SEND_WORLD + SEND_EVERY * 0.016,
+                           ack_except=(link,))
+            self.assertNotIn(20306, link.messages)
+            self.assert_world_not_admitted(link, player)
+
+        self.run.send(link)
+        self.run.until(lambda: 20306 in link.messages, ack_except=(link,))
+        self.assert_world_not_admitted(link, player)
+        self.run.send(link)  # the retransmitted predecessor completes the acknowledged prefix
+        self.run.until(lambda: player.steps_done == 4 and player.entity in link.fields)
+        self.assertIn(world.GAME_MODE_ENTITY, link.fields)
+
+    def test_healthy_ownership_keeps_world_timing_and_soldier_input(self):
+        link, player = self.start_loading()
+        self.run.until(lambda: player.entity in link.fields)
+        self.assertIn(20302, link.messages)
+        self.assertIn(world.GAME_MODE_ENTITY, link.fields)
+        elapsed = self.run.now - player.loaded_at
+        self.assertGreaterEqual(elapsed, SEND_WORLD)
+        self.assertLess(elapsed, SEND_WORLD + SEND_EVERY * 0.016)
+        self.run.until(lambda: player.steps_done == 4)
+
+        self.run.message(link, 21616, server_tests.pick(player.entity, SOLDIER))
+        script = player.body_script
+        self.assertIsNotNone(script)
+        self.run.until(lambda: script.stream.base is not None)
+        self.run.command(link)
+        self.run.until(lambda: any(entity == player.body and frame.owner for _, entity, frame in link.chunks))
+        self.run.command(link, buttons=1)
+        self.assertEqual(script.component.instances[11].vars[53].value(), 29)
+        self.run.command(link)
+        self.run.command(link, advance=25)  # settle the owner frame clock with neutral input
+        self.run.until(lambda: link.models[player.body].vars.get((11, 53)) == 29)
 
     def initialize(self, link, player, hero, *, pick=True, leave_full_unacked=False):
         if pick:

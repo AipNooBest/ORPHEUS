@@ -4,7 +4,8 @@ How a player gets into the world:
 - When the map is loaded the client sends 21601 (and later 21602). 0.3 s later the server sends
   20302 {the player entity}: "this is your entity" (0x7FF7896E6C10 writes world +0x298). It has to
   come before the player's create, or the client does not add its command components (59, 63).
-- 0.6 s after loading, one frame creates the map's server-owned placeables (the loading screen only
+- At least 0.6 s after loading and after acknowledgement of the ownership message and its predecessors,
+  one frame creates the map's server-owned placeables (the loading screen only
   ends once they all exist), the player entity (000E.003, flags 0x3C) and the game mode entity
   (16B2.003).
 - Then the player's entity gets its controller's statescript (heroselect.py): the HUD and the hero
@@ -886,7 +887,7 @@ class Match:
     def _spawn_steps(self, player: Player, client, now: float) -> None:
         waited = now - player.loaded_at
         if player.steps_done == 0 and waited >= SEND_OWN_ENTITY:
-            client.queue_reliable(20302, {"+0x78": {"+0x0": player.entity}, "+0x7C": False, "+0x80": 0})
+            client.queue_ownership()
             player.steps_done = 1
         if player.steps_done == 1 and waited >= SEND_GAME:
             client.queue_reliable(20301, {"+0x78": self.game_struct(player)})
@@ -894,6 +895,7 @@ class Match:
         if (
             player.steps_done == 2
             and waited >= SEND_WORLD
+            and client.ownership_delivered()
             and self.collision_world is not None
             and not self._pending_bot_scripts
         ):

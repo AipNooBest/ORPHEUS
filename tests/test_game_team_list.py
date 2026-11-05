@@ -155,6 +155,7 @@ class Game(PretendGame):
         self.send(ACK)
         found, _ = self.world(lambda found, entities: any(msg_id == 20300 for msg_id, _ in found))
         self.send_message(21601, {})
+        self.world(lambda found, entities: any(msg_id == 20302 for msg_id, _ in found))
         return next(value for msg_id, value in found if msg_id == 20300)
 
 

@@ -45,6 +45,7 @@ class MoveToReplayTests(unittest.TestCase):
             states=[1, 2],
             entries=[0],
         )
+        definition.header["m_statesBitCount"] = 1  # the two states also travel in the owner stream
         definition.fields["m_680A2CB2"] = [0]  # Receive logical button edges in state 0.
         bodies = graph.bodies()
         body_key, body = next((key, item) for key, item in bodies.items() if int(item["hero"], 16) == SOLDIER)

@@ -17,6 +17,7 @@ from ow174.game.content import PRACTICE_RANGE, SOLDIER, Spawn
 from ow174.game.environment import SystemEnvironment
 from ow174.game.environment_tape import EnvironmentTapeError
 from ow174.game.link import ACK, FIN, KIND_FRAME, SYN, LinkCipher, Packet, ReceiveWindow, peek_connection
+from ow174.game.match import SEND_EVERY
 from ow174.game.server import FIRST_TICK, HANDOFF_SECONDS, GameServer
 from ow174.game.server_journal import (
     RecordingServerSession,
@@ -152,6 +153,15 @@ def pick(entity, hero):
             "+0xA8": 0x0240000000001361, "+0xB0": 3}
 
 
+def acknowledge_ownership(session, peers):
+    for index in range(SEND_EVERY):
+        now = 100.5 + index * 0.016
+        session.tick(now)
+        for peer in peers:
+            peer.drain()
+            peer.send(now=now)
+
+
 class ServerJournalTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -181,6 +191,7 @@ class ServerJournalTests(unittest.TestCase):
             peer.send()
             peer.message(21601, {})
         session.report_callbacks()
+        acknowledge_ownership(session, peers)
         session.tick(100.8)
         players = session.server.matches[0].players
         self.assertTrue(all(player.spawned for player in players))

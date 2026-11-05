@@ -169,6 +169,7 @@ class Client:
         self.closed = False
         self.heard = server.environment.wall_time(callsite="client.heard")
         self.next_reliable = 0
+        self._ownership_ordinal: int | None = None
         self.reliable = []  # [(seq, encoded)] waiting to go out, oldest first
         self.unreliable = []  # [encoded]
         self.entities = []  # [EntityUpdate] waiting to go out
@@ -212,8 +213,18 @@ class Client:
 
     # --- queues --------------------------------------------------------------------------------
 
-    def queue_reliable(self, msg_id: int, value: dict) -> None:
-        self._queue_encoded_reliable(msg_id, messages.encode(msg_id, value))
+    def queue_reliable(self, msg_id: int, value: dict) -> int:
+        return self._queue_encoded_reliable(msg_id, messages.encode(msg_id, value))
+
+    def queue_ownership(self) -> None:
+        self._ownership_ordinal = self.queue_reliable(
+            20302, {"+0x78": {"+0x0": self.player.entity}, "+0x7C": False, "+0x80": 0},
+        )
+
+    def ownership_delivered(self) -> bool:
+        """The client can apply 20302 once the entire reliable prefix has arrived."""
+        ordinal = self._ownership_ordinal
+        return ordinal is not None and self._oldest_pending_reliable() > ordinal
 
     def _queue_encoded_reliable(self, msg_id: int, payload: bytes) -> int:
         ordinal = self.next_reliable

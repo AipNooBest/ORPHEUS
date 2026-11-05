@@ -13,7 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import test_server_journal as journal_tests
-from test_server_journal import MAP, FixedSource, Peer, pick
+from test_server_journal import MAP, FixedSource, Peer, acknowledge_ownership, pick
 
 from ow174.game import mover as mover_module
 from ow174.game.collision import StaticCollisionProvider, flat_world
@@ -174,6 +174,7 @@ class StoredJournalTests(unittest.TestCase):
             peer.send(flags=SYN)
             peer.send()
             peer.message(21601, {})
+            acknowledge_ownership(session, (peer,))
             session.tick(100.8)
             player = session.server.matches[0].players[0]
             peer.message(21616, pick(player.entity, SOLDIER), now=100.8)
@@ -206,6 +207,7 @@ class StoredJournalTests(unittest.TestCase):
             peer.send(flags=SYN)
             peer.send()
             peer.message(21601, {})
+        acknowledge_ownership(session, peers)
         session.tick(100.8)
         players = session.server.matches[0].players
         for peer, player in zip(peers, players, strict=True):

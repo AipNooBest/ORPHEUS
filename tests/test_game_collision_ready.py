@@ -51,12 +51,17 @@ class ControlledProvider:
 
 
 class HomeClient(FakeClient):
+    queue_ownership = Client.queue_ownership
+
     def __init__(self, player):
         super().__init__(player)
         self.home = []
 
     def go_home(self, now):
         self.home.append(now)
+
+    def ownership_delivered(self):
+        return True  # this match-only fixture delivers reliable messages immediately
 
 
 def players_in(match):

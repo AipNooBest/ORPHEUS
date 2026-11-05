@@ -107,7 +107,7 @@ class GameServerTests(unittest.TestCase):
         game.send(ACK)
         game.frames_until(lambda ids, count: 20300 in ids)
         game.send_message(21601, {})  # the map is loaded
-        seen = game.frames_until(lambda ids, count: count >= 6)
+        seen = game.frames_until(lambda ids, count: count >= 6, acknowledge=True)
         sent = [msg_id for ids, _ in seen for msg_id in ids]
         self.assertLess(sent.index(20302), sent.index(20301))
         # four placeables, the player and the game mode entity lead the frame, then the Practice Range's
@@ -127,7 +127,7 @@ class GameServerTests(unittest.TestCase):
             game.send(ACK)
             game.frames_until(lambda ids, count: 20300 in ids)
             game.send_message(21601, {})
-            game.frames_until(lambda ids, count: count >= 6)
+            game.frames_until(lambda ids, count: count >= 6, acknowledge=True)
         games[0].send_message(21616, pick(0xA0000100, REAPER))
         # Alpha gets the body and the player's update; Beta gets Alpha's body, then its movement
         games[0].frames_until(lambda ids, count: count >= 2)
@@ -142,7 +142,7 @@ class GameServerTests(unittest.TestCase):
         game.receive()
         game.send(ACK)
         game.send_message(21601, {})
-        game.frames_until(lambda ids, count: count >= 6)
+        game.frames_until(lambda ids, count: count >= 6, acknowledge=True)
         game.send_message(21616, pick(0xA0000100, REAPER))
         game.frames_until(lambda ids, count: self.server.snapshot()[0]["players"][0]["hero"] == "Reaper")
 
@@ -157,7 +157,7 @@ class GameServerTests(unittest.TestCase):
         game.receive()
         game.send(ACK)
         game.send_message(21601, {})
-        game.frames_until(lambda ids, count: count >= 6)
+        game.frames_until(lambda ids, count: count >= 6, acknowledge=True)
         game.send_message(21616, pick(0xA0000100, REAPER))
         game.frames_until(lambda ids, count: player.has_body)
         self.assertEqual(player.skin, (0x0A5000000000160F, False))
