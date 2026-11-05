@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import test_game_combat as combat_tests
 
-from ow174.game import bodytrace, native_replay
+from ow174.game import bodytrace, native_replay, projectiles
 from ow174.game.commands import FIRE, Command
 
 
@@ -31,8 +31,11 @@ class BodyTraceTests(unittest.TestCase):
             [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] for path in paths
         ]
 
-    def test_creation_commands_and_retirement_have_a_continuous_trace(self):
-        run = combat_tests.Run()
+    def test_creation_commands_and_retirement_have_a_continuous_body_only_trace(self):
+        # Projectile-lease discovery first accesses states after capture starts.
+        # This scenario explicitly omits that hook; the next test covers the real hook.
+        with mock.patch.object(projectiles, "definitions", return_value=()):
+            run = combat_tests.Run()
         player = run.players[0]
         script = player.body_script
         self.addCleanup(run.match.stop_body_script, player)
@@ -63,6 +66,22 @@ class BodyTraceTests(unittest.TestCase):
         result = native_replay.replay_document({"header": header, "events": events})
         self.assertEqual(result["status"], "matched_observed_body_trace", result["diagnostics"])
         self.assertEqual(result["validated_commands"], 10)
+        self.assertFalse(result["complete_native_capture"])
+
+    def test_real_match_first_access_after_header_is_captured_as_an_incomplete_boundary(self):
+        run = combat_tests.Run()
+        player = run.players[0]
+        self.addCleanup(run.match.stop_body_script, player)
+        player.take_commands([Command(run.frame + 1)])
+        run.match.stop_body_script(player)
+        (lines,) = self.read()
+        header, events = lines[0]["header"], lines[1:]
+        self.assertNotEqual(events[0]["before_hash"], header["initial_hash"])
+        self.assertEqual([event["kind"] for event in events], ["command", "end"])
+        result = native_replay.replay_document({"header": header, "events": events})
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["validated_commands"], 0)
+        self.assertEqual(result["diagnostics"][0]["kind"], "before_state_mismatch")
         self.assertFalse(result["complete_native_capture"])
 
     def test_disabled_capture_creates_no_files(self):

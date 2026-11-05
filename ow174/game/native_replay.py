@@ -108,6 +108,9 @@ def _snapshot(script: BodyScript, encode) -> dict:
             "parent": encode(instance.parent), "parent_state": instance.parent_state,
             "start": instance.start, "initialized": instance.initialized,
             "stopped": instance.stopped, "teardown": instance.teardown,
+            # Resync, teardown and volley reporting traverse this lazy-allocation order.
+            # Include even never-activated states: first access can change later causality.
+            "state_order": list(instance.states),
             "vars": _variables(instance.vars, encode), "states": states,
             "queue": encode(instance.queue), "deferred": encode(instance.deferred),
             "ticking": encode(instance.ticking), "params": encode(instance.params),

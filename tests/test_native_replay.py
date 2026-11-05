@@ -24,8 +24,9 @@ from ow174.game.native_replay import (
     parse_trace,
     replay_document,
     snapshot_hash,
+    stored_snapshot,
 )
-from ow174.game.script import runtime
+from ow174.game.script import graph, runtime
 from ow174.game.script.driver import BodyScript
 
 
@@ -96,6 +97,73 @@ class NativeReplayTests(unittest.TestCase):
         self.assertFalse(first["complete_native_capture"])
         self.assertTrue(first["observed_trace_closed"])
         self.assertTrue(first["commands"][0]["shots"])
+
+    def test_hash_distinguishes_allocation_history_that_changes_shot_order(self):
+        # Fixed entry/activation order, different first access: identical active attributes,
+        # but the real driver later reports the two volleys in different causal order.
+        def with_volleys(order):
+            script = body()
+            nodes = [
+                {"pos": index, "class": "STUStatescriptStateWeaponVolley", "state": index,
+                 "uid": index, "rid": index, "remote": -1,
+                 "client_only": False, "server_only": False,
+                 "fields": {"m_2BBEEAB8": True, "m_ADEB6E05": False,
+                            "m_A17BE89B": {"$": "STUConfigVarInt", "m_value": 10}}}
+                for index in (0, 1)
+            ]
+            nodes.append({
+                "pos": 2, "class": "STUStatescriptEntry", "state": None,
+                "uid": 2, "rid": 2, "remote": -1,
+                "client_only": False, "server_only": False,
+                "fields": {"m_outPlug": {"$": "STUStatescriptOutputPlug",
+                                         "links": [[0, "m_inPlug"], [1, "m_inPlug"]]}},
+            })
+            metadata = graph.Graph({
+                "index": 0xFFFF, "header": {}, "fields": {}, "items": 3,
+                "containers": {}, "nodes": nodes, "unknown_nodes": [],
+                "states": [0, 1], "entries": [2], "remote": [], "sync_vars": [],
+            })
+            instance = script.component.create(metadata, init=False)
+            for index in order:
+                instance.state(index)
+            instance.init()
+            script.component.run_now()
+            return script, instance
+
+        forward, first = with_volleys((0, 1))
+        reverse, second = with_volleys((1, 0))
+        snapshots = [stored_snapshot(script) for script in (forward, reverse)]
+        for snapshot in snapshots:
+            for instance in snapshot["instances"]:
+                instance.pop("state_order")
+        self.assertEqual(snapshots[0], snapshots[1])
+        self.assertNotEqual(snapshot_hash(forward), snapshot_hash(reverse))
+        orders = []
+        for script, instance in ((forward, first), (reverse, second)):
+            script.component.now += 15
+            script._report_shots()
+            orders.append([state.index for state, _, _ in script.component.shots
+                           if state.instance is instance])
+        self.assertEqual(orders, [[0, 1], [1, 0]])
+
+    def test_unrecorded_first_state_access_is_detected_before_next_command(self):
+        script = body()
+        document = {"header": header(script), "events": []}
+        instance, index = next(
+            (instance, node.state)
+            for instance in script.component.instances.values()
+            for node in instance.graph.states
+            if node is not None and node.state not in instance.states
+        )
+        state = instance.state(index)
+        self.assertFalse(state.active)
+        self.assertEqual(state.counter, 0)
+        document["events"].append(command_event(script, Command(1001), 0))
+        document["events"].append(ending(script, 1))
+        result = replay_document(document)
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["validated_commands"], 0)
+        self.assertEqual(result["diagnostics"][0]["kind"], "before_state_mismatch")
 
     def test_unrecorded_external_health_change_is_not_called_a_complete_replay(self):
         script = body()
@@ -189,12 +257,29 @@ class NativeReplayTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Body definition"):
             replay_document(document)
 
-    def test_existing_match_run_produces_a_replayable_live_shooter_body_prefix(self):
+    def test_match_external_first_access_is_not_mistaken_for_a_constructor_only_trace(self):
         from test_game_combat import Run
 
         run = Run()
         player = run.players[0]
         document = {"header": header(player.body_script), "events": []}
+        context = document["header"]
+        initial = BodyScript(
+            context["hero"], context["entity"], context["start_frame"],
+            quanta=context["quanta_us"], mode=context["mode"], health=context["health"],
+            ult_seconds=context["ult_seconds"],
+        )
+        # Match hooks, including projectile-lease discovery, can allocate inactive states.
+        # Those reads affect later traversal order; the body-only trace does not replay them.
+        actual_snapshot, initial_snapshot = (
+            stored_snapshot(script) for script in (player.body_script, initial)
+        )
+        actual_order, initial_order = [], []
+        for snapshot, orders in ((actual_snapshot, actual_order), (initial_snapshot, initial_order)):
+            for instance in snapshot["instances"]:
+                orders.append(instance.pop("state_order"))
+        self.assertEqual(actual_snapshot, initial_snapshot)
+        self.assertNotEqual(actual_order, initial_order)
         original = run.match.body_command
 
         def observe(current, command):
@@ -214,8 +299,10 @@ class NativeReplayTests(unittest.TestCase):
             command_epoch=0, body_epoch=1,
         ))
         result = replay_document(document)
-        self.assertEqual(result["status"], "matched_observed_body_trace", result["diagnostics"])
-        self.assertEqual(result["validated_commands"], 12)
+        self.assertEqual(len(document["events"]), 13)
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["validated_commands"], 0)
+        self.assertEqual(result["diagnostics"], [{"kind": "initial_state_mismatch"}])
 
     def test_cli_accepts_jsonl_and_distinguishes_incomplete_and_hash_mismatch(self):
         path = Path(__file__).resolve().parents[1] / "tools" / "replay_native_body.py"
