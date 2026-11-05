@@ -88,6 +88,61 @@ class FixedTargetMoveToTests(unittest.TestCase):
         self.assertEqual(state.evaluate(state.node.field("m_speed")), speed)
         self.assertIsNone(state.move_request())
 
+    def test_genji_authored_miss_uses_the_world_body_position(self):
+        hero_guid, graph_id, state_index, _, speed = AUTHORED_STATES[0]
+        direction = Vec3(0.0, 0.0, 1.0)
+        hit_point = Vec3(0.0, 1.0, 3.0)
+        for point, expected in ((None, Vec3(0.0, 1.0, 15.0)), (hit_point, hit_point)):
+            with self.subTest(hit=point is not None):
+                player, instance = self.spawn(hero_guid, graph_id, flat_world(1.0))
+                world_class = type(instance.component.world)
+                native = world_class.native
+
+                def resolve_direction(world, cfg, reader, *, source=instance, original=native):
+                    if reader is source and cfg.get("$") == "STU_2200A66D":
+                        return direction
+                    return original(world, cfg, reader)
+
+                def complete_ray(caller, node, _state, *, point=point):
+                    caller.write((INSTANCE, 788), point is not None)
+                    caller.write((INSTANCE, 431), point)
+                    caller.follow(node, "m_outPlug", None)
+                    return True
+
+                with (
+                    patch.object(world_class, "native", resolve_direction),
+                    patch.dict(runtime.HANDLERS, {"STU_08D6BA6E": complete_ray}),
+                ):
+                    player.match.tick = START + 1
+                    player.take_commands([Command(START + 1, buttons=0x08)])
+                self.assertEqual(instance.state(state_index).move_request(), (expected, speed))
+
+    def test_entity_position_tracks_the_current_body_and_clears_on_retirement(self):
+        hero_guid, graph_id, *_ = AUTHORED_STATES[0]
+        player, instance = self.spawn(hero_guid, graph_id, flat_world(1.0))
+        match = player.match
+        script_world = instance.component.world
+        other = match.add_player(2, "Other", hero_guid, 0, False)
+        into_world(match, other, START)
+        self.assertTrue(match.switch_hero(other, heroes()[hero_guid]))
+        bot = match.bots[0]
+
+        self.assertEqual(script_world.position(player.body), Vec3(0.0, 1.0, 0.0))
+        self.assertEqual(script_world.position(bot.entity), Vec3(*bot.position))
+        other.mover.position[:] = (3.0, 1.0, 8.0)
+        self.assertEqual(script_world.position(other.body), Vec3(3.0, 1.0, 8.0))
+        other.spawned = False
+        self.assertEqual(script_world.position(other.body), Vec3(0.0, 0.0, 0.0))
+        self.assertEqual(other.body_script.world.position(other.body), Vec3(3.0, 1.0, 8.0))
+        other.spawned = True
+
+        old_body = other.body
+        self.assertTrue(match.switch_hero(other, heroes()[hero_guid]))
+        self.assertEqual(script_world.position(old_body), Vec3(0.0, 0.0, 0.0))
+        self.assertEqual(script_world.position(other.body), Vec3(*other.spawn[0]))
+        match.stop_body_script(player)
+        self.assertEqual(script_world.position(player.body), Vec3(0.0, 0.0, 0.0))
+
     def test_entity_scale_requires_own_body_and_unit_override(self):
         hero_guid, graph_id, *_ = AUTHORED_STATES[0]
         _, instance = self.spawn(hero_guid, graph_id, flat_world(1.0))

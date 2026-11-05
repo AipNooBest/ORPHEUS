@@ -125,6 +125,13 @@ class BodyWorld(runtime.World):
         self.throttles = (0, 0)  # the command being run: (forward, right), -127..127
         self.match: Match | None = None
 
+    def position(self, entity: int) -> Vec3:
+        if self.match is not None:
+            position = self.match.script_body_position(entity, self.body)
+            if position is not None:
+                return position
+        return super().position(entity)
+
     def native(self, cfg: dict, instance):
         cls = cfg.get("$")
         if cls == "STU_1FF67CA6":  # GetLocalPlayerPossessedView: the owner's client views its body
@@ -234,6 +241,8 @@ class BodyScript(ReplicatedBody):
         mode: int = PRACTICE_RANGE_MODE,
         health: float | None = None,
         ult_seconds: float = ULT_SECONDS,
+        *,
+        match: "Match | None" = None,
     ) -> None:
         if type(start_frame) is not int or not 0 <= start_frame <= FRAME_MASK:
             raise ValueError("start_frame must be uint32")
@@ -245,6 +254,7 @@ class BodyScript(ReplicatedBody):
         self.record = record
         self.frame_ms = max(1, quanta // 1000)
         self.world = BodyWorld(hero, mode, entity)
+        self.world.match = match
         self.component = runtime.Component(entity, self.frame_ms, self.world)
         self.frame = start_frame  # the last command frame run
         self.buttons = 0

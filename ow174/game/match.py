@@ -966,6 +966,17 @@ class Match:
 
     # --- the body's statescript (ow174/game/script) ------------------------------------------------
 
+    def script_body_position(self, entity: int, owner: int) -> expr.Vec3 | None:
+        """The current match pose of a body, including the owner during its own create."""
+        for player in self.players:
+            if (player.body == entity and player.has_body and player.client is not None
+                    and (player.spawned or entity == owner)):
+                return expr.Vec3(*player.mover.position)
+        for bot in self.bots:
+            if bot.entity == entity:
+                return expr.Vec3(*bot.position)
+        return None
+
     def _message_player(self, entity: int) -> Player | None:
         shown = (player for player in self.players if player.body == entity and self._shown(player))
         return next(shown, None)
@@ -1018,13 +1029,13 @@ class Match:
                 quanta=player.quanta,
                 mode=self.game_map.mode_guid,
                 health=HEALTH,
+                match=self,
             )
         except Exception as error:
             player.body_script_failed = isinstance(error, ScriptBudgetError)
             log.exception("[game] %s: no body statescript for %s", self.label(), player.describe())
             return
         script.created(create)
-        script.world.match = self
         player.body_script = script
         bodytrace.started(player, script)
 
