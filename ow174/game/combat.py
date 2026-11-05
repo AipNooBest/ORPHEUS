@@ -586,6 +586,7 @@ class Combat:
 
     def _shoot(self, player, command, state, number: int, time: int) -> None:
         node = state.node
+        shot_frame = time // state.instance.component.frame_ms
 
         def field(name, default=None):
             cfg = node.field(name)
@@ -606,7 +607,7 @@ class Combat:
             shot = None
             if isinstance(definition, expr.Asset):
                 shot = self.projectiles.fired(
-                    player, state, command.frame, definition.guid, lifetime, origin, direction
+                    player, state, shot_frame, definition.guid, lifetime, origin, direction
                 )
             damaging = (direct is not None and direct.amount > 0.0) or (
                 blast is not None and blast.amount > 0.0
@@ -637,7 +638,6 @@ class Combat:
         hit_y = origin[1] + direction[1] * t
         critical = hit_y >= shown.feet[1] + shown.eye - HEAD_BELOW
         amount = direct.amount * direct.scale(t) * (direct.critical if critical else 1.0)
-        shot_frame = time // state.instance.component.frame_ms
         self._damage(
             player, target, amount, critical and direct.critical > 1.0, direct.loadout, shot_frame
         )

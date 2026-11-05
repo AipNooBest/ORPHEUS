@@ -197,6 +197,28 @@ class ProjectileRangeTests(unittest.TestCase):
 
 
 class BioticFieldTests(unittest.TestCase):
+    def test_canister_confirmation_uses_the_cast_timer_frame_after_a_gap(self):
+        run = Run()
+        player = run.players[0]
+        fight = run.match.combat.projectiles
+        cast = run.frame + 1
+        player.take_commands([Command(cast, buttons=ABILITY_2)])
+
+        # The 400 ms cast timer expires inside the missed command window.
+        received = cast + 39
+        player.take_commands([Command(received)])
+        [shot] = fight.shots
+        launched = cast + 25
+        self.assertEqual((shot.definition, shot.frame), (CANISTER, launched))
+
+        # No owner report has arrived, so the timeout confirms the scheduled lease.
+        fight.update(received + projectiles.UNREPORTED_TICKS)
+        expected = fight.lease_id(player, CANISTER, launched)
+        late = fight.lease_id(player, CANISTER, received)
+        creates = {item.entity for item in player.client.entities if item.op == OP_CREATE}
+        self.assertIn(expected, creates)
+        self.assertNotIn(late, creates)
+
     def test_the_default_field_create_keeps_its_wire_bytes(self):
         # These pre-theme records cover both paths, with the same non-zero observer position.
         for parent, size, expected in (
