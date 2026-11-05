@@ -215,9 +215,10 @@ class Client:
         """Whether this connection acknowledged the current create for a bot."""
         return entity in self._bot_notices and self._bot_notices[entity] is None
 
-    def acknowledged_bot_stream(self, entity: int) -> BodyStream | None:
+    def bot_stream(self, entity: int) -> BodyStream | None:
+        """The current bot lifetime's registered stream, even before its baseline ACK."""
         script = self._bot_scripts.get(entity)
-        return script.stream if script is not None and script.stream.base is not None else None
+        return script.stream if script is not None and entity not in self._bot_destroy_wait else None
 
     def queue_bot_notice(self, entity: int, msg_id: int, value: dict) -> None:
         """Keep references to a bot out of the reliable stream until its create is acknowledged."""

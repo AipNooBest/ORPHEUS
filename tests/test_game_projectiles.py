@@ -6,6 +6,7 @@ import struct
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -15,12 +16,13 @@ from test_game_combat import KANEZAKA_DM, Run
 from test_game_packet_budget import MemorySocket, decoded
 from test_game_world import read_movement
 
-from ow174.game import bodytrace, combat, movelog, projectiles, world
+from ow174.game import bodytrace, bots, combat, movelog, observers, projectiles, world
 from ow174.game.bits import BitReader
 from ow174.game.commands import Command
-from ow174.game.content import SOLDIER, heroes
+from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
 from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
 from ow174.game.script.decode import ClientBody, read_chunk
+from ow174.game.script.driver import Snapshot
 from ow174.game.server import Client, GameServer
 from ow174.game.world import HEALTH_POOL, OP_CREATE, OP_DESTROY
 
@@ -363,6 +365,118 @@ class ObserverProjectileDeliveryTests(unittest.TestCase):
         self.assert_retired(self.send(), explode=False)
         self.ack()
         self.assertFalse(any(item.entity == old_body and item.ch2 is not None for item in self.send()))
+
+    def npc_source(self):
+        # Use a known volley layout so this delivery test needs no external NPC graph bundle.
+        instance = self.shooter.body_script.component.instances[11]
+        state = instance.state(16)
+        state.counter = state.volleys = 1
+        baseline = Snapshot(self.tick, instances={instance.id: (instance.graph.index, None)})
+        script = SimpleNamespace(graphs=lambda: {instance.id: instance.graph})
+        script.initial = observers.full_frame(script, baseline), baseline
+        bot = bots.make(PRACTICE_RANGE.map_guid)[0]
+        bot.body_script = script
+        self.match.bots = [bot]
+        self.shooter.client = None
+        self.client.queue_entities([self.match._bot_create_update(bot)])
+        return bot, state
+
+    def fire_npc(self, bot, state):
+        self.shot_frame = self.tick + 1
+        return self.fight.projectiles.fired(
+            bot, state, self.shot_frame, HELIX, 2.0, (0.0, 0.0, 0.0), (0.0, 0.0, 1.0),
+        )
+
+    def npc_volley(self, bot, state):
+        instance = state.instance
+        snapshot = Snapshot(
+            self.tick, instances={instance.id: (instance.graph.index, None)},
+            states={(instance.id, state.index): (state.node.cls, False, state.payload())},
+        )
+        self.client.queue_bot_live(bot.entity, snapshot)
+
+    def advance_delivery(self, count=1):
+        self.tick += count
+        self.match.tick = self.tick
+        self.fight.projectiles.update(self.tick)
+
+    def test_npc_shot_survives_lost_source_create_and_waits_for_matching_volley_ack(self):
+        bot, state = self.npc_source()
+        lost_create = self.send(lose=True)
+        self.assertTrue(any(item.entity == bot.entity and item.op == OP_CREATE for item in lost_create))
+        self.assertIsNotNone(self.fire_npc(bot, state))
+        self.npc_volley(bot, state)
+        self.advance_delivery()
+        self.assertEqual(self.projectile_ops(self.send()), [])
+        self.ack()
+        create = self.send()
+        self.assertTrue(any(item.entity == bot.entity and item.op == OP_CREATE for item in create))
+        self.assertEqual(self.projectile_ops(create), [])
+        self.ack()
+
+        full = self.send()
+        self.assertTrue(any(item.entity == bot.entity and item.chunk is not None for item in full))
+        self.advance_delivery()
+        self.assertEqual(self.projectile_ops(self.send()), [])  # source full has not been acknowledged
+        self.ack()
+        lost_volley = self.send(lose=True)
+        [chunk] = [item.chunk for item in lost_volley if item.entity == bot.entity and item.chunk is not None]
+
+        self.advance_delivery()
+        projectile = self.send()
+        self.assertEqual(self.projectile_ops(projectile), [OP_CREATE])
+        self.assertFalse(any(item.ch2 is not None for item in projectile))
+        self.ack()
+        self.advance_delivery()
+        retry = self.send()
+        [resent] = [item.chunk for item in retry if item.entity == bot.entity and item.chunk is not None]
+        self.assertEqual((resent.count, resent.getvalue()), (chunk.count, chunk.getvalue()))
+        self.assertFalse(any(item.ch2 is not None for item in retry))
+        self.ack()
+
+        self.advance_delivery()
+        [launch] = [item for item in self.send() if item.ch2 is not None]
+        self.assertEqual(launch.entity, bot.entity)
+        bits = bits_of(launch.ch2)
+        self.assertEqual((bits.bit(), bits.bit(), bits.var_b()), (1, 1, self.shot_frame))
+        record = read_shot(bits)
+        self.assertEqual(
+            (record["instance"], record["state"], record["activation"], record["ids"]),
+            (state.instance.id, state.index, 1, [projectiles.SEEN_FIRST]),
+        )
+
+    def test_retired_npc_source_cannot_launch_against_a_reused_entity(self):
+        bot, state = self.npc_source()
+        self.assertIsNotNone(self.fire_npc(bot, state))
+        replacement = bots.respawned(bot, bot.entity, self.tick)
+        replacement.body_script = bot.body_script
+        self.match.bots = [replacement]
+        self.client.queue_entities([self.match._bot_create_update(replacement)])
+        self.advance_delivery()
+        self.assertEqual(self.projectile_ops(self.send()), [])
+        self.ack()
+        self.npc_volley(replacement, state)
+        for _ in range(3):
+            self.advance_delivery()
+            records = self.send()
+            self.assertEqual(self.projectile_ops(records), [])
+            self.assertFalse(any(item.ch2 is not None for item in records))
+            self.ack()
+        self.assertFalse(self.fight.projectiles.observed)
+
+    def test_npc_shot_expires_before_source_ack_without_creating_a_projectile(self):
+        bot, state = self.npc_source()
+        shot = self.fire_npc(bot, state)
+        self.assertIsNotNone(shot)
+        self.fight.projectiles.flown(shot, 0.08)
+        self.advance_delivery(projectiles.OBSERVER_GRACE_TICKS)
+        for _ in range(3):
+            records = self.send()
+            self.assertEqual(self.projectile_ops(records), [])
+            self.assertFalse(any(item.ch2 is not None for item in records))
+            self.ack()
+            self.advance_delivery()
+        self.assertFalse(self.fight.projectiles.observed)
 
 
 class BioticFieldTests(unittest.TestCase):

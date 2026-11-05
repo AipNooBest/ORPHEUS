@@ -297,9 +297,9 @@ class Projectiles:
         for viewer in self.match.players:
             if viewer is shot.player or viewer.client is None:
                 continue
-            stream = observers.acknowledged_stream(viewer, shot.body, npc=npc)
+            stream = observers.projectile_stream(viewer, shot.body, npc=npc)
             if stream is None:
-                continue  # its client has no statescript of the body, so no volley record of it
+                continue  # the client has no statescript stream for this body
             entity = SEEN_FIRST + self.next_seen % SEEN_SPAN
             self.next_seen += 1
             record = ShotRecord(
@@ -321,7 +321,10 @@ class Projectiles:
             launch.stream = delivery.launch_arrival
             shot.observers.append(delivery)
             self.observed.append(delivery)
-            viewer.client.queue_entities([create])
+            if stream.base is None:
+                delivery.pending_create = create
+            else:
+                viewer.client.queue_entities([create])
 
     def flown(self, shot: Shot, seconds: float) -> None:
         """Finish an authoritative NPC copy or schedule the predicted player's release."""
@@ -639,6 +642,7 @@ class _ObservedProjectile:
     launch: EntityUpdate
     deadline: int
     npc: bool = False
+    pending_create: EntityUpdate | None = None  # queued only once the source baseline arrives
     creation: _ProjectileArrival = field(default_factory=_ProjectileArrival)
     launch_arrival: _ProjectileArrival = field(default_factory=_ProjectileArrival)
     launch_queued: bool = False
@@ -655,10 +659,12 @@ class _ObservedProjectile:
         if self.viewer.client is not self.client:
             return False
         observers = self.viewer.match.combat.observers
-        current = observers.acknowledged_stream(self.viewer, self.launch.entity, npc=self.npc)
+        current = observers.projectile_stream(self.viewer, self.launch.entity, npc=self.npc)
         source_live = current is self.stream
         launched = self.launch_arrival.received
         if not source_live or tick >= self.deadline or (self.finished and launched):
+            if self.pending_create is not None:
+                return False  # nothing about this projectile reached the client
             if self.launch_queued and not launched:
                 self.client.cancel_entity_record(self.launch)
             update = EntityUpdate(self.record.ids[0], OP_DESTROY)
@@ -666,6 +672,9 @@ class _ObservedProjectile:
                 update.ch2 = release(tick + RELEASE_AHEAD)
             self.client.queue_entities([update])
             return False
+        if self.pending_create is not None and self.stream.base is not None:
+            self.client.queue_entities([self.pending_create])
+            self.pending_create = None
         if not self.launch_queued and self.creation.received and self._volley_arrived():
             self.launch_queued = True
             self.client.queue_entities([self.launch])
