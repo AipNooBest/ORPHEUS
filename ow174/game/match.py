@@ -31,7 +31,7 @@ import secrets
 import time
 from copy import deepcopy
 
-from ow174.game import bots, combat, correction, heroselect, movelog, notices, pools, stats, world
+from ow174.game import bodytrace, bots, combat, correction, heroselect, movelog, notices, pools, stats, world
 from ow174.game.collision import MOVER, TEAM0, TEAM1, world_when_ready
 from ow174.game.commands import Command, CommandQueue
 from ow174.game.content import SOLDIER, GameMap, Hero, heroes, spawn_point
@@ -268,7 +268,7 @@ class Player:
         self.mover.use(mover_data(self.hero.body), collision)
         fresh = self.commands.new(commands)
         if movelog.ENABLED:
-            movelog.commands(self, fresh)
+            movelog.commands(self, fresh, received=commands)
         for command in fresh:
             if self.has_body:
                 dead = self.match.combat.is_dead(self)
@@ -820,23 +820,30 @@ class Match:
             return
         script.created(create)
         player.body_script = script
+        bodytrace.started(player, script)
 
     @staticmethod
     def stop_body_script(player: Player) -> None:
         if player.body_script is not None:
+            bodytrace.stopped(player, player.body_script)
             player.body_script.retire()
             player.body_script = None
 
     def body_command(self, player: Player, command: Command) -> None:
         """One new command frame for the body's statescript. A failure turns it off for this body (logged)
         instead of breaking the tick."""
+        script = player.body_script
+        before_hash = bodytrace.before(script)
         try:
-            player.body_script.command(
+            script.command(
                 command.frame, command.buttons, command.action, command.forward, command.right
             )
-        except Exception:
+        except Exception as error:
+            bodytrace.failed(script, error)
             log.exception("[game] %s: %s's body statescript failed", self.label(), player.name)
             self.stop_body_script(player)
+        else:
+            bodytrace.command(player, script, command, before_hash)
 
     def _body_frames(self, player: Player, client) -> None:
         """This tick's frames of the body's statescript: the full frame, then owner frames."""

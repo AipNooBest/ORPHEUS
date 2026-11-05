@@ -9,6 +9,7 @@ One JSON line per event in logs/movelog/<time>_<match>_<slot>_<name>.jsonl, each
     in      the commands of one datagram: how many were new, the first and the newest frame, and whether
             the mover walks on the map's collision yet (else a flat floor at the spawn height)
     cmd     one new command as the client sent it (frame, throttles, yaw, pitch, buttons, action)
+    packet  the whole received command window, before duplicate/old filtering (version 2)
     snap    the mover's state after the tick of a command frame (every field of mover.Snapshot); a frame
             the client's commands never brought (Mover.step runs it with the last command) has a snap and
             no cmd
@@ -34,7 +35,7 @@ from ow174.paths import LOGS_DIR
 
 ENABLED = os.environ.get("OW174_MOVELOG") == "1"
 FOLDER = LOGS_DIR / "movelog"
-VERSION = 1
+VERSION = 2  # adds all native command fields and the received windows; not a complete match replay
 SHOW_EVERY = 1.0  # seconds between updates of the size a folder listing shows
 
 
@@ -106,7 +107,7 @@ def _fields(snapshot) -> dict:
     return dict(vars(snapshot))
 
 
-def commands(player, fresh) -> None:
+def commands(player, fresh, *, received=None) -> None:
     """Before Player.take_commands runs them: a new mover's start, and the new commands."""
     log = log_of(player)
     if log is None:
@@ -123,6 +124,13 @@ def commands(player, fresh) -> None:
             has_body=player.has_body,
             position=list(mover.position),
             yaw=mover.yaw,
+            quanta_us=player.quanta,
+            command_epoch=player.commands.epoch,
+        )
+    if received is not None:
+        log.write(
+            "packet", tick, epoch=player.commands.epoch, wraps=player.commands.wraps,
+            commands=[dataclasses.asdict(command) for command in received], accepted=len(fresh),
         )
     if fresh:
         on_map = getattr(mover, "on_map", None)
@@ -138,6 +146,12 @@ def commands(player, fresh) -> None:
             pitch=command.pitch,
             btn=command.buttons,
             act=command.action,
+            extra=command.extra,
+            subframe=command.subframe,
+            click_yaw=command.click_yaw,
+            click_pitch=command.click_pitch,
+            entity=player.body,
+            epoch=player.commands.epoch,
             body=player.has_body,
         )
 

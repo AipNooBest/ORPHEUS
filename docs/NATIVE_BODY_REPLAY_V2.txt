@@ -1,0 +1,86 @@
+Observed native body-script replay v2
+
+Scope
+This validates an observed Soldier: 76 BodyScript trace using the actual script.driver.BodyScript.
+It does not replay Match, target selection, hits, damage decisions, movement/collision, all external
+world effects, ACK timing, UDP or the original client. It establishes no M1 real-client acceptance.
+Successful output is matched_observed_body_trace, with complete_native_capture=false even on success.
+The existing seven-field FlatMover v1 schema and result remain independent and unchanged.
+
+Recording API (all helpers read stored data and never consume shots or draw random numbers)
+ow174.game.native_replay.make_header(script, *, quanta_us, command_epoch, body_epoch, server_tick)
+snapshot_hash(script)
+make_command_event(script, command, *, seq, server_tick, before_hash, command_epoch, body_epoch)
+make_end_event(script, *, seq, server_tick, command_epoch, body_epoch, reason='retired')
+
+Create a header immediately after constructing each new BodyScript. Observe before_hash immediately
+before native command(); make the command event immediately after it, before Combat.command consumes
+the generated shots. Do not change the native consumer. Write end BEFORE script.retire(), after the
+last observed command/consumer. If the observer or native command faults, write
+{"kind":"fault","error":"description"} and close; never let observer failure mutate game execution.
+Each BodyScript lifecycle has a separate trace, even for the same player or reused entity id.
+
+Input forms
+A JSON document is {"header": <make_header result>, "events": [<events>, <end>]}. Streaming JSONL begins
+with one {"header": <result>} line, then one bare event per line. A single header is an OPEN trace.
+A missing end, invalid/truncated JSONL line, unknown event, explicit fault, missing seq, events after
+end or boundary hash mismatch produces incomplete (or a schema validation error for malformed input).
+There is no inference that a syntactically complete last command was the end of a capture.
+
+Header
+schema=ow174.native-body-replay.v2, build=1.74.0.0.104319, scope=body-script-only, model_hash, hero,
+entity, body_definition, start_frame, quanta_us, mode, health, maximum_health, ult_seconds, seed=1,
+command_epoch, body_epoch, server_tick, gap_policy=reject, shot_policy=drain_after_command, initial_hash.
+model_hash combines SHA256 of script/command/codec/pool implementations and relevant graph, body,
+stats and codec data. Restart the process after changing code/data before recording. Only seed 1 is
+supported: that is the current BodyScript constructor's native Component/default expression seed;
+reseeding after initialization would invent a different initialization. Other heroes/seeds are rejected.
+This constructor baseline requires initial health == maximum_health; unequal declarations are rejected.
+Replay reconstructs the constructor and verifies initial_hash, including RNG state. Starting recording
+mid-body without a full checkpoint will therefore normally fail initialization verification.
+
+Command event
+kind=command, seq, server_tick, command_epoch, body_epoch, command, before_hash, after_hash, shots.
+command has exactly eleven fields: frame, forward, right, yaw, pitch, buttons, action, extra, subframe,
+click_yaw, click_pitch. View delay/subframe/click aim are retained even though BodyScript itself does
+not use all of them: combat does, and discarding them would make later investigation impossible.
+shots lists instance, graph, raw state index, activation counter, shot number and internal time_ms.
+It records volley emission, not proof that any target was hit. Replay drains emitted shots after each
+validated event, emulating the existing combat consumer without making combat decisions.
+
+Time, epochs and missing input
+seq starts at 1 and increases by exactly 1 through end; the header does not consume a sequence number.
+It preserves real observation order.
+server_tick is a nondecreasing arrival/scheduling index, NOT the player's command.frame. Frame is
+uint32, with modulo distance used to classify duplicates/old input/gaps. quanta_us is the actual caller
+argument; native BodyScript uses frame_ms=max(1, quanta_us//1000). The engine's recorded seed and timing
+choices are not proof of original-client semantics. Epochs remain explicit and constant within a trace.
+Exact old/duplicate native inputs may be observed but do not run another frame. Any forward gap stops
+before native command() with inclusive missing-frame bounds/count: the native driver normally fills
+gaps, but this baseline NEVER silently uses those invented inputs. The current native body rejects a
+real uint32 rollover until a fresh body/timer/CmFD lifecycle exists; replay reports that boundary.
+It neither resets the old driver's frame nor treats a delayed packet as a restart.
+
+State hashes and honesty boundary
+Hashes read stored variables/base values, ordered links/watchers, active or previously activated state
+attributes, event queues, ticking/deferred lists, logical held buttons, time, counters and RNG state.
+They do NOT call Var.value(), State.payload(), or BodyScript.snapshot(); observing must not run graphs.
+Stable references use instance/state/variable identifiers. State hashes use Python's round-trip JSON
+float representation (finite values only); sets and object keys are canonicalized. stored_snapshot's
+debug projection additionally uses hexadecimal float values. Transport stream/reports and pending shots
+are excluded; shots have
+their own summary. This is a key execution-state fingerprint, not a restorable process checkpoint.
+The raw itertools event counter is excluded; queued event sequence/FIFO is recorded. No deprecated
+pickle/copy introspection of itertools is used. State tables are canonicalized by raw state index;
+their incidental lazy-construction order is distinct from the explicitly recorded event/ticking order.
+Unrecorded set_health/set_ult_charge/messages/voice state operations can cause before/final hash
+mismatch, which is reported incomplete; not every possible external event is recorded by this format.
+Even a closed matching trace only validates the observed body boundary sequence. It does not establish
+complete external-world coverage or Match/combat/network fidelity. State hashes cover validated body
+rows; input_hash covers the full recording, including all eleven input fields and server ticks.
+
+CLI
+py tools/replay_native_body.py trace.jsonl --output replay.json
+py tools/replay_native_body.py trace.json --expect-state-hash <sha256>
+Exit 0: matched closed observed trace. 1: malformed input/I/O. 2: expected state hash differs.
+Exit 3: incomplete, with explicit diagnostics and the count/hash of the validated prefix.

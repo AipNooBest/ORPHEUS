@@ -3,6 +3,7 @@
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -59,6 +60,110 @@ class BnetPortTests(unittest.TestCase):
                 cli._start_bnet(server, port)
                 self.assertEqual(start_bnet.call_args.args[1], "127.0.0.1:3724")
                 self.assertEqual(start_bnet.call_args.kwargs, {"ports": (port, RPC_PORT)})
+
+
+class NoLaunchTests(unittest.TestCase):
+    @contextmanager
+    def host_services(self, mode, *, no_launch=True, options=()):
+        flags = ["--mode", mode, *options]
+        if no_launch:
+            flags.append("--no-launch")
+        args = cli.parse_args(flags)
+        names = (
+            "find_game", "close_running_copy", "start_game", "ensure_requirements", "ensure_relay_dll",
+            "load_or_create_profile", "LobbyServer", "_bind", "_start_game_server", "start_dashboard",
+            "RetailGames", "_start_bnet", "_log_banner",
+        )
+        with ExitStack() as stack:
+            mocks = {name: stack.enter_context(patch.object(cli, name)) for name in names}
+            mocks["thread"] = stack.enter_context(patch.object(cli.threading, "Thread"))
+            server = mocks["LobbyServer"].return_value
+            server.games = None  # the real LobbyServer starts without a client manager
+            mocks["find_game"].return_value = Path("Overwatch.exe")
+            mocks["ensure_relay_dll"].return_value = Path("relay.dll")
+            yield args, mocks, server
+
+    def test_no_launch_is_explicit_and_defaults_off(self):
+        self.assertFalse(cli.parse_args([]).no_launch)
+        self.assertTrue(cli.parse_args(["--no-launch"]).no_launch)
+
+    def test_all_host_modes_keep_services_and_never_touch_a_game(self):
+        for mode in ("retail", "host", "tournament", "server"):
+            with self.subTest(mode=mode), self.host_services(mode) as (args, mocks, server):
+                cli.run(args)
+                for name in (
+                    "find_game", "close_running_copy", "start_game", "ensure_relay_dll", "RetailGames",
+                ):
+                    mocks[name].assert_not_called()
+                self.assertIsNone(server.games)  # also disables dashboard client launching
+                mocks["_bind"].assert_called_once_with(server)
+                mocks["_start_game_server"].assert_called_once_with(server)
+                mocks["start_dashboard"].assert_called_once_with(server, port=args.dashboard_port)
+                mocks["ensure_requirements"].assert_called_once()
+                mocks["thread"].return_value.start.assert_called_once()
+                server.serve_forever.assert_called_once_with(mocks["_bind"].return_value)
+                if mode in ("retail", "host"):
+                    mocks["_start_bnet"].assert_called_once_with(server, args.bnet_port)
+                else:
+                    mocks["_start_bnet"].assert_not_called()
+
+    def test_no_launch_preserves_the_service_disable_options(self):
+        with self.host_services("server", options=("--game-port", "0", "--dashboard-port", "0")) as values:
+            args, mocks, _server = values
+            cli.run(args)
+            mocks["_start_game_server"].assert_not_called()
+            mocks["start_dashboard"].assert_not_called()
+            mocks["ensure_requirements"].assert_not_called()
+
+    def test_join_modes_are_refused_before_network_or_client_work(self):
+        for mode in ("join", "join-tournament"):
+            with (
+                self.subTest(mode=mode),
+                patch.object(cli, "join") as join,
+                patch.object(cli, "join_tournament") as tournament,
+                self.assertRaisesRegex(LaunchError, "join mode"),
+            ):
+                cli.run(cli.parse_args(["--mode", mode, "--no-launch"]))
+            join.assert_not_called()
+            tournament.assert_not_called()
+
+    def test_a_client_path_is_refused_instead_of_silently_ignored(self):
+        with self.host_services("retail", options=("--game-exe", "Overwatch.exe")) as (args, mocks, _server):
+            with self.assertRaisesRegex(LaunchError, "--game-exe"):
+                cli.run(args)
+            mocks["LobbyServer"].assert_not_called()
+            mocks["find_game"].assert_not_called()
+
+    def test_no_launch_without_a_mode_does_not_ask_an_interactive_question(self):
+        with (
+            patch.object(cli.sys.stdin, "isatty", return_value=True),
+            patch.object(cli, "ask_mode") as ask,
+            patch.object(cli, "setup_logging"),
+            patch.object(cli, "run") as run,
+        ):
+            self.assertEqual(cli.main(["--no-launch"]), 0)
+        ask.assert_not_called()
+        self.assertEqual(run.call_args.args[0].mode, "retail")
+        self.assertTrue(run.call_args.args[0].no_launch)
+
+    def test_normal_retail_still_uses_its_client_manager(self):
+        with self.host_services("retail", no_launch=False) as (args, mocks, server):
+            cli.run(args)
+            mocks["find_game"].assert_called_once_with(None)
+            mocks["close_running_copy"].assert_called_once_with(Path("Overwatch.exe"))
+            mocks["ensure_relay_dll"].assert_called_once()
+            mocks["RetailGames"].assert_called_once_with(
+                Path("Overwatch.exe"), Path("relay.dll"), "auto", 30.0, bnet_port=args.bnet_port,
+            )
+            self.assertIs(server.games, mocks["RetailGames"].return_value)
+            server.games.start.assert_called_once()
+
+    def test_normal_tournament_still_starts_the_requested_client(self):
+        with self.host_services("tournament", no_launch=False) as (args, mocks, _server):
+            cli.run(args)
+            mocks["start_game"].assert_called_once_with(
+                Path("Overwatch.exe"), ["--tank_TournamentMode", "--lobbyServer=127.0.0.1:3724"], "auto",
+            )
 
 
 class JoinTests(unittest.TestCase):

@@ -3,6 +3,9 @@ setlocal
 title Overwatch 1.74 - Local Practice
 cd /d "%~dp0"
 set PYTHONUTF8=1
+rem Optional local diagnostics preserve explicitly supplied environment values.
+if not defined OW174_MOVELOG set OW174_MOVELOG=0
+if not defined OW174_BODY_TRACE set OW174_BODY_TRACE=0
 chcp 65001 >nul
 if not exist ".venv\Scripts\python.exe" (
   py -3 -m venv .venv

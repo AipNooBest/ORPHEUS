@@ -84,6 +84,28 @@ class LogTests(unittest.TestCase):
         self.assertEqual((sent["f"], sent["tick"], sent["count"]), (7005, 7005, 0))
         self.assertEqual(sent["ack"], 7007)  # two past the record, not the newest 7009
 
+    def test_native_aim_data_and_duplicate_input_windows_are_preserved(self):
+        self.enable()
+        click = Command(7000, buttons=0x10001, extra=417, subframe=37, click_yaw=-233, click_pitch=291)
+        release = Command(7001, extra=421)
+        self.player.take_commands([click])
+        self.player.take_commands([click, release])
+        lines = self.lines()
+        self.assertEqual(lines[0]["version"], 2)
+        packets = [line for line in lines if line["k"] == "packet"]
+        self.assertEqual([[c["frame"] for c in p["commands"]] for p in packets], [[7000], [7000, 7001]])
+        self.assertEqual([p["accepted"] for p in packets], [1, 1])
+        self.assertEqual(packets[0]["commands"][0]["click_yaw"], -233)
+        cmds = [line for line in lines if line["k"] == "cmd"]
+        self.assertEqual([line["f"] for line in cmds], [7000, 7001])
+        self.assertEqual(
+            (cmds[0]["extra"], cmds[0]["subframe"], cmds[0]["click_yaw"], cmds[0]["click_pitch"]),
+            (417, 37, -233, 291),
+        )
+        self.assertEqual((cmds[1]["click_yaw"], cmds[1]["click_pitch"]), (None, None))
+        self.assertEqual({line["epoch"] for line in cmds}, {0})
+        self.assertEqual({line["entity"] for line in cmds}, {self.player.body})
+
     @unittest.skipUnless(os.name == "nt", "the size in a folder's entry is NTFS's")
     def test_a_folder_listing_shows_the_open_log_with_its_lines(self):
         # Flushed lines alone leave the folder's entry at 0 bytes while the server keeps the log open.

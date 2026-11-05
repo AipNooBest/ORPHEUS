@@ -790,7 +790,7 @@ class DashboardService:
         """Start a second retail game on this PC that plays the account, to test two players."""
         games = self.lobby.games
         if games is None:
-            raise ApiError("A second game needs the server in retail mode", 409)
+            raise ApiError("Client launching is unavailable in this server mode", 409)
         account = self.account(data.get("name"))
         if self.lobby.social.is_online(account) or account.name in games.second_accounts():
             raise ApiError(f"{account.name} is already playing", 409)

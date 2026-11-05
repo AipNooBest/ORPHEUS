@@ -12,9 +12,9 @@ Per graph it keeps what a runtime needs and drops the editor layout (positions, 
 colours). The file format is described in ow174/game/script/graph.py, which reads it.
 
 How the XML is read (DataTool's DragonML):
-- An object is an element named after its STU class. Scalar fields are attributes ("{null}" = null, decimals
-  use a comma), object and array fields are child elements with dragon:name. An object met a second time is a
-  `dragon:ref` to its dragon:id; a `tank:ref` with a GUID is an asset reference.
+- An object is an element named after its STU class. Scalar fields are attributes ("{null}" = null; decimal
+  separators can be a dot or comma), object and array fields are child elements with dragon:name.
+  A repeated object uses `dragon:ref` with its dragon:id; `tank:ref` with a GUID references an asset.
 - Nodes live in m_nodes (the index is the node's m_871A8203) and in m_graph.m_items with the editor's other
   items (subgraph boxes). A node is identified here by its position in m_items.
 - A plug holds its links; a link names the input plug it enters, and that plug's m_parentNode is the node
@@ -25,6 +25,7 @@ How the XML is read (DataTool's DragonML):
 import argparse
 import gzip
 import json
+import math
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -59,8 +60,8 @@ NODE_KEYS = {
     "m_serverOnly": "server_only",
 }
 LISTS = {"m_states": "states", "m_entries": "entries", "m_remoteSyncNodes": "remote"}
-INT = re.compile(r"-?\d+$")
-FLOAT = re.compile(r"-?\d+(,\d+)?(E[-+]?\d+)?$")
+INT = re.compile(r"[+-]?\d+$")
+FLOAT = re.compile(r"[+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)(?:[Ee][+-]?\d+)?$")
 CS_CLASS = re.compile(r"public class (\w+)(?:\s*:\s*(\w+))?\s*\{(.*?)\n    \}", re.S)
 CS_FIELD = re.compile(r"public ([\w<>]+)(?:\[\])? (m_\w+)\s*(?:=[^;]*)?;")
 CS_ENUM = re.compile(r"public enum (\w+)\s*:\s*\w+\s*\{(.*?)\}", re.S)
@@ -115,7 +116,10 @@ def scalar(text: str | None):
     if INT.match(text):
         return int(text)
     if FLOAT.match(text):
-        return float(text.replace(",", "."))
+        number = float(text.replace(",", "."))
+        if not math.isfinite(number):
+            raise ValueError(f"nonfinite numeric XML value: {text}")
+        return number
     return text
 
 
@@ -270,7 +274,7 @@ class GraphXml(StuXml):
         belongs to no node of m_nodes."""
         plug = self.field(link, "m_inputPlug")
         if plug is None:
-            self.problems.append("a link without an input plug")
+            self.problems.append(f"a link without an input plug (link_id={link.get(ID)})")
             return [None, None]
         owners = self.owners.get(id(plug), [])
         parent = self.field(plug, "m_parentNode")
@@ -280,8 +284,45 @@ class GraphXml(StuXml):
             return [position, paths[0] if paths else plug.get(NAME)]
         if parent is None and owners:
             return list(owners[0])
-        self.problems.append(f"a link into {tag(plug)} {plug.get(NAME)} of no known node")
+        self.problems.append(self.unowned_link(link, plug, parent))
         return [None, plug.get(NAME)]
+
+    def unowned_link(self, link: ET.Element, plug: ET.Element, parent: ET.Element | None) -> str:
+        """Keep the XML evidence for a broken link without inventing a node or input field.
+
+        Null nodes in an exported XML may be absent in the asset or unread by DataTool. Their order
+        does not establish an input plug's ownership or explain why its parent is null.
+        """
+        if parent is not None:
+            parent_info = f"input_parent_id={parent.get(ID)}, input_parent_class={tag(parent)}"
+        else:
+            explicit_null = plug.get("m_parentNode") == "{null}" or any(
+                child.get(NAME) == "m_parentNode" and tag(self.resolve(child)) == "null" for child in plug
+            )
+            parent_info = "m_parentNode=null" if explicit_null else "m_parentNode=missing"
+        output = self.field(link, "m_outputPlug")
+        output_parent = self.field(output, "m_parentNode") if output is not None else None
+        source = (
+            f"output_plug_id={output.get(ID) if output is not None else None}, "
+            f"output_parent_id={output_parent.get(ID) if output_parent is not None else None}, "
+            f"output_parent_class={tag(output_parent) if output_parent is not None else None}, "
+            f"output_parent_pos={self.nodes.get(id(output_parent)) if output_parent is not None else None}, "
+            f"output_parent_rid={output_parent.get('m_871A8203') if output_parent is not None else None}, "
+            f"output_owners={self.owners.get(id(output), [])}"
+        )
+        null_slots = {
+            name: [number for number, element in enumerate(elements) if tag(element) == "null"]
+            for name, elements in (
+                ("m_nodes", self.node_list),
+                ("m_states", [self.resolve(child) for child in self.top.get("m_states", [])]),
+                ("m_items", self.item_list),
+            )
+        }
+        return (
+            f"a link into {tag(plug)} {plug.get(NAME)} of no known node "
+            f"(link_id={link.get(ID)}, input_plug_id={plug.get(ID)}, {parent_info}; {source}; "
+            f"null slots={null_slots}; ownership/node schema cannot be recovered from these nulls)"
+        )
 
     def node(self, element: ET.Element) -> dict:
         record = {"pos": self.nodes[id(element)], "class": tag(element)}

@@ -128,3 +128,32 @@ Acceptance and redirection
 Reproduce the static report (from repository root):
   .venv\Scripts\python.exe tools/analyze_game_graphs.py --hero soldier --detail-graph 0254
   Add --json for complete machine-readable node/field evidence.
+
+I. Local target-build resource extraction (2026-11-05)
+  Built OWLib overwatch/1.74 at 7afe5f52706e7002ed8c2717299cd60846f3fa3a, TACTLib
+  a00459fe0885a58da19bceb0a366605c92f1927b, revorbstd 8204be4f86811aa71007cd0d0ca8a3a198ea4273.
+  The latter was checked out as source without its unnecessary native audio binaries.
+  The original DataTool net6.0 Release build succeeded; pinned dependency/compiler warnings
+  are retained in the build log. An isolated Microsoft SDK 8.0.427 archive was SHA512-verified.
+  No system SDK installation or game launch was needed. The installed .NET 6 runtime ran the tool.
+  Exact source: https://github.com/overtools/OWLib/tree/7afe5f52706e7002ed8c2717299cd60846f3fa3a
+  Exact manifest parser: https://github.com/overtools/TACTLib/blob/a00459fe0885a58da19bceb0a366605c92f1927b/TACTLib/Core/Product/Tank/CMF/ProCMF_104319.cs
+
+  Offline reads of the user's client explicitly selected zhCN, disabled locale-registry
+  selection and caches, and left online download/manifest fallback off. The log identified
+  build 1.74.0.0.104319 and its exact TRG/CMF procedures. Extraction produced 3528 definition
+  XML files (003), 1587 graph XML files (01B), and further selected resource types in work/.
+  Full NPC components were retained rather than reducing them to the hero body_record fields.
+  Eight research roots give 22 graphs; all nine graphs overlapping canonical data match after
+  numeric parsing is corrected. These NPC definitions are not activated in the live runtime.
+
+  Local XML uses dot decimals, while the previous extractor recognized only comma decimals.
+  Dot/comma and E/e parsing now preserves numeric types and rejects overflow. Regenerating
+  32 hero bodies / 373 graphs corrected 3862 string-to-float fields; the resulting JSON is
+  value/type-equivalent to the existing canonical data (no canonical file was replaced).
+  Its normalized SHA256 is febfbcc8d406ea59f76b10029cc825b765b49ece29c8020b9ba7929b3671104f.
+  Missing graph 0F9C remains explicit. Unknown input-plug ownership in 288B, 05AD and 0D24
+  now retains source/plug/link/null-slot identifiers; targets are not guessed from null slots.
+
+  Static resource and chunk evidence still does not establish comp43 replication fields,
+  ClientInCombat 25000 semantics or original client presentation. Those remain open work.

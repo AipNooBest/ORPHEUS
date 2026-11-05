@@ -6,6 +6,13 @@ integration uses LizRollin's wip revision
 local startup/research work. [WIP.md](../WIP.md) retains the upstream author's
 test claims and known issues. Those claims are separate from the observations below.
 
+The current user instruction is unattended server development through the full
+M0-M6 list: do not start or operate the game. All real-client acceptance is
+deferred to the user after the server implementation and self-checks are complete.
+The local server-only entry is `START_SERVER_LOCAL.cmd` / `--mode retail
+--no-launch`; it retains the Battle.net/RPC/lobby/game services without a game
+path, relay preparation or client-launch manager.
+
 ## Local client observations
 
 - The real `_retail_/Overwatch.exe` logs into the local emulator without running
@@ -52,7 +59,7 @@ rejected. The live match handler retires that body's script; other players keep
 running. This prevents half-completed simulations from looking successful. It
 does not add automatic recovery or prove the cause of the reported live issues.
 
-The latest full Python regression ran 818 tests: 817 passed and one was skipped
+The latest full Python regression ran 852 tests: 851 passed and one was skipped
 for an unavailable King's Row collision cache. A separate 62.448-second offline
 Soldier sequence applied/decoded 3903 owner chunks, observed ammo spending and
 seven refills, and ended with no active volley after release. This is a native
@@ -75,6 +82,14 @@ The v1 replay schema deliberately keeps its original seven input fields. Native
 command extensions with non-default values require a newer recording contract;
 the v1 adapter rejects them instead of silently losing information. See
 [SIMULATION_CONTRACT.txt](SIMULATION_CONTRACT.txt).
+
+Observed native body traces now have a separate v2 recording/replay path, including
+all eleven decoded command fields, model/data fingerprints, stored-state and
+shot-boundary checks, explicit retirement, and missing-input/fault/truncation
+diagnostics. Movement log v2 also preserves windows before old/duplicate filtering.
+These diagnostics are opt-in. A 975-command offline-generated body trace matched
+its replay; it is not a full Match/combat/network capture. See
+[NATIVE_BODY_REPLAY_V2.txt](NATIVE_BODY_REPLAY_V2.txt).
 
 ## Remaining acceptance and implementation work
 

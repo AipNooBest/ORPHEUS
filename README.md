@@ -11,6 +11,21 @@ An offline lobby server for Overwatch 1.74 (build 104319) on Windows.
 
 The server and the game start. Keep the black window open while you play.
 
+For local server work without launching a game, use `START_SERVER_LOCAL.cmd`.
+It binds the local services to loopback and uses Battle.net port 1118. From the
+project environment, the equivalent is `python -m ow174 --mode retail --no-launch
+--host 127.0.0.1 --bnet-port 1118 --test-players 1` (one line). `--no-launch` does
+not find or close a game, prepare the relay, or create a client-launch manager.
+The dashboard's client-start action is unavailable in this mode. Join modes and
+`--game-exe` cannot be combined with it.
+
+Local diagnostics are opt-in: `OW174_MOVELOG=1` retains full received input
+windows and movement observations; `OW174_BODY_TRACE=1` records body-script
+boundaries for `tools/replay_native_body.py`. Body hashing has measurable cost,
+so it stays off by default. See [the v2 contract](docs/NATIVE_BODY_REPLAY_V2.txt)
+for scope and incomplete-trace diagnostics, and [local state](docs/STATE.md) for
+the distinction between implementation, model tests and real-client acceptance.
+
 To switch modes, close the game and the black window, then start `START.bat` again and choose another mode.
 
 - **Play in retail mode**: the default Overwatch menu, with a hero in the lobby.

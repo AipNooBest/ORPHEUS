@@ -9,6 +9,9 @@ Modes:
   join             the game with the full menu on someone else's server (--server host:port and
                    --name): a Battle.net emulator and the relay of its own send it there
   join-tournament  only the game, in tournament mode, on someone else's server (--server host:port)
+
+--no-launch runs the selected host services without locating, closing or starting a game.
+In retail/host it keeps the local Battle.net emulator, with no dashboard client-launch manager.
 """
 
 import argparse
@@ -69,10 +72,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="START.bat", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--mode", choices=MODES, help="what to start; without it you are asked")
+    parser.add_argument(
+        "--no-launch", action="store_true",
+        help="run host services only; no game lookup, relay or client launch (not for join modes)",
+    )
     parser.add_argument("--server", help="address of the server to join, such as 1.2.3.4:3724")
     parser.add_argument("--name", help="your name on the server you join with the full menu")
     parser.add_argument(
-        "--game-exe", type=Path, help="Overwatch.exe to start (default: the one picked before)"
+        "--game-exe", type=Path,
+        help="Overwatch.exe to start (default: the one picked before; incompatible with --no-launch)",
     )
     parser.add_argument(
         "--locale",
@@ -198,7 +206,7 @@ def is_player_name(text: str) -> bool:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.mode is None:
-        args.mode = ask_mode() if sys.stdin.isatty() else "retail"
+        args.mode = ask_mode() if sys.stdin.isatty() and not args.no_launch else "retail"
         if args.mode in HOSTING and not args.game_host:
             args.game_host = ask_public_address()
     setup_logging(_paths(args).log_file)
@@ -229,6 +237,10 @@ def _paths(args: argparse.Namespace) -> Paths:
 
 
 def run(args: argparse.Namespace) -> None:
+    if args.no_launch and args.mode in ("join", "join-tournament"):
+        raise LaunchError("--no-launch runs host services and cannot be used with a join mode.")
+    if args.no_launch and args.game_exe is not None:
+        raise LaunchError("--game-exe selects a client to launch and cannot be used with --no-launch.")
     if args.mode == "join":
         join(args)
         return
@@ -246,12 +258,12 @@ def run(args: argparse.Namespace) -> None:
         paths=_paths(args),
     )
     game = relay = None
-    if args.mode != "server":
+    if args.mode != "server" and not args.no_launch:
         game = find_game(args.game_exe)
         close_running_copy(game)
     if retail or settings.game_port > 0:
         ensure_requirements()
-    if retail:
+    if retail and not args.no_launch:
         relay = ensure_relay_dll()
 
     load_or_create_profile(settings.paths.template)
@@ -265,11 +277,14 @@ def run(args: argparse.Namespace) -> None:
         target=watch_inject_file, args=(server, settings.paths.inject_file), daemon=True, name="inject"
     ).start()
     if retail:
-        server.games = RetailGames(game, relay, args.locale, args.timeout, bnet_port=args.bnet_port)
+        if not args.no_launch:
+            server.games = RetailGames(game, relay, args.locale, args.timeout, bnet_port=args.bnet_port)
         _start_bnet(server, args.bnet_port)
     _log_banner(server)
 
-    if retail:
+    if args.no_launch:
+        log.info("[+] Server services ready; client launching is disabled.")
+    elif retail:
         server.games.start()
     elif args.mode == "tournament":
         start_game(game, ["--tank_TournamentMode", f"--lobbyServer=127.0.0.1:{settings.port}"], args.locale)

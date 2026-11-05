@@ -29,6 +29,8 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
   were checked before using earlier conclusions.
 
 - **[overtools / OWLib](https://github.com/overtools/OWLib)** — DataTool, TankLib, asset definitions and extraction tools used to inspect client data and prepare catalogs.
+  The local target-build extraction also uses the `overwatch/1.74` source revision
+  `7afe5f52706e7002ed8c2717299cd60846f3fa3a`, with its pinned TACTLib and revorbstd dependencies.
 - **[overtools / TACTLib](https://github.com/overtools/TACTLib)** — CASC/TACT reading and related tooling used by the extraction toolchain.
 - **[Plasmawatch](https://github.com/plasmawatch/login-server)** — Battle.net login-server emulation and protocol reference work.
 - **[Prometheus](https://github.com/saturn-xvi/prometheus/tree/ad1fea7e6c04c9959c7115cb8ecd9c79c93c1ccb)** —
