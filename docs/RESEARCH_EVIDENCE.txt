@@ -43,6 +43,15 @@ E. Cross-version references
   Prometheus: https://github.com/saturn-xvi/prometheus
   Its early/beta client research is useful as a method and comparison, not a complete
   1.74 server or evidence that addresses, layouts and weapon behavior transfer unchanged.
+  At ad1fea7, its Voice System Triggerer reads the voice-set entries and calls the
+  beta client's PlayVoice function. This identifies a client audio endpoint. The
+  104319 server's stimuli, event routing, listeners and timing need target-build
+  evidence. The selective map-resource hook shows where the beta client filters
+  loaded entities. The project reports incorrect placement for several dynamic
+  objects after the bypass. Verify 104319 placement and replicated activation for
+  each spawn-room and environmental effect.
+  https://github.com/saturn-xvi/prometheus/blob/ad1fea7e6c04c9959c7115cb8ecd9c79c93c1ccb/prometheus/windows/voice_system_triggerer.h
+  https://github.com/saturn-xvi/prometheus/blob/ad1fea7e6c04c9959c7115cb8ecd9c79c93c1ccb/prometheus/dllmain.cpp
   data/README.md identifies 1.68 reference traffic decoded with 1.74 schemas; original
   capture files are not included. Some comments use OW2 traffic as comparison.
   Mark each cross-version inference and verify it on target build 104319 before acceptance.
