@@ -41,7 +41,11 @@ OPERATIONS = {
     "report_callbacks": set(),
     "run_loop": {"receives", "callback_actions"},
 }
-CALLBACK_OPERATIONS = {"take_out", "expire_handoff"}
+CALLBACK_OPERATIONS = {
+    "joined": {"take_out", "expire_handoff"},
+    "left": {"take_out", "expire_handoff"},
+    "clock_ready": {"create_match"},
+}
 
 
 class ServerJournalError(RuntimeError):
@@ -85,6 +89,10 @@ def _handoffs(value):
     if not all(isinstance(item, Handoff) for item in value):
         raise ServerJournalError("unexpected handoff result")
     return [dataclasses.asdict(item) for item in value]
+
+
+def _operation_result(operation, result):
+    return _handoffs(result) if operation in ("create_match", "join_match") else result
 
 
 class _MemorySocket:
@@ -182,6 +190,7 @@ class _Session:
             skin_of=self._skin,
             on_join=lambda player: self._callback("joined", player),
             on_leave=lambda player: self._callback("left", player),
+            on_clock_ready=lambda: self._callback("clock_ready", None),
             collision_provider_factory=lambda: self._collision_reads,
         )
         self.server.sock = _MemorySocket(self)
@@ -191,14 +200,14 @@ class _Session:
         return (player.match.id, player.slot)
 
     def _callback(self, kind, player):
-        key = self._player_key(player)
-        self._observe({"kind": kind, "player": key})
+        key = self._player_key(player) if player is not None else None
+        self._observe({"kind": kind} if key is None else {"kind": kind, "player": key})
         while self._callback_actions and self._callback_actions[0][:2] == (kind, key):
             _, _, operation, arguments = self._callback_actions.popleft()
             self._observe({"kind": "callback_action", "operation": operation, "arguments": arguments,
                            "player": key, "callback": kind})
             try:
-                result = self._dispatch(operation, arguments)
+                result = _operation_result(operation, self._dispatch(operation, arguments))
             except Exception as error:  # noqa: BLE001 - production catches callback exceptions
                 self._fail(f"callback action failed: {type(error).__name__}")
             self._observe({"kind": "callback_result", "result": result})
@@ -275,17 +284,26 @@ class _Session:
             if type(action) is not tuple or len(action) != 4:
                 self._fail("invalid callback action")
             kind, key, operation, arguments = action
-            if (kind not in ("joined", "left") or type(operation) is not str
-                    or operation not in CALLBACK_OPERATIONS):
+            if (type(kind) is not str or type(operation) is not str
+                    or operation not in CALLBACK_OPERATIONS.get(kind, ())):
                 self._fail("unsupported callback action")
-            self._player(key)
+            if kind == "clock_ready":
+                if key is not None:
+                    self._fail("clock-ready callback has no player reference")
+            else:
+                self._player(key)
             _fields(arguments, OPERATIONS[operation], "callback action arguments")
             if operation == "take_out":
                 self._player(arguments["player"])
                 if type(arguments["reason"]) is not str:
                     self._fail("invalid callback leave reason")
-            else:
+            elif operation == "expire_handoff":
                 _integer(arguments["conn"], "handoff connection", minimum=1)
+            else:
+                _game_map(arguments["game_map"])
+                _integer(arguments["card"], "queue card")
+                if type(arguments["players"]) not in (tuple, list):
+                    self._fail("callback match players must be an ordered sequence")
 
         original_socket = self.server.sock
         loop_socket = _LoopSocket(self, receives)
@@ -354,11 +372,11 @@ class _Session:
                 after = self.server.tick, self._indices()
                 state_after = self._stored_hash()
             self._healthy()
-            normalized = _handoffs(result) if operation in ("create_match", "join_match") else result
             row = {
                 "operation": operation, "arguments": replay_values.encode(args),
                 "before": replay_values.encode(before), "after": replay_values.encode(after),
-                "result": replay_values.encode(normalized), "effects": replay_values.clone(self._effects),
+                "result": replay_values.encode(_operation_result(operation, result)),
+                "effects": replay_values.clone(self._effects),
                 "state_before": state_before, "state_after": state_after,
             }
             return row, result
@@ -391,8 +409,9 @@ class RecordingServerSession(_Session):
 
     sendto is an optional in-memory outcome source, not a live socket. Without it,
     all sends succeed with len(data). A scheduler root can dispatch explicit server
-    operations from its observed callbacks. A controlled lobby handler can record
-    a seat cancellation through expire_handoff; the surrounding lobby is external.
+    operations from its observed callbacks, including create_match after clock
+    rollover. A controlled lobby handler can record a seat cancellation through
+    expire_handoff; the surrounding lobby is external.
     """
 
     _recording = True

@@ -40,6 +40,13 @@ their read positions. Invalid or unconsumed input fails the journal.
 Failures inside a scheduler iteration or callback remain recorded as a journal
 fault even if production catches and logs the exception.
 
+The game clock rollover emits a clock_ready observation when the production
+dispatcher reopens admission. A controlled scheduler can exercise deferred
+admission with ("clock_ready", None, "create_match", arguments). Use the same
+arguments as the create_match root. The new handoffs are recorded in the
+callback result and can authenticate subsequent datagram roots. The handler
+does not execute the live lobby, its queue or its network sends.
+
 The production callback dispatcher detaches its current batch before
 invoking handlers outside the server lock. A callback action that queues a
 new callback leaves it for the next iteration or a later report_callbacks
@@ -49,7 +56,8 @@ are outside this scope.
 
 The v2 envelope and the existing datagram, tick and report_callbacks roots
 are unchanged. The manifest still rejects recordings from a different
-server model. Both profiles check root boundaries with the server stopped.
+server model, including older v2 recordings without the clock-ready
+observation. Both profiles check root boundaries with the server stopped.
 The registered-state profile also checks stored state at those boundaries.
 
 RecordingServerSession(..., verify_stored_state=False) keeps the inexpensive

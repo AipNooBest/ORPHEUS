@@ -8,7 +8,7 @@ from test_game_command_handoff import input_window
 from test_game_repeated_lifecycles import wire_frame
 from test_server_journal import MAP, FixedSource, Peer, SchedulerSource, pick
 
-from ow174.game import bodytrace, messages, movelog, world
+from ow174.game import bodytrace, messages, movelog, replay_values, world
 from ow174.game.bits import BitReader, BitWriter
 from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.commands import FIRE
@@ -24,7 +24,7 @@ from ow174.game.server import (
     TICK_SECONDS,
     GameServer,
 )
-from ow174.game.server_journal import RecordingServerSession, replay_server_session
+from ow174.game.server_journal import RecordingServerSession, _ReplaySession, replay_server_session
 
 ROOM = dataclasses.replace(MAP, team_sizes=(2, 1))
 OWNER = (1, "Clock", SOLDIER, 0, False)
@@ -43,7 +43,7 @@ class GlobalClockTests(unittest.TestCase):
             self.addCleanup(edit.stop)
 
     @staticmethod
-    def session(source=None, *, stored=False):
+    def session(source=None, *, stored=False, collision_provider=None):
         sent = []
 
         def send(data, address):
@@ -52,7 +52,9 @@ class GlobalClockTests(unittest.TestCase):
 
         session = RecordingServerSession(
             environment=FixedSource() if source is None else source,
-            collision_provider=StaticCollisionProvider(flat_world(0.0)),
+            collision_provider=(
+                StaticCollisionProvider(flat_world(0.0)) if collision_provider is None else collision_provider
+            ),
             sendto=send,
             verify_stored_state=stored,
         )
@@ -111,6 +113,61 @@ class GlobalClockTests(unittest.TestCase):
         self.assertEqual(sent, [])
         replay = replay_server_session(session.finish(), resolver=session.registry.resolve)
         self.assertTrue(replay["stored_state_verified"])
+
+    def test_scheduler_records_clock_ready_after_old_leave_then_replays_new_handoff(self):
+        class DistinctLoadStates(StaticCollisionProvider):
+            def poll(self, map_guid, name="", mode=None):
+                return dataclasses.replace(super().poll(map_guid, name, mode))
+
+        class RolloverSource(SchedulerSource):
+            handoff_times = iter((100.0, 160.03))
+
+            def wall_time(self, *, callsite):
+                if callsite == "server.handoff.deadline":
+                    return next(self.handoff_times)
+                return super().wall_time(callsite=callsite)
+
+        source = RolloverSource(
+            ("start", 10.0), ("timeout", 10.0), ("due", 10.020), ("next_tick", 10.020), ("tick", 160.01),
+            ("timeout", 10.020), ("due", 10.040), ("next_tick", 10.040), ("tick", 160.03),
+        )
+        session, sent = self.session(
+            source, stored=True, collision_provider=DistinctLoadStates(flat_world(0.0)),
+        )
+        old, = session.create_match(ROOM, [OWNER])
+        session.tick(100.0, missed=MAX_SIMULATION_TICK - FIRST_TICK)
+        args = {"game_map": dataclasses.asdict(ROOM), "players": [WAITING], "card": 0}
+        session.run_loop([None, None], callback_actions=[("clock_ready", None, "create_match", args)])
+        self.assertEqual(session.server.tick, FIRST_TICK)
+        self.assertEqual(sent, [])
+        (handoff, player, _), = session.server.handoffs.values()
+        self.assertNotEqual(handoff.conn, old.conn)
+        self.assertEqual(player.account_lo, WAITING[0])
+
+        peer = Peer(session, handoff, sent, ADDRESS)
+        peer.send(flags=SYN, now=160.04)
+        peer.send(now=160.04)
+        session.report_callbacks()
+        document = session.finish()
+        scheduler, = (row for row in document["roots"] if row["operation"] == "run_loop")
+        effects = [replay_values.decode(effect)[1] for effect in scheduler["effects"]]
+        self.assertEqual(
+            [
+                effect["kind"] for effect in effects
+                if effect["kind"] not in ("socket_receive", "socket_timeout")
+            ],
+            ["left", "clock_ready", "callback_action", "collision_poll", "callback_result", "socket_close"],
+        )
+        self.assertEqual(next(effect for effect in effects if effect["kind"] == "left")["player"],
+                         (old.match_id, 0))
+        result = next(effect["result"] for effect in effects if effect["kind"] == "callback_result")
+        self.assertEqual(result, [dataclasses.asdict(handoff)])
+        replay = _ReplaySession(document, session.registry.resolve)
+        self.assertTrue(replay.run()["stored_state_verified"])
+        for server in (session.server, replay.server):
+            self.assertEqual(server.handoffs, {})
+            self.assertEqual(set(server.clients), {handoff.conn})
+            self.assertTrue(server.clients[handoff.conn].open)
 
     def test_drain_delivers_reliable_leave_with_bad_world_queue_and_pending_handoff(self):
         late = 10.0 + 2 * CLOCK_DRAIN_TICKS * TICK_SECONDS
