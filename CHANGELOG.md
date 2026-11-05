@@ -429,3 +429,11 @@ This log records tested changes and their acceptance status. Entries are grouped
 - On original 104319 data, resolved 35 omitted definitions and 27 model records. The Practice Range gains 31 static placements and Kanezaka gains one. Found a previously missing hit for each of the four added definitions. Both original movement caches kept their hashes, and 3,000 movement-category queries kept their prior distances.
 - Passed 195 targeted tests with each runtime data pack, Ruff and Git diff checks. The final rebuild reproduced the validated cache hashes.
 - Attached child geometry, dynamic and server-generated objects, original ability filters and client acceptance remain open.
+
+#### Analytic static rays against round props
+
+- In expanded static ray scenes, intersect uniformly scaled sphere and capsule props against their authored round surfaces. Retain each prop's original mask and mode selection, and choose the closest hit across round props and triangles.
+- Resolve the first positive surface in range, including an exit for an origin inside the shape. Keep existing movement and combat queries on the legacy geometry.
+- Original Practice Range controls reproduce a sphere hit at 0.1549701543 m and remove a prism-only hit. On Practice Range and Kanezaka, 3,000 movement-category ray distances still match. All 95 original movement cache hashes matched after the local expanded builds.
+- Passed 199 targeted tests with each runtime data pack, Ruff and Git diff checks.
+- Existing ray caches retain the authored round primitives. Gameplay filter selection and original-client acceptance remain open.

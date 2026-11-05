@@ -47,6 +47,7 @@ from typing import Protocol
 
 from ow174.game import contacts, props
 from ow174.game.casc import CascError, RecordCatalog, Storage, game_root
+from ow174.game.static_ray import MIN_SURFACE_DISTANCE, round_hit
 from ow174.paths import COLLISION_CACHE_DIR, DATA_DIR, GAME_PATH_FILE
 
 log = logging.getLogger("ow174.game")
@@ -383,10 +384,19 @@ def engine_world(meshes, hulls, models=(), placements=(), groups=frozenset({0}))
     return contacts.StaticWorld(shapes)
 
 
+@dataclass(frozen=True)
+class _RoundProp:
+    a: tuple[float, float, float]
+    b: tuple[float, float, float]
+    radius: float
+    mask: int
+
+
 def probe_triangles(
-    meshes, hulls, models=(), placements=(), groups=frozenset({0}), *, prop_surfaces=False,
+    meshes, hulls, models=(), placements=(), groups=frozenset({0}), *,
+    prop_surfaces=False, round_props: list[_RoundProp] | None = None,
 ) -> tuple:
-    """The static query triangles as (9-tuples of vertices, masks, surfaces)."""
+    """Project static triangles and optionally collect uniform round props separately."""
     triangles, masks, surfaces = [], array("H"), array("H")
     for vertices, records in meshes:
         for a, b, c, _w0, _w1, _w2, mask, surface in records:
@@ -398,21 +408,38 @@ def probe_triangles(
             triangles.append((*a, *b, *c))
             masks.append(mask)
             surfaces.append(0)
-    shapes: dict[int, list] = {}
+    shapes: dict[tuple[int, bool], list] = {}
     for model, group, translation, scale, rotation in placements:
         if group not in groups:
             continue
-        if model not in shapes:
-            shapes[model] = [
+        analytic = round_props is not None and 0.0 < scale[0] == scale[1] == scale[2] < math.inf
+        key = model, analytic
+        if key not in shapes:
+            shapes[key] = [
                 (*triangle, shape[3][i][-1] if prop_surfaces and shape[0] == "mesh" else 0)
                 for shape in models[model]
+                if not (analytic and shape[0] in ("sphere", "capsule"))
                 for i, triangle in enumerate(props.shape_triangles(shape))
             ]
-        for a, b, c, mask, surface in shapes[model]:
+        for a, b, c, mask, surface in shapes[key]:
             corners = [props.place(p, translation, scale, rotation) for p in (a, b, c)]
             triangles.append(tuple(axis for corner in corners for axis in corner))
             masks.append(mask)
             surfaces.append(surface)
+        if analytic:
+            for shape in models[model]:
+                if shape[0] == "sphere":
+                    _, mask, a, radius = shape
+                    b = a
+                elif shape[0] == "capsule":
+                    _, mask, a, b, radius = shape
+                else:
+                    continue
+                round_props.append(_RoundProp(
+                    props.place(a, translation, scale, rotation),
+                    props.place(b, translation, scale, rotation),
+                    radius * scale[0], mask,
+                ))
     return triangles, masks, surfaces
 
 
@@ -663,6 +690,10 @@ class World(_TriangleScene):
 class RayWorld(_TriangleScene):
     """Explicit static query geometry from the core chunk and indexed static props."""
 
+    def __init__(self, triangles, masks=None, surfaces=None, name: str = "", *, round_props=()) -> None:
+        super().__init__(triangles, masks, surfaces, name)
+        self.round_props = tuple(round_props)
+
     @classmethod
     def load(cls, map_guid: int, mode: int | None = None) -> "RayWorld":
         """Load an expanded cache or report it unavailable before any query can return a miss."""
@@ -674,10 +705,26 @@ class RayWorld(_TriangleScene):
         except FileNotFoundError as error:
             raise CollisionError(f"no expanded ray geometry for map {map_guid:#x}") from error
         groups = _placement_groups(header, props.mode_identifiers(mode))
+        round_props: list[_RoundProp] = []
         triangles, masks, surfaces = probe_triangles(
-            meshes, hulls, models, placements, groups, prop_surfaces=True,
+            meshes, hulls, models, placements, groups, prop_surfaces=True, round_props=round_props,
         )
-        return cls(triangles, masks, surfaces, header.get("name", ""))
+        return cls(triangles, masks, surfaces, header.get("name", ""), round_props=round_props)
+
+    def cast_ray(self, origin, direction, length: float, category: int = MOVER) -> RayHit | None:
+        hit = super().cast_ray(origin, direction, length, category)
+        best = length if hit is None else hit.distance
+        for shape in self.round_props:
+            if not shape.mask & category:
+                continue
+            result = round_hit(origin, direction, best, shape.a, shape.b, shape.radius)
+            if result is not None:
+                distance, normal = result
+                if hit is None or distance < best:
+                    point = tuple(a + distance * axis for a, axis in zip(origin, direction, strict=True))
+                    hit = RayHit(distance, point, normal, shape.mask, 0)
+                    best = distance
+        return hit
 
 
 def _ray_triangle(ox, oy, oz, dx, dy, dz, t) -> float | None:
@@ -699,7 +746,7 @@ def _ray_triangle(ox, oy, oz, dx, dy, dz, t) -> float | None:
     if v < 0.0 or u + v > 1.0:
         return None
     hit = (e2x * qx + e2y * qy + e2z * qz) * inv
-    return hit if hit > 1e-6 else None
+    return hit if hit > MIN_SURFACE_DISTANCE else None
 
 
 def inside_xz(t: tuple, x: float, z: float) -> bool:

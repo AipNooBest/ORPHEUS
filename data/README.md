@@ -39,7 +39,7 @@ In the prepared research checkout, use the local 104319 installation to generate
 
 The tool reads the installation from `game_path.txt` or an executable path given with `--game`. It writes `0688.rays.col` and `0CD3.rays.col` beside the existing movement caches. Runtime preparation copies each selected map's optional ray cache into the external pack and records its SHA-256.
 
-Explicit static queries can use `collision.RayWorld.load(map_guid, mode_guid)`. It verifies the map and original chunk key, then selects props for the requested mode. A missing or mismatched cache produces a load error. Base coverage includes the core chunk and the supported static shapes in the existing prop index.
+Explicit static queries can use `collision.RayWorld.load(map_guid, mode_guid)`. It verifies the map and original chunk key, then selects props for the requested mode. A missing or mismatched cache produces a load error. Base coverage includes the core chunk and the supported static shapes in the existing prop index. Sphere and capsule props with positive uniform scale use analytic intersections. Nonuniformly scaled round props retain the existing triangle projection.
 
 For a wider static query, use PowerShell 7 and the built DataTool from OWLib revision `7afe5f52706e7002ed8c2717299cd60846f3fa3a`. List unindexed client-made root definitions, export their local records and build the selected ray caches.
 
