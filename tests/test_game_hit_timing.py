@@ -58,7 +58,9 @@ class HitTimingTests(unittest.TestCase):
 
     def test_catch_up_hits_keep_scheduled_frames_and_late_input_cannot_repeat_them(self):
         self.player.take_commands([self.fire(frame) for frame in (1001, 1002, 1040)])
-        expected = [(self.bot.entity, frame) for frame in (1001, 1007, 1014, 1021, 1028, 1035)]
+        # F1035 is the first neutral fallback frame. The round due later in
+        # that frame is canceled and the rifle goes through its restart delay.
+        expected = [(self.bot.entity, frame) for frame in (1001, 1007, 1014, 1021, 1028)]
         self.assertEqual(self.hits(), expected)
         health = self.fight.vitals[self.bot.entity].total
 
@@ -67,4 +69,6 @@ class HitTimingTests(unittest.TestCase):
         self.assertEqual(self.fight.vitals[self.bot.entity].total, health)
 
         self.player.take_commands([self.fire(1042)])
-        self.assertEqual(self.hits(), [*expected, (self.bot.entity, 1042)])
+        self.assertEqual(self.hits(), expected)
+        self.player.take_commands([self.fire(1045)])
+        self.assertEqual(self.hits(), [*expected, (self.bot.entity, 1045)])

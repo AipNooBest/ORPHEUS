@@ -21,7 +21,7 @@ from ow174.game.world import OP_CREATE, OP_DESTROY, EntityUpdate, Movement
 
 def client() -> Client:
     server = SimpleNamespace(environment=SystemEnvironment())
-    player = SimpleNamespace(name="Test", match=SimpleNamespace(bots=[]))
+    player = SimpleNamespace(name="Test", match=SimpleNamespace(bots=[], players=[]))
     return Client(server, ("127.0.0.1", 1), 1, None, player)
 
 
