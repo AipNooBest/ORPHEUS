@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from test_game_graph_analysis import make_graph, node, output
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ow174.game import bots, combat, observers, stats, world
@@ -16,6 +18,7 @@ from ow174.game.commands import FIRE, Command, read_commands
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
 from ow174.game.match import Match
 from ow174.game.script import expr, graph, runtime
+from ow174.game.script.bot import BotScript
 from ow174.game.script.decode import read_chunk
 from ow174.game.script.driver import BodyStream
 from ow174.game.statescript import chunk
@@ -253,6 +256,56 @@ class ProjectileTimingTests(unittest.TestCase):
         run.match.update(frame * combat.TICK, frame)
         self.assertEqual(rocket.flown, 4 * combat.TICK)
         self.assertEqual(vitals.total, 200.0)
+
+    def test_skipped_npc_frames_fire_before_a_lethal_projectile_and_stop_after_it(self):
+        def run_frames(advances, *, admitted):
+            run = Run(KANEZAKA_DM)
+            match = run.match
+            match.bots.clear()
+            match._pending_bot_scripts.clear()
+            run.step({})
+            fight = match.combat
+            player, = run.players
+            player.client = None
+            x, y, z = player.mover.position
+            bot = bots.Bot(bots.BOT_ENTITY, {
+                "hero": f"0x{SOLDIER:X}", "team": player.team, "position": (x, y, z + 2.5),
+                "rotation": (0, 0, 0, 1), "graphs": [f"0x{bots.FIRING:X}"],
+            }, {"name": "Firing bot", "body": "0x0400000000001403", "health": 200}, {})
+            definition = make_graph(0xF0FF, [
+                node(0, "STUStatescriptEntry", fields={"m_outPlug": output([1, "m_beginPlug"])}),
+                node(1, "STUStatescriptStateWait", state=0, fields={
+                    "m_timeout": {"$": "STUConfigVarFloat", "m_value": 0.032},
+                    "m_onFinishedPlug": output([2, "m_beginPlug"]),
+                }),
+                node(2, "STUStatescriptStateWeaponVolley", state=1, fields={
+                    "m_onFinishedPlug": output([1, "m_beginPlug"]),
+                }),
+            ], states=[1, 2], entries=[0])
+            with (
+                patch.object(graph, "entity_body", return_value={"graphs": [{"graph": definition.index}]}),
+                patch.object(graph, "graph", return_value=definition),
+            ):
+                bot.body_script = BotScript(
+                    bot.body, bot.hero, bot.entity, run.frame, match.game_map.mode_guid, 200,
+                )
+            match.bots.append(bot)
+            projectile = combat.Rocket(
+                player, player.team, fight._eye(player), (0.0, 0.0, 1.0), 50.0, 1.0, HitDef(250.0), None,
+                last_tick=run.frame if admitted else None,
+            )
+            fight.rockets.append(projectile)
+            with patch.object(fight, "_shoot") as shoot:
+                for advance in advances:
+                    frame = run.frame + advance
+                    match.update(frame * combat.TICK, frame)
+            fired = [call.args[4] // 16 - run.frame for call in shoot.call_args_list]
+            return fired, bot.dead, bot.body_script.frame - run.frame
+
+        continuous = run_frames(range(1, 9), admitted=True)
+        self.assertEqual(continuous, ([2], True, 3))
+        self.assertEqual(run_frames((8,), admitted=True), continuous)
+        self.assertEqual(run_frames((8,), admitted=False), ([2, 4, 6, 8], False, 8))
 
 
 class BotTests(unittest.TestCase):

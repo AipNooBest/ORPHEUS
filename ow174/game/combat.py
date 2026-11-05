@@ -76,6 +76,7 @@ EYE_CROUCHED = {0x04000000000003CF: 1.085}  # Soldier's m_816B830F (DATA); other
 EYE_CROUCHED_DEFAULT = 1.15
 HEAD_BELOW = 0.2  # m under the eye where the head starts (unverified)
 HISTORY = 64  # ticks of body positions kept for the shots' view time (about 1 s; unverified: retail's limit)
+NPC_CATCH_UP = 64  # at most about a second of NPC weapon and projectile simulation per update
 RANGE = 200.0  # m a hitscan shot reaches when its volley names none (unverified)
 RESPAWN = 10.0  # s a hero waits in the PvP modes (0F4A and 0EC2 send 06FD.025 {10}: DATA)
 PRACTICE_RESPAWN = 3.0  # s in the Practice Range (13C0 sends 06FD.025 {3}: DATA)
@@ -492,13 +493,22 @@ class Combat:
         other players' body frames only on the ticks that send (`frames`)."""
         if self.match.collision_world is None:
             return
-        self.now, self.tick = now, tick
+        first = tick
+        if self.tick and tick > self.tick + 1 and any(
+            bot.firing and not bot.dead and isinstance(bot.body_script, BotScript) for bot in self.match.bots
+        ):
+            first = max(self.tick + 1, tick - NPC_CATCH_UP + 1)
         for target in self._targets():
             history = self.history.setdefault(target.entity, deque(maxlen=HISTORY))
             history.append((tick, target.feet, target.height, target.eye))
-        for rocket in list(self.rockets):
-            self._fly(rocket)
-        self._bot_weapons(tick)
+        # Replay the retained combat frames using the most recent poses. Player input
+        # accepted just before the scheduler caught up joins only at the endpoint.
+        for at in range(first, tick + 1):
+            self.now, self.tick = now - (tick - at) * TICK, at
+            for rocket in list(self.rockets):
+                if at == tick or rocket.last_tick is not None:
+                    self._fly(rocket)
+            self._bot_weapons(at)
         self.projectiles.update(tick)
         self.match.deliver_body_messages()
         if frames:
@@ -594,7 +604,7 @@ class Combat:
         """Advance the weapon bodies of the map's firing bots and consume their volley reports."""
         for bot in self.match.bots:
             script = bot.body_script
-            if not bot.firing or bot.dead or not isinstance(script, BotScript):
+            if not bot.firing or bot.dead or not isinstance(script, BotScript) or script.frame > tick:
                 continue
             try:
                 snapshot = script.advance_live(tick, bot.position)
@@ -681,7 +691,8 @@ class Combat:
         critical = hit_y >= shown.feet[1] + shown.eye - HEAD_BELOW
         amount = direct.amount * direct.scale(t) * (direct.critical if critical else 1.0)
         self._damage(
-            shooter, target, amount, critical and direct.critical > 1.0, direct.loadout, shot_frame
+            shooter, target, amount, critical and direct.critical > 1.0, direct.loadout, shot_frame,
+            world_tick=self.tick if npc else None,
         )
 
     def _fly(self, rocket: Rocket) -> None:
@@ -719,7 +730,8 @@ class Combat:
         point = _along(rocket.position, rocket.direction, t)
         if struck is not None and rocket.direct is not None and rocket.direct.amount > 0.0:
             self._damage(
-                rocket.shooter, struck, rocket.direct.amount, False, rocket.direct.loadout, self.tick
+                rocket.shooter, struck, rocket.direct.amount, False, rocket.direct.loadout, self.tick,
+                world_tick=self.tick,
             )
         blast = rocket.blast
         if blast is None or blast.amount <= 0.0:
@@ -729,7 +741,10 @@ class Combat:
             distance = max(0.0, segment_distance(point, a, b) - target.radius)
             scalar = blast.splash(distance)
             if scalar > 0.0:
-                self._damage(rocket.shooter, target, blast.amount * scalar, False, blast.loadout, self.tick)
+                self._damage(
+                    rocket.shooter, target, blast.amount * scalar, False, blast.loadout, self.tick,
+                    world_tick=self.tick,
+                )
 
     def _landed(self, rocket: Rocket) -> None:
         """The projectile ended (hit, range, lifetime): the predicted one's release follows."""
@@ -773,7 +788,10 @@ class Combat:
 
     # --- damage and death --------------------------------------------------------------------------
 
-    def _damage(self, shooter, target: Target, amount: float, critical: bool, loadout, frame: int) -> None:
+    def _damage(
+        self, shooter, target: Target, amount: float, critical: bool, loadout, frame: int,
+        *, world_tick: int | None = None,
+    ) -> None:
         vitals = self.vitals_of(target)
         if vitals.dead or amount <= 0.0:
             return
@@ -792,7 +810,8 @@ class Combat:
         victim = target.owner
         if killed and isinstance(victim, bots.Bot):
             # The NPC death script owns its terminal health change and death event ordering.
-            self._bot_died(shooter, victim, critical, loadout)
+            tick = self.match.tick if world_tick is None else world_tick
+            self._bot_died(shooter, victim, critical, loadout, tick)
             return
         self._sync_body_health(victim, vitals)
         if killed:
@@ -838,8 +857,8 @@ class Combat:
             ASSISTS: (),
         }
 
-    def _bot_died(self, killer, bot: bots.Bot, critical: bool, loadout) -> None:
-        bot.died(self.tick)
+    def _bot_died(self, killer, bot: bots.Bot, critical: bool, loadout, tick: int) -> None:
+        bot.died(tick)
         self.respawns.append((self.now + BOT_RESPAWN, bot))
         if not isinstance(killer, bots.Bot):
             killer.stats.add(stats.ELIMINATIONS)
@@ -850,7 +869,9 @@ class Combat:
             return
         try:
             params = self._death_parameters(killer, critical, loadout)
-            event = script.die(self.match.tick, params, _source_entity(killer))
+            if isinstance(script, BotScript):
+                tick = max(tick, script.frame)
+            event = script.die(tick, params, _source_entity(killer))
         except Exception:
             bot.body_script = None
             log.exception("[game] %s: %s's body script failed on %X", self.match.label(), bot.name, DIED)
