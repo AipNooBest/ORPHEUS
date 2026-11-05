@@ -1,0 +1,191 @@
+Local game/jam replay model manifest v1 (M0.8/M0.9 building block)
+
+Purpose and API
+
+ow174/game/replay_manifest.py gives a journal a strict local model identity to put
+in a header. It fingerprints bytes, interpreter identity, dependency versions and
+explicit configuration. It does not load a recording, restore state, open a socket,
+start the game, read collision cache content or turn a partial journal into a full
+battle replay.
+
+  from ow174.paths import ROOT, DATA_DIR
+  from ow174.game.replay_manifest import (
+      runtime_configuration, capture_manifest, assert_compatible,
+  )
+
+  configuration = runtime_configuration(
+      quanta_us=16000,
+      run_options={"entry": "controlled-roots", "mode": "practice"},
+  )
+  local = capture_manifest(
+      root=ROOT, data_dir=DATA_DIR, configuration=configuration,
+  )
+  # Store local as a header value in the caller's journal.
+  # On replay, capture the current local model in the same manner:
+  assert_compatible(recorded_header["model_manifest"], local)
+
+Every capture requires explicit root, data_dir and configuration arguments. There
+is no fallback to ROOT/DATA_DIR if those arguments are invalid or files are absent.
+runtime_configuration requires both an explicitly selected positive quanta_us and
+a run_options dict. Options are supplied by the journal for its own controlled
+scenario; callers must keep passwords, handoff keys, profiles and local paths out
+of that mapping.
+
+capture_manifest(*, root, data_dir, configuration, runtime=None, dependencies=None)
+  returns a detached JSON-compatible dict with a SHA-256 seal. By default, runtime
+  reads the current Python identity and dependencies reads installed distribution
+  metadata. Supplying explicit runtime/dependencies replaces those reads completely
+  for fixture tests; empty/invalid values fail instead of triggering defaults.
+
+runtime_identity() returns the current interpreter's raw identity fields.
+dependency_versions() requires metadata for all three direct dependencies.
+runtime_configuration(*, quanta_us, run_options) returns detached raw Python values
+  for the declared runtime settings, retaining their types.
+manifest_digest(document) validates schema, canonical typed structure, sorted file
+  identities and the existing seal, then returns its verified digest. It does not
+  silently reseal a modified document.
+compare_manifests(expected, actual) validates both and returns ordered diagnostics:
+  {"path": logical_location, "kind": "missing" | "added" | "changed"}.
+assert_compatible(expected, actual) raises ManifestMismatch when they differ;
+  its differences attribute contains that diagnostic list. Invalid/unreadable
+  local input or malformed manifests raise ManifestError.
+
+Diagnostics contain logical paths and field names, not return values, profiles,
+key material or absolute checkout paths. An unreadable required file fails capture
+with its logical identity. Removing an ordinary .py produces a missing diagnostic
+against the earlier manifest; adding a .py produces an added diagnostic.
+
+Source coverage
+
+Each capture recursively enumerates every *.py under ow174/game and ow174/jam.
+This deliberately includes research/offline modules, replay modules and any new
+source file, rather than maintaining a fixed list that misses future additions.
+Also required: ow174/__init__.py, ow174/paths.py and requirements.txt.
+
+Both package roots and their __init__.py must exist. Symlinked package roots and
+symlinked files/paths escaping the declared source root fail. File identity uses
+sorted POSIX-style repository-relative names. Only raw byte length and SHA-256 of
+raw file bytes are included; Git status/revision, mtime, owner, absolute paths,
+__pycache__, bytecode, logs, profiles and other checkout files are not consulted.
+Changing line endings therefore changes a source fingerprint; touching a file or
+moving an identical checkout does not.
+
+This covers the current game/jam imports, including ow174.paths. It does not claim
+to fingerprint every source file in the lobby, catalog, launcher, dashboard or RPC
+services. User-provided callbacks are an external boundary: for example Match's
+skin_of defaults to game.match.no_skin, while a live lobby can inject
+lobby.server.Server.skin_of using a user's profile and Catalog. That callback's
+outputs/provider contract must be captured by the journal or a separate declared
+manifest; arbitrary callback code is not discovered by this source scanner.
+
+Required target-build data
+
+The following 11 files are read as exact bytes from the explicit data_dir and
+represented with logical data/<name> identities:
+
+  ai_spawners_174.json          game.bots
+  collision_keys_174.json       game.collision's map/CASC definition table
+  collision_props_174.json      game.props' identifier/shape definitions
+  game_graphs_174.json.gz       game.script.graph; graphs, bodies, resources
+  game_heroes_174.json          game.content's hero/body definitions
+  game_maps_174.json            game.content's map/spawn/mode definitions
+  game_movers_174.json          game.mover's target-build movement data
+  game_schemas_174.json         game.messages
+  game_stats_174.json           game.stats
+  schemas_174.json              jam.codec
+  statescript_codecs_174.json   game.script.codecs
+
+These are the current game/jam DATA_DIR readers, including tables used by optional
+paths; missing optional-path data is still an explicit capture failure. The GZ's
+compressed bytes are hashed, without decompression or semantic canonicalization.
+A changed JSON whitespace byte or GZ header byte intentionally changes identity.
+
+Files in data_dir are not swept indiscriminately. In particular, unrelated profile
+data and catalog/resource-key material are not read. game Match receives a skin
+callback; it does not itself load extracted_items.json or resource_keys_174.json.
+Catalog's items/events helpers and their data are outside this v1 scope. A journal
+that invokes those helpers as part of its local model must explicitly extend its
+manifest scope instead of claiming the 11-file set covers all lobby behavior.
+
+collision_keys/props define model inputs, not an actual World. This manifest does
+not read .col caches, installed CASC archives, selected collision bytes, loaded
+meshes/shapes, per-mode filtering or collision-provider readiness/results. A
+separate collision-content manifest is required for those. A matching source/table
+manifest alone cannot prove two matches used the same collision World.
+
+When new game/jam code reads another DATA_DIR file, its source identity will change,
+but the explicit required data set must also be extended in a reviewed schema/model
+update. v1 does not pretend to statically discover arbitrary dynamic file paths or
+caller-injected schemas/providers.
+
+Runtime and configuration coverage
+
+Target build: 1.74.0.0.104319.
+Python identity: sys.implementation.name, full Python version tuple, implementation
+version tuple, cache_tag, pointer width, machine architecture label, byte order and
+OS family. No executable path, hostname, environment dump, process id or timestamp
+is included.
+Critical direct dependency versions: cryptography, protobuf, websockets. Missing
+distribution metadata is fatal. requirements.txt's own bytes are also fingerprinted.
+These are version identities, not hashes of installed wheels, transitive libraries,
+OpenSSL binaries, OS/kernel files, CPU microcode or a complete environment image.
+
+The declared production module registry in _CONFIG_MODULES covers game model,
+physics, transport, VM, codec and typed replay limits. runtime_configuration takes
+all public uppercase numeric/None values in those modules, all MAX_*/ *_MAX and
+BUDGET-named values, and explicit mutable model controls. This includes:
+
+  match.HEALTH, BODY_SCRIPT_HEROES, SEND_EVERY
+  correction.CORRECTIONS, HEROES
+  match.RETAIL_QUANTA and TOURNAMENT_QUANTA, independently of run.quanta_us
+  script.runtime.EVENTS_PER_TIME, MAX_INSTANCE_UPDATES, MAX_COMPONENT_UPDATES,
+    MAX_SCRIPT_WORK, MAX_FOLLOW_DEPTH
+  script.expr.MAX_EXPRESSION_STEPS
+  script.driver.MAX_GAP, MAX_SHOTS, MAX_REPORTS, ULT_SECONDS, SETTLE_FRAMES
+  transport/command/codec MAX limits and replay_values.MAX_DEPTH/MAX_VALUES
+
+The required fields cannot disappear silently. Newly added runtime settings outside
+the declared registry need a reviewed registry/contract update; the corresponding
+source change is already visible in source hashes. This is not introspection of all
+live module objects, registries, monkeypatched functions or per-instance state.
+
+run.quanta_us records the selected scenario frequency. run.options records the
+caller's nonsecret scenario options, such as mode and controlled-entry selection.
+The manifest cannot infer omitted constructor options or future dynamic settings;
+the journal must declare them before taking its header.
+
+Typed canonical values and compatibility
+
+Every configuration/runtime/dependency value has an explicit type tag. None, bool,
+int, float, str, bytes, list, tuple, set, frozenset and string-keyed dict are supported.
+Integers use canonical signed hexadecimal text, including values larger than decimal
+conversion limits. Finite floats use exact big-endian IEEE-754 binary64 hex bits,
+including -0.0. Bytes use lowercase hex. Lists/tuples preserve order; sets/frozensets
+are sorted by canonical typed representation; dict keys are unique and sorted.
+Thus True, 1, 1.0, different float bits and different container types have distinct
+identities. Unsupported objects, nonfinite floats and malformed encodings fail.
+
+The top-level seal is SHA-256 over canonical JSON of all payload fields except the
+seal itself. It identifies content; it is not an authentication signature. Build,
+scope, file inventory/content, Python/dependency values and configuration all enter
+that seal. Comparing valid manifests reports specific logical locations rather than
+only an unexplained aggregate digest mismatch.
+
+The scanner captures disk bytes, not an atomically frozen process image. Stop model
+file mutation while constructing a header; use a fresh process after changing code
+or tables rather than treating an old imported module or decoded table cache as the
+new disk model. Loaded state/caches and root event order require separate journal
+capture and state validation.
+
+Verification
+
+  .venv/Scripts/python.exe -B -m unittest discover -s tests -p test_game_replay_manifest.py
+  .venv/Scripts/python.exe -m ruff check ow174/game/replay_manifest.py tests/test_game_replay_manifest.py
+
+Fourteen dedicated tests use explicit temporary roots/data/runtime/dependencies for
+byte changes, new/deleted source files, missing required tables, relocation/mtime,
+typed changes, invalid seals, dependency/Python differences and cross-process hash
+seeds. A current-repository coverage check verifies helpers/tables without reading
+collision contents. A real configuration check captures both quanta constants,
+mutable controls and VM limits without constructing a server. No game, UI, external
+service, collision loader or real user profile is started/read by these tests.
