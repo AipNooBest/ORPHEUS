@@ -585,9 +585,12 @@ class WeaponVolley(State):
         if self.instance.component.owner_dead:
             # unverified (PS4 build): a dead owner's volley shoots no more (allowShotsWhileDead: not read)
             return
-        fired = min(self.shots_planned(), self.shots_at(until - self.start - self.offset) + 1)
-        while self.reported < fired:
-            time = self.start + self.offset + shot_time(self.reported, self.rate)
+        start = self.start + self.offset
+        planned = self.shots_planned()
+        while self.reported < planned:
+            time = start + shot_time(self.reported, self.rate)
+            if time > until:
+                break
             self.instance.component.shots.append((self, self.reported, time))
             self.reported += 1
 
@@ -623,7 +626,7 @@ class WeaponVolley(State):
         return self.instance.find_var(*target) if target else None
 
     def shots_at(self, elapsed: int) -> int:
-        """Shots fired up to `elapsed` ms after the start, minus one (-1 before the start)."""
+        """The float-based shot index used by the ammunition output (-1 before the start)."""
         if elapsed < 0:
             return -1
         return math.floor(f32(f32(f32(elapsed) * MS) * self.rate))

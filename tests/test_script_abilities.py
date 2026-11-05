@@ -86,6 +86,33 @@ class SprintTests(unittest.TestCase):
         self.assertEqual(session.ability(SPRINT, 1).flags & RUNNING, 0)
 
 
+class RifleTests(unittest.TestCase):
+    def test_reports_every_round_at_its_scheduled_time(self):
+        session = Session()
+        body = session.body
+        component = body.component
+        first_frame = body.frame + 1
+        first_time = first_frame * component.frame_ms
+        # 0254 holds one volley at nine shots per second until its 30 rounds run out.
+        delays = [(1000 * shot + 4) // 9 for shot in range(30)]
+        reports = []
+        for _ in range(delays[-1] // component.frame_ms + 5):
+            session.run(1, FIRE)
+            for volley, shot, when in component.shots:
+                self.assertEqual((volley.instance.id, volley.index), (RIFLE, 10))
+                reports.append((shot, when - first_time, body.frame))
+            component.shots.clear()
+
+        self.assertEqual(session.var(RIFLE, 53), 0)
+        self.assertEqual(session.client.vars[(RIFLE, 53)], 0)
+        self.assertFalse(session.ability(RIFLE, 10).active)
+        self.assertEqual(len(reports), 30)
+        self.assertEqual(reports, [
+            (shot, delay, first_frame + delay // component.frame_ms)
+            for shot, delay in enumerate(delays)
+        ])
+
+
 class CooldownTests(unittest.TestCase):
     def test_helix_rockets_start_their_cooldown(self):
         session = Session()
