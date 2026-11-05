@@ -6,7 +6,9 @@ bodies) and keeps every graph reachable from the 32 hero bodies (their statescri
 graphs and their weapon scripts) and from the controller, hero select, HUD and mode graphs, following every
 graph reference (a GUID of type 01B anywhere in a kept graph).
 
-    py tools/extract_game_graphs.py --xml <XML dump folder> --owlib <OWLib checkout>
+    py -X utf8 tools/extract_game_graphs.py --xml <XML dump folder> --owlib <OWLib checkout>
+
+Additional entity definitions can be added to a separate bundle with repeated --entity options.
 
 Per graph it keeps what a runtime needs and drops the editor layout (positions, comments, display names,
 colours). The file format is described in ow174/game/script/graph.py, which reads it.
@@ -384,8 +386,8 @@ def graph_ref(xml: StuXml, element: ET.Element, name: str) -> int | None:
     return guid_index(ref.get("GUID")) if ref is not None else None
 
 
-def body_record(path: Path, enums: EnumTables, hero: str, name: str) -> tuple[dict, set[int]]:
-    """A hero body (003): its statescript component's initial graphs in order, with their schema
+def body_record(path: Path, enums: EnumTables, hero: str | None, name: str) -> tuple[dict, set[int]]:
+    """A body definition (003): its statescript component's initial graphs in order, with their schema
     overrides, and its weapon component's scripts."""
     xml = StuXml(path, enums)
     graphs, weapons, manager = [], [], None
@@ -406,7 +408,7 @@ def body_record(path: Path, enums: EnumTables, hero: str, name: str) -> tuple[di
     return record, {graph for graph in used if graph is not None}
 
 
-def collect(xml_dir: Path, enums: EnumTables) -> dict:
+def collect(xml_dir: Path, enums: EnumTables, entity_indexes: tuple[int, ...] = ()) -> dict:
     heroes = json.loads(HEROES.read_text(encoding="utf-8"))
     bodies, reason, queue = {}, {}, []
     for hero, entry in heroes.items():
@@ -416,6 +418,13 @@ def collect(xml_dir: Path, enums: EnumTables) -> dict:
         bodies[f"0x{body:016X}"] = record
         for graph in sorted(used):
             queue.append((graph, entry["name"]))
+    entities = {}
+    for index in sorted(set(entity_indexes)):
+        path = xml_dir / "003" / f"{index:012X}.003.xml"
+        name = f"entity {index:04X}"
+        record, used = body_record(path, enums, None, name)
+        entities[f"0x{0x0400000000000000 | index:016X}"] = record
+        queue.extend((graph, name) for graph in sorted(used))
     queue += list(ROOT_GRAPHS.items())
     graphs, missing = {}, set()
     while queue:
@@ -432,7 +441,7 @@ def collect(xml_dir: Path, enums: EnumTables) -> dict:
         for problem in sorted(set(xml.problems)):
             print(f"  {index:04X}: {xml.problems.count(problem)} x {problem}")
         queue += [(child, why) for child in sorted(xml.graph_refs())]
-    return {
+    data = {
         "version": 1,
         "roots": {"bodies": sorted(bodies), "graphs": sorted(ROOT_GRAPHS)},
         "bodies": bodies,
@@ -440,15 +449,30 @@ def collect(xml_dir: Path, enums: EnumTables) -> dict:
         "graphs": [graphs[index] for index in sorted(graphs)],
         "_reason": reason,
     }
+    if entities:
+        data["entities"] = entities
+    return data
+
+
+def entity_index(text: str) -> int:
+    if not re.fullmatch(r"[0-9a-fA-F]{1,12}", text):
+        raise argparse.ArgumentTypeError("use a hexadecimal 003 asset index such as 1403")
+    return int(text, 16)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--xml", type=Path, required=True, help="DataTool XML dump")
     parser.add_argument("--owlib", type=Path, required=True, help="the OWLib checkout that made the dump")
+    parser.add_argument("--entity", action="append", type=entity_index, default=[],
+                        help="additional 003 asset index such as 1403, repeatable")
+    parser.add_argument("--output", type=Path, help="destination bundle")
     args = parser.parse_args()
+    output = args.output or OUT
+    if args.entity and output.resolve() == OUT.resolve():
+        parser.error("--entity requires --output outside the canonical hero bundle")
     enums = EnumTables(args.owlib / "TankLib" / "STU" / "Types")
-    data = collect(args.xml, enums)
+    data = collect(args.xml, enums, tuple(args.entity))
     for where, count in sorted(enums.missed.items()):
         print(f"  enum value without a member: {where} x{count}")
     reason = data.pop("_reason")
@@ -460,10 +484,11 @@ def main() -> None:
     if data["missing"]:
         print("referenced but not in the dump: " + " ".join(f"{index:04X}" for index in data["missing"]))
     text = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
-    OUT.write_bytes(gzip.compress(text.encode("utf-8"), compresslevel=9, mtime=0))
+    output.write_bytes(gzip.compress(text.encode("utf-8"), compresslevel=9, mtime=0))
     nodes = sum(len(graph["nodes"]) for graph in data["graphs"])
-    print(f"{len(data['graphs'])} graphs, {nodes} nodes, {len(data['bodies'])} bodies -> {OUT}")
-    print(f"{OUT.stat().st_size / 1e6:.2f} MB ({len(text) / 1e6:.1f} MB of JSON)")
+    print(f"{len(data['graphs'])} graphs, {nodes} nodes, {len(data['bodies'])} hero bodies, "
+          f"{len(data.get('entities', {}))} additional entity definitions -> {output}")
+    print(f"{output.stat().st_size / 1e6:.2f} MB ({len(text) / 1e6:.1f} MB of JSON)")
 
 
 if __name__ == "__main__":

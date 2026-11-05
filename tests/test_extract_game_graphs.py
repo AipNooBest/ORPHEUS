@@ -4,9 +4,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from tools import extract_game_graphs as extractor
 from tools.extract_game_graphs import EnumTables, GraphXml, scalar
 
 INPUT = (
@@ -92,6 +94,54 @@ class LinkEvidenceTests(unittest.TestCase):
         graph, record = self.read(input_xml="")
         self.assertEqual(record["nodes"][0]["fields"]["m_subgraphPlug"]["links"], [[None, None]])
         self.assertEqual(graph.problems, ["a link without an input plug (link_id=1491)"])
+
+
+class EntityRootTests(unittest.TestCase):
+    def test_optional_entity_roots_preserve_initial_order_and_follow_shared_graph_references(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "003").mkdir()
+            (root / "01B").mkdir()
+            heroes = root / "heroes.json"
+            heroes.write_text("{}", encoding="utf-8")
+            namespace = 'xmlns:dragon="https://yretenai.com/dragonml/v1" xmlns:tank="urn:test:tank"'
+            (root / "003/000000001403.003.xml").write_text(f"""
+                <STUEntityDefinition {namespace}>
+                  <STUStatescriptComponent>
+                    <dragon:array dragon:name="m_B634821A">
+                      <GraphDefinition>
+                        <tank:ref dragon:name="m_graph" GUID="000000000BE2.01B" />
+                      </GraphDefinition>
+                      <GraphDefinition>
+                        <tank:ref dragon:name="m_graph" GUID="000000000033.01B" />
+                      </GraphDefinition>
+                    </dragon:array>
+                  </STUStatescriptComponent>
+                </STUEntityDefinition>
+                """, encoding="utf-8")
+            (root / "01B/000000000BE2.01B.xml").write_text(f"""
+                <STUStatescript {namespace}>
+                  <tank:ref dragon:name="m_child" GUID="000000000C18.01B" />
+                </STUStatescript>
+                """, encoding="utf-8")
+            for index in (0x0033, 0x0C18):
+                (root / f"01B/{index:012X}.01B.xml").write_text("<STUStatescript />", encoding="utf-8")
+
+            with (
+                patch.object(extractor, "HEROES", heroes),
+                patch.object(extractor, "ROOT_GRAPHS", {0x33: "base"}),
+            ):
+                baseline = extractor.collect(root, EnumTables(root))
+                extended = extractor.collect(root, EnumTables(root), (0x1403, 0x1403))
+
+        self.assertNotIn("entities", baseline)
+        self.assertEqual(extended["bodies"], baseline["bodies"])
+        self.assertEqual(extended["roots"], baseline["roots"])
+        self.assertEqual([item["index"] for item in extended["graphs"]], [0x0033, 0x0BE2, 0x0C18])
+        self.assertEqual(extended["missing"], [])
+        entity, = extended["entities"].values()
+        self.assertEqual([item["graph"] for item in entity["graphs"]], [0x0BE2, 0x0033])
+        self.assertIsNone(entity["hero"])
 
 
 class NumericScalarTests(unittest.TestCase):
