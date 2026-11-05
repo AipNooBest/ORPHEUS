@@ -20,6 +20,7 @@ from ow174.game.commands import CROUCH, JUMP, Command
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
 from ow174.game.match import Match
 from ow174.game.mover import Mover, f32, mover_data
+from ow174.game.script.decode import read_chunk
 from ow174.game.world import NO_INPUT, OP_CREATE, EntityUpdate, Movement
 
 TICK = 0.016
@@ -157,6 +158,51 @@ class CadenceTests(unittest.TestCase):
         self.assertEqual([speeds[frame] for frame in range(7039, 7043)], [5.5, 5.5, 8.1396484375, 8.25])
         (record,) = self.own(7049)
         self.assertEqual(math.hypot(record["velocity"][0], record["velocity"][2]), 8.25)
+
+    def test_sprint_through_a_command_gap_matches_the_movers_fallback_inputs(self):
+        control = self.match.add_player(2, "Control", SOLDIER, 0, False)
+        control.has_body = True
+        control.spawn = self.player.spawn
+        control.mover = control.new_mover()
+        self.match.start_body_script(control, EntityUpdate(control.body, OP_CREATE))
+        control.body_script.create_arrived = True
+
+        start = [Command(frame) for frame in range(7000, 7030)]
+        start += [Command(frame, forward=127, buttons=SHIFT if frame == 7040 else 0,
+                          action=2 if frame == 7049 else 0) for frame in range(7030, 7050)]
+        for player in (self.player, control):
+            player.take_commands(start)
+            for _ in range(2):  # ACK the full and first owner frame while Sprint is running
+                [update] = player.body_script.frames()
+                player.body_script.stream.arrived(update.chunk_last)
+
+        final = Command(7090, forward=127)
+        # Mover repeats the last continuous input 32 times, then steps eight neutral frames.
+        control.take_commands([Command(frame, forward=127) for frame in range(7050, 7082)]
+                              + [Command(frame) for frame in range(7082, 7090)] + [final])
+        script = self.player.body_script
+        with mock.patch.object(script, "command", wraps=script.command) as run_script:
+            self.player.take_commands([final])
+        with self.subTest(channel="statescript inputs"):
+            self.assertEqual([call.args[0] for call in run_script.call_args_list], list(range(7050, 7091)))
+            self.assertTrue(all(call.args[2] == 0 for call in run_script.call_args_list))
+
+        with self.subTest(channel="movement correction"):
+            [actual] = self.own(7090)
+            expected = read(correction.own_record(control, 7090).movement, 7090)
+            self.assertEqual(actual, expected)
+            self.assertEqual(actual["frame"], 7090)
+
+        for player in (self.player, control):
+            with self.subTest(channel="owner statescript", player=player.name):
+                script = player.body_script
+                [update] = script.frames()
+                known = {number: entry[0] for number, entry in script.stream.base.instances.items()}
+                sprint = next(number for number, index in known.items() if index == 0x0255)
+                frame = read_chunk(update.chunk.getvalue(), update.chunk.count, known)
+                self.assertEqual((frame.owner, frame.cmfd), (True, 7090))
+                instance = frame.instances.get(sprint)
+                self.assertEqual(instance.vars.get(699) if instance else None, (0, ()))
 
 
 if __name__ == "__main__":

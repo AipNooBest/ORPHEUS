@@ -291,16 +291,27 @@ class Player:
             if self.has_body:
                 dead = self.match.combat.is_dead(self)
                 if not dead:  # a dead body lies where it fell
-                    self.mover.step(command, seconds, self.match.tick)
+                    self.mover.step(
+                        command, seconds, self.match.tick,
+                        after_missing=self._replay_body_frame if self.body_script is not None else None,
+                    )
                 if self.body_script is not None:
                     self.match.body_command(self, command)
                     self.match.combat.command(self, command)
                 # The movement mods the statescript has on act on the mover from the next frame on.
-                script = self.body_script
-                self.mover.track_mods(statescript_mods(script.component) if script else {}, command.frame)
+                self._track_body_mods(command.frame)
         if movelog.ENABLED:
             movelog.snapshots(self)
         return boundary
+
+    def _replay_body_frame(self, command: Command) -> None:
+        if self.body_script is not None:
+            self.match.body_command(self, command)
+        self._track_body_mods(command.frame)
+
+    def _track_body_mods(self, frame: int) -> None:
+        script = self.body_script
+        self.mover.track_mods(statescript_mods(script.component) if script else {}, frame)
 
     def new_body(self) -> None:
         """The next body id, at the spawn point, where the new body is created. Ids cycle through the

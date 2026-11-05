@@ -56,6 +56,7 @@ import math
 import struct
 import threading
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, fields, replace
 from functools import cache
 
@@ -589,16 +590,23 @@ class Mover:
 
     # ---- the tick
 
-    def step(self, command: Command, seconds: float, tick: int = 0) -> None:
+    def step(
+        self, command: Command, seconds: float, tick: int = 0,
+        *, after_missing: Callable[[Command], None] | None = None,
+    ) -> None:
         """One tick per command frame. Frames that never arrived are run first: the client ran them, most
         likely with the same keys (the last command again, and from the 33rd
-        missing one without throttles and buttons)."""
+        missing one without throttles and buttons). A body script can follow each missing movement step
+        to keep its modifiers aligned with the fallback input."""
         last = self.last_command
         if last is not None and 1 < command.frame - last.frame <= 2 * REPEAT:
             for frame in range(last.frame + 1, command.frame):
                 if frame - last.frame > REPEAT:
                     last = Command(last.frame, yaw=last.yaw, pitch=last.pitch)
-                self._tick(replace(last, frame=frame), seconds, tick)
+                missing = replace(last, frame=frame, action=0)
+                self._tick(missing, seconds, tick)
+                if after_missing is not None:
+                    after_missing(missing)
         self.last_command = command
         self._tick(command, seconds, tick)
 
