@@ -339,4 +339,5 @@ This log records tested changes and their acceptance status. Entries are grouped
 
 - Document the supported build, known limits and evidence behind the current server behavior. Publish the M0–M6 roadmap and explain how developers, researchers and players can contribute.
 - Add GitHub forms for bugs, feature requests and gameplay verification, plus a pull request checklist for testing, redaction and AI-assisted changes. Preserve contributor authorship through the audited publication workflow.
-- Add a public source workflow for Windows, Python 3.12 and Node.js 24. The source-only checkout passed Ruff, 43 Python tests and two JavaScript tests without runtime data. Prepared-data regression and original-client acceptance remain separate.
+- Add a public source workflow for Windows, Python 3.12 and Node.js 24. The current source-only selection runs Ruff, 51 Python tests and two JavaScript tests without runtime data. Prepared-data regression and original-client acceptance remain separate.
+- Resolve the graph export test's temporary repository path to match the real CLI, including on Windows runners that supply an 8.3 short path.

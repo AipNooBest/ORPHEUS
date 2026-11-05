@@ -207,7 +207,7 @@ class SpawnerRootTests(unittest.TestCase):
                 "--ai-spawners", str(self.spawners), "--output", str(output)]
         errors = io.StringIO()
         with (
-            patch.object(extractor, "ROOT", self.root),
+            patch.object(extractor, "ROOT", self.root.resolve()),
             patch.object(sys, "argv", argv),
             redirect_stderr(errors),
             self.assertRaises(SystemExit) as stopped,
