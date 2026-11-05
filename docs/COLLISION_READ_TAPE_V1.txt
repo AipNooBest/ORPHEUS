@@ -1,4 +1,4 @@
-Collision provider read tape v1 — explicit in-memory external-read boundary (M0.8)
+Collision provider read tape v2 with v1 replay support (M0.8)
 
 Scope and use
 
@@ -47,7 +47,7 @@ Tape format
 
 The detached Python value has exactly these fields:
 
-  schema: "ow174.collision-read-tape.v1"
+  schema: "ow174.collision-read-tape.v2"
   build: "1.74.0.0.104319"
   scope: "collision-provider-reads-only"
   reads: list of rows in actual poll invocation order
@@ -57,6 +57,7 @@ Each row has exactly:
 
   seq: an exact integer, from 0 without gaps
   operation: "poll"
+  state_ref: exact integer identifying a LoadState object by first observation
   key: {
     "map_guid": uint64,
     "name": exact supplied text, including an empty string,
@@ -76,6 +77,20 @@ wrong sequence numbers, unknown states, malformed descriptors and missing or
 incomplete end markers are rejected. All rows are validated during replay
 construction and copied into immutable internal records. Later edits to the
 original dict cannot alter a replay.
+
+Recording numbers distinct LoadState objects from zero in first-observation
+order. A row can introduce the next reference or repeat an earlier one with the
+same status, error and asset descriptor. Distinct objects with equal results
+retain separate references. Replay returns the same LoadState object for a
+repeated reference, including across match constructors that share a provider.
+It resolves and verifies the World on every ready read. When a resolver returns
+a different but equivalent World for an existing reference, replay also verifies
+the World retained by the first LoadState before returning it.
+
+Standalone v1 tapes use the schema "ow174.collision-read-tape.v1" and have no
+state_ref fields. Replay still constructs one LoadState per v1 poll. Those
+tapes cannot establish whether two recorded polls shared a LoadState. An outer
+server journal separately checks its source and data manifests.
 
 The derived identifiers come from the current props.mode_identifiers(mode). Both
 recording and replay compare them along with every supplied argument. Recording
@@ -201,8 +216,10 @@ altered assets, rejected flat substitution, field-level geometry changes and
 legitimate cache warming. Real-map verification is a separate read-only report;
 unit tests use explicitly constructed geometry and never start a game or socket.
 
-Validation at this implementation boundary: 16 tape tests and 12 fingerprint
-tests passed. work/collision_fingerprint_real_cache_validation.json separately
+Initial v1 validation included 16 tape tests and 12 fingerprint tests.
+The v2 tests also verify shared references in two registered production match
+roots, distinct equal states, and repeat World verification.
+work/collision_fingerprint_real_cache_validation.json separately
 records read-only checks of 0688, 07E2 and 070D v5 caches (the last includes Sphere
 props). Cold, warmed and independently loaded copies had identical descriptors;
 changing shape.order changed the digest and restoring it restored the identity.

@@ -43,7 +43,7 @@ class GlobalClockTests(unittest.TestCase):
             self.addCleanup(edit.stop)
 
     @staticmethod
-    def session(source=None, *, stored=False, collision_provider=None):
+    def session(source=None, *, stored=False):
         sent = []
 
         def send(data, address):
@@ -52,9 +52,7 @@ class GlobalClockTests(unittest.TestCase):
 
         session = RecordingServerSession(
             environment=FixedSource() if source is None else source,
-            collision_provider=(
-                StaticCollisionProvider(flat_world(0.0)) if collision_provider is None else collision_provider
-            ),
+            collision_provider=StaticCollisionProvider(flat_world(0.0)),
             sendto=send,
             verify_stored_state=stored,
         )
@@ -115,10 +113,6 @@ class GlobalClockTests(unittest.TestCase):
         self.assertTrue(replay["stored_state_verified"])
 
     def test_scheduler_records_clock_ready_after_old_leave_then_replays_new_handoff(self):
-        class DistinctLoadStates(StaticCollisionProvider):
-            def poll(self, map_guid, name="", mode=None):
-                return dataclasses.replace(super().poll(map_guid, name, mode))
-
         class RolloverSource(SchedulerSource):
             handoff_times = iter((100.0, 160.03))
 
@@ -131,9 +125,7 @@ class GlobalClockTests(unittest.TestCase):
             ("start", 10.0), ("timeout", 10.0), ("due", 10.020), ("next_tick", 10.020), ("tick", 160.01),
             ("timeout", 10.020), ("due", 10.040), ("next_tick", 10.040), ("tick", 160.03),
         )
-        session, sent = self.session(
-            source, stored=True, collision_provider=DistinctLoadStates(flat_world(0.0)),
-        )
+        session, sent = self.session(source, stored=True)
         old, = session.create_match(ROOM, [OWNER])
         session.tick(100.0, missed=MAX_SIMULATION_TICK - FIRST_TICK)
         args = {"game_map": dataclasses.asdict(ROOM), "players": [WAITING], "card": 0}
@@ -149,6 +141,7 @@ class GlobalClockTests(unittest.TestCase):
         peer.send(now=160.04)
         session.report_callbacks()
         document = session.finish()
+        self.assertEqual([row["state_ref"] for row in document["collision"]["reads"]], [0, 0])
         scheduler, = (row for row in document["roots"] if row["operation"] == "run_loop")
         effects = [replay_values.decode(effect)[1] for effect in scheduler["effects"]]
         self.assertEqual(

@@ -14,13 +14,17 @@ from ow174.game import props
 from ow174.game.collision import LoadState, StaticCollisionProvider, World, flat_world
 from ow174.game.collision_fingerprint import WorldRegistry
 from ow174.game.collision_tape import (
+    SCHEMA,
+    SCHEMA_V1,
     SCOPE,
     CollisionTapeError,
     RecordingCollisionProvider,
     ReplayCollisionProvider,
 )
-from ow174.game.content import PRACTICE_RANGE
+from ow174.game.content import PRACTICE_RANGE, SOLDIER
+from ow174.game.environment import SystemEnvironment
 from ow174.game.match import Match
+from ow174.game.server_journal import RecordingServerSession, _ReplaySession
 
 
 def wall_world():
@@ -79,6 +83,50 @@ class CollisionTapeTests(unittest.TestCase):
         self.assertIs(actual[1].world, world)
         self.assertIs(actual[3].world, world)
         self.assertEqual((replay.position, replay.remaining), (4, 0))
+
+    def test_v2_replays_identity_for_repeated_states_without_interning_equal_states(self):
+        pending = LoadState("pending")
+        ready = LoadState("ready", wall_world())
+        equal_ready = dataclasses.replace(ready)
+        unavailable = LoadState("unavailable", error="no chunk")
+        tape, _ = recorded(pending, ready, equal_ready, pending, ready, unavailable, unavailable)
+        self.assertEqual(tape["schema"], SCHEMA)
+        self.assertEqual([row["state_ref"] for row in tape["reads"]], [0, 1, 2, 0, 1, 3, 3])
+
+        resolver = mock.Mock(side_effect=lambda asset: wall_world())
+        replay = ReplayCollisionProvider(tape, resolver=resolver)
+        states = [replay.poll(1) for _ in tape["reads"]]
+        replay.assert_complete()
+        self.assertIs(states[0], states[3])
+        self.assertIs(states[1], states[4])
+        self.assertIsNot(states[1], states[2])
+        self.assertIs(states[5], states[6])
+        self.assertEqual(resolver.call_count, 3)
+
+    def test_v1_replays_repeated_results_as_separate_load_states(self):
+        ready = LoadState("ready", wall_world())
+        tape, registry = recorded(ready, ready)
+        tape["schema"] = SCHEMA_V1
+        for read in tape["reads"]:
+            del read["state_ref"]
+        replay = ReplayCollisionProvider(tape, resolver=registry.resolve)
+        first, second = replay.poll(1), replay.poll(1)
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        replay.assert_complete()
+
+    def test_repeated_state_verifies_original_world_even_if_resolver_returns_fresh_copy(self):
+        ready = LoadState("ready", wall_world())
+        tape, _ = recorded(ready, ready)
+        replay = ReplayCollisionProvider(tape, resolver=lambda asset: wall_world())
+        first = replay.poll(1)
+        first.world.data[0] += 0.125
+        with self.assertRaisesRegex(CollisionTapeError, "World resolution failed") as failure:
+            replay.poll(1)
+        self.assertEqual(replay.position, 1)
+        with self.assertRaises(CollisionTapeError) as completion:
+            replay.assert_complete()
+        self.assertIs(failure.exception, completion.exception)
 
     def test_detached_exports_and_replay_rows_do_not_share_mutable_tape_values(self):
         tape, registry = recorded(LoadState("ready", wall_world()))
@@ -289,6 +337,9 @@ class CollisionTapeTests(unittest.TestCase):
         change(["end", "extra"], 1)
         change(["reads", 0, "seq"], False)
         change(["reads", 0, "operation"], "world_for")
+        change(["reads", 0, "state_ref"], False)
+        change(["reads", 0, "state_ref"], 1)
+        change(["reads", 0, "state_ref"], -1)
         change(["reads", 0, "key", "map_guid"], True)
         change(["reads", 0, "key", "mode"], False)
         change(["reads", 0, "key", "name"], None)
@@ -309,6 +360,13 @@ class CollisionTapeTests(unittest.TestCase):
             with self.subTest(malformed=malformed), self.assertRaises(CollisionTapeError):
                 ReplayCollisionProvider(malformed, resolver=registry.resolve)
 
+    def test_reused_state_reference_cannot_change_result(self):
+        tape, registry = recorded(LoadState("unavailable", error="first"),
+                                  LoadState("unavailable", error="second"))
+        tape["reads"][1]["state_ref"] = tape["reads"][0]["state_ref"]
+        with self.assertRaisesRegex(CollisionTapeError, "state reference changed result"):
+            ReplayCollisionProvider(tape, resolver=registry.resolve)
+
     def test_shared_provider_is_usable_by_real_match_constructors_without_default_changes(self):
         world = wall_world()
         registry = WorldRegistry()
@@ -324,6 +382,27 @@ class CollisionTapeTests(unittest.TestCase):
         for first, second in zip(original, repeated, strict=True):
             self.assertIs(first.collision_world, world)
             self.assertIs(second.collision_world, world)
+
+    def test_shared_load_state_replays_two_registered_matches(self):
+        world = wall_world()
+        game_map = dataclasses.replace(
+            PRACTICE_RANGE, name="controlled shared collision state", map_guid=0x0800000000FFEE00,
+            placeables=(),
+        )
+        session = RecordingServerSession(
+            environment=SystemEnvironment(), collision_provider=StaticCollisionProvider(world),
+            verify_stored_state=True,
+        )
+        with mock.patch("socket.socket", side_effect=AssertionError("must not create a socket")):
+            session.create_match(game_map, [(1, "First", SOLDIER, 0, False)])
+            session.create_match(game_map, [(2, "Second", SOLDIER, 0, False)])
+            first, second = session.server.matches
+            self.assertIs(first.collision_state, second.collision_state)
+            replay = _ReplaySession(session.finish(), session.registry.resolve)
+            self.assertTrue(replay.run()["stored_state_verified"])
+        first, second = replay.server.matches
+        self.assertIs(first.collision_state, second.collision_state)
+        self.assertIs(first.collision_world, world)
 
 
 if __name__ == "__main__":
