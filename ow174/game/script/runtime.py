@@ -24,7 +24,6 @@ Node classes (nodes.py) subclass State and register their action handlers here.
 """
 
 import bisect
-import itertools
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -55,6 +54,32 @@ MESSAGE_ENTRIES = {"STUStatescriptEntryGameMessage"}
 
 class ScriptBudgetError(RuntimeError):
     """The component could not complete its simulation within a work/recursion limit."""
+
+
+class EventSequence:
+    """The next FIFO sequence number, observable without advancing the iterator."""
+
+    __slots__ = ("_next_value",)
+
+    def __init__(self, start: int = 0) -> None:
+        if type(start) is not int or start < 0:
+            raise ValueError("event sequence start must be a nonnegative integer")
+        self._next_value = start
+
+    @property
+    def next_value(self) -> int:
+        return self._next_value
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> int:
+        value = self._next_value
+        self._next_value += 1
+        return value
+
+    def __repr__(self) -> str:
+        return f"EventSequence(next_value={self._next_value})"
 
 
 def state_class(*names: str):
@@ -266,7 +291,7 @@ class Component:
         self.held: list[int] = []  # logical buttons held down, in press order
         self.button = NO_BUTTON  # the button of the edge being handled
         self.disabled: dict[int, list[State]] = {}  # button -> active DisableLogicalButton states
-        self.seq = itertools.count()
+        self.seq = EventSequence()
         self.next_id = 1
         self.destroyed: list[Instance] = []
         self.shots: list = []  # (volley state, shot number, time) of the shots fired, for combat.py

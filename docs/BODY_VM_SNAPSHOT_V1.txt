@@ -1,0 +1,331 @@
+Body VM storage snapshot v1 — explicit offline inspection boundary
+Target build: 1.74.0.0.104319
+
+Purpose and API
+
+ow174/game/body_vm_snapshot.py exports the complete supported stored representation
+of a body statescript VM. This is an explicit, detached snapshot for inspection,
+comparison and hashing. Nothing captures by default or starts a server, socket,
+asset loader, game client or UI.
+
+  export_body_vm(script) -> dict
+  export_component_vm(component, *, extra_roots=()) -> dict
+  export_component_vm_with_identities(component, *, extra_roots=()) -> (dict, tuple)
+  snapshot_digest(document) -> str
+  BodyVMSnapshotError
+
+export_body_vm accepts an exact BodyScript and includes its Component, BodyWorld
+and VM reference roots. export_component_vm supports the Component boundary
+without requiring a BodyScript. extra_roots explicitly retain supported VM
+objects which an outer adapter holds but which the ordinary component roots no
+longer reach. They do not authorize arbitrary object introspection or references
+into another Component. An invalid or unsupported representation raises
+BodyVMSnapshotError instead of returning an apparently complete snapshot.
+
+The body output declares schema "ow174.body-vm-storage.v1" and scope
+"body-vm-storage-excludes-transport". The independent component output declares
+schema "ow174.component-vm-storage.v1" and scope "component-vm-storage".
+Both include the statescript source-data signature. The outer local replay model
+manifest binds the implementation source bytes; this VM document does not duplicate
+that source manifest. Graph/Node identifiers carry a fixed-schema typed SHA256
+of their actual stored definition and the SHA256 of the original bundled
+game_graphs_174.json.gz. Definitions need not be repeated in every component.
+Changing a defined graph field changes its definition digest; unknown Graph or
+Node attributes fail rather than falling outside that digest. The definition and
+source-data signatures do not cover arbitrary runtime monkey-patching; bind this
+document to LOCAL_REPLAY_MANIFEST_V1.txt's source/runtime/config manifest externally.
+The detached stored value representation uses replay_values.encode, preserving
+scalar types, binary64 float bits, ordered mappings and the distinction between
+lists and tuples. snapshot_digest hashes the exported document deterministically;
+native object addresses and repr text are not identities.
+
+Mutable identity is part of the document. Exact list/dict/set storage, Link/Event
+records, RNG/counter/fault objects and actual object __dict__ mappings receive
+first-seen storage IDs. Their inline records retain identity metadata; cyclic
+mutable back-edges use references. Two equal empty dictionaries differ from one
+shared dictionary: for example sharing two Vars' watchers changes a later watch
+registration, so value equality cannot be the snapshot contract. Tuple/immutable
+value structure is retained while its nested mutable children use those same IDs.
+Set members are sorted by supported stable value/VM-reference keys before identity
+registration; unknown ordering keys fail rather than using an address-dependent
+iteration order.
+
+Graph definition hashes use a separate canonical first-seen identity namespace,
+so adding an unrelated VM container cannot change an unchanged model's identity.
+Graph records include storage_bindings from definition-local IDs to the document's
+storage IDs. Graph/Node attribute dictionaries and nested model containers share
+that registration with VM values. A Var.base that points into Node.fields is thus
+distinguished from an equal independent copy. No formatter-created containers or
+the caller's extra_roots parameter sequence receive a stored-game-object identity.
+
+Cross-artifact identity requires the outer adapter
+
+export_component_vm_with_identities performs exactly the same single capture as
+the ordinary component API and additionally returns ephemeral triples:
+
+  (storage_id, original_live_object, scope_tag)
+
+scope_tag is vm, model, or vm+model when a mutable object occurs in both domains.
+The sidecar keeps original objects alive only for the caller's capture interval;
+it must not be serialized, logged, retained across roots or put in a replay tape.
+It contains actual stored objects, not cloned values, synthetic formatting lists
+or observer dictionaries. No identity callback is accepted or invoked.
+
+The ordinary artifact preserves aliases inside its own Component closure. It
+cannot know whether a private container is also held in transport, physics or
+another Component artifact. A full root adapter must consume these identity
+bindings and bridge supported sharing or fail closed. Equal separately captured
+values are not evidence of separate ownership. Static model sharing may be accepted
+only with the matching data/actual-definition signatures; mixed vm+model storage
+is explicitly marked. Component-owned State/Instance/Var and BodyWorld references
+also require the outer adapter's established reference namespaces. This module
+alone does not certify those external bridges.
+
+This boundary is separate from native_replay.py's observed body-command trace.
+It does not change the native trace schema or silently broaden that trace's
+body-script-only claim. Exporting VM storage does not finish a battle full-state
+snapshot or establish complete server/native replay.
+
+Stored scope and explicit exclusions
+
+Every allocated supported Instance and State is retained, including inactive,
+never-activated and counter-zero states. Destroyed instances are stored in full,
+not reduced to their former runtime instance numbers. Variables retain their
+stored base values, links and watchers; no resolved variable value is substituted.
+Pending events, deferred work, ticking order, parameter stacks, held buttons,
+disabled-button registrations, undrained shots and terminal VM fault state are
+part of the representation.
+
+BodyScript fields covered by the VM adapter:
+
+  hero entity record frame_ms world component frame buttons retired server_only
+  ult_seconds ultimates
+
+record identifies the body definition covered by the source/data signature.
+ultimates is an ordered list of State references: future charge updates depend
+on those states and cannot reconstruct it merely by inspecting active states.
+
+Five known BodyScript fields belong to a later owner-transport adapter and are
+explicitly excluded from this VM storage document:
+
+  stream create_arrived first_owner_frame reports report_count
+
+They include acknowledgment history, owner-frame scheduling and projectile report
+bookkeeping. Exclusion is deliberate and named; it is not permission to ignore
+other newly introduced BodyScript attributes. BodyStream, its pending snapshots,
+full_update, transport records and acknowledgment callbacks are not traversed.
+
+Match, Combat, projectiles, movers and contacts, command queues, collision assets
+and providers, environment reads, root-event order, datagrams, delivery/ACK state,
+player/account state and external world behavior are not completed by this adapter.
+They require their own explicit adapters and an outer recording/replay contract.
+
+Exact class and field coverage
+
+Supported live object classes are exact classes, not arbitrary subclasses.
+Required fields must be present. Unknown instance fields, unsupported classes,
+unsupported values and invalid references fail closed. A broad isinstance check
+against State or a generic dataclasses serializer must not admit an unknown
+subclass or silently discard its extra storage.
+
+Component required fields:
+
+  entity frame_ms world rng frame now instances vars held button disabled seq
+  next_id destroyed shots owner_dead fault
+  _operation_depth _follow_depth _work_left
+
+Instance required fields:
+
+  component id graph parent parent_state vars states queue ticking deferred params
+  stopped teardown initialized start
+
+State base required fields, inherited by every concrete State class:
+
+  instance node index active ending counter start ended_at ticked_at watched
+  flags_changed flags_check polled natives
+
+BodyWorld required fields, including those inherited from runtime.World:
+
+  hero mode body throttles
+
+The exact runtime.World representation, when accepted by export_component_vm, has
+hero and mode. A custom World subclass with additional behavior or hidden storage
+is not equivalent to either supported World type.
+
+The entire known BodyScript field set consists of its twelve covered fields and
+five named transport exclusions above. Required/unknown-field checking still
+applies to the known object layout even though transport storage is not emitted.
+
+Concrete State class additions are listed below. Every row also requires all
+State base fields. Optional means the attribute can legitimately be absent until
+a lifecycle hook has run. Export only attributes actually present; missing and
+present-with-None must remain distinct.
+
+  Class                    Required additions
+                           Optional lifecycle additions
+
+  runtime.State            none
+  BooleanSwitch            current pending
+  Stack                    top under value var
+  LogicalButton            down pressed_at early_counter
+  DisableLogicalButton     none
+                           button_id
+  Wait                     none
+                           ms
+  WaitForServerFrames      none
+  WaitFrames               target
+  ChaseVar                 cur reached remaining last var interrupted
+  WeaponVolley             offset volleys per_shot ammo0 rate spread0 links reported
+                           max_shots min_shots
+  Anim                     none
+  Ability                  flags presses cur cooldown_rate last var stack_var
+  Defer                    none
+  Watch                    none
+                           seen
+  Switch                   case
+  SubScript                child
+  GameMessageEntry         none
+                           received
+  SendGameMessageState     none
+  CosmeticEntity           none
+                           var
+  GamePadVibration         none
+  TrackTargets             none
+  Effect                   none
+  ClientOnlyPulser         pulses pulsed_at
+  ActiveQuery              none
+
+There are 23 registered concrete State subclasses and the plain runtime.State
+fallback. Stack is registered for STUStatescriptStateStack and STU_A97E6999;
+Effect is registered for STU_691BFA55 and STU_7CA2FBAF. Other supported subclasses
+have one registration each. A node class without a model legitimately constructs
+the plain State under runtime.Instance.state; that fallback is not a custom Python
+subclass. State type, graph node and state-index relationships must agree.
+
+Other exact stored records:
+
+  Var             key base links watchers
+  Link            state slot priority above stack
+  Event           time seq kind state op param node button pressed message transient
+  EventSequence   _next_value
+
+All Event fields are retained, including transient events and ENTRY, MESSAGE or
+BUTTON events which need not refer to a State. Graph/Node references identify
+the matching definitions and their owning graph; an arbitrary object with the
+same numeric node position is not an interchangeable reference.
+
+The actual static-definition layout is also checked rather than accepting open
+objects with matching identifiers:
+
+  Graph           index header fields items containers nodes unknown_rids
+                  _by_pos _by_rid states entries remote_nodes sync_vars
+                  _owner _remote _presence
+  Node            pos cls uid rid remote state client_only server_only fields
+  SyncVar         index var scope flag
+
+The definition signature covers supported stored definition fields and their
+ordered collections. Lookup references and derived definition lists must remain
+consistent with those definitions.
+
+The current Graph implementation eagerly creates _owner/_remote/_presence lists;
+its accessors merely return them. Export never calls those accessors or warms a
+cache. It independently computes their expected ordered references from stored
+fields and rejects an invalid member, order or list representation. No None-as-cold
+state is declared valid by the current source. A future lazy-cache representation
+requires an explicit contract update; the observer must not invent or populate it.
+
+Supported expression-value records are exact Asset(guid), Entity(id),
+Vec3(x,y,z), Handle(kind,instance,state,extra) and Map(items). Map.items retains
+ordered pairs and any repeated keys; it must not become a Python dict. Scalar
+and container representation distinguishes None, bool, int, finite float, text,
+bytes, list and tuple. Explicitly supported set storage, such as natives and
+server_only, is canonicalized as unordered membership, without inventing a
+notification order. Unknown values are rejected; arbitrary serializers, repr,
+and generic dataclass introspection are not fallbacks.
+
+Ordering, references and progression state
+
+The snapshot retains every sequence that can affect subsequent graph execution
+or observed output, rather than sorting it into a superficially stable shape:
+
+  - Component.instances creation order and Instance.states lazy-allocation order;
+  - variable storage-map order, Var.links priority/tie order and Var.watchers
+    registration order;
+  - State.watched registration order and State.natives membership;
+  - event-queue FIFO order with each event's time and sequence number;
+  - ticking and deferred-work order, parameter stacks and held-button order;
+  - disabled-button State lists, destroyed-instance order and extra-root order;
+  - BodyScript.ultimates and the undrained Component.shots queue, including each
+    referenced volley, shot number and stored shot time;
+  - ordered arrays, expression Map pairs and nested stored mappings.
+
+Canonical attribute-name presentation does not authorize reordering the stored
+contents of a causal collection. In particular, hash-table addresses must never
+choose watcher, state, subgraph, shot or event order.
+
+The current VM has no separate historical global activation-order list. Export
+retains each State's active/ending/counter/start/ended_at/ticked_at storage and all
+current causal collections; it does not invent a past tie order from start times
+or add a new activation-history field to the gameplay model.
+
+runtime.EventSequence starts at zero by default. next(sequence) returns the
+current number and increments it by one. Its next_value property is read-only
+and observes the next number without consuming it. The snapshot stores that
+next number even when no event remains queued; reconstructing it from the maximum
+queued event would lose progression state. A complete RNG state includes its
+generator state and cached Gaussian value, not a new draw or only a digest of
+currently visible values.
+
+Object identity and sharing are represented by stable snapshot-local references.
+Addresses may be used internally only to recognize repeated objects. Reference
+namespaces are isolated per Component; another component's similarly numbered
+Instance, State or Var cannot satisfy a reference. Explicit construction can reuse
+an instance ID after destruction. V1 rejects distinct objects that reuse one local
+Instance/State/Var identity, rather than silently folding them together; production
+automatic instance IDs increase. Aliases to one supported object retain one
+reference. extra_roots extend this same-component reference closure; they do not
+merge namespaces or turn foreign objects into local ones. Reused body entity
+numbers in separate Components remain separate namespaces, which the outer adapter
+identifies by its own component ID.
+
+Read-only boundary and limits
+
+Export reads stored fields. It must not call Var.value, State.output,
+State.payload, expression evaluation, BodyScript.snapshot or any other driver
+snapshot/frame/delta helper. Those paths can evaluate links, register watchers,
+read external state or perform work outside this inspection boundary. Export
+must not run commands, ticks, entries, plugs, completion checks or callbacks;
+draw RNG values; advance EventSequence; consume shots; alter caches or modify
+any live object. The standard RNG state accessor is an observation, not a draw.
+
+Callers must prevent concurrent VM mutation during export. This helper supplies
+neither a live mutation barrier nor an atomic server-wide snapshot. Python call
+stacks, suspended control flow, active context managers and local callback
+variables are not stored. Even a document containing every supported VM field
+cannot resume execution from an arbitrary point inside a callback. This version
+exports storage; it is not a restore API or proof of arbitrary-point resumability.
+
+Fail-closed storage coverage and deterministic hashes establish what this adapter
+observed under its supported model. They do not prove agreement with the original
+Overwatch client or completeness of an eventual battle-state/replay system.
+
+Verification
+
+  .venv/Scripts/python.exe -B -m unittest discover -s tests -p test_body_vm_snapshot.py
+  .venv/Scripts/python.exe -B -m unittest discover -s tests -p test_body_vm_aliases.py
+  .venv/Scripts/python.exe -B -m unittest discover -s tests -p test_script_event_sequence.py
+  .venv/Scripts/python.exe -m ruff check ow174/game/body_vm_snapshot.py ow174/game/script/runtime.py tests/test_body_vm_snapshot.py tests/test_script_event_sequence.py
+
+Twenty-one dedicated snapshot tests pass, including all 24 State runtime types,
+all supported field layouts, inactive/counter-zero objects, exact ordering, old
+extra-root closure, graph-definition mutations, unsafe/unknown values and fields,
+float bits/bytes/Map pairs, fault inspection and read-only real-Soldier observation.
+Twenty additional alias/sidecar tests pass: shared/independent empty storage,
+watcher cross-notifications, Link/Event identity, normal nested value sharing,
+mutable cycles, actual attribute-dictionary aliases, Graph/VM bindings, allocation
+independence, stable set ordering, exact sidecar ownership and derived-cache checks.
+Five EventSequence tests pass for the old count behavior, read-only next_value,
+same-time/nested FIFO, cross-instance sequence use and failure progression.
+The existing eight VM budget tests and sixteen native replay tests also pass.
+No game, UI or service is started by these checks; existing native trace code and
+the actual event dispatch/FIFO insertion call sites are unchanged.
