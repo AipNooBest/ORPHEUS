@@ -260,6 +260,11 @@ class ServerJournalTests(unittest.TestCase):
         self.assertEqual(session.server.handoffs[first.conn], (first, alpha, 0.0))
         self.assertEqual(session.server.handoffs[second.conn][2], second_deadline)
         self.assertFalse(alpha.gone)
+        cancelled = Peer(session, first, sent, ("127.0.0.1", 43000))
+        cancelled.send(flags=SYN)
+        self.assertNotIn(first.conn, session.server.clients)
+        self.assertIn(first.conn, session.server.handoffs)
+        self.assertEqual(sent, [])
         session.report_callbacks()
 
         session.tick(100.0)

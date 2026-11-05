@@ -219,10 +219,10 @@ class GameEnvironmentTests(unittest.TestCase):
         self.assertEqual(server.handoffs[second.conn][2], 102.0 + HANDOFF_SECONDS)
         server.sock = MemorySocket()
         peer = LinkCipher(first.key_out, first.key_in)
-        server._datagram(peer.seal(Packet(first.conn, flags=SYN)), ("127.0.0.1", 4567), 200.0)
+        server._datagram(peer.seal(Packet(first.conn, flags=SYN)), ("127.0.0.1", 4567), 110.0)
         client = server.clients[first.conn]
         self.assertIs(client.server.environment, tape)
-        self.assertEqual(client.heard, 200.0)  # received(now) follows the independent constructor read.
+        self.assertEqual(client.heard, 110.0)  # received(now) follows the independent constructor read.
         self.assertEqual(peer.open(server.sock.sent[0][0]).flags, SYN | ACK)
         tape.assert_exhausted()
 
@@ -299,6 +299,44 @@ class GameEnvironmentTests(unittest.TestCase):
         self.assertTrue(server.sock.closed)
         self.assertEqual(next(iter(server._dropped.values())), [0, 1000.0])
         tape.assert_exhausted()
+
+    def test_run_cannot_accept_an_expired_handoff_before_its_due_tick(self):
+        deadline = 101.0 + HANDOFF_SECONDS
+        for received, cancelled, accepted in (
+            (deadline - 0.001, False, True),
+            (deadline, False, False),
+            (102.0, True, False),
+        ):
+            with self.subTest(received=received, cancelled=cancelled):
+                client_reads = (Read("wall_time", "client.heard", received),) if accepted else ()
+                tape = ReadTape(
+                    *initial_reads(),
+                    Read("monotonic", "server.run.start", 10.0),
+                    Read("monotonic", "server.run.timeout", 10.0),
+                    Read("wall_time", "server.run.datagram", received),
+                    *client_reads,
+                    Read("monotonic", "server.run.due", 10.0),
+                    Read("monotonic", "server.run.next_tick", 10.0),
+                    Read("wall_time", "server.run.tick", max(deadline, received)),
+                )
+                left = []
+                server = GameServer(environment=tape, on_leave=left.append)
+                (handoff,) = server.create_match(PRACTICE_RANGE, [(1, "Alpha", 0, 0, False)])
+                _, player, _ = server.handoffs[handoff.conn]
+                if cancelled:
+                    self.assertTrue(server.expire_handoff(handoff.conn))
+                peer = LinkCipher(handoff.key_out, handoff.key_in)
+                server.sock = OneReceiveSocket(server, peer.seal(Packet(handoff.conn, flags=SYN)))
+                server.running = True
+                server._run()
+
+                self.assertNotIn(handoff.conn, server.handoffs)
+                self.assertEqual(handoff.conn in server.clients, accepted)
+                self.assertEqual(player.gone, not accepted)
+                self.assertEqual(left, [] if accepted else [player])
+                flags = [peer.open(data).flags for data, _ in server.sock.sent]
+                self.assertEqual(flags, [SYN | ACK] if accepted else [])
+                tape.assert_exhausted()
 
     def test_receive_timeout_does_not_add_a_datagram_wall_read(self):
         tape = ReadTape(

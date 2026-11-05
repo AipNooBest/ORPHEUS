@@ -557,7 +557,7 @@ class GameServer:
         return handoff
 
     def expire_handoff(self, conn: int) -> bool:
-        """Expire a pending handoff on the next tick. Return whether the seat still exists."""
+        """Reject a pending handoff immediately and release its seat on the next tick."""
         with self.lock:
             waiting = self.handoffs.get(conn)
             if waiting is None:
@@ -723,7 +723,10 @@ class GameServer:
         if waiting is None:
             self._drop_datagram(address, conn, "unknown connection", now)
             return
-        handoff, player, _ = waiting
+        handoff, player, deadline = waiting
+        if now >= deadline:
+            self._drop_datagram(address, conn, "expired handoff", now)
+            return
         cipher = LinkCipher(handoff.key_in, handoff.key_out)
         packet = cipher.open(data)
         if packet is None or not packet.flags & SYN:
