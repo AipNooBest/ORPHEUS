@@ -151,7 +151,33 @@ def _same_var(a, b) -> bool:
     return expr.same(a[0], b[0]) and a[1] == b[1]
 
 
-class BodyScript:
+class ReplicatedBody:
+    component: runtime.Component
+    server_only: set[int]
+
+    def initial_exclusions(self) -> set[int]:
+        """Collect the existing entity-scope exclusions from the initialized graph tree."""
+        return {
+            var_id
+            for instance in self.component.instances.values()
+            for var_id in _server_only_vars(instance.graph)
+        }
+
+    def graphs(self) -> dict[int, object]:
+        return {instance.id: instance.graph for instance in self.component.instances.values()}
+
+    def replicated_vars(self, instance: runtime.Instance | None = None) -> Iterator[tuple[int, runtime.Var]]:
+        """Variables eligible for both wire snapshots. Instance variable IDs are local to their graph."""
+        if instance is None:
+            variables = self.component.vars
+            excluded = self.server_only | NOT_SENT
+        else:
+            variables = instance.vars
+            excluded = _server_only_vars(instance.graph)
+        return ((var_id, var) for var_id, var in variables.items() if var_id not in excluded)
+
+
+class BodyScript(ReplicatedBody):
     """The statescript of one hero body: `spawn_frames()` once the body exists on the client, then
     `command()` for every new client command frame and `frames()` every server tick."""
 
@@ -182,7 +208,6 @@ class BodyScript:
         self.create_arrived = False  # the client has the body (see `created`)
         self.retired = False
         self.first_owner_frame: int | None = None
-        self.server_only: set[int] = set()  # existing entity-scope exclusions
         self.ult_seconds = ult_seconds
         self.ultimates: list = []  # the Ability states that start on #342e (not charged while they run)
         self.reports: list = []  # (number, CmFD, chunk last, keys) of the owner frames sent (projectiles.py)
@@ -206,16 +231,7 @@ class BodyScript:
         component.set(DEFAULT_SLOT, next((slot for slot, item in enumerate(weapons) if item is not None), 0))
         self.set_health(health, health)
         component.set(ULT_CHARGE, 0.0)
-        created = []
-        for number, item in enumerate(self.record["graphs"], 1):
-            found = graph.graph(item["graph"])
-            if found is None:
-                continue
-            values = {}
-            for entry in item.get("m_1EB5A024") or []:
-                var = expr.guid_of(entry.get("m_0D09D2D9")) & 0xFFFF
-                values[(INSTANCE, var)] = expr.evaluate(entry.get("m_value"), expr.Context())
-            created.append(component.create(found, number, values=values, init=False))
+        created = create_initial_graphs(component, self.record)
         manager = graph.graph(self.record["manager"]) if self.record.get("manager") is not None else None
         if manager is not None:
             created.append(component.create(manager, init=False))
@@ -225,8 +241,8 @@ class BodyScript:
         for instance in created:
             instance.init()
         component.run_frame(frame)
+        self.server_only = self.initial_exclusions()
         for instance in component.instances.values():
-            self.server_only.update(_server_only_vars(instance.graph))
             for node in instance.graph.states:
                 if node is None or node.cls != "STUStatescriptStateAbility":
                     continue
@@ -299,19 +315,6 @@ class BodyScript:
             self.set_ult_charge(min(cost, f32(charge + step)))
 
     # --- what the client gets ----------------------------------------------------------------------
-
-    def graphs(self) -> dict[int, object]:
-        return {instance.id: instance.graph for instance in self.component.instances.values()}
-
-    def replicated_vars(self, instance: runtime.Instance | None = None) -> Iterator[tuple[int, runtime.Var]]:
-        """Variables eligible for both wire snapshots. Instance variable IDs are local to their graph."""
-        if instance is None:
-            variables = self.component.vars
-            excluded = self.server_only | NOT_SENT
-        else:
-            variables = instance.vars
-            excluded = _server_only_vars(instance.graph)
-        return ((var_id, var) for var_id, var in variables.items() if var_id not in excluded)
 
     def snapshot(self) -> Snapshot:
         """The body as the client should have it after the last frame run."""
@@ -500,6 +503,21 @@ class BodyScript:
         self.reports.append((self.report_count, self.frame, stream.last, keys))
         del self.reports[:-MAX_REPORTS]
         return [update]
+
+
+def create_initial_graphs(component: runtime.Component, record: dict) -> list[runtime.Instance]:
+    """Allocate the definition's instances in asset order, before running their entries."""
+    created = []
+    for number, item in enumerate(record["graphs"], 1):
+        definition = graph.graph(item["graph"])
+        if definition is None:
+            continue
+        values = {}
+        for entry in item.get("m_1EB5A024") or ():
+            var = expr.guid_of(entry.get("m_0D09D2D9")) & 0xFFFF
+            values[(INSTANCE, var)] = expr.evaluate(entry.get("m_value"), expr.Context())
+        created.append(component.create(definition, number, values=values, init=False))
+    return created
 
 
 def _server_only_vars(definition: graph.Graph) -> set[int]:

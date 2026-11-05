@@ -3,13 +3,15 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ow174.game import observers
 from ow174.game.combat import ASSISTS, CRIT, DIED, KILLER, LOADOUT
-from ow174.game.content import SOLDIER
-from ow174.game.script import expr, runtime
+from ow174.game.content import PRACTICE_RANGE, SOLDIER
+from ow174.game.script import expr, graph, runtime
+from ow174.game.script.bot import BotScript
 from ow174.game.script.decode import read_chunk
 from ow174.game.script.driver import BodyScript, BodyStream
 
@@ -65,3 +67,22 @@ class ClientOnlyPulserTests(unittest.TestCase):
         wire = read_chunk(chunk.getvalue(), chunk.count)
         self.assertFalse(wire.owner)
         self.assertEqual(wire.instances[instance.id].states[34], (True, {"fresh": False, "count": 1}))
+
+    def test_bot_death_in_its_spawn_tick_is_fresh_after_the_initial_frame(self):
+        # Use the available body lifecycle graph to exercise the same pulser
+        # semantics with a real bot stream, without the external NPC graph pack.
+        definition = {"graphs": [{"graph": 0x004B}]}
+        with patch.object(graph, "entity_body", return_value=definition):
+            script = BotScript(0x0400000000001403, SOLDIER, BODY, START, PRACTICE_RANGE.mode_guid, 200)
+        stream = BodyStream(BODY)
+        full = stream.full(*script.initial)
+        known = {item: item_graph.index for item, item_graph in script.graphs().items()}
+        stream.arrived(full.chunk_last)
+
+        params = {KILLER: expr.Entity(OTHER_BODY), CRIT: False, LOADOUT: None, ASSISTS: ()}
+        frame, snapshot, keys = script.die(START, params, OTHER_BODY)
+        chunk = stream.delta(frame, snapshot, keys, 0).chunk
+        wire = read_chunk(chunk.getvalue(), chunk.count, known)
+        feed = next(item for item in wire.instances.values() if item.graph == 0x01CF)
+        self.assertFalse(wire.owner)
+        self.assertEqual(feed.states[108], (True, {"fresh": True, "count": 1}))

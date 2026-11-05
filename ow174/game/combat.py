@@ -55,6 +55,7 @@ from ow174.game.bits import BitWriter
 from ow174.game.collision import AX, AY, AZ, BX, BY, BZ, CELL, CX, CY, CZ, MASK, MOVER, NUMBER
 from ow174.game.mover import mover_data
 from ow174.game.script import expr, graph, runtime
+from ow174.game.script.bot import DIED
 from ow174.game.statescript import InstanceWire, StateWire, remote_full_frame
 from ow174.game.world import ARMOUR_POOL, HEALTH_POOL, OP_DESTROY, OP_UPDATE, POOLS, SHIELDS_POOL
 
@@ -66,7 +67,6 @@ KILL_NOTICE = 25005  # to the killer: whom he killed
 KILLED_BY = 2  # 25004 +0x78: "you were killed by" (0F7B.025); anything else "you died" (0F7C.025)
 CRITICAL, KILLING = 0x01, 0x02  # 25001 flags (unverified, see above)
 DEAD = 0x2000  # movement-state flag: dead (the 3P anim's dead pose)
-DIED = 0x024000000000003E  # game message 003E.025: the body's graphs' "died"
 # 003E.025's parameters, by the low 16 bits of their 026 identifiers (01CF rid4).
 KILLER, CRIT, LOADOUT, ASSISTS = 0x0012, 0x0095, 0x03E6, 0x03E7
 MODE_UI = 0x0CB6  # the mode's client UI graph: the kill feed 0DEA and the notices 1FC0 (client-only)
@@ -739,11 +739,7 @@ class Combat:
         shooter.stats.add(stats.HERO_DAMAGE, dealt)
         if isinstance(target.owner, bots.Bot):
             if killed:
-                target.owner.died(self.tick)
-                self.respawns.append((self.now + BOT_RESPAWN, target.owner))
-                shooter.stats.add(stats.ELIMINATIONS)
-                self._kill_notice(shooter, target.entity, bot=True)
-                log.info("[game] %s: %s killed %s", self.match.label(), shooter.name, target.owner.name)
+                self._bot_died(shooter, target.owner, critical, loadout)
             return
         victim = target.owner
         script = victim.body_script
@@ -783,6 +779,35 @@ class Combat:
         else:
             killer.client.queue_reliable(KILL_NOTICE, notice)
 
+    @staticmethod
+    def _death_parameters(killer, critical: bool, loadout) -> dict:
+        return {
+            KILLER: expr.Entity(killer.body),
+            CRIT: bool(critical),
+            LOADOUT: expr.Asset(loadout) if loadout else None,
+            ASSISTS: (),
+        }
+
+    def _bot_died(self, killer, bot: bots.Bot, critical: bool, loadout) -> None:
+        bot.died(self.tick)
+        self.respawns.append((self.now + BOT_RESPAWN, bot))
+        killer.stats.add(stats.ELIMINATIONS)
+        self._kill_notice(killer, bot.entity, bot=True)
+        log.info("[game] %s: %s killed %s", self.match.label(), killer.name, bot.name)
+        script = bot.body_script
+        if script is None:
+            return
+        try:
+            params = self._death_parameters(killer, critical, loadout)
+            event = script.die(self.match.tick, params, killer.body)
+        except Exception:
+            log.exception("[game] %s: %s's body script failed on %X", self.match.label(), bot.name, DIED)
+            return
+        if event is not None:
+            for viewer in self.match.players:
+                if viewer.client is not None:
+                    viewer.client.queue_bot_death(bot.entity, event)
+
     def _died(self, killer, victim, critical: bool, loadout) -> None:
         """A player died: the notices, his body script's "died" (the kill feed line), and the respawn."""
         label = self.match.label()
@@ -796,14 +821,10 @@ class Combat:
             victim.client.queue_reliable(DEATH_NOTICE, {"+0x78": how, "+0x7C": {"+0x0": killer.body}})
         script = victim.body_script
         if script is not None:
-            params = {
-                KILLER: expr.Entity(killer.body),
-                CRIT: bool(critical),
-                LOADOUT: expr.Asset(loadout) if loadout else None,
-                ASSISTS: (),
-            }
             try:
-                runtime.send_message(script.component, DIED, params, killer.body)
+                runtime.send_message(
+                    script.component, DIED, self._death_parameters(killer, critical, loadout), killer.body
+                )
             except Exception:
                 log.exception("[game] %s: %s's body script failed on %X", label, victim.name, DIED)
         self.respawns.append((self.now + respawn_seconds(self.match), victim))
@@ -828,6 +849,7 @@ class Combat:
         entity = self.next_bot
         self.next_bot += 1
         fresh = bots.respawned(bot, entity, match.tick + match_record_delay())
+        match._prepare_bot_script(fresh)
         match.bots[match.bots.index(bot)] = fresh
         self.vitals.pop(bot.entity, None)
         for viewer in match.players:

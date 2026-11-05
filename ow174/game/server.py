@@ -24,7 +24,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 
 from ow174.game import correction, messages, movelog, world
-from ow174.game.bits import BitReader
+from ow174.game.bits import BitReader, BitWriter
 from ow174.game.commands import InputError, read_commands
 from ow174.game.environment import ExecutionEnvironment, SystemEnvironment
 from ow174.game.link import (
@@ -42,7 +42,7 @@ from ow174.game.link import (
     peek_connection,
 )
 from ow174.game.match import Match, Player, no_skin, pong, sends
-from ow174.game.script.driver import warm_up
+from ow174.game.script.driver import BodyStream, Snapshot, warm_up
 from ow174.jam.codec import DecodeError
 from ow174.jam.values import to_jsonable
 
@@ -135,6 +135,15 @@ class OpenMatch:
     started: float  # time.time() of its creation
 
 
+_BotDeathPayload = tuple[BitWriter, Snapshot, set]
+
+
+@dataclass
+class _BotScriptDelivery:
+    stream: BodyStream
+    death: _BotDeathPayload | None = None  # waits here for the full frame ACK
+
+
 class Client:
     """One connected game: the transport state and the queues of what to send."""
 
@@ -158,7 +167,8 @@ class Client:
         self._bot_notices: dict[int, deque[tuple[int, bytes]] | None] = {}
         self._bot_health: dict[int, world.EntityUpdate] = {}  # latest snapshot awaiting delivery per bot
         self._bot_notice_tail: dict[int, int] = {}  # last promoted reliable ordinal per bot
-        self._bot_destroy_wait: dict[int, tuple[world.EntityUpdate, int, int]] = {}
+        self._bot_scripts: dict[int, _BotScriptDelivery] = {}
+        self._bot_destroy_wait: dict[int, tuple[world.EntityUpdate, int]] = {}
         self.expected_in = 0  # the client's next reliable message
         self.parked_in = {}
         self.leaving_since: float | None = None  # when go_home sent 20304
@@ -192,7 +202,7 @@ class Client:
 
     def queue_bot_notice(self, entity: int, msg_id: int, value: dict) -> None:
         """Keep references to a bot out of the reliable stream until its create is acknowledged."""
-        if entity not in self._bot_notices:
+        if entity not in self._bot_notices or entity in self._bot_destroy_wait:
             return
         payload = messages.encode(msg_id, value)
         pending = self._bot_notices[entity]
@@ -203,7 +213,7 @@ class Client:
 
     def queue_bot_health(self, entity: int, components: dict) -> None:
         """Keep the latest complete pool snapshot for this connection's current bot."""
-        if entity not in self._bot_notices:
+        if entity not in self._bot_notices or entity in self._bot_destroy_wait:
             return
         previous = self._bot_health.get(entity)
         if previous is not None:
@@ -215,6 +225,29 @@ class Client:
         if self.bot_create_acked(entity):
             self.queue_entities([update])
 
+    def queue_bot_death(self, entity: int, payload: _BotDeathPayload) -> None:
+        """Deliver this lifetime's death once its initial statescript frame has arrived."""
+        script = self._bot_scripts.get(entity)
+        if (
+            script is None
+            or entity in self._bot_destroy_wait
+            or script.death is not None
+            or script.stream.last > 1
+        ):
+            return
+        script.death = payload
+        self._flush_bot_death(script)
+
+    def _flush_bot_death(self, script: _BotScriptDelivery) -> None:
+        stream = script.stream
+        if stream.base is None or script.death is None:
+            return
+        frame, snapshot, keys = script.death
+        update = stream.delta(frame, snapshot, keys, 0)
+        update.resend = True  # this one-off event has no newer snapshot to carry it again
+        script.death = None
+        self.queue_entities([update])
+
     def _ack_bot_create(self, entity: int) -> None:
         pending = self._bot_notices.get(entity)
         if pending is not None:
@@ -222,6 +255,9 @@ class Client:
             health = self._bot_health.get(entity)
             if health is not None:
                 self.queue_entities([health])
+            script = self._bot_scripts.get(entity)
+            if script is not None:
+                self.queue_entities([script.stream.full_update])
             for msg_id, payload in pending:
                 self._bot_notice_tail[entity] = self._queue_encoded_reliable(msg_id, payload)
 
@@ -230,18 +266,29 @@ class Client:
         in_flight = (batch[0][0] for batch, _ in self.in_flight.values() if batch)
         return min(queued, min(in_flight, default=queued))
 
+    def _bot_destroy_pending(self, entity: int, oldest: int) -> bool:
+        tail = self._bot_notice_tail.get(entity)
+        health_pending = entity in self._bot_health
+        if tail is not None and (oldest <= tail or health_pending):
+            return True  # the receiver can park a notice behind an earlier reliable gap
+        script = self._bot_scripts.get(entity)
+        if script is None:
+            return False
+        stream = script.stream
+        return bool(stream.pending or script.death is not None or (stream.last > 1 and health_pending))
+
     def _hold_bot_destroy(self, item: world.EntityUpdate) -> bool:
         entity = item.entity
         if entity in self._bot_destroy_wait:
             return True
-        tail = self._bot_notice_tail.pop(entity, None)
-        if tail is None or (entity not in self._bot_health and self._oldest_pending_reliable() > tail):
+        if entity not in self._bot_notices or not self._bot_destroy_pending(
+            entity, self._oldest_pending_reliable()
+        ):
             return False
-        # The client can receive the notice but park it behind an earlier reliable gap.
-        # Its terminal health update can also be sent in a later packet.
-        self._bot_notices.pop(entity, None)
+        # Keep the old generation eligible for delivery until its notices, health and
+        # statescript frames have arrived. New bot writes stop at logical retirement.
         expiry = self.player.match.tick + BOT_DESTROY_GRACE_TICKS
-        self._bot_destroy_wait[entity] = (item, tail, expiry)
+        self._bot_destroy_wait[entity] = (item, expiry)
         return True
 
     def _release_bot_destroys(self, tick: int) -> None:
@@ -249,12 +296,19 @@ class Client:
             return
         oldest = self._oldest_pending_reliable()
         ready = []
-        for entity, (item, tail, expiry) in list(self._bot_destroy_wait.items()):
-            if tick >= expiry or (oldest > tail and entity not in self._bot_health):
-                del self._bot_destroy_wait[entity]
+        for entity, (item, expiry) in list(self._bot_destroy_wait.items()):
+            if tick >= expiry or not self._bot_destroy_pending(entity, oldest):
+                self._forget_bot(entity)
                 ready.append(item)
         if ready:
             self.queue_entities(ready)
+
+    def _forget_bot(self, entity: int) -> None:
+        self._bot_notices.pop(entity, None)
+        self._bot_health.pop(entity, None)
+        self._bot_notice_tail.pop(entity, None)
+        self._bot_scripts.pop(entity, None)
+        self._bot_destroy_wait.pop(entity, None)
 
     def queue_unreliable(self, msg_id: int, value: dict) -> None:
         self.unreliable.append(messages.encode(msg_id, value))
@@ -273,9 +327,6 @@ class Client:
             if item not in generations:
                 if item.op == world.OP_DESTROY and self._hold_bot_destroy(item):
                     continue
-                if item.op == world.OP_CREATE:
-                    self._bot_notice_tail.pop(item.entity, None)
-                    self._bot_destroy_wait.pop(item.entity, None)
                 if item.op in (world.OP_CREATE, world.OP_DESTROY):
                     # Preserve the generation of already-sent records, even for an older
                     # producer that did not put them through queue_entities first.
@@ -288,10 +339,9 @@ class Client:
                     generation += 1
                     alive = item.op == world.OP_CREATE
                     lifecycles[item.entity] = (generation, alive)
-                    self._bot_notices.pop(item.entity, None)
-                    self._bot_health.pop(item.entity, None)
-                    if alive and any(bot.entity == item.entity for bot in self.player.match.bots):
-                        self._bot_notices[item.entity] = deque(maxlen=MAX_PENDING_BOT_NOTICES)
+                    self._forget_bot(item.entity)
+                    if alive:
+                        self._track_bot_create(item.entity)
                 generations[item] = generation
             if generations[item] == generation and (alive or item.op == world.OP_DESTROY):
                 self.entities.append(item)
@@ -301,6 +351,17 @@ class Client:
             if generations.get(item, 0) == lifecycles.get(item.entity, (0, True))[0]
             and (lifecycles.get(item.entity, (0, True))[1] or item.op == world.OP_DESTROY)
         ]
+
+    def _track_bot_create(self, entity: int) -> None:
+        bot = next((bot for bot in self.player.match.bots if bot.entity == entity), None)
+        if bot is None:
+            return
+        self._bot_notices[entity] = deque(maxlen=MAX_PENDING_BOT_NOTICES)
+        script = getattr(bot, "body_script", None)
+        if script is not None:
+            stream = BodyStream(entity)
+            stream.full(*script.initial)
+            self._bot_scripts[entity] = _BotScriptDelivery(stream)
 
     # --- sending -------------------------------------------------------------------------------
 
@@ -395,6 +456,9 @@ class Client:
                         del self._bot_health[item.entity]
                     if item.stream is not None:
                         item.stream.arrived(item.chunk_last)
+                        script = self._bot_scripts.get(item.entity)
+                        if script is not None and item.stream is script.stream:
+                            self._flush_bot_death(script)
             else:
                 lost_reliable += reliable
                 lost_records += [item for item in records if item.resend and current(item)]
@@ -851,6 +915,7 @@ class GameServer:
         client._bot_notices.clear()
         client._bot_health.clear()
         client._bot_notice_tail.clear()
+        client._bot_scripts.clear()
         client._bot_destroy_wait.clear()
         if self.clients.get(client.conn) is client:
             del self.clients[client.conn]

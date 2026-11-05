@@ -39,7 +39,8 @@ from ow174.game.link import LinkCipher, ReceiveWindow
 from ow174.game.match import Match, Player, ShownController
 from ow174.game.mover import Mover, MoverData, loaded_mover_table
 from ow174.game.script import driver, expr, runtime
-from ow174.game.server import Client, GameServer, Handoff
+from ow174.game.script.bot import BotScript
+from ow174.game.server import Client, GameServer, Handoff, _BotScriptDelivery
 from ow174.paths import ROOT
 
 SCHEMA = "ow174.controlled-server-stored-state.v1"
@@ -72,10 +73,11 @@ FIELDS = {
                        "_sent_home running"),
     Client: _names("server address conn cipher player window seq open closed heard next_reliable reliable "
                    "unreliable entities in_flight _bot_notices _bot_health _bot_notice_tail "
-                   "_bot_destroy_wait expected_in parked_in leaving_since"),
+                   "_bot_destroy_wait _bot_scripts expected_in parked_in leaving_since"),
+    _BotScriptDelivery: _names("stream death"),
     Match: _names("environment id game_map card skin_of tick controller assemble_ends assembled players "
-                  "started on_leave ended bots bots_shown notices combat collision_provider collision_state "
-                  "collision_world _collision_failed"),
+                  "started on_leave ended bots _pending_bot_scripts bots_shown notices combat "
+                  "collision_provider collision_state collision_world _collision_failed"),
     Player: _names("match slot account_lo name rank role card card_sent card_again hero team quanta entity "
                    "body has_body skin client gone loaded_at steps_done spawned spawn mover commands "
                    "body_script body_script_failed seen shown script mode_script next_countdown "
@@ -104,6 +106,7 @@ FIELDS = {
         "retired first_owner_frame server_only ult_seconds ultimates reports report_count"
     ),
     driver.BodyWorld: _names("hero mode body throttles"),
+    BotScript: _names("component frame server_only initial"),
     runtime.World: _names("hero mode"),
     LinkCipher: _names("key_in key_out salt_in salt_out"),
     ReceiveWindow: _names("expected bits"),
@@ -113,7 +116,7 @@ FIELDS = {
     world.Movement: _names("position yaw pitch velocity flags throttles input_frame input_throttles "
                            "air_ticks gravity frame crouch_frame spring spring_speed fall"),
     bots.Bot: _names(
-        "entity spawner hero_data hints dead records_from hero name body team health speed accel "
+        "entity spawner hero_data hints dead body_script records_from hero name body team health speed accel "
         "brake pace direction position yaw velocity route index wait target start keys turning held "
         "last_held input_tick moved_tick last_tick"
     ),

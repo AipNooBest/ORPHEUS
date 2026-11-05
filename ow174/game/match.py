@@ -27,6 +27,7 @@ How a player gets into the world:
 
 import logging
 import math
+from collections import deque
 from copy import deepcopy
 
 from ow174.game import bodytrace, bots, combat, correction, heroselect, movelog, notices, pools, stats, world
@@ -43,6 +44,8 @@ from ow174.game.commands import Command, CommandQueue
 from ow174.game.content import SOLDIER, GameMap, Hero, heroes, spawn_point
 from ow174.game.environment import ExecutionEnvironment, SystemEnvironment
 from ow174.game.mover import CROUCHED, GRAVITY_SCALE, Mover, mover_data, statescript_mods
+from ow174.game.script import graph
+from ow174.game.script.bot import BotScript
 from ow174.game.script.driver import BodyScript, CommandEpochError
 from ow174.game.script.runtime import ScriptBudgetError
 from ow174.game.statescript import Stream, owner_ack
@@ -356,6 +359,7 @@ class Match:
         self.on_leave = on_leave  # called with each player who leaves
         self.ended = False
         self.bots = bots.make(game_map.map_guid)  # the map's training bots (bots.py)
+        self._pending_bot_scripts = deque(bot for bot in self.bots if graph.entity_body(bot.body) is not None)
         self.bots_shown: dict[int, int] = {}  # player slot -> the tick the bots' creates went to its queue
         self.notices = notices.Notices(self)  # joined / left / hero switch lines in the clients' chat
         self.combat = combat.Combat(self)  # hits, health, deaths, respawns (combat.py)
@@ -484,6 +488,16 @@ class Match:
             if other is not viewer and self._shown(other):
                 updates.append(self.remote_body_create(viewer, other))
         return updates
+
+    def _prepare_bot_script(self, bot: bots.Bot) -> None:
+        if graph.entity_body(bot.body) is None:
+            return
+        try:
+            bot.body_script = BotScript(
+                bot.body, bot.hero, bot.entity, self.tick, self.game_map.mode_guid, bot.health
+            )
+        except Exception:
+            log.exception("[game] %s: could not initialize %s's statescript", self.label(), bot.name)
 
     def _bot_create_update(self, bot: bots.Bot) -> EntityUpdate:
         # A later viewer cannot depend on the globally cleared health dirty bits.
@@ -761,6 +775,9 @@ class Match:
             self._collision_failure(now)
             return
         if ready and self.bots:
+            if self._pending_bot_scripts:
+                # Keep graph setup within the loading window and off the world-create burst.
+                self._prepare_bot_script(self._pending_bot_scripts.popleft())
             for bot in self.bots:
                 bot.step(tick, RETAIL_QUANTA / 1e6, self.collision_world)
         if ready:
@@ -800,7 +817,12 @@ class Match:
         if player.steps_done == 1 and waited >= SEND_GAME:
             client.queue_reliable(20301, {"+0x78": self.game_struct(player)})
             player.steps_done = 2
-        if player.steps_done == 2 and waited >= SEND_WORLD and self.collision_world is not None:
+        if (
+            player.steps_done == 2
+            and waited >= SEND_WORLD
+            and self.collision_world is not None
+            and not self._pending_bot_scripts
+        ):
             client.queue_entities(self.spawn_updates(player))
             player.steps_done = 3
             player.spawned = True

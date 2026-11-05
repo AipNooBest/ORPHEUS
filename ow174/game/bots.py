@@ -120,6 +120,7 @@ class Bot:
         self.entity = entity
         self.spawner, self.hero_data, self.hints = spawner, hero, hints  # for a respawn (respawned)
         self.dead = False  # killed (combat.py): it stands still with the dead flag until it is made again
+        self.body_script = None  # optional statescript from the match's prepared graph bundle
         self.records_from: int | None = None  # a respawned bot's first record tick (after its create)
         self.hero = int(spawner["hero"], 16)
         self.name = hero["name"]

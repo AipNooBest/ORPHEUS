@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ow174.paths import LOBBY_RUNTIME_DATA, MATCH_RUNTIME_DATA
 
 
-def prepare(source: Path, destination: Path, maps: list[str]) -> None:
+def prepare(source: Path, destination: Path, maps: list[str], *, game_graphs: Path | None = None) -> None:
     source, destination = source.resolve(), destination.resolve()
     if not source.is_dir():
         raise ValueError("The prepared checkout does not exist")
@@ -21,6 +21,8 @@ def prepare(source: Path, destination: Path, maps: list[str]) -> None:
         raise ValueError("Choose a new destination outside the source checkout")
 
     inputs = {f"data/{name}": source / "data" / name for name in LOBBY_RUNTIME_DATA + MATCH_RUNTIME_DATA}
+    if game_graphs is not None:
+        inputs["data/game_graphs_174.json.gz"] = game_graphs
     inputs["bnet/descriptors.pb"] = source / "ow174" / "bnet" / "descriptors.pb"
     cache = source / "cache" / "collision"
     if maps:
@@ -55,9 +57,10 @@ def main() -> None:
     parser.add_argument("--source", type=Path, required=True, help="prepared local research checkout")
     parser.add_argument("--destination", type=Path, required=True, help="new directory outside the checkout")
     parser.add_argument("--map", dest="maps", action="append", default=[], help="map index such as 0688")
+    parser.add_argument("--game-graphs", type=Path, help="local graph bundle for the new pack")
     args = parser.parse_args()
     try:
-        prepare(args.source, args.destination, args.maps)
+        prepare(args.source, args.destination, args.maps, game_graphs=args.game_graphs)
     except (OSError, ValueError) as error:
         parser.error(str(error))
     print(f"Prepared runtime data at {args.destination.resolve()}")
