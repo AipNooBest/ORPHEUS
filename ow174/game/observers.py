@@ -19,6 +19,7 @@ shows no weapon.
 """
 
 import logging
+from functools import lru_cache
 
 from ow174.game.script import expr, graph
 from ow174.game.script.codecs import stec_classes
@@ -41,23 +42,29 @@ def snapshot(script) -> Snapshot:
     for instance in script.replicated_instances():
         parent = (instance.parent.id, instance.parent_state) if instance.parent is not None else None
         snap.instances[instance.id] = (instance.graph.index, parent)
-        for var_id, var in script.replicated_vars(instance):
-            _add_var(snap, instance.id, var_id, var)
-        for node in instance.graph.remote_states():
-            state = instance.states.get(node.state)
-            if state is None or presenter(node):
+        _add_vars(snap, instance.id, script.replicated_vars(instance))
+        for index, cls, codec, stec in _remote_snapshot_states(instance.graph):
+            state = instance.states.get(index)
+            if state is None or not (state.active or (stec and state.counter)):
                 continue
-            cls = node.cls
-            if not (state.active or (cls in stec_classes() and state.counter)):
-                continue
-            if family(cls) == "unknown":
+            if codec == "unknown":
                 expr.warn_once(f"observe{cls}", "remote state class %s has no H=0 payload", cls)
                 continue
-            payload = state.payload() if family(cls) != "none" else {}
-            snap.states[(instance.id, node.state)] = (cls, state.active, tuple(sorted(payload.items())))
-    for var_id, var in script.replicated_vars():
-        _add_var(snap, 0, var_id, var)
+            payload = state.payload() if codec != "none" else {}
+            snap.states[(instance.id, index)] = (cls, state.active, tuple(sorted(payload.items())))
+    _add_vars(snap, 0, script.replicated_vars())
     return snap
+
+
+@lru_cache(maxsize=256)
+def _remote_snapshot_states(definition: graph.Graph) -> tuple:
+    """Classify static graph metadata once, keeping native remote state order."""
+    stec = stec_classes()
+    return tuple(
+        (node.state, node.cls, family(node.cls), node.cls in stec)
+        for node in definition.remote_states()
+        if not presenter(node)
+    )
 
 
 def presenter(node) -> bool:
@@ -66,10 +73,11 @@ def presenter(node) -> bool:
     return node.cls == "STUStatescriptStateUXPresenter" or "m_45216F79" in node.fields
 
 
-def _add_var(snap: Snapshot, owner: int, var_id: int, var) -> None:
-    value = var.value()
-    if value is not None:
-        snap.vars[(owner, var_id)] = (value, ())
+def _add_vars(snap: Snapshot, owner: int, variables) -> None:
+    for var_id, var in variables:
+        value = var.value() if var.links else var.base
+        if value is not None:
+            snap.vars[(owner, var_id)] = (value, ())
 
 
 def _graphs(script) -> dict:
