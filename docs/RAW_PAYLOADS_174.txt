@@ -1,0 +1,53 @@
+Strict raw statescript payload tools (1.74)
+
+ow174.game.script.raw_payloads encodes/decodes only the VERIFIED table layouts for
+STU_9935FBC8 (linked_target) and STU_861D9015. It supplies wire-format tools, not VM
+behavior: neither class is added to statescript.WRITERS/family/sendable or the driver.
+The seven optional f32 values have no assigned runtime purpose. 861D9015 v0..v6
+remain unsigned 16/16/32/32/32/16/16-bit patterns, including float-looking bit patterns.
+
+    from ow174.game.bits import BitReader, BitWriter
+    from ow174.game.script.raw_payloads import encode_payload, decode_payload, LinkMetadata
+
+    fields = {"link": None, "has_entity": 0, "values": [{"set": 0} for _ in range(7)]}
+    payload = encode_payload("STU_9935FBC8", fields, owner=True, full=True)
+    reader = BitReader(payload.getvalue())
+    reader.size = payload.count  # exact bit limit, excluding byte padding
+    assert decode_payload(reader, "STU_9935FBC8", owner=True, full=True) == fields
+
+Supply every field of the current branch, including presence bits and an explicit
+link=None when absent. Omit inactive fields. Missing/extra fields, repeat lists of
+any length other than seven, integer coercion/overflow, and nonfinite/overflowing
+f32 values raise PayloadError. Bits accept integers; 1-bit flags also accept bool.
+Float inputs are rounded to f32. Entity fields are integer 0 (null), or a canonical
+32-bit id with bit 31 set and a nonzero low 29-bit index; no silently masked ids.
+
+9935FBC8 always carries link. Only owner=True, full=True adds has_entity, its entity
+when set, and seven {"set": 0} or {"set": 1, "value": finite_f32} items. All other
+contexts accept only link. 861D9015 accepts {"a": 0}, or a=1 with v0..v6,
+has_entity, optional entity and has_extra, optional unsigned 32-bit extra, and g.
+The terminal g is present only when a=1, in all owner/full contexts.
+
+A present link is (instance_id, raw_index), with caller-supplied metadata:
+
+    links = {3: LinkMetadata(owner_bits=5, owner_indices=frozenset({0, 4, 17}),
+                             remote_bits=3, remote_indices=frozenset({0, 2, 5}))}
+    payload = encode_payload("STU_9935FBC8", {"link": (3, 5)},
+                             owner=False, full=False, links=links)
+
+Metadata must identify each known linked instance and its actual graph widths and
+allowed indexes (explicit set/frozenset). Both contexts are validated, including
+unused metadata. Zero-bit widths allow index 0; an empty index set allows no link.
+H=1 uses owner indexes, H=0 uses remote-sync indexes, without translation or graph
+lookup. The caller is responsible for supplying correct graph metadata.
+
+encode_payload returns a fresh BitWriter only after all validation succeeds. To
+append atomically, use destination.append(encode_payload(...)); failure leaves the
+destination unchanged. decode_payload advances the input BitReader only on success
+and respects its size bit limit. Truncation, invalid link indexes, malformed entity
+low bits and nonfinite floats leave reader.pos unchanged. Successful decoding stops
+at the exact payload end; following fields/sentinels are untouched. Width selectors
+use the existing writer's smallest form; decoding also accepts wider client forms.
+
+Independent offset/sentinel vectors and rejection/rollback tests:
+    python -m unittest discover -s tests -p test_script_raw_payloads.py
