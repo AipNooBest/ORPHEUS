@@ -13,10 +13,10 @@ Frames, in order:
 2. a plain full frame (H = 0): every instance and every variable, every state off. The client binds its
    own instances 1..N and makes the server's (the weapon manager, the weapons, the SubScript children);
 3. once it arrived: an owner delta with C = 0 at the newest command frame K: every state that is on, the
-   variables that have bindings, the timers. Owner mode starts here;
-4. SETTLE_FRAMES later, an owner delta with C = 1 for every new K.
-A delta always describes the change since the last chunk the client acknowledged, plus everything the
-chunks sent after it carried (the client may have applied them), so a lost datagram needs no resend.
+   variables that have bindings, the timers. Retry the same chunk until it is acknowledged;
+4. once acknowledged and SETTLE_FRAMES have passed, an owner delta with C = 1 for every new K.
+A correction describes the change since the last chunk the client acknowledged, plus everything the
+chunks sent after it carried (the client may have applied them), so it needs no resend.
 """
 
 import logging
@@ -539,6 +539,9 @@ class BodyScript(ReplicatedBody):
         self.world.match = None
         if self.stream.full_update is not None:
             self.stream.full_update.resend = False
+        if self.stream.initial_owner is not None:
+            self.stream.initial_owner.resend = False
+            self.stream.initial_owner = None
 
     def spawn_frames(self) -> list:
         """The full frame that puts the body's statescript on the client (send it once the client has the
@@ -558,6 +561,8 @@ class BodyScript(ReplicatedBody):
             return self.spawn_frames() if self.create_arrived else []
         if stream.base is None or self.frame <= stream.cmfd:
             return []
+        if stream.initial_owner is not None and stream.initial_owner.resend:
+            return []  # transport is delivering the exact first owner frame
         if self.first_owner_frame is None or replace_initial:
             self.first_owner_frame = self.frame
             correction = False
@@ -568,7 +573,10 @@ class BodyScript(ReplicatedBody):
         frame, keys, snap = self.delta(
             stream.base, stream.touched(), self.frame, correction, kill_feed=kill_feed,
         )
-        return [stream.delta(frame, snap, keys, self.frame)]
+        update = stream.delta(frame, snap, keys, self.frame)
+        if not correction:
+            stream.initial_owner = update
+        return [update]
 
     def report_sent(self, last: int) -> None:
         """Record the owner delta actually transmitted for projectile confirmation."""
@@ -592,6 +600,10 @@ class BodyScript(ReplicatedBody):
         stream.sent_reports[last] = report
         self.reports.append(report)
         del self.reports[:-MAX_REPORTS]
+        if stream.initial_owner is not None and stream.initial_owner.chunk_last == last:
+            # Before the first actual send, the queued initial can still coalesce.
+            # After send, retain its original chunk and report through transport retries.
+            stream.initial_owner.resend = True
 
 
 def create_initial_graphs(component: runtime.Component, record: dict) -> list[runtime.Instance]:
@@ -656,6 +668,7 @@ class BodyStream:
         self.lost_keys: dict[tuple, int] = {}  # each key's newest lost owner chunk
         self.latest_lost: Snapshot | None = None  # newest owner projection, for kill-feed pulse freshness
         self.full_update = None  # the full frame's record (sent again when lost)
+        self.initial_owner = None  # first C = 0 update, retried once actually sent
 
     def _update(self, frame: BitWriter, first: int, resend: bool):
         from ow174.game.world import EntityUpdate
@@ -741,6 +754,9 @@ class BodyStream:
         self.base_last = last
         self.pending = {key: value for key, value in self.pending.items() if key > last}
         self.lost_keys = {key: number for key, number in self.lost_keys.items() if number > last}
+        if self.initial_owner is not None and self.initial_owner.chunk_last <= last:
+            self.initial_owner.resend = False
+            self.initial_owner = None
 
     def _report_delivery(self, last: int, received: bool) -> None:
         # A newer cumulative acknowledgement can discard a snapshot before the

@@ -104,7 +104,7 @@ FIELDS = {
     stats.PlayerStats: _names("values"),
     statescript.Stream: _names("entity last delivered data_last cmfd next_ack"),
     driver.BodyStream: _names(
-        "entity last cmfd base base_last pending sent_reports lost_keys latest_lost full_update"
+        "entity last cmfd base base_last pending sent_reports lost_keys latest_lost full_update initial_owner"
     ),
     driver._CreateArrived: _names("script"),
     driver.BodyScript: _names(

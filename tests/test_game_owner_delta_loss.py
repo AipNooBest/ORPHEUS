@@ -4,21 +4,118 @@ import unittest
 from unittest.mock import patch
 
 import test_server_journal as journal_tests
+from test_game_packet_budget import connection, prepare_corrections
 from test_game_repeated_lifecycles import wire_frame
 from test_script_driver import ClientModel
 
 from ow174.game import bodytrace, movelog
 from ow174.game.bits import BitWriter
 from ow174.game.commands import FIRE
-from ow174.game.link import KIND_FRAME
+from ow174.game.content import SOLDIER
+from ow174.game.link import KIND_FRAME, SYN
 from ow174.game.match import SEND_EVERY
 from ow174.game.script.driver import SETTLE_FRAMES, BodyStream, Snapshot
 
 
 class OwnerDeltaLossTests(unittest.TestCase):
-    def test_encrypted_negative_acks_compact_owner_snapshots_and_preserve_rifle_ammo(self):
+    def setUp(self):
         for diagnostics in (bodytrace, movelog):
             self.enterContext(patch.object(diagnostics, "ENABLED", False))
+
+    def test_first_owner_chunk_retries_exactly_before_corrections(self):
+        session, sent = journal_tests.ServerJournalTests().make()
+        handoff, = session.create_match(journal_tests.MAP, [(1, "Alpha", SOLDIER, 0, False)])
+        peer = journal_tests.Peer(session, handoff, sent, ("memory.test", 42000))
+        peer.send(flags=SYN)
+        peer.send()
+        peer.message(21601, {})
+        session.report_callbacks()
+        journal_tests.acknowledge_ownership(session, [peer])
+        now = 100.8
+        session.tick(now)
+        player, = session.server.matches[0].players
+        peer.message(21616, journal_tests.pick(player.entity, SOLDIER), now=now)
+        script = player.body_script
+        model = ClientModel()
+
+        def next_world():
+            nonlocal now
+            cursor = len(sent)
+            for _ in range(SEND_EVERY):
+                now += 0.016
+                session.tick(now)
+                if len(sent) > cursor:
+                    break
+            self.assertEqual(len(sent), cursor + 1)
+            packet = peer.cipher.open(sent[-1][0])
+            self.assertEqual(packet.kind, KIND_FRAME)
+            return [item for item, _ in wire_frame(packet)[1] if item.entity == player.body and item.chunk]
+
+        def receive(*, lose=False):
+            peer.drain(lose=lose)
+            peer.send(now=now)
+
+        self.assertEqual(next_world(), [])  # create precedes the full script
+        receive()
+        full, = next_world()
+        self.assertTrue(model.apply(full).full)
+        receive()
+        self.assertNotIn((11, 70), model.on())  # 0254 ammo UXPresenter
+
+        command = script.frame + 1
+        peer.commands(command, 1, FIRE, now=now)
+        self.assertEqual(script.component.instances[11].vars[53].value(), 29)
+        first, = next_world()
+        original = first.chunk.getvalue(), first.chunk.count
+        report, = script.reports
+        receive(lose=True)
+        self.assertEqual(next_world(), [])
+        receive()  # a later positive ACK reports the first frame missing
+
+        retry, = next_world()  # no new command was needed to retry the initial state
+        self.assertEqual((retry.chunk.getvalue(), retry.chunk.count), original)
+        receive(lose=True)
+        peer.commands(command + 1, SETTLE_FRAMES, 0, now=now)
+        self.assertEqual(next_world(), [])  # even with fresh commands, no correction yet
+        receive()
+        retry, = next_world()
+        self.assertEqual((retry.chunk.getvalue(), retry.chunk.count), original)
+        initial = model.apply(retry)
+        self.assertEqual((initial.owner, initial.correction, initial.cmfd), (True, False, command))
+        self.assertTrue({(11, 11), (11, 70)} <= model.on())  # weapon and ammo presenter
+        receive()
+        self.assertEqual(script.reports, [report])
+        self.assertIs(report.received, True)
+        self.assertIsNone(script.stream.initial_owner)
+
+        correction, = next_world()
+        frame = model.apply(correction)
+        self.assertEqual((frame.owner, frame.correction, frame.cmfd), (True, True, command + SETTLE_FRAMES))
+        self.assertEqual(model.vars[(11, 53)], 29)
+        receive()
+
+    def test_stop_cancels_an_already_queued_first_owner_retry(self):
+        server, client, player, peer = connection()
+        prepare_corrections(player)
+        script = player.body_script
+        full, = script.frames()
+        script.stream.arrived(full.chunk_last)
+        initial, = script.frames()
+        client.queue_entities([initial])
+        client.send_frame(110, 10.0)
+        packet = peer.open(server.sock.sent[-1][0])
+        client.acked(packet.seq + 1, 0)
+        self.assertIn(initial, client.entities)
+        self.assertTrue(initial.resend)
+
+        player.match.stop_body_script(player, failed=True)
+        self.assertTrue(player.has_body and script.retired)
+        self.assertEqual(player.body, initial.entity)
+        self.assertNotIn(initial, client.entities)
+        self.assertFalse(initial.resend)
+        self.assertIsNone(script.stream.initial_owner)
+
+    def test_encrypted_negative_acks_compact_owner_snapshots_and_preserve_rifle_ammo(self):
         fixture = journal_tests.ServerJournalTests()
         session, sent = fixture.make()
         (peer,), (player,) = fixture.connected(session, sent, two=False)

@@ -1054,9 +1054,13 @@ class Match:
 
     @staticmethod
     def stop_body_script(player: Player, *, failed: bool = False) -> None:
-        if player.body_script is not None:
-            bodytrace.stopped(player, player.body_script)
-            player.body_script.retire()
+        script = player.body_script
+        if script is not None:
+            bodytrace.stopped(player, script)
+            initial = script.stream.initial_owner
+            if initial is not None and player.client is not None:
+                player.client.cancel_entity_record(initial)
+            script.retire()
             player.body_script = None
         player.body_script_failed = failed
 
