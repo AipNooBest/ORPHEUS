@@ -11,7 +11,7 @@ from test_game_repeated_lifecycles import wire_frame
 
 from ow174.game import bodytrace, bots, combat, movelog, projectiles, statescript, world
 from ow174.game.body_vm_snapshot import export_component_vm
-from ow174.game.content import SOLDIER
+from ow174.game.content import PRACTICE_RANGE_MODE, SOLDIER
 from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
 from ow174.game.script import decode, graph, runtime
 from ow174.game.script.bot import DIED, FIRING_GRAPH, RESET, BotScript, BotWorld
@@ -122,6 +122,67 @@ class AIFireWeaponTests(unittest.TestCase):
             decoded = decode.read_chunk(chunk.getvalue(), chunk.count, {1: GRAPH})
             self.assertEqual(tuple(decoded.instances), (1,))
             self.assertEqual(decoded.instances[1].vars, {LIVE_VAR: (True, ())})
+
+
+class BotNameplateTests(unittest.TestCase):
+    def test_only_stock_practice_owner_filter_mounts_the_authored_nameplate(self):
+        parent, nameplate = 0x0C18, 0x0D24
+        enabled = {"$": "STUConfigVarDynamic", "m_identifier": 14680}
+        exact_filter = {
+            "$": "STUConfigVarFilter", "m_84065FD1": 0x3FFFFFFF, "m_4EA686DB": 0x100,
+            "m_27CF71D5": 0, "m_condition": None,
+        }
+        condition = {"$": "STU_AC829876", "m_entity": {"$": "STU_B5A0CAF0"}, "m_filter": exact_filter}
+        child_fields = {
+            "m_36F7B64C": {"m_36F7B64C": {"m_C974E369": {"m_graph": "0x0580000000000D24"}}},
+            "m_89402D74": [{"m_out_Var": enabled, "m_value": enabled}],
+        }
+        alternate = make_graph(0x0A5B, [
+            node(0, "STUStatescriptEntry", fields={"m_outPlug": output([1, "m_beginPlug"])}),
+            node(1, "STU_37D754C8", state=11, fields=child_fields),
+        ], states=[None] * 11 + [1], entries=[0])
+        child = make_graph(nameplate, variables=[(14680, 0, 1)])
+        cases = (
+            (0x016B, PRACTICE_RANGE_MODE, condition, False, (1, 3)),
+            (0x016C, PRACTICE_RANGE_MODE, condition, False, (1, 3)),
+            (0x016B, 0x0230000000000014, condition, False, None),
+            (0x0170, PRACTICE_RANGE_MODE, condition, True, (2, 11)),
+            (0x016B, PRACTICE_RANGE_MODE, {**condition, "m_entity": {"$": "STU_1FF67CA6"}}, False, None),
+            (0x016B, PRACTICE_RANGE_MODE,
+             {**condition, "m_filter": {**exact_filter, "m_66747E7D": 2}}, False, None),
+        )
+        for hero, mode, predicate, has_alternate, expected in cases:
+            with self.subTest(hero=hero, mode=mode, predicate=predicate):
+                source = make_graph(parent, [
+                    node(0, "STUStatescriptEntry", fields={"m_outPlug": output([1, "m_beginPlug"])}),
+                    node(1, "STUStatescriptStateBooleanSwitch", state=1, fields={
+                        "m_condition": predicate, "m_trueSubgraphPlug": output([2, "m_beginPlug"]),
+                    }),
+                    node(2, "STU_37D754C8", state=3, fields=child_fields),
+                ], states=[None, 1, None, 2], entries=[0])
+                definitions = {parent: source, nameplate: child, alternate.index: alternate}
+                roots = [{"graph": parent, "m_1EB5A024": [{
+                    "m_0D09D2D9": "0x0D80000000003958", "m_value": {"$": "STUConfigVarBool", "m_value": 0},
+                }]}]
+                if has_alternate:
+                    roots.append({"graph": alternate.index})
+                with (
+                    patch.object(graph, "entity_body", return_value={"graphs": roots}),
+                    patch.object(graph, "graph", side_effect=definitions.get),
+                    patch.object(decode, "graph_of", side_effect=definitions.get),
+                ):
+                    script = BotScript(
+                        0x0400000000001403, 0x02E0000000000000 | hero, bots.BOT_ENTITY, 100, mode, 200,
+                    )
+                    payload, _ = script.initial
+                    chunk = statescript.chunk(payload, 0, 1)
+                    frame = decode.read_chunk(chunk.getvalue(), chunk.count)
+                self.assertFalse(frame.owner)
+                plates = [item for item in frame.instances.values() if item.graph == nameplate]
+                self.assertEqual([item.parent for item in plates], [] if expected is None else [expected])
+                self.assertNotIn(3, frame.instances[1].states)
+                if expected == (1, 3):
+                    self.assertEqual(plates[0].vars, {14680: (False, ())})
 
 
 class SyntheticScript:

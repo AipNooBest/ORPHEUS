@@ -3,17 +3,21 @@
 from ow174.game import observers
 from ow174.game.bits import BitWriter
 from ow174.game.bots import FIRING
+from ow174.game.content import PRACTICE_RANGE_MODE
 from ow174.game.script import expr, graph, runtime
 from ow174.game.script.driver import OWNER_HEALTH, BodyStream, ReplicatedBody, Snapshot, create_initial_graphs
 
 DIED = 0x024000000000003E  # 003E.025, the body's authoritative death message
 RESET = 0x0240000000000013  # 0013.025, the placement's eligibility reset
 FIRING_GRAPH = FIRING & 0xFFFF
+PRACTICE_NAMEPLATE_PARENT = 0x0C18
+PRACTICE_BOT_HEROES = frozenset(range(0x02E000000000016B, 0x02E000000000016F))
+PRACTICE_NAMEPLATE_FILTER = {"$": "STUConfigVarFilter", "m_84065FD1": 0x3FFFFFFF, "m_4EA686DB": 0x100}
 _Payload = tuple[BitWriter, Snapshot, set]
 
 
 class BotWorld(runtime.World):
-    """Use the NPC body's associated fire-control slots as logical input bindings."""
+    """Resolve the supported authored predicates and input bindings for an NPC body."""
 
     def __init__(
         self, hero: int, mode: int, weapon_buttons: dict[str, int], owner_position: expr.Vec3 | None = None,
@@ -30,6 +34,22 @@ class BotWorld(runtime.World):
         return self.owner_position is not None and instance.graph.index == FIRING_GRAPH
 
     def native(self, cfg: dict, instance: runtime.Instance):
+        if (
+            cfg.get("$") == "STU_AC829876"
+            and self.mode == PRACTICE_RANGE_MODE
+            and self.hero in PRACTICE_BOT_HEROES
+            and instance.graph.index == PRACTICE_NAMEPLATE_PARENT
+        ):
+            owner, target_filter = cfg.get("m_entity"), cfg.get("m_filter")
+            # Reconstruct the stock 0C18 owner gate for its authored 0D24 child.
+            # The native meaning of filter flag 0x100 remains unverified.
+            if (
+                owner in ({"$": "STU_B5A0CAF0"}, {"$": "STU_B5A0CAF0", "m_EE729DCB": 0})
+                and isinstance(target_filter, dict)
+                and {key: value for key, value in target_filter.items() if value not in (None, 0)}
+                == PRACTICE_NAMEPLATE_FILTER
+            ):
+                return True
         if self.selects_ai_behavior(instance):
             owner = cfg.get("m_entity")
             if isinstance(owner, dict) and owner.get("$") == "STU_0AC15F78":
@@ -53,10 +73,10 @@ class BotScript(ReplicatedBody):
         if record is None:
             raise ValueError(f"no statescript data for entity body {body:016X}")
         self.frame = frame
-        buttons = record.get("ai_weapon_buttons")
+        buttons = record.get("ai_weapon_buttons") or {}
         firing = graph.graph(FIRING_GRAPH) if buttons and firing_position is not None else None
         position = expr.Vec3(*firing_position) if firing is not None else None
-        world = BotWorld(hero, mode, buttons, position) if buttons else runtime.World(hero, mode)
+        world = BotWorld(hero, mode, buttons, position)
         component = self.component = runtime.Component(entity, world=world, seed=entity if firing else 1)
         component.frame = frame
         component.now = frame * component.frame_ms
