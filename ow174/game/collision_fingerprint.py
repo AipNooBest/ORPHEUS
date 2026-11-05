@@ -113,7 +113,26 @@ def _digest(value):
 
 
 def _same(actual, expected):
-    # The typed encoding also checks finite floats and preserves signed zero in cached values.
+    """Compare cache entries without encoding and hashing both copies."""
+    kind = type(expected)
+    if type(actual) is not kind:
+        return False
+    if kind is float:
+        return (
+            math.isfinite(actual) and actual == expected
+            and (actual != 0.0 or math.copysign(1.0, actual) == math.copysign(1.0, expected))
+        )
+    if kind in (list, tuple):
+        return len(actual) == len(expected) and all(
+            _same(a, b) for a, b in zip(actual, expected, strict=True)
+        )
+    if kind is dict:
+        return (
+            all(type(key) is str for key in actual) and actual.keys() == expected.keys()
+            and all(type(key) is str and _same(actual[key], value) for key, value in expected.items())
+        )
+    if kind in (bool, int, type(None)):
+        return actual == expected
     return _digest(actual) == _digest(expected)
 
 

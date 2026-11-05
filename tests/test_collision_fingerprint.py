@@ -182,6 +182,19 @@ class FingerprintTests(unittest.TestCase):
         with world.lock, self.assertRaises(CollisionFingerprintError):
             world_fingerprint(world)
 
+    def test_lazy_cache_validation_compares_types_and_the_sign_of_zero(self):
+        for index, replacement in ((collision.MINY, -0.0), (collision.SURFACE, False)):
+            with self.subTest(index=index):
+                world = scene()
+                warm(world)
+                column = world.columns[0, 0]
+                triangle = list(column[0])
+                self.assertEqual(triangle[index], replacement)
+                triangle[index] = replacement
+                column[0] = tuple(triangle)
+                with self.assertRaisesRegex(CollisionFingerprintError, "column cache disagrees"):
+                    world_fingerprint(world)
+
     def test_model_source_identity_is_separate_from_the_geometry_identity(self):
         world = scene()
         original = world_fingerprint(world)
