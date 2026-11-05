@@ -402,6 +402,10 @@ def evaluate(cfg, ctx: Context):
         return ctx.would_stack_to_top(var, stack_priority(cfg.get("m_012B7AF7")))
     if cls == "STU_7197C080":
         return cooldown_duration(cfg, ctx)
+    if cls == "STU_BE0BD267":  # Random float between the asset's bounds (0B92's waits, 0C17's chance gate).
+        low = f32(to_float(cfg.get("m_min")))
+        high = f32(to_float(cfg.get("m_max")))
+        return f32(ctx.rng.uniform(low, high))
     if cls == "STUConfigVarVec3":
         value = cfg.get("m_value") or {}
         # The target build's DataTool export preserves the teVec3 field casing.

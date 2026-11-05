@@ -110,6 +110,16 @@ class BytecodeTests(unittest.TestCase):
         self.assertEqual(self.run_code([6, 0, 6, 1, 26, 0], floats=[3.0, 0.0]), 0.0)
         self.assertIsInstance(self.run_code([6, 0, 6, 1, 25, 0], floats=[2.0, 3.0]), float)
 
+    def test_random_float_config_uses_the_seeded_float_random_stream(self):
+        config = {"$": "STU_BE0BD267", "m_min": 1.75, "m_max": 2.5}
+        random_code = expression([6, 0, 6, 1, 69, 0], floats=[1.75, 2.5])
+        ctx, reference = Context(seed=31), Context(seed=31)
+        draws = [expr.evaluate(config, ctx) for _ in range(8)]
+        self.assertEqual(draws, [expr.evaluate(random_code, reference) for _ in range(8)])
+        self.assertTrue(all(1.75 <= value <= 2.5 for value in draws))
+        self.assertGreater(len(set(draws)), 1)
+        self.assertEqual(ctx.rng.getstate(), reference.rng.getstate())
+
     def test_round_gives_an_int_and_compares_a_bool(self):
         self.assertEqual(self.run_code([6, 0, 68, 0], floats=[29.5]), 30)
         self.assertIsInstance(self.run_code([6, 0, 68, 0], floats=[29.5]), int)
