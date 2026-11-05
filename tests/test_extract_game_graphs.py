@@ -1,8 +1,11 @@
 """Unread DragonML nodes remain explicit instead of inventing input-plug ownership."""
 
+import io
+import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -142,6 +145,77 @@ class EntityRootTests(unittest.TestCase):
         entity, = extended["entities"].values()
         self.assertEqual([item["graph"] for item in entity["graphs"]], [0x0BE2, 0x0033])
         self.assertIsNone(entity["hero"])
+
+
+class SpawnerRootTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        self.spawners = self.root / "ai_spawners_174.json"
+
+    def write_table(self, table):
+        self.spawners.write_text(json.dumps(table), encoding="utf-8")
+
+    def test_optional_map_roots_deduplicate_and_follow_graph_references(self):
+        self.write_table({"maps": {
+            "0688": {"spawners": [{"graphs": ["0x0580000000000B92", "0x0580000000000033"]}, {"graphs": []}]},
+            "tutorial": {"spawners": [{"identifier": "0x0D80000000000001",
+                                       "graphs": ["0x0580000000000B92", "0x0580000000000BE5"]}]},
+        }})
+        heroes = self.root / "heroes.json"
+        heroes.write_text("{}", encoding="utf-8")
+        folder = self.root / "01B"
+        folder.mkdir()
+        for index in (0x0033, 0x0C18):
+            (folder / f"{index:012X}.01B.xml").write_text("<STUStatescript />", encoding="utf-8")
+        (folder / "000000000B92.01B.xml").write_text("""
+            <STUStatescript xmlns:dragon="https://yretenai.com/dragonml/v1" xmlns:tank="urn:test:tank">
+              <tank:ref dragon:name="m_child" GUID="000000000C18.01B" />
+            </STUStatescript>
+            """, encoding="utf-8")
+        with (
+            patch.object(extractor, "HEROES", heroes),
+            patch.object(extractor, "ROOT_GRAPHS", {0x0033: "base"}),
+        ):
+            baseline = extractor.collect(self.root, EnumTables(self.root))
+            extended = extractor.collect(self.root, EnumTables(self.root), ai_spawners=self.spawners)
+
+        self.assertEqual(baseline["roots"]["graphs"], [0x0033])
+        self.assertEqual(extended["roots"]["graphs"], [0x0033, 0x0B92, 0x0BE5])
+        self.assertEqual([item["index"] for item in extended["graphs"]], [0x0033, 0x0B92, 0x0C18])
+        self.assertEqual(extended["missing"], [0x0BE5])
+
+    def test_malformed_tables_and_wrong_asset_types_are_rejected(self):
+        cases = (
+            ([], "expected a map table"),
+            ({"maps": {"0688": {}}}, "map 0688 must contain a spawner list"),
+            ({"maps": {"0688": {"spawners": [{}]}}}, "spawner 0 must contain a graph list"),
+            ({"maps": {"0688": {"spawners": [{"graphs": [None]}]}}}, "spawner 0 has an invalid graph GUID"),
+            ({"maps": {"0688": {"spawners": [{"graphs": ["0x0400000000001403"]}]}}}, "nonzero 16-bit index"),
+            ({"maps": {"0688": {"spawners": [{"graphs": ["0x0580000000010B92"]}]}}}, "nonzero 16-bit index"),
+        )
+        for table, message in cases:
+            with self.subTest(message=message):
+                self.write_table(table)
+                with self.assertRaisesRegex(ValueError, message):
+                    extractor.ai_graph_roots(self.spawners)
+
+    def test_cli_requires_a_destination_outside_the_repository(self):
+        output = self.root / "bundle.gz"
+        argv = ["extract_game_graphs.py", "--xml", str(self.root), "--owlib", str(self.root),
+                "--ai-spawners", str(self.spawners), "--output", str(output)]
+        errors = io.StringIO()
+        with (
+            patch.object(extractor, "ROOT", self.root),
+            patch.object(sys, "argv", argv),
+            redirect_stderr(errors),
+            self.assertRaises(SystemExit) as stopped,
+        ):
+            extractor.main()
+        self.assertEqual(stopped.exception.code, 2)
+        self.assertIn("--ai-spawners requires --output outside the repository", errors.getvalue())
+        self.assertFalse(output.exists())
 
 
 class NumericScalarTests(unittest.TestCase):

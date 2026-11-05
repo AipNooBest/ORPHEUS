@@ -64,6 +64,8 @@ $env:ORPHEUS_RUNTIME_DIR = 'C:\path\to\orpheus-runtime'
 
 Omit `--map` to copy all prepared collision caches. The tool copies the expected server data files and writes their hashes. The public repository contains server source. Store the separate runtime directory locally or provision it through an authorized distribution channel. Server-only startup requires no installed client or Relay DLL. The client installation and extraction tools belong to the preparation step. See [data provenance](data/README.md) and [collision extraction](tools/build_collision.py).
 
+For local AI research, `tools/extract_game_graphs.py --ai-spawners` reads a prepared `ai_spawners_174.json` and includes the map placement graphs in a bundle written outside the repository. Pass that bundle to `prepare_server_runtime.py --game-graphs` when preparing a new runtime directory. AI execution and original-client acceptance remain separate checklist items.
+
 ## Development
 
 The full regression suite uses the prepared local research data, including additional fixtures listed in the data provenance document.

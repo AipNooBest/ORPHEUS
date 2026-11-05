@@ -11,6 +11,7 @@ graph reference (a GUID of type 01B anywhere in a kept graph).
 Additional entity definitions can be added to a separate bundle with repeated --entity options.
 Use --mode-xml <0C5 directory> with --output outside the repository to also export the mode entity's
 initial variables from the mode definitions.
+Use --ai-spawners <ai_spawners_174.json> with an external --output to include the graphs placed on maps.
 
 Per graph it keeps what a runtime needs and drops the editor layout (positions, comments, display names,
 colours). The file format is described in ow174/game/script/graph.py, which reads it.
@@ -476,10 +477,40 @@ def mode_variables(folder: Path, enums: EnumTables) -> dict[str, dict[str, bool 
     return modes
 
 
+def ai_graph_roots(path: Path) -> set[int]:
+    """Collect .01B roots from the existing map spawner table, including mode-gated placements."""
+    table = json.loads(path.read_text(encoding="utf-8"))
+    maps = table.get("maps") if isinstance(table, dict) else None
+    if not isinstance(maps, dict):
+        raise ValueError(f"{path.name}: expected a map table")
+    graph_type = full_guid("0.01B") >> 48
+    roots = set()
+    for map_id, record in maps.items():
+        spawners = record.get("spawners") if isinstance(record, dict) else None
+        if not isinstance(spawners, list):
+            raise ValueError(f"{path.name}: map {map_id} must contain a spawner list")
+        for index, spawner in enumerate(spawners):
+            context = f"{path.name}: map {map_id} spawner {index}"
+            references = spawner.get("graphs") if isinstance(spawner, dict) else None
+            if not isinstance(references, list):
+                raise ValueError(f"{context} must contain a graph list")
+            for reference in references:
+                if not isinstance(reference, str) or not re.fullmatch(r"0x[0-9a-fA-F]{16}", reference):
+                    raise ValueError(f"{context} has an invalid graph GUID")
+                guid = int(reference, 16)
+                graph = guid & 0xFFFFFFFFFFFF
+                if guid >> 48 != graph_type or not 0 < graph <= 0xFFFF:
+                    raise ValueError(f"{context} must reference a .01B graph with a nonzero 16-bit index")
+                roots.add(graph)
+    return roots
+
+
 def collect(
     xml_dir: Path, enums: EnumTables, entity_indexes: tuple[int, ...] = (), mode_xml: Path | None = None,
+    *, ai_spawners: Path | None = None,
 ) -> dict:
     variables = mode_variables(mode_xml, enums) if mode_xml is not None else None
+    ai_roots = ai_graph_roots(ai_spawners) if ai_spawners is not None else set()
     heroes = json.loads(HEROES.read_text(encoding="utf-8"))
     bodies, reason, queue = {}, {}, []
     for hero, entry in heroes.items():
@@ -497,6 +528,7 @@ def collect(
         entities[f"0x{0x0400000000000000 | index:016X}"] = record
         queue.extend((graph, name) for graph in sorted(used))
     queue += list(ROOT_GRAPHS.items())
+    queue.extend((index, "map AI spawners") for index in sorted(ai_roots))
     graphs, missing = {}, set()
     while queue:
         index, why = queue.pop(0)
@@ -514,7 +546,7 @@ def collect(
         queue += [(child, why) for child in sorted(xml.graph_refs())]
     data = {
         "version": 1,
-        "roots": {"bodies": sorted(bodies), "graphs": sorted(ROOT_GRAPHS)},
+        "roots": {"bodies": sorted(bodies), "graphs": sorted(ROOT_GRAPHS.keys() | ai_roots)},
         "bodies": bodies,
         "missing": sorted(missing),
         "graphs": [graphs[index] for index in sorted(graphs)],
@@ -540,15 +572,22 @@ def main() -> None:
     parser.add_argument("--entity", action="append", type=entity_index, default=[],
                         help="additional 003 asset index such as 1403, repeatable")
     parser.add_argument("--mode-xml", type=Path, help="directory of .0C5 XML files to export mode variables")
+    parser.add_argument("--ai-spawners", type=Path, help="local map spawner table to include as graph roots")
     parser.add_argument("--output", type=Path, help="destination bundle")
     args = parser.parse_args()
     output = args.output or OUT
     if args.entity and output.resolve() == OUT.resolve():
         parser.error("--entity requires --output outside the canonical hero bundle")
-    if args.mode_xml is not None and (args.output is None or output.resolve().is_relative_to(ROOT)):
-        parser.error("--mode-xml requires --output outside the repository")
+    for option, source in (("--mode-xml", args.mode_xml), ("--ai-spawners", args.ai_spawners)):
+        if source is not None and (args.output is None or output.resolve().is_relative_to(ROOT)):
+            parser.error(f"{option} requires --output outside the repository")
     enums = EnumTables(args.owlib / "TankLib" / "STU" / "Types")
-    data = collect(args.xml, enums, tuple(args.entity), mode_xml=args.mode_xml)
+    try:
+        data = collect(
+            args.xml, enums, tuple(args.entity), mode_xml=args.mode_xml, ai_spawners=args.ai_spawners,
+        )
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     for where, count in sorted(enums.missed.items()):
         print(f"  enum value without a member: {where} x{count}")
     reason = data.pop("_reason")
