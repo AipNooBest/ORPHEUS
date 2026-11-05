@@ -90,6 +90,16 @@ class ValueTests(unittest.TestCase):
         self.assertEqual(f32(0.1), 0.10000000149011612)
         self.assertEqual(expr.round_half_away(f32(f32(0.7665) * 1000.0)), 767)
 
+    def test_biotic_field_vectors_use_extracted_coordinate_names(self):
+        launch = graphs.graph(0x0257).state(1).field("m_5EC1EB38.m_1C78B91C")
+        track = graphs.graph(0x0258).state(0).field("m_05BE62DD")
+        self.assertEqual(expr.evaluate(launch, Vars()), Vec3(f32(0.2), 1.0, f32(0.3)))
+        self.assertEqual(expr.evaluate(track, Vars()), Vec3(0.0, 1.0, 0.0))
+
+    def test_lowercase_vector_literals_remain_supported(self):
+        config = {"$": "STUConfigVarVec3", "m_value": {"x": -1.0, "z": 0.25}}
+        self.assertEqual(expr.evaluate(config, Vars()), Vec3(-1.0, 0.0, 0.25))
+
 
 class BytecodeTests(unittest.TestCase):
     def run_code(self, opcodes, dynamics=(), floats=(), ctx=None, configs=None):

@@ -404,7 +404,8 @@ def evaluate(cfg, ctx: Context):
         return cooldown_duration(cfg, ctx)
     if cls == "STUConfigVarVec3":
         value = cfg.get("m_value") or {}
-        return Vec3(*(f32(float(value.get(axis) or 0.0)) for axis in ("x", "y", "z")))
+        # The target build's DataTool export preserves the teVec3 field casing.
+        return Vec3(*(f32(float(value.get(axis, value.get(axis.lower())) or 0.0)) for axis in "XYZ"))
     if "m_resourceKey" in cfg:  # any other resource config var: the resource's id
         for key, value in cfg.items():
             if key != "m_resourceKey" and guid_of(value):
