@@ -306,10 +306,10 @@ class MatchReadinessTests(unittest.TestCase):
         match.update(10.8, 1000)
         original_step = a.mover.step
 
-        def step(*args):
+        def step(*args, **kwargs):
             # An external resource transition must not become a new read during this packet.
             provider.state = LoadState("pending")
-            return original_step(*args)
+            return original_step(*args, **kwargs)
 
         with mock.patch.object(a.mover, "step", side_effect=step):
             fire_packet(a)
