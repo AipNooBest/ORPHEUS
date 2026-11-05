@@ -137,9 +137,8 @@ COUNTDOWN = 1303
 COUNTDOWN_EVERY = 1.0  # the screen shows whole seconds
 STATS_EVERY = 0.5  # seconds between updates of a player's own board numbers (component 64, stats.py)
 
-# The bots' creates do not fit one datagram (about 94 bytes each), so the server spreads them over a few
-# frames; their movement records start this many ticks after the creates were queued, so that none comes
-# before its create (retail never sent ch3 in an entity's create frame).
+# The bots' creates span several datagrams. Give them this many ticks before adding movement records,
+# and wait for each create's ACK separately.
 BOT_RECORD_DELAY = 8
 
 
@@ -668,11 +667,12 @@ class Match:
                 continue
             updates.append(EntityUpdate(other.body, movement=other.movement()))
         shown = self.bots_shown.get(viewer.slot)
-        if shown is not None and self.tick - shown >= BOT_RECORD_DELAY:
+        client = viewer.client
+        if client is not None and shown is not None and self.tick - shown >= BOT_RECORD_DELAY:
             updates += [
                 EntityUpdate(bot.entity, movement=bot.movement(self.tick))
                 for bot in self.bots
-                if bot.record_due(self.tick, SEND_EVERY)
+                if client.bot_create_acked(bot.entity) and bot.record_due(self.tick, SEND_EVERY)
             ]
         own = correction.own_record(viewer, self.tick)
         if own is not None:

@@ -10,6 +10,8 @@ from test_game_repeated_lifecycles import wire_frame
 from ow174.game import bodytrace, bots, combat, movelog, world
 from ow174.game.content import PRACTICE_RANGE, SOLDIER
 from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
+from ow174.game.match import BOT_RECORD_DELAY
+from ow174.game.script import graph
 from ow174.game.server import SILENCE_SECONDS, TICK_SECONDS, Client
 
 
@@ -122,6 +124,43 @@ class BotNoticeTests(unittest.TestCase):
         self.ack()
         reliable, _ = self.send(110)
         self.assert_kill_notices(reliable)
+
+    def assert_movement_waits_for_create_ack(self, bot, tick):
+        bot.moved_tick = tick  # make the production movement record due on each send tick
+        _, lost = self.send(tick, deliver=False)
+        self.assertIn((bot.entity, world.OP_CREATE), lost)
+        due = tick + BOT_RECORD_DELAY + 1
+        _, waiting = self.send(due)
+        self.assertFalse(self.client.bot_create_acked(bot.entity))
+        self.assertNotIn((bot.entity, 0), waiting)
+        self.ack()  # the later frame arrived with the create missing
+        _, retry = self.send(due + 3)
+        self.assertIn((bot.entity, world.OP_CREATE), retry)
+        self.assertNotIn((bot.entity, 0), retry)
+        self.ack()
+        self.assertTrue(self.client.bot_create_acked(bot.entity))
+        _, active = self.send(due + 6)
+        self.assertIn((bot.entity, 0), active)
+
+    def test_movement_waits_for_the_lost_initial_bot_create(self):
+        self.prepare(single=True)
+        self.assert_movement_waits_for_create_ack(self.target.owner, 100)
+
+    def test_respawned_bot_movement_waits_for_its_own_create(self):
+        self.prepare(single=True)
+        self.send(100)
+        self.ack()
+        self.kill_bot()
+        self.send(101)
+        self.ack()
+        old = self.target.owner
+        index = self.match.bots.index(old)
+        # Isolate movement from optional graph chunks so op 0 refers to ch3 only.
+        with patch.object(graph, "entity_body", return_value=None):
+            self.respawn_target(104)
+        fresh = self.match.bots[index]
+        self.assertNotEqual(fresh.entity, old.entity)
+        self.assert_movement_waits_for_create_ack(fresh, 104)
 
     def test_reused_entity_id_ignores_ack_for_previous_lifetime(self):
         self.prepare(single=True)

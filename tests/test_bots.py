@@ -6,6 +6,7 @@ import struct
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[0]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -386,6 +387,7 @@ class MatchTests(unittest.TestCase):
     def test_records_start_after_the_creates(self):
         self.match.tick = 1000
         self.match.spawn_updates(self.player)
+        self.player.client = SimpleNamespace(bot_create_acked=lambda entity: entity in self.ids)
         self.assertEqual(self.bot_records(1000 + BOT_RECORD_DELAY - 1), [])
         seen = set()
         for tick in range(1000 + BOT_RECORD_DELAY, 1000 + BOT_RECORD_DELAY + bots.SETTLE_TICKS):

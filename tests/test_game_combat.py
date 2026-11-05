@@ -34,8 +34,11 @@ class FakeClient:
     def queue_reliable(self, msg_id: int, value: dict) -> None:
         self.reliable.append((msg_id, value))
 
+    def bot_create_acked(self, entity: int) -> bool:
+        return True  # this model acknowledges every create immediately
+
     def queue_bot_notice(self, entity: int, msg_id: int, value: dict) -> None:
-        self.queue_reliable(msg_id, value)  # this model acknowledges every create immediately
+        self.queue_reliable(msg_id, value)
 
     def queue_bot_health(self, entity: int, components: dict) -> None:
         self.queue_entities([
