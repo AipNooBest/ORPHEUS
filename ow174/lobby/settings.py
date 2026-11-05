@@ -18,3 +18,4 @@ class Settings:
     # players search the same queue (for tests with fewer players).
     test_players: int = 0
     paths: Paths = field(default_factory=Paths)
+    build_missing_collision: bool = False  # local client testing may extract a missing cache

@@ -24,8 +24,6 @@ from ow174.game.script.codecs import f32, w_u16, w_var
 from ow174.game.script.graph import bodies
 from ow174.game.script.graph import graph as graph_of
 
-STEC_CLASSES = codecs.stec_classes()
-
 
 class DecodeError(ValueError):
     pass
@@ -371,7 +369,7 @@ def _owner_states(
 
     if frame.full:
         for node in graph.owner_states():
-            if node.cls in STEC_CLASSES:
+            if node.cls in codecs.stec_classes():
                 if reader.bit():
                     active = bool(reader.bit())
                     item.states[node.state] = (active, payload(node.cls))
@@ -382,7 +380,7 @@ def _owner_states(
         return
     for index in sorted(mask(reader, len(graph.states))):
         node = graph.states[index]
-        if node.cls in STEC_CLASSES:
+        if node.cls in codecs.stec_classes():
             if not reader.bit():
                 continue
             active = bool(reader.bit())
@@ -410,7 +408,7 @@ def _remote_states(
             if not reader.bit():  # X = 0: off
                 item.states[node.state] = (False, {})
                 continue
-            if node.cls in STEC_CLASSES:
+            if node.cls in codecs.stec_classes():
                 if reader.bit():  # Y
                     active = bool(reader.bit())
                     item.states[node.state] = (active, payload(node.cls))
@@ -423,7 +421,7 @@ def _remote_states(
         node = graph.remote_nodes[index]
         if node is None or node not in networked:
             raise DecodeError(f"instance {item.id}: an H=0 delta sets remote index {index}, it has no bits")
-        if node.cls in STEC_CLASSES:
+        if node.cls in codecs.stec_classes():
             if not reader.bit():  # X
                 continue
             active = bool(reader.bit())

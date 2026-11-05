@@ -27,9 +27,9 @@ from ow174.game.bits import BitWriter
 from ow174.game.commands import FRAME_HALF, FRAME_MASK, frame_distance
 from ow174.game.content import SOLDIER
 from ow174.game.script import expr, graph, nodes, runtime
+from ow174.game.script.codecs import stec_classes
 from ow174.game.script.expr import INSTANCE, Asset, Entity, Vec3, f32
 from ow174.game.statescript import (
-    STEC_CLASSES,
     Binding,
     EventWire,
     InstanceWire,
@@ -338,7 +338,7 @@ class BodyScript:
     @staticmethod
     def _add_state(snap: Snapshot, owner: int, index: int, state: runtime.State) -> None:
         cls = state.node.cls
-        if not state.networked or not (state.active or (cls in STEC_CLASSES and state.counter)):
+        if not state.networked or not (state.active or (cls in stec_classes() and state.counter)):
             return
         if not sendable(cls, state.active):
             expr.warn_once(f"send{cls}", "state class %s is on but cannot be sent", cls)
@@ -414,7 +414,7 @@ class BodyScript:
                 continue
             if now is None:
                 cls = graphs[owner].states[index].cls
-                if cls in STEC_CLASSES:
+                if cls in stec_classes():
                     continue  # it never reached the client as on
                 state = StateWire(cls, False)
             else:

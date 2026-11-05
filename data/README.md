@@ -1,6 +1,6 @@
 # Runtime data
 
-These are the small data sets required by the server and its tests, not user saves or research logs.
+The server and its tests use the following data sets. The public source checkout uses separately prepared runtime data. See [separate deployment data](../README.md#separate-deployment-data).
 
 | File | Purpose |
 | --- | --- |
@@ -11,6 +11,7 @@ These are the small data sets required by the server and its tests, not user sav
 | `extracted_maps.json` | Map metadata and seasonal variants. |
 | `ai_spawners_174.json` | The training bots: each map's AI spawners (hero, team, place, route) and hint points, and the bot heroes' bodies, health and speed (`tools/extract_ai_spawners.py`). |
 | `resource_keys_174.json` | Game content keys used by event resources. These are not account credentials. |
+| `lobby_state_blob.key` | Local 64-byte signing input for the target build's lobby handshake. |
 | `extracted_events_174.json` | Verified scene mappings used by regression tests. |
 | `announced_crcs_174.json` | Protocol identifiers used by the schema-extraction tool. |
 | `arcade_cards_174.json` | The Arcade's cards (`tools/extract_arcade_cards.py`). |

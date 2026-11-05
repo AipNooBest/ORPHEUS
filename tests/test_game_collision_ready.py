@@ -2,6 +2,7 @@
 
 import dataclasses
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -113,7 +114,7 @@ class ProviderTests(unittest.TestCase):
         started, release, published = threading.Event(), threading.Event(), threading.Event()
         world = wall_world()
         guid = MAP.map_guid + 1
-        key = (guid, props.mode_identifiers(MAP.mode_guid))
+        key = (guid, props.mode_identifiers(MAP.mode_guid), True)
         original_keep = collision._keep
 
         def load(*args):
@@ -146,7 +147,7 @@ class ProviderTests(unittest.TestCase):
 
     def test_unexpected_loader_failure_is_terminal_and_clears_pending(self):
         guid = MAP.map_guid + 2
-        key = (guid, props.mode_identifiers(MAP.mode_guid))
+        key = (guid, props.mode_identifiers(MAP.mode_guid), True)
         published = threading.Event()
         original_keep = collision._keep
 
@@ -169,6 +170,45 @@ class ProviderTests(unittest.TestCase):
             self.assertIs(provider.poll(guid, MAP.name, MAP.mode_guid), failed)
             self.assertEqual(loader.call_count, 1)
         self.assertNotIn(key, collision._pending)
+
+    def test_cache_only_missing_map_never_consults_client_and_does_not_poison_builder(self):
+        guid = MAP.map_guid + 3
+        published = threading.Event()
+        original_keep = collision._keep
+        deployed = AsyncCollisionProvider(build_missing=False)
+
+        def keep(*args):
+            result = original_keep(*args)
+            published.set()
+            return result
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(collision, "cache_path", return_value=Path(tmp) / "missing.col"),
+            mock.patch.object(collision, "collision_keys", side_effect=AssertionError) as keys,
+            mock.patch.object(collision, "installed_game", side_effect=AssertionError) as lookup,
+            mock.patch.object(collision, "build", side_effect=AssertionError("cache build")) as build,
+            mock.patch.object(collision, "_keep", side_effect=keep),
+            self.assertLogs("ow174.game", level="WARNING"),
+        ):
+            deployed.poll(guid, MAP.name, MAP.mode_guid)
+            self.assertTrue(published.wait(5))
+            result = deployed.poll(guid, MAP.name, MAP.mode_guid)
+            self.assertEqual(result.status, "unavailable")
+            self.assertIn("no collision cache", result.error)
+            keys.assert_not_called()
+            lookup.assert_not_called()
+            build.assert_not_called()
+
+            published.clear()
+            local_test = AsyncCollisionProvider(build_missing=True)
+            world = wall_world()
+            with mock.patch.object(collision, "_read_cache", return_value=world) as load:
+                local_test.poll(guid, MAP.name, MAP.mode_guid)
+                self.assertTrue(published.wait(5))
+                self.assertIs(local_test.poll(guid, MAP.name, MAP.mode_guid).world, world)
+                self.assertTrue(load.call_args.args[2])
+            self.assertIs(deployed.poll(guid, MAP.name, MAP.mode_guid), result)
 
     def test_six_pending_requests_keep_their_completion_before_any_second_poll(self):
         count = collision.KEEP_WORLDS + 2
@@ -281,13 +321,13 @@ class MatchReadinessTests(unittest.TestCase):
 
     def test_active_match_keeps_collision_after_global_lru_eviction(self):
         ready = wall_world()
-        key = (MAP.map_guid, props.mode_identifiers(MAP.mode_guid))
+        key = (MAP.map_guid, props.mode_identifiers(MAP.mode_guid), True)
         collision._keep(key, ready)
         match = Match(MAP)
         a, b = players_in(match)
         match.update(10.8, 1000)
         for index in range(collision.KEEP_WORLDS):
-            collision._keep((MAP.map_guid + 10 + index, frozenset()), flat_world(0.0))
+            collision._keep((MAP.map_guid + 10 + index, frozenset(), True), flat_world(0.0))
         self.assertNotIn(key, collision._worlds)
         failure = AssertionError("must stay pinned")
         with mock.patch.object(collision, "_read_cache", side_effect=failure) as loader:

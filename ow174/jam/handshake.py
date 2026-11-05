@@ -11,8 +11,10 @@ import socket
 import struct
 import time
 from dataclasses import dataclass
+from functools import cache
 
 from ow174.jam.cipher import Jam
+from ow174.paths import LOBBY_STATE_BLOB_KEY
 
 HELLO_CLIENT = b"HELLO PRO CLIENT\x00"
 HELLO_SERVER = b"HELLO PRO SERVER\x00"
@@ -20,8 +22,13 @@ ZERO_KEY = bytes(32)  # the client does not check a session key, so both sides u
 DIFFICULTY = 0
 CLIENT_MESSAGE_SIZE = 40  # 8 bytes we ignore, then a 32-byte nonce or proof
 
-# HMAC key that signs the state blob. It is fixed in the client.
-BLOB_KEY = None  # Historical client key omitted from ORPHEUS publication.
+@cache
+def lobby_state_blob_key() -> bytes:
+    """Read the target build's fixed state-blob signing key from the local runtime inputs."""
+    key = LOBBY_STATE_BLOB_KEY.read_bytes()
+    if len(key) != 64:
+        raise ValueError("Lobby state blob signing key must be 64 bytes.")
+    return key
 
 
 class HandshakeError(ConnectionError):
@@ -57,7 +64,7 @@ def build_state_blob(seq: int, host: str, port: int) -> bytes:
     blob[5:7] = struct.pack("<H", port)
     blob[255] = 0xFF
     signed = bytes(blob[:176]) + bytes(blob[208:256])
-    blob[176:208] = hmac.new(BLOB_KEY, signed, hashlib.sha256).digest()
+    blob[176:208] = hmac.new(lobby_state_blob_key(), signed, hashlib.sha256).digest()
 
     peer_id = struct.pack("<IBHBH", seq, 0x00, 5, 0x01, 0xBEEF) + bytes(6)
     channel_id = struct.pack("<IBHBH", seq, 0x00, 13, 0x01, 0x0000) + struct.pack("<H", port) + address

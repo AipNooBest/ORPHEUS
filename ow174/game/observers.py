@@ -21,9 +21,9 @@ shows no weapon.
 import logging
 
 from ow174.game.script import expr, graph
+from ow174.game.script.codecs import stec_classes
 from ow174.game.script.driver import NOT_SENT, BodyStream, Snapshot
 from ow174.game.statescript import (
-    STEC_CLASSES,
     InstanceWire,
     StateWire,
     family,
@@ -49,7 +49,7 @@ def snapshot(script) -> Snapshot:
             if state is None or presenter(node):
                 continue
             cls = node.cls
-            if not (state.active or (cls in STEC_CLASSES and state.counter)):
+            if not (state.active or (cls in stec_classes() and state.counter)):
                 continue
             if family(cls) == "unknown":
                 expr.warn_once(f"observe{cls}", "remote state class %s has no H=0 payload", cls)
@@ -154,7 +154,7 @@ def delta(script, stream: BodyStream, snap: Snapshot):
             continue
         if now is None:
             cls = graphs[owner].states[index].cls
-            if cls in STEC_CLASSES:
+            if cls in stec_classes():
                 continue  # it never reached the client as on
             state = StateWire(cls, False)
         else:
@@ -173,7 +173,7 @@ def _activity(snap: Snapshot) -> tuple:
     """What must reach the other clients at once: the instances, the states that are on, the StEC states'
     payloads (their counters start them again)."""
     on = frozenset(key for key, (_, active, _) in snap.states.items() if active)
-    stec = frozenset((key, value) for key, value in snap.states.items() if value[0] in STEC_CLASSES)
+    stec = frozenset((key, value) for key, value in snap.states.items() if value[0] in stec_classes())
     return frozenset(snap.instances), on, stec
 
 

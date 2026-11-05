@@ -85,6 +85,7 @@ credentials.json
 secrets.json
 /secrets/
 /local-data/
+/runtime-data/
 /game-client/
 /captures/
 /data/resource_keys_174.json

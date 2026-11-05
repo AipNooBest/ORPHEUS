@@ -59,8 +59,9 @@ def codec(cls: str) -> Codec | None:
     return _index().get(cls)
 
 
-def stec_classes() -> set[str]:
-    return {item.name for item in _index().values() if item.stec}
+@cache
+def stec_classes() -> frozenset[str]:
+    return frozenset(item.name for item in _index().values() if item.stec)
 
 
 # --- the readers the layouts use (the client's) ------------------------------------------------------------

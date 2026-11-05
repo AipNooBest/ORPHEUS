@@ -221,6 +221,7 @@ class LobbyServer:
     def start_game_server(self) -> None:
         """Bind the game server's UDP port and start it. Raises OSError when the port is taken. It
         needs the packages of requirements.txt, so it is imported here."""
+        from ow174.game.collision import AsyncCollisionProvider
         from ow174.game.server import GameServer
 
         game = GameServer(
@@ -229,6 +230,9 @@ class LobbyServer:
             on_leave=self.game_left,
             skin_of=self.skin_of,
             on_join=self.game_joined,
+            collision_provider_factory=lambda: AsyncCollisionProvider(
+                build_missing=self.settings.build_missing_collision,
+            ),
         )
         game.start()
         self.game = game

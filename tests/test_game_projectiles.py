@@ -181,7 +181,9 @@ class ProjectileRangeTests(unittest.TestCase):
                 reach = rocket.speed * rocket.left
                 self.assertEqual(reach, 100.0)
                 target = next(target for target in fight._targets() if target.owner is victim)
-                contact = combat.ray_capsule(rocket.position, rocket.direction, *target.segment(), target.radius)
+                contact = combat.ray_capsule(
+                    rocket.position, rocket.direction, *target.segment(), target.radius,
+                )
                 self.assertGreater(contact, reach - rocket.speed * combat.TICK)
                 self.assertEqual(contact < reach, hit)
                 vitals = fight.vitals_of(target)

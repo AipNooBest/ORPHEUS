@@ -26,6 +26,7 @@ from ow174.accounts.registry import account_id_for
 from ow174.bnet.session_key import MAX_NAME_BYTES
 from ow174.content.presence import PRO_ACCOUNT_BITS
 from ow174.dashboard.server import start_dashboard
+from ow174.jam.handshake import lobby_state_blob_key
 from ow174.launcher import LaunchError
 from ow174.launcher.game import close_running_copy, find_game, start_game
 from ow174.launcher.relay import ensure_relay_dll
@@ -36,7 +37,14 @@ from ow174.lobby.research import watch_inject_file
 from ow174.lobby.server import LobbyServer
 from ow174.lobby.settings import Settings
 from ow174.log import setup_logging
-from ow174.paths import PLAYER_NAME_FILE, PUBLIC_ADDRESS_FILE, SERVER_ADDRESS_FILE, Paths
+from ow174.paths import (
+    PLAYER_NAME_FILE,
+    PUBLIC_ADDRESS_FILE,
+    RUNTIME_DIR,
+    SERVER_ADDRESS_FILE,
+    Paths,
+    missing_runtime_files,
+)
 
 log = logging.getLogger("ow174")
 
@@ -248,6 +256,15 @@ def run(args: argparse.Namespace) -> None:
         join_tournament(args)
         return
     retail = args.mode in ("retail", "host")
+    if RUNTIME_DIR is not None:
+        missing = missing_runtime_files(matches=args.game_port > 0, bnet=retail)
+        if missing:
+            raise LaunchError(f"Missing files in ORPHEUS_RUNTIME_DIR: {', '.join(missing)}")
+    try:
+        lobby_state_blob_key()
+    except (OSError, ValueError) as error:
+        raise LaunchError(f"Lobby state blob key is unavailable: {error}") from error
+    launches_game = args.mode != "server" and not args.no_launch
     settings = Settings(
         host=listen_host(args),
         port=args.port,
@@ -256,9 +273,10 @@ def run(args: argparse.Namespace) -> None:
         game_host=args.game_host,
         test_players=max(0, args.test_players),
         paths=_paths(args),
+        build_missing_collision=launches_game,
     )
     game = relay = None
-    if args.mode != "server" and not args.no_launch:
+    if launches_game:
         game = find_game(args.game_exe)
         close_running_copy(game)
     if retail or settings.game_port > 0:

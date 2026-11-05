@@ -18,9 +18,9 @@ The chunk does not hold the props the client makes from the map's entity placeab
 clip boxes): their models' physics shapes are added from props.py, each with the placeable's identifier
 when it has one, since such a prop exists only in the game modes that list it.
 
-The server reads the chunk from the player's own game install (casc.py) once per map and keeps the
-mover's part in a git-ignored cache, cache/collision/<map>.col (tools/build_collision.py builds them all;
-the server builds a missing or outdated one the first time a match is played on that map). The cache
+The mover's part lives in a git-ignored cache, cache/collision/<map>.col. tools/build_collision.py
+builds it from the player's own game install. The client launcher can build it on demand; a
+server-only deployment reads prepared caches. The cache
 keeps the shapes the way the client's physics engine has them (contacts.py): each mesh's triangles in
 chunk order with their wing vertices, the polytopes whole, the props as their models' shapes placed with
 the placeable's translation, rotation and scale.
@@ -45,7 +45,7 @@ from typing import Protocol
 
 from ow174.game import contacts, props
 from ow174.game.casc import CascError, Storage, game_root
-from ow174.paths import DATA_DIR, GAME_PATH_FILE, ROOT
+from ow174.paths import COLLISION_CACHE_DIR, DATA_DIR, GAME_PATH_FILE
 
 log = logging.getLogger("ow174.game")
 
@@ -54,7 +54,7 @@ MOVER = TEAM0 | TEAM1
 NOT_GROUND = 0x1  # surface bit: the probe does not stand on it
 CHUNK_TYPE = 0x11
 KEYS_PATH = DATA_DIR / "collision_keys_174.json"
-CACHE_DIR = ROOT / "cache" / "collision"
+CACHE_DIR = COLLISION_CACHE_DIR
 MAGIC = b"OW174COL"
 VERSION = 5  # 2: props with their identifiers; 3: no client-only breakables; 4: the engine's shapes;
 # 5: only the props' static shapes, at their nodes (props.static_part, props.at_node)
@@ -685,14 +685,16 @@ class StaticCollisionProvider:
 
 
 class AsyncCollisionProvider:
-    def __init__(self) -> None:
+    def __init__(self, *, build_missing: bool = True) -> None:
+        self._build_missing = build_missing
         self._handles: dict[tuple, _LoadHandle] = {}
 
     def poll(self, map_guid: int, name: str = "", mode: int | None = None) -> LoadState:
         key = (map_guid, props.mode_identifiers(mode))
         handle = self._handles.get(key)
         if handle is None:
-            handle = self._handles[key] = _request_world(map_guid, name, mode)
+            handle = _request_world(map_guid, name, mode, build_missing=self._build_missing)
+            self._handles[key] = handle
         with _loading:
             return handle.state
 
@@ -748,7 +750,7 @@ def world_for(
     it), loaded once (and built from the game install when its cache is missing or outdated); None when
     there is none to be had (the mover then walks on a flat floor)."""
     identifiers = props.mode_identifiers(mode)
-    key = (map_guid, identifiers)
+    key = (map_guid, identifiers, build_missing)
     with _loading:
         if key in _worlds:
             _worlds.move_to_end(key)
@@ -758,9 +760,11 @@ def world_for(
     return world
 
 
-def _request_world(map_guid: int, name: str, mode: int | None) -> _LoadHandle:
+def _request_world(map_guid: int, name: str, mode: int | None, *, build_missing: bool = True) -> _LoadHandle:
     identifiers = props.mode_identifiers(mode)
-    key = (map_guid, identifiers)
+    # A cache-only miss must not block a later development build or join a worker
+    # that can access a game installation.
+    key = (map_guid, identifiers, build_missing)
     with _loading:
         if key in _worlds:
             _worlds.move_to_end(key)
@@ -773,7 +777,7 @@ def _request_world(map_guid: int, name: str, mode: int | None) -> _LoadHandle:
 
     def load() -> None:
         try:
-            world = _read_cache(map_guid, name, True, identifiers)
+            world = _read_cache(map_guid, name, build_missing, identifiers)
         except Exception as error:  # noqa: BLE001 - all worker failures must publish a terminal state
             # A failed worker must publish a terminal state instead of leaving the map pending forever.
             detail = f"{type(error).__name__}: {error}"

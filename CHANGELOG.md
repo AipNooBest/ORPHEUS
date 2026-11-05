@@ -37,3 +37,10 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Swept the final fraction of projectile flight before expiry. Soldier: 76's Helix Rockets now detect impacts in the final part of their configured range and report the time they actually flew.
 - Used the volley timestamp for hitscan notice attribution. Shots caught up after missing input report their own frames. Their aim, position, and target rewind still use the available command sample.
 - Passed 36 targeted projectile, combat, command epoch, and timing tests. Client acceptance for the changes is pending. GitHub synchronization awaits the reviewed standalone server build.
+
+#### Standalone server
+
+- Added an external runtime directory for protocol tables, graph and map data, the lobby signing input, Battle.net descriptors, and prepared collision. The preparation tool copies the required files from a local research checkout and writes a SHA-256 manifest.
+- Made server-only modes load collision caches without searching for a client installation. Startup reports missing runtime files before binding, and the map loader reports missing collision.
+- Kept upstream notices and references, added the project contributor list, and documented the separate publication history and GitHub synchronization workflow.
+- Passed 69 targeted Python tests, including lobby wire vectors and collision readiness, plus Ruff and Git diff checks. An isolated Windows deployment completed a signed lobby handshake and served the Battle.net WebSocket, dashboard, and UDP match. The Practice Range loaded its prepared collision and spawned 15 bots. Manual client acceptance is pending.

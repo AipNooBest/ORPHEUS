@@ -9,16 +9,15 @@ the answer repeats.
 """
 
 import struct
-from pathlib import Path
 
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
-DESCRIPTORS = Path(__file__).with_name("descriptors.pb")
+from ow174.paths import BNET_DESCRIPTORS
 
 
 def _build_pool() -> descriptor_pool.DescriptorPool:
     """Load descriptors.pb. A file can only be added after the files it imports."""
-    descriptor_set = descriptor_pb2.FileDescriptorSet.FromString(DESCRIPTORS.read_bytes())
+    descriptor_set = descriptor_pb2.FileDescriptorSet.FromString(BNET_DESCRIPTORS.read_bytes())
     files = {file.name: file for file in descriptor_set.file}
     pool = descriptor_pool.DescriptorPool()
     added: set[str] = set()

@@ -96,6 +96,7 @@ class NoLaunchTests(unittest.TestCase):
                 ):
                     mocks[name].assert_not_called()
                 self.assertIsNone(server.games)  # also disables dashboard client launching
+                self.assertFalse(mocks["LobbyServer"].call_args.args[0].build_missing_collision)
                 mocks["_bind"].assert_called_once_with(server)
                 mocks["_start_game_server"].assert_called_once_with(server)
                 mocks["start_dashboard"].assert_called_once_with(server, port=args.dashboard_port)
@@ -152,6 +153,7 @@ class NoLaunchTests(unittest.TestCase):
             mocks["find_game"].assert_called_once_with(None)
             mocks["close_running_copy"].assert_called_once_with(Path("Overwatch.exe"))
             mocks["ensure_relay_dll"].assert_called_once()
+            self.assertTrue(mocks["LobbyServer"].call_args.args[0].build_missing_collision)
             mocks["RetailGames"].assert_called_once_with(
                 Path("Overwatch.exe"), Path("relay.dll"), "auto", 30.0, bnet_port=args.bnet_port,
             )

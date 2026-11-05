@@ -292,7 +292,6 @@ class Stream:
 # What the client reads for each state class comes from its codec table (ow174/game/script/codecs.py,
 # data/statescript_codecs_174.json, read in the client code): whether it is an StEC class and its codec. The
 # writers below cover these codecs; tests/test_statescript_codecs.py reads every writer back with the table.
-STEC_CLASSES = codecs.stec_classes()
 WRITERS = {
     "none", "switch", "stack", "anim", "chase", "button", "ability", "targets", "volley", "subscript",
     "message", "send", "link", "hits", "flags13", "frames", "counter2", "pulser",
@@ -311,7 +310,7 @@ def family(cls: str) -> str:
 def sendable(cls: str, active: bool) -> bool:
     """Whether a state of this class can go into an owner frame: one whose payload we cannot write only when
     it is off and not an StEC class (an StEC state carries its payload when it is off too)."""
-    return family(cls) != "unknown" or (not active and cls not in STEC_CLASSES)
+    return family(cls) != "unknown" or (not active and cls not in codecs.stec_classes())
 
 
 def signed_u16(out: BitWriter, value: int) -> None:
@@ -706,7 +705,7 @@ def _instance_states(out: BitWriter, item: InstanceWire, frame_time: int, frame_
         node = nodes[index]
         if node is None or node.client_only or node.server_only:
             raise ValueError(f"instance {item.id} st{index} is not a networked state")
-        if state.cls in STEC_CLASSES:
+        if state.cls in codecs.stec_classes():
             out.bit(1)  # X
             out.bit(state.active)
             write_payload(out, state.cls, state.payload, frame_time, frame_ms)
@@ -884,7 +883,7 @@ def write_remote_payload(out: BitWriter, cls: str, payload: dict, full: bool) ->
 def _remote_state(out: BitWriter, state: "StateWire | None", full: bool) -> None:
     """One remote-synced state: in a full frame X, then Y for an StEC class (off goes as X = 0); in a delta X
     for an StEC class; then StAc (StEC) or A and the payload."""
-    stec = state is not None and state.cls in STEC_CLASSES
+    stec = state is not None and state.cls in codecs.stec_classes()
     if full:
         if state is None or not (state.active or stec):
             out.bit(0)  # X = 0: off
