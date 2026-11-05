@@ -162,6 +162,34 @@ class BotNoticeTests(unittest.TestCase):
         self.assertNotEqual(fresh.entity, old.entity)
         self.assert_movement_waits_for_create_ack(fresh, 104)
 
+    def test_skipped_respawn_deadline_still_sends_terminal_health(self):
+        self.prepare(single=True)
+        self.send(100)
+        self.ack()
+        self.match.update(10.0, 101)
+        fight = self.match.combat
+        old = self.target.owner
+        index = self.match.bots.index(old)
+        fight._damage(self.player, self.target, old.health, False, None, 101)
+        self.assertTrue(fight.vitals[self.entity].dead)
+
+        # No intermediate combat update can flush the dirty pool before the respawn deadline.
+        skipped = 200
+        tick = 101 + skipped
+        with patch.object(graph, "entity_body", return_value=None):
+            self.match.update(10.0 + skipped * combat.TICK, tick)
+        fresh = self.match.bots[index]
+        self.assertNotEqual(fresh.entity, self.entity)
+
+        reliable, records = self.send(tick)
+        self.assert_kill_notices(reliable)
+        self.assertIn((world.OP_UPDATE, 0.0), self.health)
+        self.assertIn((fresh.entity, world.OP_CREATE), records)
+        self.assertNotIn((self.entity, world.OP_DESTROY), records)
+        self.ack()
+        _, retired = self.send(tick + 3)
+        self.assertIn((self.entity, world.OP_DESTROY), retired)
+
     def test_reused_entity_id_ignores_ack_for_previous_lifetime(self):
         self.prepare(single=True)
         build = self.client.entities[0].build
@@ -214,15 +242,6 @@ class BotNoticeTests(unittest.TestCase):
         self.prepare(single=True)
         self.send(100)
         self.ack()
-        observer = self.match.add_player(2, "Beta", SOLDIER, 0, False)
-        observer.client = Client(
-            self.server, ("memory.test", 40002), 2, LinkCipher(b"v" * 32, b"w" * 32), observer,
-        )
-        observer.spawned = True
-        self.match.bots_shown[observer.slot] = self.match.tick
-        observer.client.queue_entities([self.match._bot_create_update(self.target.owner)])
-        observer.client.send_frame(100, 10.0)
-        observer.client.acked(1, 1)
         self.kill_bot()
         lost, _ = self.send(101, deliver=False)
         self.assert_kill_notices(lost)
@@ -230,9 +249,6 @@ class BotNoticeTests(unittest.TestCase):
 
         fresh = self.match.combat.next_bot
         self.respawn_target(289)
-        self.assertEqual([(item.entity, item.op) for item in observer.client.entities], [
-            (self.entity, world.OP_DESTROY), (fresh, world.OP_CREATE),
-        ])
         self.client.queue_entities([world.EntityUpdate(self.entity, world.OP_DESTROY)])
         reliable, records = self.send(289)
         self.assertEqual(self.notices(reliable), [])
@@ -245,6 +261,54 @@ class BotNoticeTests(unittest.TestCase):
         self.assertNotIn((self.entity, world.OP_DESTROY), records)
         self.ack()
         self.assertEqual(self.send(295)[1].count((self.entity, world.OP_DESTROY)), 1)
+
+    def test_unscripted_bystander_retries_terminal_health_before_destroy(self):
+        self.prepare(single=True)
+        viewer = self.match.add_player(2, "Bystander", SOLDIER, 0, False)
+        key_in, key_out = b"v" * 32, b"w" * 32
+        observer = Client(self.server, ("memory.test", 40002), 2, LinkCipher(key_in, key_out), viewer)
+        self.server.clients[observer.conn] = observer
+        viewer.client, viewer.spawned, observer.open = observer, True, True
+        self.match.bots_shown[viewer.slot] = self.match.tick
+        observer.queue_entities([self.match._bot_create_update(self.target.owner)])
+        peer, window = LinkCipher(key_out, key_in), ReceiveWindow()
+        sequence = 0
+
+        def send(tick, *, lose=False):
+            self.match.tick = tick
+            observer.send_frame(tick, 10.0)
+            packet, _, reliable, _, _, _ = decoded(self, peer, self.server.sock.sent[-1][0])
+            self.assertEqual(self.notices(reliable), [])
+            if not lose:
+                self.assertTrue(window.accept(packet.seq))
+            return wire_frame(packet)[1]
+
+        def ack():
+            nonlocal sequence
+            packet = Packet(observer.conn, KIND_CONTROL, sequence, window.expected, window.bits, ACK)
+            sequence += 1
+            self.server._datagram(peer.seal(packet), observer.address, 10.0)
+
+        self.assertEqual(self.bot_health(send(100)), [(world.OP_CREATE, self.target.owner.health)])
+        ack()
+        self.assertTrue(observer.bot_create_acked(self.entity))
+        self.assertNotIn(self.entity, observer._bot_scripts)
+        self.kill_bot()
+        self.assertEqual(self.bot_health(send(101, lose=True)), [(world.OP_UPDATE, 0.0)])
+        self.assertNotIn(self.entity, observer._bot_notice_tail)
+
+        fresh = self.match.combat.next_bot
+        with patch.object(graph, "entity_body", return_value=None):
+            self.respawn_target(289)
+        records = [(item.entity, item.op) for item, _ in send(289)]
+        self.assertIn((fresh, world.OP_CREATE), records)
+        self.assertNotIn((self.entity, world.OP_DESTROY), records)
+        ack()  # the replacement arrived, the old terminal pool did not
+        retry = send(292)
+        self.assertEqual(self.bot_health(retry), [(world.OP_UPDATE, 0.0)])
+        self.assertNotIn((self.entity, world.OP_DESTROY), [(item.entity, item.op) for item, _ in retry])
+        ack()
+        self.assertIn((self.entity, world.OP_DESTROY), [(item.entity, item.op) for item, _ in send(295)])
 
     def test_acknowledged_kill_notices_wait_for_earlier_reliable_gap(self):
         self.prepare(single=True)

@@ -287,7 +287,9 @@ class Client:
     def _bot_destroy_pending(self, entity: int, oldest: int) -> bool:
         tail = self._bot_notice_tail.get(entity)
         health_pending = entity in self._bot_health
-        if tail is not None and (oldest <= tail or health_pending):
+        if health_pending and self.bot_create_acked(entity):
+            return True  # bystanders also need the old body's terminal health
+        if tail is not None and oldest <= tail:
             return True  # the receiver can park a notice behind an earlier reliable gap
         script = self._bot_scripts.get(entity)
         if script is None:

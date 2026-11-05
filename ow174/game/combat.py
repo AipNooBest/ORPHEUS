@@ -496,6 +496,8 @@ class Combat:
         self.match.deliver_body_messages()
         if frames:
             self.observers.update()
+        # A skipped tick can reach a respawn deadline with the old body's terminal pool still dirty.
+        self._send_health()
         for when, who in list(self.respawns):
             if isinstance(who, bots.Bot) and who in self.match.bots:
                 self._advance_bot_death(who, tick)
@@ -503,7 +505,6 @@ class Combat:
                 self.respawns.remove((when, who))
                 self._respawn(who)
         self.voice.expire(now)
-        self._send_health()
         current = {target.entity for target in self._targets()}
         for table in (self.history, self.vitals):
             for entity in [key for key in table if key not in current]:
