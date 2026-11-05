@@ -122,9 +122,11 @@ class Var:
         self.links: list[Link] = []
         self.watchers: dict[State, None] = {}
 
-    def value(self):
+    def value(self, below: "State | None" = None):
         value = self.base
         for link in self.links:
+            if link.state is below:
+                break
             if link.state.active:
                 value = link.state.output(link.slot)
         return value
@@ -164,6 +166,8 @@ class InstanceContext(Context):
             return None
         if self.watcher is not None:
             self.watcher.watch(var)
+            if self.watcher.reads_below(var):
+                return var.value(below=self.watcher)
         return var.value()
 
     def var(self, scope: int, var: int):
@@ -356,11 +360,25 @@ class Component:
 
     # --- variables ---------------------------------------------------------------------------------
 
-    def changed(self, var: Var, before) -> None:
-        """Tell a variable's watchers that it changed, when its value did: an event for each (9)."""
-        if expr.same(before, var.value()):
-            return
+    def changed(self, var: Var, before, *, stack_source: "State | None" = None) -> None:
+        """Notify effective-value watchers and Stack expressions whose lower input may have changed."""
+        changed = not expr.same(before, var.value())
+        above_source = None
+        if stack_source is not None:
+            # A Stack value change can only affect the inputs of entries above it.
+            above_source = set()
+            above = False
+            for link in var.links:
+                if above:
+                    above_source.add(link.state)
+                elif link.state is stack_source:
+                    above = True
         for state in list(var.watchers):
+            if state.reads_below(var):
+                if above_source is not None and state not in above_source:
+                    continue
+            elif not changed:
+                continue
             if state.active and not state.flags_changed:
                 state.flags_changed = True
                 state.instance.post(Event(self.now, 0, CHANGED, state=state))
@@ -528,8 +546,8 @@ class Instance:
                 link.state.var_written(var)
         self.changed(var, before)
 
-    def changed(self, var: Var, before) -> None:
-        self.component.changed(var, before)
+    def changed(self, var: Var, before, *, stack_source: "State | None" = None) -> None:
+        self.component.changed(var, before, stack_source=stack_source)
 
     # --- states ------------------------------------------------------------------------------------
 
@@ -892,6 +910,10 @@ class State:
         for var in self.watched:
             var.watchers.pop(self, None)
         self.watched.clear()
+
+    def reads_below(self, var: Var) -> bool:
+        """Whether this state's expression reads the value beneath its link to var."""
+        return False
 
     def evaluate(self, cfg, watch: bool = True):
         return self.instance.evaluate(cfg, self if watch else None)

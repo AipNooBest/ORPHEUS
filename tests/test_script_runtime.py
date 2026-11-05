@@ -140,6 +140,24 @@ class MechanicsTests(unittest.TestCase):
         self.assertEqual(button_edges(FIRE, RELOAD), [(20, False), (14, True), (111, False)])
         self.assertEqual(button_edges(0, 0, 2), [(16, True), (16, False)])
 
+    def test_doomfist_rocket_punch_adds_to_the_underlying_stack_value_once(self):
+        # 0D06 state 77 adds 0.5 to the same variable it overrides. This input used
+        # to exhaust instance 5's event budget and retire the live Doomfist body.
+        body = BodyScript(0x02E000000000012F, 0xA0000106, 8831)
+        charge = 0x5A90
+        body.component.set(charge, 2.0)
+        run(body, 1, 0x02)
+        self.assertIn(77, on(body, 5))
+        self.assertEqual(entity(body, charge), 2.5)
+
+        body.component.set(charge, 3.0)
+        run(body, 4, 0x02)
+        self.assertEqual(entity(body, charge), 3.5)
+
+        run(body, 112, 0)
+        self.assertNotIn(77, on(body, 5))
+        self.assertEqual(entity(body, charge), 3.0)
+
     def test_stack_order(self):
         var = runtime.Var((0, 1))
 

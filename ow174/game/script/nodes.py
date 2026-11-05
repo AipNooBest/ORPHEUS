@@ -124,7 +124,8 @@ class BooleanSwitch(State):
 class Stack(State):
     """OnBegin 0x7FF78AAA5FF0: push an entry {state, priority} on m_out_Var. The last entry is the top: its
     state follows m_topSubgraphPlug, every other m_underSubgraphPlug (only on a change). The variable reads
-    the top's m_value. The entry is popped at the end."""
+    the top's m_value. A modifier that reads its output variable uses the value below its own entry
+    (for example Doomfist 0D06 state 77 adds 0.5 to entity var 5A90). The entry is popped at the end."""
 
     family = "stack"
 
@@ -158,6 +159,9 @@ class Stack(State):
             self.instance.exit_subgraph(self.node, "m_topSubgraphPlug")
             self.instance.follow(self.node, "m_underSubgraphPlug", self)
 
+    def reads_below(self, var: Var) -> bool:
+        return var is self.var
+
     def dependency_changed(self) -> None:
         if self.var is None or _field(self, "m_value") is None:
             return
@@ -165,7 +169,7 @@ class Stack(State):
         if not expr.same(value, self.value):
             before = self.var.value()
             self.value = value
-            self.instance.changed(self.var, before)
+            self.instance.changed(self.var, before, stack_source=self)
 
     def on_end(self, finished: bool) -> None:
         self.instance.exit_subgraph(self.node, "m_topSubgraphPlug")
