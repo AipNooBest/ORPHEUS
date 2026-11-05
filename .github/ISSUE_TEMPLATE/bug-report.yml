@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a reproducible ORPHEUS problem.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please report one problem per issue. If you tested with a game client, use your own copy of build `1.74.0.0.104319`.
+
+        Issues are public. Share only redacted excerpts. Remove credentials, keys, account identifiers, IP addresses, and personal paths. Keep complete captures, game files, and prepared runtime data in local storage.
+  - type: input
+    id: revision
+    attributes:
+      label: ORPHEUS commit
+      description: Run `git rev-parse --short HEAD` in your checkout or copy the commit from GitHub.
+      placeholder: abc1234
+    validations:
+      required: true
+  - type: input
+    id: client-build
+    attributes:
+      label: Client build and language
+      description: If the report is server-only, enter `Server-only`.
+      placeholder: 1.74.0.0.104319, enUS
+    validations:
+      required: true
+  - type: dropdown
+    id: test-lane
+    attributes:
+      label: Where did you observe it?
+      options:
+        - Original client with a prepared runtime
+        - Offline server test with a prepared runtime
+        - Source-only test or tool
+    validations:
+      required: true
+  - type: input
+    id: context
+    attributes:
+      label: Map, mode, hero, and action
+      description: Include the target if relevant. Leave blank for issues unrelated to gameplay.
+      placeholder: Practice Range (0688), Soldier 76, rifle headshot against a hostile Training Bot
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Give the shortest sequence of actions, or the command to run for a server-only issue.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result
+      description: If it happens intermittently, give the number of attempts and how many showed the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Optional evidence
+      description: Add a short redacted log excerpt, screenshot, or video link. Include the relevant timestamp or frame if available.

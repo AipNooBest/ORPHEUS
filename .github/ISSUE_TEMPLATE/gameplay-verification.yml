@@ -1,0 +1,73 @@
+name: Gameplay verification
+description: Record the result of a specific original-client or offline gameplay check.
+labels: [gameplay verification]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Record one scenario per issue. For a manual acceptance result, use your own original `1.74.0.0.104319` client. Choose the offline option for replay, server, and protocol results.
+
+        Issues are public. Share only redacted excerpts. Remove credentials, keys, account identifiers, IP addresses, and personal paths. Keep complete captures, game files, and prepared runtime data in local storage.
+  - type: input
+    id: revision
+    attributes:
+      label: ORPHEUS commit
+      description: Run `git rev-parse --short HEAD` in your checkout or copy the commit from GitHub.
+    validations:
+      required: true
+  - type: dropdown
+    id: test-lane
+    attributes:
+      label: Test lane
+      options:
+        - Manual acceptance with the original client
+        - Offline replay or server integration with a prepared runtime
+        - Offline synthetic fixture
+    validations:
+      required: true
+  - type: input
+    id: client-build
+    attributes:
+      label: Client build and language
+      description: If no client was used, enter `Offline`.
+      placeholder: 1.74.0.0.104319, zhCN
+    validations:
+      required: true
+  - type: input
+    id: context
+    attributes:
+      label: Map, mode, hero, and action
+      description: Include the target and whether you tested as the acting player or an observer.
+      placeholder: Practice Range (0688), Soldier 76, fire at a hostile Training Bot as the shooter
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps or test command
+      description: Include any setup needed to repeat the result and the number of attempts.
+    validations:
+      required: true
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Result
+      options:
+        - Passed
+        - Failed
+        - Mixed results
+        - Blocked
+    validations:
+      required: true
+  - type: textarea
+    id: observations
+    attributes:
+      label: Expected and observed results
+      description: Where relevant, list damage or healing, animation, HUD, effects, and audio separately. Identify the blocked step if the check could not run.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Optional evidence
+      description: Link the issue or pull request being checked and add a redacted log excerpt, screenshot, or video link if useful.

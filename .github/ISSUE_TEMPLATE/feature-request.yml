@@ -1,0 +1,40 @@
+name: Feature request
+description: Suggest an original-build behavior to restore or a project improvement.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe one change and how you would tell it works. For original game behavior, reference the target build `1.74.0.0.104319` when possible.
+
+        Issues are public. Share only redacted excerpts. Keep credentials, keys, complete captures, game files, and prepared runtime data in local storage.
+  - type: textarea
+    id: current
+    attributes:
+      label: Current behavior
+      description: Describe the problem or gap and when it matters.
+    validations:
+      required: true
+  - type: textarea
+    id: desired
+    attributes:
+      label: Proposed behavior
+      description: Describe what should happen and one observable result that would verify it.
+    validations:
+      required: true
+  - type: input
+    id: context
+    attributes:
+      label: Map, mode, hero, and action
+      description: Include a target or affected player role when relevant.
+      placeholder: Practice Range (0688), Soldier 76, eliminating a hostile Training Bot
+  - type: input
+    id: versions
+    attributes:
+      label: Client build and ORPHEUS commit
+      description: If you tested this scenario, include the exact build and the commit you used.
+  - type: textarea
+    id: references
+    attributes:
+      label: Optional references
+      description: Link a related issue, public reference, redacted screenshot, or video and identify the relevant detail.

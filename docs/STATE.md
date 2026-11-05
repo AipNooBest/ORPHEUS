@@ -1,14 +1,16 @@
 # Project state
 
-Local evidence updated 2026-11-05, for client **1.74.0.0.104319**. The gameplay
-integration uses LizRollin's wip revision
+Local evidence from 2026-11-05, for client **1.74.0.0.104319**. This record
+includes historical checkpoints. See the [changelog](../CHANGELOG.md) for
+subsequent repairs and the [roadmap](ROADMAP.md) for current acceptance goals.
+The gameplay integration uses LizRollin's wip revision
 `9f8f3bcb5eccab6fb7738bee3c2371fcf0623f29`, on top of the Boi baseline and the
 local startup/research work. [WIP.md](../WIP.md) retains the upstream author's
 test claims and known issues. Those claims are separate from the observations below.
 
-The current user instruction is unattended server development through the full
-M0-M6 list: do not start or operate the game. All real-client acceptance is
-deferred to the user after the server implementation and self-checks are complete.
+Maintainer automation runs server work and offline checks. Volunteer client
+playtests are a separate, manual verification lane described in
+[CONTRIBUTING.md](../CONTRIBUTING.md#original-client-verification).
 The local server-only entry is `START_SERVER_LOCAL.cmd` / `--mode retail
 --no-launch`; it retains the Battle.net/RPC/lobby/game services without a game
 path, relay preparation or client-launch manager.
@@ -48,9 +50,10 @@ Local repairs add bounded expression execution and malformed-bytecode handling;
 freeze reliable body creates to their original hero, skin, pose and projectile
 lease; retire queued/in-flight entity records and ACK callbacks after destroy;
 and reject late input packets without resetting only one command consumer.
-Command decoding handles uint32 wrap. The native body driver explicitly rejects
-a forward wrap before changing its old-epoch timers/state; automatic live epoch
-recovery is not implemented.
+Command decoding handles uint32 wrap. At this checkpoint the native body driver
+rejected a forward wrap before changing its old-epoch timers and state. Later
+server-driven handoff and global clock recovery work is recorded in the
+[changelog](../CHANGELOG.md), with original-client recovery still to verify.
 
 Runtime event/update exhaustion and immediate plug cycles now fail the entire
 component with `ScriptBudgetError` (entity, frame and time included). Pending
@@ -59,7 +62,7 @@ rejected. The live match handler retires that body's script; other players keep
 running. This prevents half-completed simulations from looking successful. It
 does not add automatic recovery or prove the cause of the reported live issues.
 
-The latest full Python regression ran 1086 tests, all passing. The formerly skipped
+At the initial integration checkpoint, 1086 Python tests passed. The formerly skipped
 King's Row physics case now runs with the locally built cache. A separate 62.448-second offline
 Soldier sequence applied/decoded 3903 owner chunks, observed ammo spending and
 seven refills, and ended with no active volley after release. This is a native
@@ -172,9 +175,8 @@ acceptance; the user's real-client lifecycle/HUD checks remain separate.
 
 ## Local startup
 
-`START_LOCAL.cmd` uses `.venv`, `--test-players 1` and `--bnet-port 1118` on this
-machine. Port 1119 is occupied by another application; the relay RPC port remains
-21119. Passing an install folder or `Overwatch Launcher.exe` resolves to the
+`START_LOCAL.cmd` uses `.venv`, `--test-players 1` and `--bnet-port 1118`.
+The relay RPC port is 21119. Passing an install folder or `Overwatch Launcher.exe` resolves to the
 actual game executable. The original client files and launcher are retained.
 
 ## Lobby and data
@@ -183,7 +185,8 @@ The existing lobby includes menus/scenes, loot boxes, catalog purchases, profile
 and cosmetic management, events/challenges, competitive menu data and the local
 dashboard. See the upstream README for its scope.
 
-`data/` contains target-build schemas/catalogs/graphs and some 1.68 reference
-traffic decoded with 1.74 schemas. Raw captures are not bundled. Cross-version
-references, unavailable specifications and evidence limits are recorded in
+`data/` in the local research checkout contains target-build schemas,
+catalogs, graphs and data derived from 1.68 reference traffic decoded with 1.74
+schemas. The [public data guide](../data/README.md) describes the separate runtime.
+Cross-version references, unavailable specifications and evidence limits are recorded in
 [RESEARCH_EVIDENCE.txt](RESEARCH_EVIDENCE.txt).
