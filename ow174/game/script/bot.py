@@ -1,6 +1,7 @@
 """The NPC body's statescript, shared by all observers."""
 
 from ow174.game import observers
+from ow174.game.bits import BitWriter
 from ow174.game.bots import FIRING
 from ow174.game.content import PRACTICE_RANGE_MODE
 from ow174.game.script import expr, graph, runtime
@@ -100,9 +101,20 @@ class BotScript(ReplicatedBody):
             runtime.send_instance_message(self.behavior, RESET, {}, entity)
             component.run_now()
         snapshot = observers.snapshot(self)
-        self.initial = observers.full_frame(self, snapshot), snapshot
+        self.latest_live = snapshot
+        self._initial_frame: BitWriter | None = observers.full_frame(self, snapshot)
         self.death_frame: int | None = None
         self._produced = snapshot
+
+    def _initial_payload(self) -> BitWriter:
+        if self._initial_frame is None:
+            self._initial_frame = observers.full_frame(self, self.latest_live)
+        return self._initial_frame
+
+    @property
+    def initial(self) -> tuple[BitWriter, Snapshot]:
+        """Encode the current live baseline only when a viewer needs its full frame."""
+        return self._initial_payload(), self.latest_live
 
     def replicated_instances(self):
         return (instance for instance in super().replicated_instances() if instance is not self.behavior)
@@ -118,7 +130,8 @@ class BotScript(ReplicatedBody):
         self._report_shots()
         snapshot = self._changed_snapshot()
         if snapshot is not None:
-            self.initial = observers.full_frame(self, snapshot), snapshot
+            self.latest_live = snapshot
+            self._initial_frame = None
         return snapshot
 
     def die(self, frame: int, params: dict, sender: int) -> Snapshot | None:
@@ -128,6 +141,8 @@ class BotScript(ReplicatedBody):
             return None
         if frame < self.frame:
             raise ValueError("bot death predates its script")
+        # A terminal graph may remove instances needed to encode the last live baseline.
+        self._initial_payload()
         # A bot can die in the tick that created it. Its initial frame is already
         # frozen, so run the terminal event after the bootstrap simulation frame.
         self.frame = max(frame, self.frame + 1)

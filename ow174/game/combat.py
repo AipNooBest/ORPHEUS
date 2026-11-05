@@ -576,7 +576,7 @@ class Combat:
                 for state, number, time, activation in shots:
                     self._shoot(
                         bot, None, state, number, time, activation=activation,
-                        snapshot=snapshot or script.initial[1],
+                        snapshot=snapshot or script.latest_live,
                     )
                 if snapshot is not None:
                     for viewer in self.match.players:

@@ -727,7 +727,7 @@ class ObserverProjectileDeliveryTests(unittest.TestCase):
         state = instance.state(16)
         state.counter = state.volleys = 1
         baseline = Snapshot(self.tick, instances={instance.id: (instance.graph.index, None)})
-        script = SimpleNamespace(graphs=lambda: {instance.id: instance.graph})
+        script = SimpleNamespace(graphs=lambda: {instance.id: instance.graph}, latest_live=baseline)
         script.initial = observers.full_frame(script, baseline), baseline
         bot = bots.make(PRACTICE_RANGE.map_guid)[0]
         bot.body_script = script

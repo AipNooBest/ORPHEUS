@@ -199,6 +199,10 @@ class SyntheticScript:
         self.deaths = []
         self.initial = self.frame()
 
+    @property
+    def latest_live(self):
+        return self.initial[1]
+
     def graphs(self):
         return {1: self.graph}
 
@@ -1111,6 +1115,80 @@ class BotStatescriptTests(unittest.TestCase):
         _, _, late_after = self.send(late)
         self.assertEqual(self.chunks(late_after, old), [])
         self.assertEqual((peer.pulses, late.pulses), ([], []))
+
+    def test_live_full_is_encoded_for_viewers_and_retries_keep_the_registered_baseline(self):
+        child = make_graph(GRAPH - 1)
+        definition = make_graph(GRAPH, [
+            node(0, "STUStatescriptEntry", fields={"m_outPlug": output([1, "m_beginPlug"])}),
+            node(1, "STU_37D754C8", state=0, fields={
+                "m_36F7B64C": {"m_36F7B64C": {"m_C974E369": {"m_graph": f"0x058000000000{child.index:04X}"}}},
+            }),
+            node(2, "STUStatescriptEntryGameMessage", fields={
+                "m_gameMessage": {"$": "STUConfigVarGameMessage", "m_gameMessage": f"0x{DIED:016X}"},
+                "m_outPlug": output([1, runtime.ABORT_PLUG]),
+            }),
+        ], states=[1], entries=[0, 2], variables=[(LIVE_VAR, 0, 1)])
+        definitions = {GRAPH: definition, child.index: child}
+        old, first, later = self.bot.entity, self.shooting_peer, self.watching_peer
+        with (
+            patch.object(graph, "entity_body", return_value={"graphs": [{"graph": GRAPH}]}),
+            patch.object(graph, "graph", side_effect=definitions.get),
+            patch.object(decode, "graph_of", side_effect=definitions.get),
+            patch.object(observers, "full_frame", wraps=observers.full_frame) as encode,
+        ):
+            script = self.bot.body_script = BotScript(
+                self.bot.body, self.bot.hero, old, self.tick, self.match.game_map.mode_guid, self.bot.health,
+            )
+            instance = script.component.instances[1]
+            instance.write((runtime.INSTANCE, LIVE_VAR), 10.0)
+            snapshot = script.advance_live(self.tick + 1)
+            self.assertEqual(encode.call_count, 1)  # only the bootstrap frame
+            self.assertIs(script.latest_live, snapshot)
+
+            self.show_bots(first)
+            self.assertEqual(encode.call_count, 2)
+            _, _, create = self.send(first)
+            self.assertIn(old, self.entities(create, world.OP_CREATE))
+            first.ack()
+            _, _, dropped = self.send(first, receive=False)
+            frozen = self.only_chunk(dropped, old)
+            self.assert_live(frozen, first=0, last=1, value=10.0)
+
+            for value in (20.0, 30.0):
+                instance.write((runtime.INSTANCE, LIVE_VAR), value)
+                script.advance_live(script.frame + 1)
+            self.assertEqual(encode.call_count, 2)
+            self.show_bots(later)
+            self.assertEqual(encode.call_count, 3)
+            self.assertIs(script.initial[1], script.latest_live)
+            self.assertEqual(encode.call_count, 3)
+
+            _, _, gap = self.send(first)
+            self.assertEqual(self.chunks(gap, old), [])
+            first.ack()
+            _, _, retry = self.send(first)
+            self.assert_same_chunk(frozen, self.only_chunk(retry, old))
+            _, _, create = self.send(later)
+            self.assertIn(old, self.entities(create, world.OP_CREATE))
+            later.ack()
+            _, _, full = self.send(later)
+            self.assert_live(self.only_chunk(full, old), first=0, last=1, value=30.0)
+            self.assertEqual(encode.call_count, 3)
+
+            # Death aborts the child, but a late viewer's baseline still describes
+            # the last live graph tree without the terminal transition.
+            instance.write((runtime.INSTANCE, LIVE_VAR), 40.0)
+            script.advance_live(self.tick)
+            self.assertEqual(encode.call_count, 3)
+            terminal = script.die(self.tick + 1, {}, self.shooter.body)
+            self.assertNotIn(2, terminal.instances)
+            payload, snapshot = script.initial
+            self.assertEqual(encode.call_count, 4)
+            self.assertIn(2, snapshot.instances)
+            wire = statescript.chunk(payload, 0, 1)
+            self.assert_live(wire, first=0, last=1, value=40.0)
+            frame = decode.read_chunk(wire.getvalue(), wire.count)
+            self.assertEqual((frame.instances[2].graph, frame.instances[2].parent), (child.index, (1, 0)))
 
     def test_lost_live_retries_before_death_while_replacement_gets_its_own_stream(self):
         old, peer = self.bot.entity, self.watching_peer

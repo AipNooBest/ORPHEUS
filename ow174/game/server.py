@@ -446,7 +446,7 @@ class Client:
             if (base is None or stream.pending or script.live is not None or script.volleys
                     or script.death_frames is not None or stream.entity in self._body_destroy_wait):
                 continue
-            latest = script.source.initial[1]
+            latest = script.source.latest_live
             child = practice_nameplate(latest)
             if child is None or child in base.instances:
                 continue
@@ -695,9 +695,10 @@ class Client:
         script = getattr(bot, "body_script", None)
         if script is not None:
             stream = BodyStream(entity)
-            frame, initial = script.initial
+            initial = script.latest_live
             snapshot = self._project_bot_snapshot(initial)
-            stream.full(frame if snapshot is initial else observers.full_frame(script, snapshot), snapshot)
+            frame = script.initial[0] if snapshot is initial else observers.full_frame(script, snapshot)
+            stream.full(frame, snapshot)
             self._bot_scripts[entity] = _BotScriptDelivery(stream, script)
 
     # --- sending -------------------------------------------------------------------------------
