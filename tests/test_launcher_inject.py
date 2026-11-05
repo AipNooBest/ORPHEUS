@@ -1,4 +1,5 @@
 import ctypes
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -7,6 +8,34 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ow174.launcher import inject as injector
+
+
+class FindPidsTests(unittest.TestCase):
+    def test_localized_no_matching_tasks_is_empty_and_uses_the_windows_oem_encoding(self):
+        result = subprocess.CompletedProcess([], 0, stdout="信息: 没有运行的任务匹配指定标准。\r\n")
+        with patch.object(injector.subprocess, "run", return_value=result) as run:
+            self.assertEqual(injector.find_pids(), [])
+        run.assert_called_once_with(
+            ["tasklist", "/FI", "IMAGENAME eq Overwatch.exe", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            encoding="oem",
+            errors="replace",
+            check=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+
+    def test_normal_csv_returns_only_matching_game_pids(self):
+        result = subprocess.CompletedProcess(
+            [], 0,
+            stdout=(
+                '"Overwatch.exe","1234","控制台","1","123,456 K"\r\n'
+                '"Other.exe","5678","控制台","1","456 K"\r\n'
+                '"OVERWATCH.EXE","9012","控制台","1","789 K"\r\n'
+            ),
+        )
+        with patch.object(injector.subprocess, "run", return_value=result):
+            self.assertEqual(injector.find_pids(), [1234, 9012])
 
 
 class Kernel:

@@ -176,6 +176,9 @@ class Client:
                 for item in records:
                     if item.stream is not None:
                         item.stream.arrived(item.chunk_last)
+                    callback = getattr(item, "on_arrived", None)
+                    if callback is not None:
+                        callback()
             else:
                 lost_reliable += reliable
                 lost_records += [item for item in records if item.resend]
@@ -249,11 +252,17 @@ class Client:
 
 
 class GameServer:
-    def __init__(self, host: str = "127.0.0.1", port: int = 3730, on_leave=None, skin_of=no_skin) -> None:
+    def __init__(
+        self, host: str = "127.0.0.1", port: int = 3730, on_leave=None, skin_of=no_skin,
+        *, body_scripts: str = "off",
+    ) -> None:
+        if body_scripts not in ("off", "diagnostic", "experimental"):
+            raise ValueError("Unknown body script mode")
         self.host = host
         self.port = port
         self.on_leave = on_leave  # called with each player who leaves a match
         self.skin_of = skin_of  # (account, hero) -> the equipped (skin theme, golden weapon); no locks
+        self.body_scripts = body_scripts
         self.sock: socket.socket | None = None
         self.lock = threading.RLock()
         self.handoffs: dict[int, tuple[Handoff, Player]] = {}  # connection id -> waiting player
@@ -283,7 +292,9 @@ class GameServer:
         """A match for these players: [(account_lo, name, hero GUID, team, tournament)]. Returns the
         20600 data of each, in the same order."""
         with self.lock:
-            match = Match(game_map, on_leave=self._left, skin_of=self.skin_of)
+            match = Match(
+                game_map, on_leave=self._left, skin_of=self.skin_of, body_scripts=self.body_scripts
+            )
             handoffs = []
             for account_lo, name, hero, team, tournament in players:
                 player = match.add_player(account_lo, name, hero, team, tournament)

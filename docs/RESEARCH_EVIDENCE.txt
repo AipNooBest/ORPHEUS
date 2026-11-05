@@ -1,0 +1,68 @@
+Research evidence ledger -- Overwatch 1.74.0.0.104319
+Date: 2026-11-05
+
+This ledger records provenance and limits, not independent reproduction of every claim.
+The analysis command reads local extracted data. It does not run the client or execute scripts.
+
+A. Target-client structural evidence
+  Local game_graphs_174.json.gz, game schemas and graph.py are the structural input.
+  tools/extract_game_graphs.py documents extraction from DataTool 01B and body 003 XML.
+  The analyzer records the input SHA-256 to make reports reproducible. The bundle has no
+  embedded exact-build verification; its target attribution comes from the repository.
+  A graph reference closure includes schema references, dormant scripts and conditional
+  branches. It is not a list of initialized instances or proven executed gameplay.
+  Entry-link candidates follow plug links without evaluating conditions, entry triggers,
+  events, time, subgraph invocation or lifecycle. They are not execution reachability.
+  A class name, readable parameter or numeric constant alone does not prove its behavior.
+  Source indexes, filtered owner/remote slots and presence bits are reported separately.
+
+B. Locally observed behavior (previous session evidence)
+  Local login, Practice Range loading, spawn and hero selection were observed; the server
+  recorded a hero switch. That does not establish weapons, abilities, damage or full matches.
+  This analysis tool adds no new live-client behavior verification.
+
+C. Official architecture reference
+  Timothy Ford, GDC 2017, Gameplay Architecture and Netcode:
+  https://www.gdcvault.com/play/1024001/-Overwatch-Gameplay-Architecture-and
+  Dan Reed, GDC 2017, Networking Scripted Weapons and Abilities:
+  https://www.gdcvault.com/play/1024653/Networking-Scripted-Weapons-and-Abilities
+  These talks inform architecture and research questions. They are not the 1.74 wire
+  specification, expression opcode table, node implementation or original server source.
+
+D. Community code and notes
+  Original lobby research:
+  https://github.com/Boi-027/Overwatch-1-v1.74-Lobby-Research
+  Current implementation and outstanding work:
+  https://github.com/Boi-027/overwatch-1.74-lobby-server/blob/wip/WIP.md
+  Provenance and contribution attributions:
+  https://github.com/Boi-027/overwatch-1.74-lobby-server/blob/wip/CREDITS.md
+  The original lobby research and the current wip UDP/game implementation have different
+  scopes. A working menu, map load or node decoder does not establish combat semantics.
+
+E. Cross-version references
+  Prometheus: https://github.com/saturn-xvi/prometheus
+  Its early/beta client research is useful as a method and comparison, not a complete
+  1.74 server or evidence that addresses, layouts and weapon behavior transfer unchanged.
+  data/README.md identifies 1.68 reference traffic decoded with 1.74 schemas; original
+  capture files are not included. Some comments use OW2 traffic as comparison.
+  Mark each cross-version inference and verify it on target build 104319 before acceptance.
+
+F. Tools and unavailable specifications
+  OWLib/DataTool: https://github.com/overtools/OWLib
+  Extraction recovers structures and values, not all native engine behavior or server rules.
+  CREDITS.md and source comments attribute findings to Xref and ProCore. The repository
+  does not provide a complete public knowledge base/spec for independent inspection.
+  graph.py mentions "spec 09 section 7.1"; the referenced spec is not bundled here.
+  Do not describe that unavailable material as read, public or fully verified.
+
+Acceptance and redirection
+  An unsupported node or unknown expression that blocks a scenario remains an explicit
+  blocker. Do not count structural node presence or caller-declared handlers as support.
+  If the server log agrees but the client rolls back weapon/ammo state, return to body
+  initialization, state layout and processed-input acknowledgement before adding damage.
+  Prefer independently checked target-client evidence when cross-version sources conflict.
+  Preserve unverified parameter meanings and original-server differences in the report.
+
+Reproduce the static report (from repository root):
+  .venv\Scripts\python.exe tools/analyze_game_graphs.py --hero soldier --detail-graph 0254
+  Add --json for complete machine-readable node/field evidence.

@@ -26,7 +26,7 @@ from ow174.launcher import LaunchError
 from ow174.launcher.game import close_running_copy, find_game, start_game
 from ow174.launcher.relay import ensure_relay_dll
 from ow174.launcher.requirements import ensure_requirements
-from ow174.launcher.retail import RetailGames
+from ow174.launcher.retail import DEFAULT_BNET_PORT, RetailGames
 from ow174.lobby.battle_tag_query import ask_battle_tag
 from ow174.lobby.research import watch_inject_file
 from ow174.lobby.server import LobbyServer
@@ -48,6 +48,16 @@ Which mode?
 MAX_NAME_LENGTH = 24
 EVERY_ADDRESS = "0.0.0.0"
 CHECK_SECONDS = 5.0  # how long a join waits for the server to answer
+
+
+def bnet_port_number(text: str) -> int:
+    try:
+        port = int(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("Battle.net port must be between 1 and 65535") from error
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("Battle.net port must be between 1 and 65535")
+    return port
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -75,6 +85,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--port", type=int, default=defaults.port, help="lobby port (default: 3724)")
     parser.add_argument(
+        "--bnet-port",
+        type=bnet_port_number,
+        default=DEFAULT_BNET_PORT,
+        help="local Battle.net client port (default: 1119; change it if that port is taken)",
+    )
+    parser.add_argument(
         "--dashboard-port",
         type=int,
         default=defaults.dashboard_port,
@@ -97,6 +113,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=defaults.test_players,
         help="start a match once this many players search (default: 0 = full teams only)",
+    )
+    parser.add_argument(
+        "--body-scripts", choices=("off", "diagnostic", "experimental"), default=defaults.body_scripts,
+        help="body statescript research: diagnostics only, or gated experimental replication (default: off)",
     )
     parser.add_argument(
         "--save", type=Path, default=defaults.paths.template, help="template profile for new accounts"
@@ -198,6 +218,7 @@ def run(args: argparse.Namespace) -> None:
         game_port=args.game_port,
         game_host=args.game_host,
         test_players=max(0, args.test_players),
+        body_scripts=args.body_scripts,
         paths=_paths(args),
     )
     game = relay = None
@@ -220,8 +241,8 @@ def run(args: argparse.Namespace) -> None:
         target=watch_inject_file, args=(server, settings.paths.inject_file), daemon=True, name="inject"
     ).start()
     if args.mode == "retail":
-        server.games = RetailGames(game, relay, args.locale, args.timeout)
-        _start_bnet(server)
+        server.games = RetailGames(game, relay, args.locale, args.timeout, bnet_port=args.bnet_port)
+        _start_bnet(server, args.bnet_port)
     _log_banner(server)
 
     if args.mode == "retail":
@@ -249,17 +270,17 @@ def join(args: argparse.Namespace) -> None:
     relay = ensure_relay_dll()
     # These need the packages ensure_requirements installs.
     from ow174.bnet.rpc_server import Player
-    from ow174.bnet.service import start_bnet
+    from ow174.bnet.service import RPC_PORT, start_bnet
 
     account = account_id_for(name)
     player = Player(account, account ^ PRO_ACCOUNT_BITS, tag, name)
     try:
-        start_bnet(lambda peer: player, lobby)
+        start_bnet(lambda peer: player, lobby, ports=(args.bnet_port, RPC_PORT))
     except OSError as error:
         raise LaunchError(
             f"The Battle.net ports are taken ({error}). Is a server or another game running here?"
         ) from error
-    game_process = RetailGames(game, relay, args.locale, args.timeout).start()
+    game_process = RetailGames(game, relay, args.locale, args.timeout, bnet_port=args.bnet_port).start()
     log.info("[+] The game is starting on %s as %s (%s).", address, name, tag)
     log.info("Keep this window open while you play; closing it disconnects the game.")
     game_process.wait()
@@ -340,7 +361,7 @@ def _start_game_server(server: LobbyServer) -> None:
         ) from error
 
 
-def _start_bnet(server: LobbyServer) -> None:
+def _start_bnet(server: LobbyServer, bnet_port: int = DEFAULT_BNET_PORT) -> None:
     # These need the packages ensure_requirements installs.
     from ow174.bnet.rpc_server import Player
     from ow174.bnet.service import RPC_PORT, start_bnet
@@ -352,7 +373,7 @@ def _start_bnet(server: LobbyServer) -> None:
         return Player(account.account_lo, game_account, account.battle_tag, account.name)
 
     try:
-        start_bnet(player, f"127.0.0.1:{server.settings.port}")
+        start_bnet(player, f"127.0.0.1:{server.settings.port}", ports=(bnet_port, RPC_PORT))
     except OSError as error:
         raise LaunchError(
             f"The Battle.net ports are taken ({error}). Is the server already running in another window?"

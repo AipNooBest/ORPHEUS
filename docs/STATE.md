@@ -10,16 +10,43 @@
 - Hero challenges with a Play menu banner (Tracer, Symmetra, Hanzo's Kanezaka) and their rewards.
 - Competitive seasons, ratings and the Top 500 board in the menus.
 
-## Partly works
+## Experimental game server
 
-- Practice Range and matchmaking: the game sends its requests (24000 for the Practice Range, 44100 to search, 44102 to cancel), and the server starts or stops a worker for each. No match actually starts.
-- `tools/probe_practice.py` can put the game into the "searching" state (message 53000 with state 4, answered by 52903). It resets the game back to idle afterwards.
+The `wip` branch includes a UDP game server. See [WIP.md](../WIP.md) for the upstream
+gameplay research status. Loading a map does not imply a complete playable match.
 
-## Does not work yet
+On 2026-11-05, a local Windows client of build 1.74.0.0.104319 was observed to:
 
-- Joining a match. Sending a server address (message 20600) gave no network traffic from the game.
+- Log in through the local Battle.net emulator, without the official launcher.
+- Load the Practice Range, spawn, and display hero selection.
+- Switch heroes; the server log recorded a switch to Doomfist.
 
-Do not describe this server as able to play matches.
+Walking, multiplayer visibility and matchmaking are described in the upstream WIP notes;
+they were not independently verified during this local UI check. The user stopped UI
+automation with Escape after the hero-selection observation.
+
+Weapons, abilities, reliable combat HUD, damage, death/respawn, objectives and complete
+match phases are not implemented. `game/script/graph.py` loads graph data; the expression
+interpreter and graph runtime still need implementation. Current movement is a flat mover,
+without proper map collision or gravity.
+
+## Local startup
+
+- Use `START_LOCAL.cmd` for this machine's single-player research setup. It uses the
+  isolated `.venv`, `--test-players 1`, and `--bnet-port 1118`.
+- The original port 1119 is occupied on this machine. `--bnet-port` changes only the
+  local client/stall port; the relay still connects to RPC port 21119.
+- An installation folder or `Overwatch Launcher.exe` passed to `--game-exe` is resolved
+  to the real `_retail_/Overwatch.exe`. The official launcher is never executed.
+- The original game files and official launcher are retained.
+
+## Next combat milestone
+
+Start with Soldier: 76 in the Practice Range. Establish body statescript instances,
+state/variable layouts and owner input acknowledgements, then verify that the weapon
+and ammo HUD remain stable through client prediction rollback. Only then add firing,
+ammo/reload, target hit detection and replicated damage. Input decoding or server-only
+damage calculations alone are not combat acceptance criteria.
 
 ## Data
 

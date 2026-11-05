@@ -16,24 +16,32 @@ from ow174.launcher.game import inject_relay, start_game
 
 log = logging.getLogger("ow174.launcher")
 
-BNET_ADDRESS = "127.0.0.1:1119"
+DEFAULT_BNET_PORT = 1119
 # A second game must not take the screen from the first in exclusive fullscreen. The client only masks
 # that mode while it runs; the display setting it saves stays as it was.
 SECOND_GAME_ARGUMENTS = ("--tank_NoFullScreen=1",)
 
 
 class RetailGames:
-    def __init__(self, game: Path, relay: Path, locale: str, timeout: float) -> None:
+    def __init__(
+        self, game: Path, relay: Path, locale: str, timeout: float, bnet_port: int = DEFAULT_BNET_PORT
+    ) -> None:
+        if not 1 <= bnet_port <= 65535:
+            raise ValueError("Battle.net port must be between 1 and 65535")
         self._game = game
         self._relay = relay
         self._locale = locale
         self._timeout = timeout
+        self._bnet_port = bnet_port
         self._lock = threading.Lock()
         self._second: dict[int, tuple[subprocess.Popen, str]] = {}  # PID -> (game, account name)
 
     def start(self, account: str | None = None) -> subprocess.Popen:
         """Start a game with the relay in it: for `account`, or for the dashboard's account."""
-        arguments = [f"--BNetServer={BNET_ADDRESS}", *(SECOND_GAME_ARGUMENTS if account else ())]
+        arguments = [
+            f"--BNetServer=127.0.0.1:{self._bnet_port}",
+            *(SECOND_GAME_ARGUMENTS if account else ()),
+        ]
         process = start_game(self._game, arguments, self._locale)
         if account:
             with self._lock:

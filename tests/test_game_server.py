@@ -136,6 +136,32 @@ class GameServerTests(unittest.TestCase):
         game.send_message(21616, pick(0xA0000100, REAPER))
         game.frames_until(lambda ids, count: self.server.snapshot()[0]["players"][0]["hero"] == "Reaper")
 
+    def test_diagnostic_body_runtime_follows_hero_lifecycles_without_sending_guesses(self):
+        self.server.body_scripts = "diagnostic"
+        (handoff,) = self.server.create_match(PRACTICE_RANGE, [(1, "Alpha", 0, 0, False)])
+        player = self.server.matches[0].players[0]
+        game = PretendGame(self.server.port, handoff)
+        self.addCleanup(game.sock.close)
+        game.send(SYN)
+        game.receive()
+        game.send(ACK)
+        game.send_message(21601, {})
+        game.frames_until(lambda ids, count: count >= 6)
+        game.send_message(21616, pick(player.entity, player.hero.guid))
+        game.frames_until(lambda ids, count: player.has_body)
+        first = player.body_script
+        self.assertIsNotNone(first)
+        self.assertFalse(first.runtime.complete)
+        self.assertEqual(first.stream.data_last, 0)
+        generation = first.runtime.generation
+        game.send_message(21616, pick(player.entity, REAPER))
+        game.frames_until(lambda ids, count: player.hero.guid == REAPER)
+        self.assertIsNot(player.body_script, first)
+        self.assertGreater(player.body_script.runtime.generation, generation)
+        status = self.server.snapshot()[0]["players"][0]["body_script"]
+        self.assertEqual(status["mode"], "diagnostic")
+        self.assertFalse(status["wire_data_sent"])
+
     def test_a_new_skin_on_the_same_hero_brings_a_new_body(self):
         skins = {REAPER: (0x0A5000000000160F, False)}
         self.server.skin_of = lambda account, hero: skins.get(hero, (0, False))

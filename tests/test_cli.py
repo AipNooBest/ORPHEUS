@@ -10,6 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ow174 import cli
 from ow174.accounts.registry import account_id_for
+from ow174.bnet.service import RPC_PORT
 from ow174.launcher import LaunchError
 
 
@@ -34,6 +35,29 @@ class AskModeTests(unittest.TestCase):
     def test_a_mode_on_the_command_line_is_not_asked(self):
         self.assertEqual(cli.parse_args(["--mode", "tournament"]).mode, "tournament")
         self.assertIsNone(cli.parse_args([]).mode)
+
+
+class BnetPortTests(unittest.TestCase):
+    def test_the_local_bnet_port_defaults_to_1119(self):
+        self.assertEqual(cli.parse_args([]).bnet_port, 1119)
+
+    def test_a_custom_port_and_the_valid_boundaries_are_accepted(self):
+        for port in (1, 1118, 65535):
+            with self.subTest(port=port):
+                self.assertEqual(cli.parse_args(["--bnet-port", str(port)]).bnet_port, port)
+
+    def test_invalid_ports_are_rejected_before_startup(self):
+        for port in ("0", "-1", "65536", "not-a-port"):
+            with self.subTest(port=port), patch("sys.stderr"), self.assertRaises(SystemExit):
+                cli.parse_args(["--bnet-port", port])
+
+    def test_the_retail_bnet_service_uses_the_configured_stall_port_and_fixed_rpc_port(self):
+        server = SimpleNamespace(settings=SimpleNamespace(port=3724))
+        for port in (1119, 1118):
+            with self.subTest(port=port), patch("ow174.bnet.service.start_bnet") as start_bnet:
+                cli._start_bnet(server, port)
+                self.assertEqual(start_bnet.call_args.args[1], "127.0.0.1:3724")
+                self.assertEqual(start_bnet.call_args.kwargs, {"ports": (port, RPC_PORT)})
 
 
 class JoinTests(unittest.TestCase):
@@ -117,8 +141,16 @@ class JoinTests(unittest.TestCase):
     def test_a_join_logs_in_with_the_name_and_goes_to_that_server(self):
         # The game gets the full menu from a Battle.net emulator of its own, which puts the name in
         # the session key and sends the game on to the server's lobby.
-        args = SimpleNamespace(server="lobby.example.org:12357", name="Jinxzi", game_exe=None, locale="auto")
-        args.timeout = 30.0
+        self.check_join(1119)
+
+    def test_a_join_uses_the_custom_local_bnet_port_for_the_service_and_game(self):
+        self.check_join(1118)
+
+    def check_join(self, port):
+        args = cli.parse_args([
+            "--mode", "join", "--server", "lobby.example.org:12357", "--name", "Jinxzi",
+            "--bnet-port", str(port),
+        ])
         with (
             patch.object(cli, "find_game", return_value=Path("Overwatch.exe")),
             patch.object(cli, "close_running_copy"),
@@ -131,12 +163,13 @@ class JoinTests(unittest.TestCase):
         ):
             cli.join(args)
         player, lobby = start_bnet.call_args.args
+        self.assertEqual(start_bnet.call_args.kwargs, {"ports": (port, RPC_PORT)})
         self.assertEqual(lobby, "1.2.3.4:12357")
         account = player(("127.0.0.1", 50000))
         self.assertEqual((account.account, account.name), (account_id_for("Jinxzi"), "Jinxzi"))
         ask.assert_called_once_with("1.2.3.4", 12357, "Jinxzi")
         self.assertEqual(account.battle_tag, "XQC#6691")  # the nickname the host shows
-        games.assert_called_once_with(Path("Overwatch.exe"), Path("relay.dll"), "auto", 30.0)
+        games.assert_called_once_with(Path("Overwatch.exe"), Path("relay.dll"), "auto", 30.0, bnet_port=port)
         games.return_value.start.return_value.wait.assert_called_once()
 
 

@@ -158,6 +158,9 @@ def find_pids(name="Overwatch.exe"):
         ["tasklist", "/FI", f"IMAGENAME eq {name}", "/FO", "CSV", "/NH"],
         capture_output=True,
         text=True,
+        # tasklist uses the Windows OEM code page even when Python UTF-8 mode is enabled.
+        encoding="oem",
+        errors="replace",
         check=True,
         creationflags=subprocess.CREATE_NO_WINDOW,
     )

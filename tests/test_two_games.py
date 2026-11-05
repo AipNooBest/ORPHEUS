@@ -72,6 +72,24 @@ class RetailGamesTests(unittest.TestCase):
         self.assertNotIn("--tank_NoFullScreen=1", self.arguments[0])
         self.assertIn("--tank_NoFullScreen=1", self.arguments[1])
 
+    def test_the_client_uses_the_default_local_bnet_port(self):
+        self.games.start()
+        self.assertIn("--BNetServer=127.0.0.1:1119", self.arguments[0])
+
+    def test_a_custom_bnet_port_is_used_by_both_games(self):
+        games = retail.RetailGames(Path("Overwatch.exe"), Path("relay.dll"), "auto", 5.0, bnet_port=1118)
+        games.start()
+        games.start("Second")
+        for arguments in self.arguments:
+            self.assertIn("--BNetServer=127.0.0.1:1118", arguments)
+            self.assertNotIn("--BNetServer=127.0.0.1:1119", arguments)
+
+    def test_invalid_bnet_ports_do_not_start_a_game(self):
+        for port in (0, -1, 65536):
+            with self.subTest(port=port), self.assertRaises(ValueError):
+                retail.RetailGames(Path("Overwatch.exe"), Path("relay.dll"), "auto", 5.0, bnet_port=port)
+        self.assertEqual(self.arguments, [])
+
     def test_a_game_without_the_relay_is_closed(self):
         no_relay = mock.patch.object(retail, "inject_relay", side_effect=LaunchError("no relay"))
         with no_relay, self.assertRaises(LaunchError):

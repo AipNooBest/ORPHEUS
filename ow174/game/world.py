@@ -301,6 +301,7 @@ class EntityUpdate:
         self.chunk = chunk  # a statescript.chunk()
         self.chunk_last = 0  # the chunk's last frame, to know when the client has it
         self.stream = None  # the statescript.Stream told when the chunk arrives
+        self.on_arrived = None  # optional callback after the containing datagram is acknowledged
         self.resend = True  # send it again when its datagram is lost
 
 

@@ -29,6 +29,7 @@ from ow174.game import heroselect, world
 from ow174.game.commands import Command, CommandQueue
 from ow174.game.content import SOLDIER, GameMap, Hero, heroes, spawn_point
 from ow174.game.mover import FlatMover
+from ow174.game.script.body import BodyScript
 from ow174.game.statescript import Float, Stream, owner_ack, variables_frame
 from ow174.game.world import (
     OP_CREATE,
@@ -99,6 +100,8 @@ class Player:
         self.entity = 0xA0000000 | (slot + 1) << 8
         self.body = self.entity | 1
         self.has_body = False  # not before the first pick
+        self.body_generation = 0
+        self.body_script: BodyScript | None = None
         self.skin = (0, False)  # the body's (skin theme, golden weapon)
         self.client = None  # the connected client (server.Client), None before it joins or after it left
         self.loaded_at: float | None = None
@@ -130,6 +133,8 @@ class Player:
         for command in self.commands.new(commands):
             if self.has_body:
                 self.mover.step(command, seconds)
+                if self.body_script is not None:
+                    self.body_script.advance(command)
 
     def new_body(self) -> None:
         """The next body id, at the spawn point: the server's flat mover is not exact enough to put a
@@ -146,9 +151,10 @@ def no_skin(account_lo: int, hero: int) -> tuple[int, bool]:
 
 
 class Match:
-    def __init__(self, game_map: GameMap, on_leave=None, skin_of=no_skin) -> None:
+    def __init__(self, game_map: GameMap, on_leave=None, skin_of=no_skin, *, body_scripts="off") -> None:
         self.id = (secrets.randbits(63), secrets.randbits(63))
         self.game_map = game_map
+        self.body_scripts = body_scripts
         # (account, hero GUID) -> (skin theme, golden weapon) the player has equipped, from the lobby.
         # The client's hero select equips a skin through the lobby (24500), even in a match.
         self.skin_of = skin_of
@@ -236,11 +242,12 @@ class Match:
         """The viewer's own body: its movement state rides in the create (at frame 0xFFFFFFFE) and in a
         movement record at the packet frame, as in ProCore's working spawn."""
         state = viewer.movement()
-        return [
-            EntityUpdate(
-                viewer.body, OP_CREATE, lambda origin: self._body_create(origin, viewer, state), state
-            )
-        ]
+        update = EntityUpdate(
+            viewer.body, OP_CREATE, lambda origin: self._body_create(origin, viewer, state), state
+        )
+        if viewer.body_script is not None:
+            update.on_arrived = viewer.body_script.on_created
+        return [update]
 
     def _body_create(self, origin: int, owner: Player, state: Movement | None) -> world.RecordWriter:
         components = world.health(HEALTH, HEALTH)
@@ -319,6 +326,10 @@ class Match:
                 self._spawn_steps(player, client, now)
             if player.script.data_last and now >= player.script.next_ack:
                 self._owner_ack(player, player.script, now)
+            if player.body_script is not None:
+                update = player.body_script.pending(now)
+                if update is not None:
+                    client.queue_entities([update])
             if self.assembling() and player.steps_done >= 4 and now >= player.next_countdown:
                 self._send_countdown(player, now)
         for viewer in self.players:
@@ -450,6 +461,19 @@ class Match:
         player.hero = hero
         player.skin = self.skin_of(player.account_lo, hero.guid)
         player.has_body = True
+        player.body_generation += 1
+        player.body_script = None
+        if self.body_scripts != "off":
+            player.body_script = BodyScript(
+                player.body, hero.body, player.quanta, generation=player.body_generation,
+                mode=self.body_scripts, frame=player.commands.last_frame,
+            )
+            state = player.body_script.snapshot()
+            log.info(
+                "[game] %s: %s body runtime %s; %d instances, %d diagnostics; complete=%s",
+                self.label(), player.name, self.body_scripts, len(state["instances"]),
+                len(state["diagnostics"]), state["complete"],
+            )
         if player.client is not None and player.spawned:
             components = self._possession(player)
             updates = self.own_body_updates(player)
@@ -488,9 +512,21 @@ class Match:
                     "hero": player.hero.name,
                     "team": player.team + 1,
                     "state": "playing" if player.spawned else ("loading" if player.client else "waiting"),
+                    **({"body_script": self._script_status(player)} if player.body_script else {}),
                 }
                 for player in self.players
             ],
+        }
+
+    @staticmethod
+    def _script_status(player: Player) -> dict:
+        script = player.body_script
+        return {
+            "mode": script.mode,
+            "complete": script.runtime.complete,
+            "diagnostics": len(script.runtime.diagnostics),
+            "wire_data_sent": script.stream.data_last > 0,
+            "replication_error": script.error,
         }
 
 

@@ -1,0 +1,87 @@
+M0 decoded-command simulation and replay contract, version 1
+Target build: 1.74.0.0.104319
+
+Purpose and boundary
+This is an OFFLINE recording/replay contract. It does not change CommandQueue, the UDP server,
+the original client's code, or its replication protocol. It replays the existing FlatMover model:
+flat floor, existing movement constants, no map collision/gravity, no original weapon/ability logic.
+The original client's complete timing, prediction, reconciliation and restart behavior remain unknown.
+Input is decoded Command fields; ignored wire/subframe/latency fields and raw datagrams are not
+preserved. This format is a semantic command capture, not a lossless packet capture.
+
+Two clocks
+quanta_us is a caller-selected positive integer: microseconds applied to each DISTINCT known command.
+It is an explicit offline model parameter, not a measured or proven original-client tick duration.
+server_tick is the recorder's nonnegative scheduler/arrival index. Packets appear in recorded order
+with nondecreasing server_tick, including equal ticks. It is NOT the player's command frame, does not
+set movement duration, and need not increment by one. The schema records neither wall-clock time nor
+network latency. A client's frame number cannot be used as a server tick or vice versa.
+
+Per-player command ordering
+Each (player, epoch) has its own 32-bit frame sequence. Frames in JSON are 0..4294967295; commands
+carry complete decoded payloads. Unwrapping chooses the signed serial difference nearest the current
+high-water frame, with a half-cycle horizon. Thus fffffffe, ffffffff, 0, 1 are consecutive. Exactly
+2147483648 frames of separation is ambiguous and rejected. Full unobserved cycles are unknowable.
+Late packets and overlapping windows are collected, then commands are sorted by unwrapped frame.
+Output anchors the earliest observed frame to its raw u32 cycle (0..4294967295) and unwraps later
+frames from there. Late delivery across a wrap therefore has the same canonical frame coordinates.
+Same player/epoch/frame + identical payload is a duplicate and moves once. A conflicting payload
+raises an error; neither first-wins nor last-wins silently hides corrupt captures.
+
+Epochs and restart uncertainty
+The recording source MUST supply epoch explicitly. A client restart is represented by a new epoch;
+the same frame values in the new epoch are independent. Replaying an epoch resets FlatMover to that
+player's declared initial state; there is no invented continuity across client restarts. Old-epoch
+packets remain assigned to their declared epoch, even if recorded after a newer epoch's packets.
+A low frame <=128 following a backwards gap >=1024 and <2^31 emits restart_candidate, provided the
+packet adds a new command. It does NOT automatically increment epoch: a delayed old packet can look
+identical. The declared epoch is authoritative. Review candidates and correct the source epoch when
+there is independent restart evidence. These thresholds are diagnostics, not recovered client rules.
+
+Missing input
+Interior gaps are returned as inclusive unwrapped frame ranges with counts. No preceding/following
+unknown frames can be inferred, so only the observed first..last interval is assessed. A late command
+may fill an earlier gap before offline replay. No synthetic held input, neutral input or movement
+step is inserted for any remaining gap. Frame differences never multiply a movement step's duration.
+Each epoch reports applied_time_us = known_commands * quanta_us, and separately source_frame_span =
+last_unwrapped_frame - first_unwrapped_frame, source_span_us = source_frame_span * quanta_us. The
+latter is the separation between source frame timestamps, not an additional simulation duration.
+For frames 100 and 103: there are 2 applied steps, 2 missing frames, source span 3. First command
+source_offset_us is 0; its post-step applied_time_us is already one quantum. Empty tracks have no
+states, no endpoints and zero spans. This distinction prevents apparently smooth fabricated input.
+
+Fixed JSON schema (all shown fields required; unknown fields rejected)
+{
+  "schema": "ow174.command-replay.v1",
+  "build": "1.74.0.0.104319",
+  "quanta_us": 16000,
+  "players": {"p1": {"position": [0, 1, 0], "yaw": 0}},
+  "packets": [{"player": "p1", "epoch": 0, "server_tick": 40, "commands": [
+    {"frame": 100, "forward": 127, "right": 0, "yaw": 0, "pitch": 0,
+     "buttons": 0, "action": 0}
+  ]}]
+}
+16000 here is an example MODEL CHOICE, not an established original-client quantum.
+Throttle values are signed 8-bit; buttons unsigned 24-bit; action unsigned 8-bit. yaw/pitch preserve
+the existing decoder's integer angle values, including deltas that cross the initial signed-16-bit
+range; this layer invents no additional angle wrapping. Initial yaw is signed 16-bit. Angles follow
+existing commands.py: yaw zero +z, positive yaw toward +x,
+y up, positive pitch down. Initial states require finite numbers. Nonfinite output is rejected.
+
+Outputs and hashes
+replay_document returns ow174.command-replay-result.v1 with model/build/quanta, every known command's
+post-step position/velocity/yaw/pitch/crouched state, source offsets, applied times, per-epoch gap and
+duplicate/reorder summaries, and restart candidates. Position/velocity are rounded to 9 decimal
+places with zero sign normalized before hashing. Players and epochs are sorted, commands ordered.
+state_hash is SHA256 of canonical UTF-8 JSON states (sorted keys, no spaces). Arrival metadata and
+duplicate counts are excluded; equivalent accepted commands yield the same state hash within this
+model. recording_hash covers the canonical complete input, including arrival order and duplicates.
+Repeatability is for this model/runtime; hashes are not proof of agreement with original Overwatch,
+nor a claim of bit-identical trigonometry across all Python platforms or future model changes.
+
+Usage
+py tools/replay_game_commands.py capture.json --output replay.json
+py tools/replay_game_commands.py capture.json --expect-state-hash <previous-state-sha256>
+Exit 0: replay/optional hash match; 1: invalid recording or I/O error; 2: state hash mismatch.
+CommandRecording can record decoded commands in memory and export an independent JSON value with
+to_document(). Validation is mandatory at replay_document; no network capture or live hook is added.

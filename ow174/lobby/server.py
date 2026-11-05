@@ -222,7 +222,8 @@ class LobbyServer:
         from ow174.game.server import GameServer
 
         game = GameServer(
-            self.settings.host, self.settings.game_port, on_leave=self.game_left, skin_of=self.skin_of
+            self.settings.host, self.settings.game_port, on_leave=self.game_left, skin_of=self.skin_of,
+            body_scripts=self.settings.body_scripts,
         )
         game.start()
         self.game = game

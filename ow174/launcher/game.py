@@ -14,6 +14,7 @@ from ow174.paths import GAME_LOG_FILE, GAME_PATH_FILE, ROOT
 log = logging.getLogger("ow174.launcher")
 
 GAME_EXE = "Overwatch.exe"
+OFFICIAL_LAUNCHER = "Overwatch Launcher.exe"
 UNPACKED_GAME_PATHS = (
     ROOT / "game" / "Overwatch" / "_retail_" / GAME_EXE,
     ROOT / "game" / "_retail_" / GAME_EXE,
@@ -30,14 +31,19 @@ def find_game(explicit: Path | None = None, saved: Path = GAME_PATH_FILE) -> Pat
     """The game to start: the given path, the one picked last time, an unpacked copy in game/, or one
     the player picks now (remembered for next time)."""
     if explicit is not None:
-        if not is_game(explicit):
-            raise LaunchError(f"{explicit} is not {GAME_EXE}.")
-        return explicit.resolve()
+        resolved = resolve_game(explicit)
+        if resolved is None:
+            raise LaunchError(
+                f"Cannot find {GAME_EXE} at {explicit}. Select the installation folder or "
+                f"_retail_\\{GAME_EXE}; {OFFICIAL_LAUNCHER} opens Battle.net."
+            )
+        return resolved
     if saved.is_file():
         # utf-8-sig: older launchers saved the path with a BOM
         remembered = Path(saved.read_text(encoding="utf-8-sig").strip())
-        if is_game(remembered):
-            return remembered.resolve()
+        resolved = resolve_game(remembered)
+        if resolved is not None:
+            return resolved
     for candidate in UNPACKED_GAME_PATHS:
         if is_game(candidate):
             return candidate.resolve()
@@ -48,6 +54,22 @@ def find_game(explicit: Path | None = None, saved: Path = GAME_PATH_FILE) -> Pat
 
 def is_game(path: Path) -> bool:
     return path.name.lower() == GAME_EXE.lower() and path.is_file()
+
+
+def resolve_game(path: Path) -> Path | None:
+    """Resolve a game, its installation folder or the official launcher without ever starting it."""
+    if is_game(path):
+        return path.resolve()
+    if path.is_dir():
+        folder = path
+    elif path.name.lower() == OFFICIAL_LAUNCHER.lower() and path.is_file():
+        folder = path.parent
+    else:
+        return None
+    for candidate in (folder / "_retail_" / GAME_EXE, folder / GAME_EXE):
+        if is_game(candidate):
+            return candidate.resolve()
+    return None
 
 
 def pick_game() -> Path:
@@ -62,13 +84,16 @@ def pick_game() -> Path:
     try:
         while True:
             chosen = filedialog.askopenfilename(
-                title=f"Select {GAME_EXE}", filetypes=[(GAME_EXE, GAME_EXE)], parent=root
+                title=f"Select _retail_\\{GAME_EXE}",
+                filetypes=[("Overwatch game or launcher", (GAME_EXE, OFFICIAL_LAUNCHER))],
+                parent=root,
             )
             if not chosen:
                 raise LaunchError(f"No game selected. Start again and pick {GAME_EXE}.")
-            if is_game(Path(chosen)):
-                return Path(chosen).resolve()
-            log.warning("That is not %s. Pick the file with exactly that name.", GAME_EXE)
+            resolved = resolve_game(Path(chosen))
+            if resolved is not None:
+                return resolved
+            log.warning("Cannot find the game there. Select _retail_\\%s.", GAME_EXE)
     finally:
         root.destroy()
 

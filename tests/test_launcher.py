@@ -31,6 +31,47 @@ class FindGameTests(TempDirTest):
         exe = self.make_game("Spiele über Überall")
         self.assertEqual(game.find_game(exe, saved=self.root / "saved.txt"), exe.resolve())
 
+    def test_an_installation_folder_or_its_official_launcher_resolves_to_the_game(self):
+        exe = self.make_game("桌面/Overwatch/_retail_")
+        folder = exe.parent.parent
+        launcher = folder / "Overwatch Launcher.exe"
+        launcher.write_bytes(b"official launcher")
+        for selected in (folder, exe.parent, launcher):
+            with self.subTest(selected=selected):
+                self.assertEqual(game.find_game(selected), exe.resolve())
+
+    def test_an_unpacked_folder_resolves_to_its_game(self):
+        exe = self.make_game()
+        self.assertEqual(game.find_game(exe.parent), exe.resolve())
+
+    def test_the_retail_game_is_preferred_when_an_installation_also_has_a_root_exe(self):
+        retail = self.make_game("Overwatch/_retail_")
+        self.make_game("Overwatch")
+        self.assertEqual(game.find_game(retail.parent.parent), retail.resolve())
+
+    def test_an_unrelated_executable_does_not_resolve_to_a_nearby_game(self):
+        exe = self.make_game()
+        unrelated = exe.parent / "Other.exe"
+        unrelated.write_bytes(b"")
+        with self.assertRaises(LaunchError):
+            game.find_game(unrelated)
+
+    def test_a_launcher_without_the_game_reports_the_real_entry_point(self):
+        launcher = self.root / "Overwatch Launcher.exe"
+        launcher.write_bytes(b"official launcher")
+        with self.assertRaisesRegex(LaunchError, r"_retail_\\Overwatch.exe"):
+            game.find_game(launcher)
+
+    def test_a_remembered_launcher_is_resolved_without_asking(self):
+        exe = self.make_game("Overwatch/_retail_")
+        launcher = exe.parent.parent / "Overwatch Launcher.exe"
+        launcher.write_bytes(b"official launcher")
+        saved = self.root / "saved.txt"
+        saved.write_text(str(launcher), encoding="utf-8-sig")
+        with patch.object(game, "pick_game") as pick:
+            self.assertEqual(game.find_game(saved=saved), exe.resolve())
+        pick.assert_not_called()
+
     def test_an_explicit_path_that_is_not_the_game_does_not_fall_back(self):
         saved = self.root / "saved.txt"
         saved.write_text(str(self.make_game()), encoding="utf-8")
