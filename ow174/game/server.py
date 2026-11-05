@@ -602,17 +602,29 @@ class Client:
         reliable = self.reliable[: messages.MAX_PER_KIND]
         try:
             payload = self._payload(tick, reliable, unreliable, entities)
-            while len(payload) > MAX_PAYLOAD:
-                if entities:
-                    entities = entities[: len(entities) // 2]
-                elif unreliable:
-                    unreliable = unreliable[: len(unreliable) // 2]
-                elif len(reliable) > 1:
+            if len(payload) > MAX_PAYLOAD:
+                # Fit each channel in priority order so a smaller reliable batch
+                # leaves room for the other messages and the ordered entity prefix.
+                if unreliable or entities:
+                    payload = self._payload(tick, reliable, [], [])
+                while len(payload) > MAX_PAYLOAD:
+                    if len(reliable) <= 1:
+                        self._frame_rejected("oldest reliable message exceeds datagram budget")
+                        return
                     reliable = reliable[: len(reliable) // 2]
-                else:
-                    self._frame_rejected("oldest reliable message exceeds datagram budget")
-                    return
-                payload = self._payload(tick, reliable, unreliable, entities)
+                    payload = self._payload(tick, reliable, [], [])
+                while unreliable:
+                    candidate = self._payload(tick, reliable, unreliable, [])
+                    if len(candidate) <= MAX_PAYLOAD:
+                        payload = candidate
+                        break
+                    unreliable = unreliable[: len(unreliable) // 2]
+                while entities:
+                    candidate = self._payload(tick, reliable, unreliable, entities)
+                    if len(candidate) <= MAX_PAYLOAD:
+                        payload = candidate
+                        break
+                    entities = entities[: len(entities) // 2]
         except (ValueError, OverflowError, struct.error) as error:
             self._frame_rejected(f"frame encoding failed: {type(error).__name__}")
             return

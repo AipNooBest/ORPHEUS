@@ -12,10 +12,11 @@ from ow174.game import bodytrace, correction, messages, movelog, projectiles, wo
 from ow174.game import server as server_module
 from ow174.game.bits import BitReader
 from ow174.game.collision import StaticCollisionProvider, flat_world
-from ow174.game.commands import Command
+from ow174.game.commands import FIRE, Command
 from ow174.game.content import PRACTICE_RANGE, SOLDIER
 from ow174.game.link import KIND_FRAME, MAX_DATAGRAM, LinkCipher
 from ow174.game.match import Match, card_message
+from ow174.game.script import decode
 from ow174.game.server import MAX_PAYLOAD, Client, GameServer
 from ow174.game.world import OP_CREATE, OP_DESTROY, OP_UPDATE, EntityUpdate, Movement
 
@@ -106,13 +107,53 @@ class PacketBudgetTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
+    def test_trimmed_reliable_batch_refills_with_the_owner_rifle_delta(self):
+        # The wire reader imports projectile fixtures that also use this module.
+        from test_game_repeated_lifecycles import wire_frame
+
+        server, client, player, peer = connection()
+        prepare_corrections(player)
+        script = player.body_script
+        tree, = script.frames()
+        initial = decode.read_chunk(tree.chunk.getvalue(), tree.chunk.count)
+        known = {number: item.graph for number, item in initial.instances.items()}
+        script.stream.arrived(tree.chunk_last)
+        player.take_commands([Command(111, buttons=FIRE)])
+        owner, = script.frames()
+        client.queue_entities([owner])
+        large_messages(client, player)
+        reliable = list(client.reliable)
+        tick = 110
+        self.assertGreater(len(client._payload(tick, reliable, [], [])), MAX_PAYLOAD)
+        self.assertLessEqual(len(client._payload(tick, reliable[:1], [], [owner])), MAX_PAYLOAD)
+
+        client.send_frame(tick, 10.0)
+
+        packet, _, rows, _, _, _ = decoded(self, peer, server.sock.sent[-1][0])
+        self.assertEqual([(seq, msg_id) for seq, msg_id, _ in rows], [(0, 20308)])
+        _, records = wire_frame(packet)
+        chunks = [record.chunk for record, _ in records if record.entity == player.body and record.chunk]
+        self.assertEqual(len(chunks), 1)
+        chunk, = chunks
+        frame = decode.read_chunk(chunk.getvalue(), chunk.count, known)
+        self.assertTrue(frame.owner)
+        self.assertEqual((frame.cmfd, frame.last), (111, owner.chunk_last))
+        self.assertTrue(frame.instances[11].states[10][0])
+        self.assertNotIn(owner, client.entities)
+        self.assertEqual(client.reliable, reliable[1:])
+        self.assertIn(owner, client.in_flight[packet.seq][1])
+        client.acked(packet.seq + 1, 1)
+        self.assertEqual(script.stream.base_last, owner.chunk_last)
+
     def test_legal_messages_defer_create_then_ack_original_record_once(self):
         server, client, player, peer = connection()
         large_messages(client, player)
         reliable = list(client.reliable)
         create = placeable()
         client.queue_entities([create])
-        client.send_frame(1002, 10.0)
+        budget = len(client._payload(1002, reliable[:1], [], []))
+        with mock.patch.object(server_module, "MAX_PAYLOAD", budget):
+            client.send_frame(1002, 10.0)
         first, _, rows, _, _, count = decoded(self, peer, server.sock.sent[-1][0])
         self.assertEqual([seq for seq, _, _ in rows], [0])
         self.assertEqual(count, 0)
@@ -248,7 +289,9 @@ class PacketBudgetTests(unittest.TestCase):
         create = viewer.match.remote_body_create(viewer, other)
         client.queue_entities([create])
         large_messages(client, viewer)
-        client.send_frame(1002, 10.0)
+        budget = len(client._payload(1002, client.reliable[:1], [], []))
+        with mock.patch.object(server_module, "MAX_PAYLOAD", budget):
+            client.send_frame(1002, 10.0)
         self.assertEqual(decoded(self, peer, server.sock.sent[-1][0])[5], 0)
         self.assertFalse(viewer.seen[other.body])
         self.assertEqual([update for update in viewer.match.remote_movements(viewer)
