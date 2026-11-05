@@ -741,8 +741,10 @@ class PlayerDeathModeTests(unittest.TestCase):
             run.send(link)
 
         lost_pulses = {}
+        lost_owner = None
 
         def lose_pulses(link, packet):
+            nonlocal lost_owner
             if link in links and packet.kind == KIND_FRAME:
                 _, records = wire_frame(packet)
                 for record, _ in records:
@@ -752,6 +754,8 @@ class PlayerDeathModeTests(unittest.TestCase):
                     state = active_pulse(link, frame)
                     if state is not None:
                         lost_pulses.setdefault(link, (frame.owner, state))
+                        if link is owner_link and lost_owner is None:
+                            lost_owner = packet.seq, frame.last
                         return
             original_apply(link, packet)
 
@@ -765,10 +769,18 @@ class PlayerDeathModeTests(unittest.TestCase):
             self.assertEqual(pulses(link), [])
             self.assertEqual(lost_pulses[link], (owner, (True, {"fresh": True, "count": 1})))
 
+        # A newer packet without a body update proves the first owner carrier was lost.
+        script = victim.body_script
+        packet_seq, chunk_last = lost_owner
+        self.assertGreater(owner_link.window.expected, packet_seq + 1)
+        self.assertIn(chunk_last, script.stream.pending)
+        run.send(owner_link)
+        self.assertNotIn(packet_seq, victim.client.in_flight)
+        self.assertNotIn(chunk_last, tuple(script.stream.pending))
+
         # The originally admitted pulse stays fresh on the wire even when the body's own
         # clock passes the local freshness window before a newer carrier can reach the peer.
         run.command(owner_link, advance=stale_ticks)
-        script = victim.body_script
         self.assertFalse(script.component.instances[feed_ids[owner_link]].state(108).payload()["fresh"])
         run.until(lambda: all(pulses(link) for link in links), limit=12)
         run.command(owner_link)

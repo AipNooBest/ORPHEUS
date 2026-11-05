@@ -616,6 +616,8 @@ class BodyStream:
         self.base: Snapshot | None = None  # what the client has after the chunk ending at base_last
         self.base_last = 0
         self.pending: dict[int, tuple[Snapshot, set]] = {}  # last -> (snapshot, keys), not acknowledged
+        self.lost_keys: dict[tuple, int] = {}  # each key's newest lost owner chunk
+        self.latest_lost: Snapshot | None = None  # newest owner projection, for kill-feed pulse freshness
         self.full_update = None  # the full frame's record (sent again when lost)
 
     def _update(self, frame: BitWriter, first: int, resend: bool):
@@ -630,6 +632,7 @@ class BodyStream:
     def full(self, frame: BitWriter, snapshot: Snapshot):
         self.last += 1
         self.pending[self.last] = (snapshot, set())
+        self.latest_lost = None
         self.full_update = self._update(frame, 0, resend=True)
         return self.full_update
 
@@ -637,17 +640,30 @@ class BodyStream:
         self.last += 1
         self.cmfd = cmfd
         self.pending[self.last] = (snapshot, keys)
+        self.latest_lost = None
         return self._update(frame, self.base_last + 1, resend=False)
 
+    def lost(self, last: int) -> None:
+        """An owner delta's packet is retired without a positive ACK. Keep its keys cumulative."""
+        pending = self.pending.pop(last, None)
+        if pending is None:
+            return
+        snapshot, keys = pending
+        for key in keys:
+            self.lost_keys[key] = max(last, self.lost_keys.get(key, 0))
+        if last == self.last:
+            self.latest_lost = snapshot
+
     def touched(self) -> set:
-        found = set()
+        found = set(self.lost_keys)
         for _, keys in self.pending.values():
             found |= keys
         return found
 
     def kill_feed_snapshot(self, snap: Snapshot, *, allowed: bool) -> Snapshot:
         """Gate the first new death pulse and keep its wire value until acknowledged."""
-        pending = self.pending[self.last][0] if self.pending else None
+        latest = self.pending.get(self.last)
+        pending = latest[0] if latest is not None else self.latest_lost
         states = None
         for owner, (graph_index, _) in snap.instances.items():
             index = KILL_FEED_PULSERS.get(graph_index)
@@ -684,6 +700,7 @@ class BodyStream:
         self.base = self.pending[last][0]
         self.base_last = last
         self.pending = {key: value for key, value in self.pending.items() if key > last}
+        self.lost_keys = {key: number for key, number in self.lost_keys.items() if number > last}
 
 
 __all__ = ["BodyScript", "BodyStream", "CommandEpochError", "Snapshot", "button_edges", "nodes", "warm_up"]

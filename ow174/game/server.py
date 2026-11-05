@@ -700,7 +700,14 @@ class Client:
                             self._flush_bot_frames(script)
             else:
                 lost_reliable += reliable
-                lost_records += [item for item in records if item.resend and current(item)]
+                script = getattr(self.player, "body_script", None)
+                for item in records:
+                    if not current(item):
+                        continue
+                    if item.resend:
+                        lost_records.append(item)
+                    elif script is not None and item.stream is script.stream:
+                        script.stream.lost(item.chunk_last)
         if lost_reliable:
             self.reliable = sorted(lost_reliable + self.reliable)
             self.log(f"[!] resending {len(lost_reliable)} reliable message(s)")

@@ -102,7 +102,7 @@ FIELDS = {
     notices.Notices: _names("match entered waiting notice_chunk sent_at sending"),
     stats.PlayerStats: _names("values"),
     statescript.Stream: _names("entity last delivered data_last cmfd next_ack"),
-    driver.BodyStream: _names("entity last cmfd base base_last pending full_update"),
+    driver.BodyStream: _names("entity last cmfd base base_last pending lost_keys latest_lost full_update"),
     driver._CreateArrived: _names("script"),
     driver.BodyScript: _names(
         "hero entity record frame_ms world component frame buttons stream create_arrived "
