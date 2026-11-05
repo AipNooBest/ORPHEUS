@@ -4,11 +4,11 @@ import math
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ow174.game import bots, combat, observers, world
+from ow174.game import bots, combat, observers, stats, world
 from ow174.game.bits import BitReader, BitWriter
 from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.combat import Combat, HitDef, Target, Vitals
@@ -36,6 +36,9 @@ class FakeClient:
 
     def bot_create_acked(self, entity: int) -> bool:
         return True  # this model acknowledges every create immediately
+
+    def queue_bot_live(self, entity: int, snapshot) -> None:
+        pass  # the combat model leaves NPC body decoding to the link tests
 
     def queue_bot_notice(self, entity: int, msg_id: int, value: dict) -> None:
         self.queue_reliable(msg_id, value)
@@ -202,6 +205,65 @@ class DamageTests(unittest.TestCase):
 
 
 class BotTests(unittest.TestCase):
+    def test_bot_damage_and_death_use_the_attacker_entity(self):
+        run = Run()
+        (player,) = run.players
+        fight = run.match.combat
+        bot = next(bot for bot in run.match.bots if bot.team != player.team)
+        target = next(target for target in fight._targets() if target.owner is player)
+        vitals = fight.vitals_of(target)
+        fight._damage(bot, target, 19.0, False, None, run.frame)
+        self.assertEqual(vitals.total, 181.0)
+        self.assertFalse(fight.is_dead(player))
+
+        loadout = 0x09E000000000008D
+        with (
+            patch.object(runtime, "send_message", wraps=runtime.send_message) as sent,
+            patch.object(player.client, "queue_bot_notice", wraps=player.client.queue_bot_notice) as notices,
+        ):
+            fight._damage(bot, target, 200.0, True, loadout, run.frame)
+        params = {
+            combat.KILLER: expr.Entity(bot.entity),
+            combat.CRIT: True,
+            combat.LOADOUT: expr.Asset(loadout),
+            combat.ASSISTS: (),
+        }
+        sent.assert_any_call(player.body_script.component, combat.DIED, params, bot.entity)
+        self.assertEqual(vitals.killer, bot.entity)
+        self.assertTrue(player.body_script.component.owner_dead)
+        notice = {"+0x78": combat.KILLED_BY, "+0x7C": {"+0x0": bot.entity}}
+        notices.assert_called_once_with(bot.entity, combat.DEATH_NOTICE, notice)
+        self.assertEqual(player.client.messages(combat.DEATH_NOTICE), [notice])
+        self.assertEqual(player.client.messages(combat.HIT), [])
+        self.assertEqual(player.client.messages(combat.KILL_NOTICE), [])
+        self.assertEqual(player.stats.value(stats.DEATHS), 1.0)
+        self.assertEqual(player.stats.value(stats.ELIMINATIONS), 0.0)
+        self.assertEqual(player.stats.value(stats.HERO_DAMAGE), 0.0)
+
+    def test_bot_death_script_uses_the_opposing_bot_as_sender(self):
+        run = Run()
+        (viewer,) = run.players
+        fight = run.match.combat
+        source = next(bot for bot in run.match.bots if bot.team == viewer.team)
+        enemies = fight._enemies(source)
+        self.assertTrue(all(target.team != source.team and target.owner is not source for target in enemies))
+        target = next(target for target in enemies if isinstance(target.owner, bots.Bot))
+        victim = target.owner
+        script = victim.body_script = Mock()
+        script.die.return_value = None
+        with patch.object(viewer.client, "queue_bot_death", create=True) as delivered:
+            fight._damage(source, target, victim.health, False, None, run.frame)
+        self.assertTrue(victim.dead)
+        self.assertEqual(fight.vitals_of(target).killer, source.entity)
+        script.die.assert_called_once_with(
+            run.frame,
+            {combat.KILLER: expr.Entity(source.entity), combat.CRIT: False,
+             combat.LOADOUT: None, combat.ASSISTS: ()},
+            source.entity,
+        )
+        delivered.assert_called_once_with(victim.entity, None)
+        self.assertEqual(viewer.client.messages(combat.KILL_NOTICE), [])
+
     @patch.object(graph, "entity_body", return_value=None)
     def test_shooting_a_bot_until_it_dies_and_comes_back(self, _entity_body):
         # The combat fixture models health and movement. Script delivery uses the encrypted peer tests.

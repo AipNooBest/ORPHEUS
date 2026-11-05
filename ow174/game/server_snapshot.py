@@ -75,7 +75,7 @@ FIELDS = {
     Client: _names("server address conn cipher player window seq open closed heard next_reliable reliable "
                    "unreliable entities in_flight _bot_notices _bot_health _bot_notice_tail "
                    "_bot_destroy_wait _bot_scripts expected_in parked_in leaving_since"),
-    _BotScriptDelivery: _names("stream death_frames"),
+    _BotScriptDelivery: _names("stream source live death_frames"),
     Match: _names("environment id game_map card skin_of tick controller assemble_ends assembled players "
                   "_body_messages started on_leave ended bots _pending_bot_scripts bots_shown notices combat "
                   "collision_provider collision_state collision_world _collision_failed"),
@@ -118,7 +118,7 @@ FIELDS = {
                            "air_ticks gravity frame crouch_frame spring spring_speed fall"),
     bots.Bot: _names(
         "entity spawner hero_data hints dead body_script records_from hero name body team health speed accel "
-        "brake pace direction position yaw velocity route index wait target start keys turning held "
+        "brake pace direction position yaw velocity firing route index wait target start keys turning held "
         "last_held input_tick moved_tick last_tick"
     ),
 }

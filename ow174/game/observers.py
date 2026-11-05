@@ -211,8 +211,10 @@ class Observers:
         """Whether the viewer's client has the body's statescript (its first frame arrived)."""
         return self.acknowledged_stream(viewer, body) is not None
 
-    def acknowledged_stream(self, viewer, body: int) -> BodyStream | None:
+    def acknowledged_stream(self, viewer, body: int, *, npc: bool = False) -> BodyStream | None:
         """The current body's stream after the viewer acknowledges its initial frame."""
+        if npc:
+            return viewer.client.acknowledged_bot_stream(body) if viewer.client is not None else None
         if not viewer.seen.get(body):
             return None
         watch = self.watches.get((viewer.slot, body))

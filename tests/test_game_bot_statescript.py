@@ -20,6 +20,7 @@ from ow174.game.server import BOT_DESTROY_GRACE_TICKS, Client
 GRAPH = 0xF0FE
 PULSER = "STU_B9898052"
 PULSE_KEY = (1, 0)
+LIVE_VAR = 32
 
 
 class SyntheticScript:
@@ -30,13 +31,24 @@ class SyntheticScript:
         self.deaths = []
         self.initial = self.frame(0, full=True)
 
-    def frame(self, count, *, full, tick=0):
+    def graphs(self):
+        return {1: self.graph}
+
+    def frame(self, count, *, full, tick=0, live=None):
         payload = {"fresh": count > 0, "count": count}
-        snap = Snapshot(tick, instances={1: (GRAPH, None)}, states={PULSE_KEY: (PULSER, True, payload)})
+        variables = {} if live is None else {LIVE_VAR: (live, ())}
+        snap = Snapshot(
+            tick, instances={1: (GRAPH, None)}, states={PULSE_KEY: (PULSER, True, payload)},
+            vars={(1, var): value for var, value in variables.items()},
+        )
         state = statescript.StateWire(PULSER, True, payload)
-        item = statescript.InstanceWire(1, self.graph, states={0: state})
+        item = statescript.InstanceWire(1, self.graph, vars=variables, states={0: state})
         encode = statescript.remote_full_frame if full else statescript.remote_delta
-        return encode([item], {}, {1: self.graph}), snap
+        return encode([item], {}, self.graphs()), snap
+
+    def live(self, value, tick):
+        self.initial = self.frame(0, full=True, tick=tick, live=value)
+        return self.initial[1]
 
     def die(self, frame, params, sender):
         self.deaths.append((frame, params, sender))
@@ -44,6 +56,7 @@ class SyntheticScript:
 
     def delta(self, count, frame):
         data, snap = self.frame(count, full=False, tick=frame)
+        snap.vars.update(self.initial[1].vars)
         return data, snap, {("state", *PULSE_KEY)}
 
     def advance_death(self, frame, lifetime_ticks):
@@ -189,6 +202,11 @@ class BotStatescriptTests(unittest.TestCase):
         self.assertEqual((frame.owner, frame.first, frame.last), (False, first, last))
         self.assertEqual(frame.instances[1].graph, GRAPH)
         self.assertEqual(frame.instances[1].states[0], (True, {"fresh": count > 0, "count": count}))
+
+    def assert_live(self, chunk, *, first, last, value):
+        frame = decode.read_chunk(chunk.getvalue(), chunk.count, {1: GRAPH})
+        self.assertEqual((frame.owner, frame.first, frame.last), (False, first, last))
+        self.assertEqual(frame.instances[1].vars, {LIVE_VAR: (value, ())})
 
     def assert_same_chunk(self, original, retry):
         self.assertEqual((original.count, original.getvalue()), (retry.count, retry.getvalue()))
@@ -382,6 +400,88 @@ class BotStatescriptTests(unittest.TestCase):
         _, _, final = self.send(peer)
         self.assertEqual(self.chunks(final, old), [])
         self.assertEqual(peer.pulses, [])
+
+    def test_live_state_waits_for_create_and_full_acks_and_late_view_gets_current_full(self):
+        old, peer = self.bot.entity, self.watching_peer
+        script = self.bot.body_script
+        peer.client.queue_bot_live(old, script.live(10.0, self.tick))
+        _, _, lost_create = self.send(peer, receive=False)
+        self.assertEqual(self.entities(lost_create, world.OP_CREATE), [old])
+        self.assertEqual(self.chunks(lost_create, old), [])
+        _, _, gap = self.send(peer)
+        self.assertEqual(self.chunks(gap, old), [])
+        peer.ack()
+        _, _, create = self.send(peer)
+        self.assertEqual(self.entities(create, world.OP_CREATE), [old])
+        self.assertEqual(self.chunks(create, old), [])
+        peer.ack()
+
+        _, _, full = self.send(peer)
+        self.assert_pulse(self.only_chunk(full, old), first=0, last=1, count=0)
+        peer.client.queue_bot_live(old, script.live(20.0, self.tick))
+        _, _, before_full_ack = self.send(peer)
+        self.assertEqual(self.chunks(before_full_ack, old), [])
+        peer.ack()
+        _, _, live = self.send(peer)
+        self.assert_live(self.only_chunk(live, old), first=2, last=2, value=20.0)
+        peer.ack()
+        _, _, after = self.send(peer)
+        self.assertEqual(self.chunks(after, old), [])
+
+        late = self.add_observer(3)
+        self.show_bots(late)
+        _, _, late_create = self.send(late)
+        self.assertEqual(self.entities(late_create, world.OP_CREATE), [old])
+        self.assertEqual(self.chunks(late_create, old), [])
+        late.ack()
+        _, _, late_full = self.send(late)
+        self.assert_live(self.only_chunk(late_full, old), first=0, last=1, value=20.0)
+        late.ack()
+        _, _, late_after = self.send(late)
+        self.assertEqual(self.chunks(late_after, old), [])
+        self.assertEqual((peer.pulses, late.pulses), ([], []))
+
+    def test_lost_live_retries_before_death_while_replacement_gets_its_own_stream(self):
+        old, peer = self.bot.entity, self.watching_peer
+        self.acknowledge_baseline(peer, old)
+        script = self.bot.body_script
+        peer.client.queue_bot_live(old, script.live(10.0, self.tick))
+        _, _, lost = self.send(peer, receive=False)
+        live = self.only_chunk(lost, old)
+        self.assert_live(live, first=2, last=2, value=10.0)
+
+        peer.client.queue_bot_live(old, script.live(20.0, self.tick))
+        peer.client.queue_bot_live(old, script.live(30.0, self.tick))
+        self.kill_bot()
+        fresh = self.respawn()
+        peer.client.queue_bot_live(old, script.frame(0, full=False, tick=self.tick, live=99.0)[1])
+        _, _, gap = self.send(peer)
+        self.assertEqual(self.entities(gap, world.OP_CREATE), [fresh])
+        self.assertNotIn(old, self.entities(gap, world.OP_DESTROY))
+        self.assertEqual(self.chunks(gap, old), [])
+        peer.ack()
+
+        _, _, retry = self.send(peer)
+        self.assert_same_chunk(live, self.only_chunk(retry, old))
+        self.assert_pulse(self.only_chunk(retry, fresh), first=0, last=1, count=0)
+        self.assertNotIn((1, LIVE_VAR), peer.models[fresh].vars)
+        peer.ack()
+        _, _, latest = self.send(peer)
+        self.assert_live(self.only_chunk(latest, old), first=3, last=3, value=30.0)
+        _, _, before_live_ack = self.send(peer)
+        self.assertEqual(self.chunks(before_live_ack, old), [])
+        self.assertNotIn(old, self.entities(before_live_ack, world.OP_DESTROY))
+        peer.ack()
+
+        _, _, death = self.send(peer)
+        self.assert_pulse(self.only_chunk(death, old), first=4, last=4, count=1)
+        self.assertEqual(peer.pulses, [(old, 4, 1)])
+        peer.ack()
+        _, _, retired = self.send(peer)
+        self.assertEqual(self.entities(retired, world.OP_DESTROY), [old])
+        self.assertEqual(self.chunks(retired, old), [])
+        self.assertNotIn(old, peer.models)
+        self.assertIn(fresh, peer.models)
 
     def test_skipped_death_ticks_deliver_reliable_deltas_before_retirement(self):
         old = self.bot.entity

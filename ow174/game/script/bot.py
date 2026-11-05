@@ -1,4 +1,4 @@
-"""The NPC body's initial and death statescript frames, shared by all observers."""
+"""The NPC body's statescript, shared by all observers."""
 
 from ow174.game import observers
 from ow174.game.bits import BitWriter
@@ -10,7 +10,7 @@ _Payload = tuple[BitWriter, Snapshot, set]
 
 
 class BotScript(ReplicatedBody):
-    """Run an NPC body's graph at creation and through its death events. Movement and AI stay with the bot."""
+    """Run the NPC body's graphs on the server clock. Movement and AI stay with the bot."""
 
     def __init__(self, body: int, hero: int, entity: int, frame: int, mode: int, health: float) -> None:
         record = graph.entity_body(body)
@@ -29,6 +29,25 @@ class BotScript(ReplicatedBody):
         self.initial = observers.full_frame(self, snapshot), snapshot
         self.death_frame: int | None = None
         self._produced = snapshot
+
+    def advance_live(self, frame: int) -> Snapshot | None:
+        """Advance a live weapon body and freeze its latest observer baseline."""
+        if frame <= self.frame or self.component.owner_dead:
+            return None
+        self.frame = frame
+        self.component.run_frame(frame)
+        self._report_shots()
+        snapshot = observers.snapshot(self)
+        before = self._produced
+        if (
+            snapshot.instances == before.instances
+            and snapshot.vars == before.vars
+            and snapshot.states == before.states
+        ):
+            return None
+        self.initial = observers.full_frame(self, snapshot), snapshot
+        self._produced = snapshot
+        return snapshot
 
     def die(self, frame: int, params: dict, sender: int) -> _Payload | None:
         """Deliver 003E.025 and encode the change that happens immediately."""

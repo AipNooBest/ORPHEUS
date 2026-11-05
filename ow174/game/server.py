@@ -24,7 +24,7 @@ from collections import deque
 from ctypes import wintypes
 from dataclasses import dataclass
 
-from ow174.game import correction, messages, movelog, world
+from ow174.game import correction, messages, movelog, observers, world
 from ow174.game.bits import BitReader, BitWriter
 from ow174.game.commands import InputError, read_commands
 from ow174.game.environment import ExecutionEnvironment, SystemEnvironment
@@ -146,6 +146,8 @@ _BotDeathPayload = tuple[BitWriter, Snapshot, set]
 @dataclass
 class _BotScriptDelivery:
     stream: BodyStream
+    source: object
+    live: Snapshot | None = None  # newest snapshot waiting behind an unacknowledged frame
     death_frames: deque[_BotDeathPayload] | None = None  # None until this viewer is registered for death
 
 
@@ -213,6 +215,10 @@ class Client:
         """Whether this connection acknowledged the current create for a bot."""
         return entity in self._bot_notices and self._bot_notices[entity] is None
 
+    def acknowledged_bot_stream(self, entity: int) -> BodyStream | None:
+        script = self._bot_scripts.get(entity)
+        return script.stream if script is not None and script.stream.base is not None else None
+
     def queue_bot_notice(self, entity: int, msg_id: int, value: dict) -> None:
         """Keep references to a bot out of the reliable stream until its create is acknowledged."""
         if entity not in self._bot_notices or entity in self._bot_destroy_wait:
@@ -237,13 +243,20 @@ class Client:
         if self.bot_create_acked(entity):
             self.queue_entities([update])
 
+    def queue_bot_live(self, entity: int, snapshot: Snapshot) -> None:
+        script = self._bot_scripts.get(entity)
+        if script is None or entity in self._bot_destroy_wait or script.death_frames is not None:
+            return
+        script.live = snapshot
+        self._flush_bot_frames(script)
+
     def queue_bot_death(self, entity: int, payload: _BotDeathPayload | None) -> None:
         """Register this lifetime's death, even when the first statescript changes are delayed."""
         script = self._bot_scripts.get(entity)
         if script is None or entity in self._bot_destroy_wait or script.death_frames is not None:
             return
         script.death_frames = deque() if payload is None else deque([payload])
-        self._flush_bot_death(script)
+        self._flush_bot_frames(script)
 
     def queue_bot_death_update(self, entity: int, payload: _BotDeathPayload) -> None:
         """Queue a continuation for a viewer already registered for this death."""
@@ -251,18 +264,27 @@ class Client:
         if script is None or entity in self._bot_destroy_wait or script.death_frames is None:
             return
         script.death_frames.append(payload)
-        self._flush_bot_death(script)
+        self._flush_bot_frames(script)
 
-    def _flush_bot_death(self, script: _BotScriptDelivery) -> None:
+    def _flush_bot_frames(self, script: _BotScriptDelivery) -> None:
         stream = script.stream
-        frames = script.death_frames
-        if stream.base is None or stream.pending or not frames:
+        if stream.base is None or stream.pending:
             return
-        # The producer encoded each delta from the preceding snapshot. Wait for
-        # that frame's ACK before sending the next in order.
-        frame, snapshot, keys = frames.popleft()
+        if script.live is not None:
+            snapshot = script.live
+            script.live = None
+            frame, keys = observers.delta(script.source, stream, snapshot)
+            if frame is not None:
+                self._queue_bot_frame(stream, frame, snapshot, keys)
+                return
+        frames = script.death_frames
+        if frames:
+            self._queue_bot_frame(stream, *frames.popleft())
+
+    def _queue_bot_frame(self, stream, frame, snapshot, keys) -> None:
+        # The next frame depends on this baseline even when this datagram is lost.
         update = stream.delta(frame, snapshot, keys, 0)
-        update.resend = True  # this one-off event has no newer snapshot to carry it again
+        update.resend = True
         self.queue_entities([update])
 
     def _ack_bot_create(self, entity: int) -> None:
@@ -295,6 +317,7 @@ class Client:
             return False
         return bool(
             script.stream.pending
+            or script.live is not None
             or script.death_frames
             or (script.death_frames is not None and health_pending)
         )
@@ -388,7 +411,7 @@ class Client:
         if script is not None:
             stream = BodyStream(entity)
             stream.full(*script.initial)
-            self._bot_scripts[entity] = _BotScriptDelivery(stream)
+            self._bot_scripts[entity] = _BotScriptDelivery(stream, script)
 
     # --- sending -------------------------------------------------------------------------------
 
@@ -488,7 +511,7 @@ class Client:
                         item.stream.arrived(item.chunk_last)
                         script = self._bot_scripts.get(item.entity)
                         if script is not None and item.stream is script.stream:
-                            self._flush_bot_death(script)
+                            self._flush_bot_frames(script)
             else:
                 lost_reliable += reliable
                 lost_records += [item for item in records if item.resend and current(item)]

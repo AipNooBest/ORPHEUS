@@ -55,7 +55,7 @@ from ow174.game.bits import BitWriter
 from ow174.game.collision import AX, AY, AZ, BX, BY, BZ, CELL, CX, CY, CZ, MASK, MOVER, NUMBER
 from ow174.game.mover import mover_data
 from ow174.game.script import expr, graph, runtime
-from ow174.game.script.bot import DIED
+from ow174.game.script.bot import DIED, BotScript
 from ow174.game.statescript import InstanceWire, StateWire, remote_full_frame
 from ow174.game.world import ARMOUR_POOL, HEALTH_POOL, OP_DESTROY, OP_UPDATE, POOLS, SHIELDS_POOL
 
@@ -362,6 +362,11 @@ def hit_def(state, cfg) -> HitDef | None:
 # --- who can be hit -------------------------------------------------------------------------------------
 
 
+def _source_entity(actor) -> int:
+    """The combat actor's live entity ID."""
+    return actor.entity if isinstance(actor, bots.Bot) else actor.body
+
+
 @dataclass
 class Target:
     entity: int
@@ -492,6 +497,7 @@ class Combat:
             history.append((tick, target.feet, target.height, target.eye))
         for rocket in list(self.rockets):
             self._fly(rocket)
+        self._bot_weapons(tick)
         self.projectiles.update(tick)
         self.match.deliver_body_messages()
         if frames:
@@ -546,9 +552,10 @@ class Combat:
 
     def _enemies(self, shooter) -> list[Target]:
         free_for_all = self.match.game_map.free_for_all
+        source = _source_entity(shooter)
         found = []
         for target in self._targets():
-            if target.owner is shooter or target.entity == getattr(shooter, "body", None):
+            if target.owner is shooter or target.entity == source:
                 continue
             if not free_for_all and target.team == shooter.team:
                 continue
@@ -582,13 +589,32 @@ class Combat:
 
     # --- shots -------------------------------------------------------------------------------------
 
+    def _bot_weapons(self, tick: int) -> None:
+        """Advance the weapon bodies of the map's firing bots and consume their volley reports."""
+        for bot in self.match.bots:
+            script = bot.body_script
+            if not bot.firing or bot.dead or not isinstance(script, BotScript):
+                continue
+            try:
+                snapshot = script.advance_live(tick)
+                if snapshot is not None:
+                    for viewer in self.match.players:
+                        if viewer.spawned and viewer.client is not None:
+                            viewer.client.queue_bot_live(bot.entity, snapshot)
+                shots, script.component.shots[:] = list(script.component.shots), []
+                for state, number, time in shots:
+                    self._shoot(bot, None, state, number, time)
+            except Exception:
+                bot.body_script = None
+                log.exception("[game] %s: %s's weapon script failed", self.match.label(), bot.name)
+
     def _eye(self, player) -> tuple:
         x, y, z = player.mover.position
         crouched = player.mover.crouched
         height = EYE_CROUCHED.get(player.hero.body, EYE_CROUCHED_DEFAULT) if crouched else EYE
         return (x, y + height, z)
 
-    def _shoot(self, player, command, state, number: int, time: int) -> None:
+    def _shoot(self, shooter, command, state, number: int, time: int) -> None:
         node = state.node
         shot_frame = time // state.instance.component.frame_ms
 
@@ -596,8 +622,12 @@ class Combat:
             cfg = node.field(name)
             return default if cfg is None else _number(state.evaluate(cfg, watch=False), default)
 
-        origin = self._eye(player)
-        direction = aim(*command.aim())
+        if isinstance(shooter, bots.Bot):
+            x, y, z = shooter.position
+            # Use the server body pose until the animated muzzle transform is available.
+            origin, direction = (x, y + EYE, z), aim(round(shooter.yaw), 0)
+        else:
+            origin, direction = self._eye(shooter), aim(*command.aim())
         direct = hit_def(state, node.field("m_6396149F"))
         speed = field("m_projectileSpeed")
         if speed:
@@ -611,23 +641,26 @@ class Combat:
             shot = None
             if isinstance(definition, expr.Asset):
                 shot = self.projectiles.fired(
-                    player, state, shot_frame, definition.guid, lifetime, origin, direction
+                    shooter, state, shot_frame, definition.guid, lifetime, origin, direction
                 )
             damaging = (direct is not None and direct.amount > 0.0) or (
                 blast is not None and blast.amount > 0.0
             )
             if damaging or shot is not None:
-                rocket = Rocket(player, player.team, origin, direction, speed, lifetime, direct, blast, shot)
-                self.rockets.append(rocket)
+                self.rockets.append(
+                    Rocket(shooter, shooter.team, origin, direction, speed, lifetime, direct, blast, shot)
+                )
             return
         if direct is None or direct.amount <= 0.0:
             return
         reach = field("m_FEC435C6", RANGE) or RANGE
         # Catch-up shots have no input sample of their own. Keep the received command's
         # aim, eye and view rewind together, and use the volley clock for hit attribution.
-        view_tick = command.frame - command.view_delay(player.quanta) * 1e6 / player.quanta
+        view_tick = self.tick
+        if command is not None:
+            view_tick = command.frame - command.view_delay(shooter.quanta) * 1e6 / shooter.quanta
         best = None
-        for target in self._enemies(player):
+        for target in self._enemies(shooter):
             shown = self.seen(target, view_tick)
             a, b = shown.segment()
             t = ray_capsule(origin, direction, a, b, shown.radius)
@@ -643,7 +676,7 @@ class Combat:
         critical = hit_y >= shown.feet[1] + shown.eye - HEAD_BELOW
         amount = direct.amount * direct.scale(t) * (direct.critical if critical else 1.0)
         self._damage(
-            player, target, amount, critical and direct.critical > 1.0, direct.loadout, shot_frame
+            shooter, target, amount, critical and direct.critical > 1.0, direct.loadout, shot_frame
         )
 
     def _fly(self, rocket: Rocket) -> None:
@@ -741,10 +774,11 @@ class Combat:
         if killed:
             vitals.now[HEALTH_POOL] = 0.0
             vitals.died_at = self.now
-            vitals.killer = getattr(shooter, "body", None)
-        flags = (CRITICAL if critical else 0) | (KILLING if killed else 0)
-        self._tell_hit(shooter, target, dealt, flags, frame)
-        shooter.stats.add(stats.HERO_DAMAGE, dealt)
+            vitals.killer = _source_entity(shooter)
+        if not isinstance(shooter, bots.Bot):
+            flags = (CRITICAL if critical else 0) | (KILLING if killed else 0)
+            self._tell_hit(shooter, target, dealt, flags, frame)
+            shooter.stats.add(stats.HERO_DAMAGE, dealt)
         victim = target.owner
         if killed and isinstance(victim, bots.Bot):
             # The NPC death script owns its terminal health change and death event ordering.
@@ -788,7 +822,7 @@ class Combat:
     @staticmethod
     def _death_parameters(killer, critical: bool, loadout) -> dict:
         return {
-            KILLER: expr.Entity(killer.body),
+            KILLER: expr.Entity(_source_entity(killer)),
             CRIT: bool(critical),
             LOADOUT: expr.Asset(loadout) if loadout else None,
             ASSISTS: (),
@@ -797,15 +831,16 @@ class Combat:
     def _bot_died(self, killer, bot: bots.Bot, critical: bool, loadout) -> None:
         bot.died(self.tick)
         self.respawns.append((self.now + BOT_RESPAWN, bot))
-        killer.stats.add(stats.ELIMINATIONS)
-        self._kill_notice(killer, bot.entity, bot=True)
+        if not isinstance(killer, bots.Bot):
+            killer.stats.add(stats.ELIMINATIONS)
+            self._kill_notice(killer, bot.entity, bot=True)
         log.info("[game] %s: %s killed %s", self.match.label(), killer.name, bot.name)
         script = bot.body_script
         if script is None:
             return
         try:
             params = self._death_parameters(killer, critical, loadout)
-            event = script.die(self.match.tick, params, killer.body)
+            event = script.die(self.match.tick, params, _source_entity(killer))
         except Exception:
             bot.body_script = None
             log.exception("[game] %s: %s's body script failed on %X", self.match.label(), bot.name, DIED)
@@ -834,18 +869,24 @@ class Combat:
         label = self.match.label()
         log.info("[game] %s: %s killed %s", label, killer.name, victim.name)
         victim.stats.add(stats.DEATHS)
-        if killer is not victim:
+        bot_killer = isinstance(killer, bots.Bot)
+        source = _source_entity(killer)
+        if killer is not victim and not bot_killer:
             killer.stats.add(stats.ELIMINATIONS)
             self._kill_notice(killer, victim.body)
         if victim.client is not None:
             how = KILLED_BY if killer is not victim else 0
-            victim.client.queue_reliable(DEATH_NOTICE, {"+0x78": how, "+0x7C": {"+0x0": killer.body}})
+            notice = {"+0x78": how, "+0x7C": {"+0x0": source}}
+            if bot_killer:
+                victim.client.queue_bot_notice(source, DEATH_NOTICE, notice)
+            else:
+                victim.client.queue_reliable(DEATH_NOTICE, notice)
         script = victim.body_script
         if script is not None:
             try:
                 component = script.component
                 params = self._death_parameters(killer, critical, loadout)
-                if runtime.send_message(component, DIED, params, killer.body):
+                if runtime.send_message(component, DIED, params, source):
                     # The server owns the death event. Run it before the observer snapshot even
                     # if the victim sends no further commands.
                     component.run_now()

@@ -33,7 +33,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 
-from ow174.game import world
+from ow174.game import bots, world
 from ow174.game.bits import BitWriter
 from ow174.game.commands import FRAME_MASK
 from ow174.game.script import graph as graphs_data
@@ -192,7 +192,7 @@ def definitions(script) -> list[int]:
 
 @dataclass
 class Shot:
-    """One projectile the owner's client shoots itself."""
+    """One projectile's authority and observer deliveries, with lease state for player shots."""
 
     player: object
     body: int
@@ -264,25 +264,27 @@ class Projectiles:
     def fired(
         self, player, state, frame: int, definition: int, bound_seconds: float, origin=None, direction=None
     ) -> Shot | None:
-        """A predicted projectile the VM fired in command frame `frame`; returns its Shot (combat.py tells it
-        when the server's projectile ended), None when it is not leased. A rocket also goes to the clients
-        that have the shooter's body: a server projectile and its shot record (unverified: they start it)."""
-        if _sync(state) != PREDICTED or self.lease_id(player, definition, frame) is None:
+        """Register a volley projectile on the owner and observer paths that apply to its source."""
+        npc = isinstance(player, bots.Bot)
+        if _sync(state) != PREDICTED or (not npc and self.lease_id(player, definition, frame) is None):
             return None
         spawned = _defs(state.node.field("m_49CBA3BC"))
+        if npc and spawned:
+            return None  # the NPC path covers ballistic projectiles
         shot = Shot(
             player,
-            player.body,
+            player.entity if npc else player.body,
             definition,
             frame,
             state.instance.id,
             state.index,
             spawn=spawned[0] if spawned else None,
-            where=tuple(player.mover.position),
+            where=tuple(player.position if npc else player.mover.position),
             bound=math.ceil(bound_seconds * 1000 / FRAME_MS),
-            seen_reports=player.body_script.report_count,
+            seen_reports=0 if npc else player.body_script.report_count,
         )
-        self.shots.append(shot)
+        if not npc:
+            self.shots.append(shot)
         if shot.spawn is None and origin is not None and direction is not None:
             self._show_others(shot, state, origin, direction)
         return shot
@@ -291,10 +293,11 @@ class Projectiles:
         """Every other client with the shooter's body: a server entity of the projectile's definition (under
         the map until a record starts it) and the shot record in the shooter's ch2 naming it."""
         observers = self.combat.observers
+        npc = isinstance(shot.player, bots.Bot)
         for viewer in self.match.players:
             if viewer is shot.player or viewer.client is None:
                 continue
-            stream = observers.acknowledged_stream(viewer, shot.body)
+            stream = observers.acknowledged_stream(viewer, shot.body, npc=npc)
             if stream is None:
                 continue  # its client has no statescript of the body, so no volley record of it
             entity = SEEN_FIRST + self.next_seen % SEEN_SPAN
@@ -312,7 +315,7 @@ class Projectiles:
             launch = EntityUpdate(shot.body)
             launch.ch2 = shot_events([record])
             deadline = self.match.tick + shot.bound + OBSERVER_GRACE_TICKS
-            delivery = _ObservedProjectile(viewer, viewer.client, stream, record, launch, deadline)
+            delivery = _ObservedProjectile(viewer, viewer.client, stream, record, launch, deadline, npc=npc)
             create = EntityUpdate(entity, OP_CREATE, confirm_record(shot.definition))
             create.stream = delivery.creation
             launch.stream = delivery.launch_arrival
@@ -321,7 +324,11 @@ class Projectiles:
             viewer.client.queue_entities([create])
 
     def flown(self, shot: Shot, seconds: float) -> None:
-        """The server's rocket ended after `seconds`: the release goes a little after the client's would."""
+        """Finish an authoritative NPC copy or schedule the predicted player's release."""
+        if isinstance(shot.player, bots.Bot):
+            for delivery in shot.observers:
+                delivery.finish(self.match.tick, False, drain=True)
+            return
         if shot.spawn is not None or shot.release_at is not None:
             return
         start = max([shot.frame] + [k for k, _ in shot.reports[:1]])
@@ -631,23 +638,25 @@ class _ObservedProjectile:
     record: ShotRecord
     launch: EntityUpdate
     deadline: int
+    npc: bool = False
     creation: _ProjectileArrival = field(default_factory=_ProjectileArrival)
     launch_arrival: _ProjectileArrival = field(default_factory=_ProjectileArrival)
     launch_queued: bool = False
     finished: bool = False
     explode: bool = False
 
-    def finish(self, tick: int, explode: bool) -> None:
+    def finish(self, tick: int, explode: bool, *, drain: bool = False) -> None:
         self.finished = True
         self.explode = explode
-        grace = OBSERVER_GRACE_TICKS if explode else 0
+        grace = OBSERVER_GRACE_TICKS if explode or drain else 0
         self.deadline = min(self.deadline, tick + grace)
 
     def advance(self, tick: int) -> bool:
         if self.viewer.client is not self.client:
             return False
         observers = self.viewer.match.combat.observers
-        source_live = observers.acknowledged_stream(self.viewer, self.launch.entity) is self.stream
+        current = observers.acknowledged_stream(self.viewer, self.launch.entity, npc=self.npc)
+        source_live = current is self.stream
         launched = self.launch_arrival.received
         if not source_live or tick >= self.deadline or (self.finished and launched):
             if self.launch_queued and not launched:

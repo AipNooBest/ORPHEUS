@@ -182,6 +182,17 @@ class ReplicatedBody:
     def graphs(self) -> dict[int, object]:
         return {instance.id: instance.graph for instance in self.component.instances.values()}
 
+    def _report_shots(self) -> None:
+        """Collect shots due in active volleys. Volleys that ended reported their own shots."""
+        self.component.ensure_valid()
+        shots = self.component.shots
+        for instance in self.component.instances.values():
+            for state in instance.states.values():
+                if isinstance(state, nodes.WeaponVolley) and state.active:
+                    state.report(self.component.now)
+        if len(shots) > MAX_SHOTS:
+            del shots[: len(shots) - MAX_SHOTS]
+
     def replicated_vars(self, instance: runtime.Instance | None = None) -> Iterator[tuple[int, runtime.Var]]:
         """Variables eligible for both wire snapshots. Instance variable IDs are local to their graph."""
         if instance is None:
@@ -304,18 +315,6 @@ class BodyScript(ReplicatedBody):
         self.component.run_frame(frame, edges)
         self._report_shots()
         self._charge_ult()
-
-    def _report_shots(self) -> None:
-        """The shots the active volleys fired up to the end of the frame go on the component's shot list
-        (a volley that ended put its own there); combat.py takes them, the oldest go past MAX_SHOTS."""
-        self.component.ensure_valid()
-        shots = self.component.shots
-        for instance in self.component.instances.values():
-            for state in instance.states.values():
-                if isinstance(state, nodes.WeaponVolley) and state.active:
-                    state.report(self.component.now)
-        if len(shots) > MAX_SHOTS:
-            del shots[: len(shots) - MAX_SHOTS]
 
     def set_ult_charge(self, points: float) -> None:
         """Set the ultimate's charge (#342e; the cost is #338e): a GM command, or damage and healing later."""

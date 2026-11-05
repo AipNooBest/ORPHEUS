@@ -9,10 +9,9 @@ spawner names a hero, a team and the graphs that drive the bot:
   It waits 2 s, then 1 s (two StateWaits), sets #39 = (#39 + 1) % count(#6947), and walks to the point
   #6947[#39] (STU_ECAEE401 with the move-to 194D744E and the face-to AB9B30EF); after a walk it waits 1 s
   (the second wait) and goes on.
-- 0B92 shoots ahead every 1.75 to 2.5 s while it stands within 0.4 m of where it spawned (its weapon,
-  STU_D7F9E1C3), stops for 2.75 s after a game message (a hit), and walks back to its place when it left
-  it. Its shots need the bot body's own statescript on the server (its weapon), which the server does not
-  run yet, so these bots only stand.
+- 0B92 alternates firing and waiting phases of 1.75 to 2.5 s within 0.4 m of spawn, and walks back when
+  displaced. Its 0013.025 reset branch delays firing eligibility by 2.75 s. The server advances the
+  weapon body and its volleys. Production AI selection and input delivery still need the native hooks.
 - No graph: the bot stands.
 
 A bot is a hero body without a player: the hero's m_gameplayEntity, its health (the body's override of
@@ -53,6 +52,7 @@ from ow174.paths import DATA_DIR
 
 SPAWNERS_PATH = DATA_DIR / "ai_spawners_174.json"
 PATROL = 0x0580000000000B8E
+FIRING = 0x0580000000000B92
 ROUTE = "0x0D80000000001B23"  # #6947, the route's hint points
 INDEX = "0x0D80000000000027"  # #39, the route index
 FIRST_WAIT = 2.0 + 1.0  # seconds: the patrol graph's two waits before its first walk (DATA)
@@ -137,7 +137,9 @@ class Bot:
         self.yaw = float(yaw_of(spawner["rotation"]))
         self.velocity = (0.0, 0.0, 0.0)
         variables = spawner.get("vars", {})
-        route = variables.get(ROUTE, []) if PATROL in {int(g, 16) for g in spawner["graphs"]} else []
+        roots = {int(g, 16) for g in spawner["graphs"]}
+        self.firing = FIRING in roots
+        route = variables.get(ROUTE, []) if PATROL in roots else []
         self.route = [tuple(hints[point]) for point in route if point in hints]
         self.index = variables.get(INDEX, 0)
         self.wait = FIRST_WAIT  # seconds to the next walk
