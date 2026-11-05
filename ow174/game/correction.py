@@ -91,13 +91,13 @@ def movement(snapshot: Snapshot) -> Movement:
     )
 
 
+def _eligible(player) -> bool:
+    return CORRECTIONS and player.has_body and player.body_script is not None and player.hero.guid in HEROES
+
+
 def correcting(player) -> bool:
-    """Whether the player's own body gets its records: the server runs its statescript, follows its
-    hero's movement and the client has the body."""
-    script = player.body_script
-    if not CORRECTIONS or not player.has_body or script is None or not script.create_arrived:
-        return False
-    return player.hero.guid in HEROES
+    """The server can correct this body and the client has acknowledged its create."""
+    return _eligible(player) and player.body_script.create_arrived
 
 
 def own_record(player, tick: int) -> EntityUpdate | None:
@@ -131,16 +131,19 @@ def sent(player, update) -> None:
 
 
 def command_ack(player, tick: int, updates=()) -> int:
-    """The command ack of a frame: the newest command frame the server has (the client stops sending the
-    ones before it), but while the owner gets records at most ACK_LEAD past the newest one sent, so that
-    the client still has the commands a correction runs again."""
+    """Acknowledge received input while keeping the commands a movement correction replays."""
     frame = player.commands.last_frame
     newest = tick if frame is None else frame
+    if not _eligible(player):
+        return newest
     sent = player.mover.corrected
     for update in updates:
         token = update.correction
         if _current(player, token) and (sent is None or token.frame > sent):
             sent = token.frame
-    if sent is None or not correcting(player):
-        return newest
+    if sent is None:
+        # While create ACK or packet budget delays the first record, its eligible frame
+        # already bounds which commands the owner can drop. Future states cannot go yet.
+        snapshot = snapshot_for(player.mover, tick)
+        sent = tick if snapshot is None else snapshot.frame
     return min(newest, sent + ACK_LEAD)

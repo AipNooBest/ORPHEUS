@@ -165,9 +165,9 @@ class AckTests(unittest.TestCase):
     def test_no_commands_yet_is_the_tick(self):
         self.assertEqual(correction.command_ack(self.player, 7000), 7000)
 
-    def test_before_the_first_record_the_newest_command(self):
+    def test_before_the_first_record_ack_keeps_commands_for_replay(self):
         self.player.take_commands([Command(7000 + n) for n in range(10)])
-        self.assertEqual(correction.command_ack(self.player, 7003), 7009)
+        self.assertEqual(correction.command_ack(self.player, 7003), 7005)
 
     def test_at_most_two_past_the_newest_record(self):
         self.player.take_commands([Command(7000 + n) for n in range(10)])
@@ -178,14 +178,15 @@ class AckTests(unittest.TestCase):
         self.match.sent_updates(self.player, self.match.remote_movements(self.player))  # newest: 7009
         self.assertEqual(correction.command_ack(self.player, 7020), 7009)
 
-    def test_no_limit_without_records(self):
+    def test_disabled_corrections_remove_the_limit_but_unconfirmed_create_keeps_it(self):
         self.player.take_commands([Command(7000 + n) for n in range(10)])
         self.match.tick = 7003
         self.match.remote_movements(self.player)
         with mock.patch.object(correction, "CORRECTIONS", False):
             self.assertEqual(correction.command_ack(self.player, 7003), 7009)
         self.player.body_script.create_arrived = False
-        self.assertEqual(correction.command_ack(self.player, 7003), 7009)
+        self.assertIsNone(correction.own_record(self.player, 7003))
+        self.assertEqual(correction.command_ack(self.player, 7003), 7005)
 
 
 if __name__ == "__main__":

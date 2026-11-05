@@ -159,6 +159,41 @@ class PacketBudgetTests(unittest.TestCase):
             self.assertEqual(player.mover.corrected, 107)
             sent.assert_called_once_with(player, tick, 107, 109)
 
+    def test_budget_delayed_first_correction_keeps_commands_for_the_later_replay(self):
+        server, client, player, peer = connection()
+        prepare_corrections(player)
+        player.mover.corrected = None  # the first movement correction has not reached the wire
+        player.take_commands([Command(frame, forward=127) for frame in range(111, 124)])
+        player.match.tick = 107
+        client.queue_reliable(20302, {"+0x78": {"+0x0": player.entity}, "+0x7C": False, "+0x80": 0})
+        budget = len(client._payload(107, client.reliable, [], []))
+        with mock.patch.object(server_module, "MAX_PAYLOAD", budget):
+            client.send_frame(107, 10.0)
+        first = decoded(self, peer, server.sock.sent[-1][0])
+        self.assertEqual((first[4], first[5]), (109, 0))
+        self.assertIsNone(player.mover.corrected)
+
+        player.match.tick = 110
+        client.send_frame(110, 10.048)
+        second = decoded(self, peer, server.sock.sent[-1][0])
+        self.assertEqual((second[4], second[5], player.mover.corrected), (112, 1, 110))
+
+    def test_ack_is_bounded_even_while_the_first_body_create_is_unconfirmed(self):
+        _, _, player, _ = connection()
+        player.has_body = True
+        player.match.tick = 100
+        player.match.start_body_script(player, EntityUpdate(player.body, OP_CREATE))
+        player.take_commands([Command(113), Command(179)])  # mover skips this long gap
+        self.assertFalse(player.body_script.create_arrived)
+        self.assertIsNone(correction.own_record(player, 140))
+        with self.subTest(history="all future"):
+            self.assertIsNone(correction.snapshot_for(player.mover, 107))
+            self.assertEqual(correction.command_ack(player, 107), 109)
+        with self.subTest(history="eligible snapshot older than tick"):
+            self.assertEqual(correction.snapshot_for(player.mover, 140).frame, 113)
+            self.assertEqual(correction.command_ack(player, 140), 115)
+        self.assertIsNone(player.mover.corrected)
+
     def test_old_mover_or_body_correction_tokens_cannot_commit(self):
         for retire in ("mover", "body"):
             with self.subTest(retire=retire):
