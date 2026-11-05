@@ -12,8 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from test_game_combat import KANEZAKA_DM, Run
 
-from ow174.game import projectiles, world
+from ow174.game import combat, projectiles, world
 from ow174.game.bits import BitReader
+from ow174.game.commands import Command
 from ow174.game.content import SOLDIER
 from ow174.game.script.decode import ClientBody, read_chunk
 from ow174.game.world import HEALTH_POOL, OP_CREATE, OP_DESTROY
@@ -160,6 +161,36 @@ class HelixTests(unittest.TestCase):
             back = (math.sin(a) * math.cos(b), math.sin(b), math.cos(a) * math.cos(b))
             for x, y in zip(direction, back, strict=True):
                 self.assertAlmostEqual(x, y, delta=2e-4)
+
+
+class ProjectileRangeTests(unittest.TestCase):
+    def test_helix_sweeps_to_its_range_boundary(self):
+        for z, hit in ((100.05, True), (100.7, False)):
+            with self.subTest(target_feet_z=z):
+                run = Run(KANEZAKA_DM, ("A", "B"))
+                shooter, victim = run.players
+                fight = run.match.combat
+                run.match.bots.clear()
+                y = run.match.game_map.spawns[0].position[1]
+                shooter.mover.position = (0.0, y, 0.0)
+                victim.mover.position = (0.0, y, z)
+                frame = shooter.body_script.frame + 1
+                shooter.body_script.command(frame, SECONDARY)
+                fight.command(shooter, Command(frame, buttons=SECONDARY))
+                [rocket] = fight.rockets
+                reach = rocket.speed * rocket.left
+                self.assertEqual(reach, 100.0)
+                target = next(target for target in fight._targets() if target.owner is victim)
+                contact = combat.ray_capsule(rocket.position, rocket.direction, *target.segment(), target.radius)
+                self.assertGreater(contact, reach - rocket.speed * combat.TICK)
+                self.assertEqual(contact < reach, hit)
+                vitals = fight.vitals_of(target)
+                before = vitals.total
+                for tick in range(126):
+                    fight.update(20.0 + tick * combat.TICK, frame + tick, frames=False)
+                self.assertFalse(fight.rockets)
+                self.assertEqual(vitals.total < before, hit)
+                self.assertAlmostEqual(rocket.flown * rocket.speed, min(contact, reach))
 
 
 class BioticFieldTests(unittest.TestCase):

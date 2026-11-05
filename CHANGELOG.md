@@ -31,3 +31,9 @@ This log records tested changes and their acceptance status. Entries are grouped
 #### Repository checks
 
 - Kept the CI relay compilation check and removed its artifact upload. Verified the workflow diff and checked that the build and regression steps remain in the workflow.
+
+#### Combat fixes
+
+- Swept the final fraction of projectile flight before expiry. Soldier: 76's Helix Rockets now detect impacts in the final part of their configured range and report the time they actually flew.
+- Used the volley timestamp for hitscan notice attribution. Shots caught up after missing input report their own frames. Their aim, position, and target rewind still use the available command sample.
+- Passed 36 targeted projectile, combat, command epoch, and timing tests. Client acceptance for the changes is pending. GitHub synchronization awaits the reviewed standalone server build.

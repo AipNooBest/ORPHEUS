@@ -618,6 +618,8 @@ class Combat:
         if direct is None or direct.amount <= 0.0:
             return
         reach = field("m_FEC435C6", RANGE) or RANGE
+        # Catch-up shots have no input sample of their own. Keep the received command's
+        # aim, eye and view rewind together, and use the volley clock for hit attribution.
         view_tick = command.frame - command.view_delay(player.quanta) * 1e6 / player.quanta
         best = None
         for target in self._enemies(player):
@@ -635,18 +637,19 @@ class Combat:
         hit_y = origin[1] + direction[1] * t
         critical = hit_y >= shown.feet[1] + shown.eye - HEAD_BELOW
         amount = direct.amount * direct.scale(t) * (direct.critical if critical else 1.0)
+        shot_frame = time // state.instance.component.frame_ms
         self._damage(
-            player, target, amount, critical and direct.critical > 1.0, direct.loadout, command.frame
+            player, target, amount, critical and direct.critical > 1.0, direct.loadout, shot_frame
         )
 
     def _fly(self, rocket: Rocket) -> None:
         """One tick of a projectile: it hits the first enemy body or wall on its way and explodes there."""
-        rocket.left -= TICK
-        if rocket.left <= 0.0:
+        duration = min(TICK, rocket.left)
+        if duration <= 0.0:
             self._landed(rocket)
             return
-        rocket.flown += TICK
-        step = rocket.speed * TICK
+        # Sweep the remaining flight even when the range or lifetime ends inside this tick.
+        step = rocket.speed * duration
         best = None
         for target in self._enemies(rocket.shooter):
             a, b = target.segment()
@@ -658,9 +661,13 @@ class Combat:
             best = (wall, None)
         if best is None:
             rocket.position = _along(rocket.position, rocket.direction, step)
+            rocket.flown += duration
+            rocket.left -= duration
+            if rocket.left <= 0.0:
+                self._landed(rocket)
             return
         t, struck = best
-        rocket.flown += t / rocket.speed - TICK
+        rocket.flown += t / rocket.speed
         self._landed(rocket)
         point = _along(rocket.position, rocket.direction, t)
         if struck is not None and rocket.direct is not None and rocket.direct.amount > 0.0:
