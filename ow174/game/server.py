@@ -24,7 +24,7 @@ from collections import deque
 from ctypes import wintypes
 from dataclasses import dataclass, field, replace
 
-from ow174.game import correction, messages, movelog, observers, world
+from ow174.game import combat, correction, messages, movelog, observers, world
 from ow174.game.bits import BitReader, BitWriter
 from ow174.game.commands import InputError, read_commands
 from ow174.game.environment import ExecutionEnvironment, SystemEnvironment
@@ -179,6 +179,9 @@ class Client:
         self._bot_scripts: dict[int, _BotScriptDelivery] = {}
         self._body_destroy_wait: dict[int, tuple[world.EntityUpdate, int]] = {}
         self._player_body_reuse_after: dict[int, float | None] = {}  # None until destroy ACK
+        self._mode_create_acked = False
+        self._pending_mode_frame: BitWriter | None = None
+        self._mode_notices: deque[tuple[int | None, int, bytes]] = deque(maxlen=MAX_PENDING_COMBAT_NOTICES)
         self.expected_in = 0  # the client's next reliable message
         self.parked_in = {}
         self.leaving_since: float | None = None  # when go_home sent 20304
@@ -190,6 +193,8 @@ class Client:
         """20304 with 0 = leave for good (0x7FF7896E6830): the game goes back to the menu and closes its
         link. GameServer._tick drops it after LEAVE_GRACE_SECONDS if it does not."""
         if self.leaving_since is None:
+            self._pending_mode_frame = None
+            self._mode_notices.clear()
             self.queue_reliable(LEAVE_GAME, {"+0x78": 0, "+0x79": False})
             self.leaving_since = now
 
@@ -223,16 +228,41 @@ class Client:
         script = self._bot_scripts.get(entity)
         return script.stream if script is not None and entity not in self._body_destroy_wait else None
 
-    def queue_combat_notice(self, entity: int, msg_id: int, value: dict) -> None:
-        """Keep references to a body out of the reliable stream until its create is acknowledged."""
-        if entity not in self._combat_notices or entity in self._body_destroy_wait:
+    def queue_mode_frame(self, frame: BitWriter) -> None:
+        """Send the mode UI only once its entity exists on the client."""
+        if self.leaving_since is not None:
+            return
+        if self._mode_create_acked:
+            self.queue_entities([self.player.mode_script.full_frame(frame)])
+        else:
+            self._pending_mode_frame = frame  # countdown updates replace earlier waiting values
+
+    def queue_combat_notice(self, entity: int | None, msg_id: int, value: dict) -> None:
+        """Wait for any referenced body before considering delivery of the notice."""
+        if self.leaving_since is not None:
+            return
+        if entity is not None and (entity not in self._combat_notices or entity in self._body_destroy_wait):
             return
         payload = messages.encode(msg_id, value)
-        pending = self._combat_notices[entity]
+        pending = self._combat_notices.get(entity)
         if pending is None:
-            self._combat_notice_tail[entity] = self._queue_encoded_reliable(msg_id, payload)
+            self._promote_combat_notice(entity, msg_id, payload)
         else:
             pending.append((msg_id, payload))
+
+    def _promote_combat_notice(self, entity: int | None, msg_id: int, payload: bytes) -> None:
+        if self.leaving_since is not None:
+            return
+        if msg_id in (combat.KILL_NOTICE, combat.DEATH_NOTICE):
+            destroy = self._body_destroy_wait.get(entity)
+            if destroy is not None and self.player.match.tick >= destroy[1]:
+                return
+            if not self.player.mode_script.delivered:
+                self._mode_notices.append((entity, msg_id, payload))
+                return
+        ordinal = self._queue_encoded_reliable(msg_id, payload)
+        if entity is not None:
+            self._combat_notice_tail[entity] = ordinal
 
     def queue_bot_health(self, entity: int, components: dict) -> None:
         """Keep the latest complete pool snapshot for this connection's current bot."""
@@ -340,7 +370,7 @@ class Client:
             if script is not None:
                 self.queue_entities([script.stream.full_update])
             for msg_id, payload in pending:
-                self._combat_notice_tail[entity] = self._queue_encoded_reliable(msg_id, payload)
+                self._promote_combat_notice(entity, msg_id, payload)
 
     def _oldest_pending_reliable(self) -> int:
         queued = self.reliable[0][0] if self.reliable else self.next_reliable
@@ -360,6 +390,8 @@ class Client:
         )
 
     def _body_destroy_pending(self, entity: int, oldest: int) -> bool:
+        if any(body == entity for body, _, _ in self._mode_notices):
+            return True
         tail = self._combat_notice_tail.get(entity)
         health_pending = entity in self._bot_health
         if health_pending and self.bot_create_acked(entity):
@@ -404,6 +436,11 @@ class Client:
 
     def _forget_body(self, entity: int) -> None:
         self._combat_notices.pop(entity, None)
+        if self._mode_notices:
+            self._mode_notices = deque(
+                (notice for notice in self._mode_notices if notice[0] != entity),
+                maxlen=MAX_PENDING_COMBAT_NOTICES,
+            )
         self._bot_health.pop(entity, None)
         if entity not in self._player_body_reuse_after:
             self._combat_notice_tail.pop(entity, None)
@@ -563,7 +600,13 @@ class Client:
                     if not current(item):
                         continue
                     if item.op == world.OP_CREATE:
-                        self._ack_body_create(item.entity)
+                        if item.entity == world.GAME_MODE_ENTITY:
+                            self._mode_create_acked = True
+                            if self._pending_mode_frame is not None:
+                                self.queue_mode_frame(self._pending_mode_frame)
+                                self._pending_mode_frame = None
+                        else:
+                            self._ack_body_create(item.entity)
                     elif item.op == world.OP_DESTROY and item.entity in self._player_body_reuse_after:
                         # ACKs can arrive before the server catches up on missed simulation ticks.
                         now = self.server.environment.monotonic(callsite="client.body_destroy_ack")
@@ -572,6 +615,10 @@ class Client:
                         del self._bot_health[item.entity]
                     if item.stream is not None:
                         item.stream.arrived(item.chunk_last)
+                        if (item.entity == world.GAME_MODE_ENTITY
+                                and item.stream is self.player.mode_script and item.stream.delivered):
+                            while self._mode_notices:
+                                self._promote_combat_notice(*self._mode_notices.popleft())
                         script = self._bot_scripts.get(item.entity)
                         if script is not None and item.stream is script.stream:
                             self._flush_bot_frames(script)
@@ -1116,6 +1163,8 @@ class GameServer:
         client._bot_scripts.clear()
         client._body_destroy_wait.clear()
         client._player_body_reuse_after.clear()
+        client._pending_mode_frame = None
+        client._mode_notices.clear()
         if self.clients.get(client.conn) is client:
             del self.clients[client.conn]
         movelog.close(client.player)

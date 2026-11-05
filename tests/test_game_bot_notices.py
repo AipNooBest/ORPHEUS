@@ -2,16 +2,17 @@
 
 import struct
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from test_game_packet_budget import connection, decoded, large_messages
 from test_game_repeated_lifecycles import wire_frame
 
-from ow174.game import bodytrace, bots, combat, movelog, world
+from ow174.game import bodytrace, bots, combat, heroselect, movelog, world
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
 from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
-from ow174.game.match import BOT_RECORD_DELAY
-from ow174.game.script import graph
+from ow174.game.match import BOT_RECORD_DELAY, COUNTDOWN
+from ow174.game.script import decode, graph
 from ow174.game.server import SILENCE_SECONDS, TICK_SECONDS, Client
 
 
@@ -35,7 +36,15 @@ class BotNoticeTests(unittest.TestCase):
         clock.start()
         self.addCleanup(clock.stop)
 
-    def prepare(self, *, last=False, single=False):
+    @staticmethod
+    def assume_mode_ready(client):
+        # Other tests isolate body or transport prerequisites from mode startup.
+        client._mode_create_acked = True
+        stream = client.player.mode_script
+        stream.last = stream.data_last = 1
+        stream.arrived(1)
+
+    def prepare(self, *, last=False, single=False, mode_ready=True):
         self.connect()
         self.match.bots = bots.make(PRACTICE_RANGE.map_guid)
         self.match.combat.next_bot = bots.BOT_ENTITY + len(self.match.bots)
@@ -48,10 +57,12 @@ class BotNoticeTests(unittest.TestCase):
         if single:
             updates = [record for record in updates if record.entity == self.entity]
         self.client.queue_entities(updates)
+        if mode_ready:
+            self.assume_mode_ready(self.client)
         self.window = ReceiveWindow()
         self.seq = 0
 
-    def prepare_player_target(self):
+    def prepare_player_target(self, *, mode_ready=True):
         self.connect()
         self.match.tick = 100
         self.player.spawned = self.player.has_body = True
@@ -64,6 +75,9 @@ class BotNoticeTests(unittest.TestCase):
         self.target = next(target for target in self.match.combat._targets() if target.owner is self.victim)
         self.entity = self.target.entity
         self.client.queue_entities([self.match.remote_body_create(self.player, self.victim)])
+        if mode_ready:
+            self.assume_mode_ready(self.client)
+            self.assume_mode_ready(victim_client)
         self.window = ReceiveWindow()
         self.seq = 0
         return LinkCipher(key_out, key_in)
@@ -75,6 +89,10 @@ class BotNoticeTests(unittest.TestCase):
         ids, records = wire_frame(packet)
         self.assertEqual((wire_tick, ids, len(records)), (tick, [number for _, number, _ in reliable], count))
         self.health = self.bot_health(records)
+        self.mode_chunks = [
+            (record.chunk.getvalue(), record.chunk.count)
+            for record, _ in records if record.entity == world.GAME_MODE_ENTITY and record.chunk is not None
+        ]
         if deliver:
             self.assertTrue(self.window.accept(packet.seq))
         return reliable, [(record.entity, record.op) for record, _ in records]
@@ -110,6 +128,215 @@ class BotNoticeTests(unittest.TestCase):
             (combat.KILL_NOTICE, {"+0x78": 0, "+0x80": {"+0x0": self.player.body},
                                   "+0x84": {"+0x0": self.entity}, "+0x88": 0, "+0x89": False}),
         ])
+
+    def queue_mode_create(self):
+        self.client.queue_entities([
+            world.EntityUpdate(world.GAME_MODE_ENTITY, world.OP_CREATE, self.match._game_mode_create),
+        ])
+
+    def assert_mode_baseline(self):
+        chunk, = self.mode_chunks
+        frame = decode.read_chunk(*chunk)
+        self.assertTrue(frame.full)
+        self.assertEqual(frame.instances[1].graph, combat.MODE_UI)
+        return chunk
+
+    def test_mode_baseline_waits_for_mode_create_ack(self):
+        self.prepare(single=True, mode_ready=False)
+        self.queue_mode_create()
+        mode_create = (world.GAME_MODE_ENTITY, world.OP_CREATE)
+        self.assertIn(mode_create, self.send(100, deliver=False)[1])
+        self.match.combat.spawned(self.player)
+
+        self.assertNotIn(mode_create, self.send(103)[1])
+        self.assertEqual(self.mode_chunks, [])
+        self.ack()  # Report the missing create packet.
+        self.assertIn(mode_create, self.send(106)[1])
+        self.assertEqual(self.mode_chunks, [])
+        self.ack()
+        self.send(109)
+        self.assert_mode_baseline()
+
+    def test_elimination_waits_for_mode_baseline_but_hit_does_not(self):
+        self.prepare(single=True, mode_ready=False)
+        self.queue_mode_create()
+        self.send(100)
+        self.ack()
+        self.match.combat.spawned(self.player)
+        self.send(103, deliver=False)
+        baseline = self.assert_mode_baseline()
+
+        self.damage_bot(self.target.owner.health, 104)
+        hit = self.notices(self.send(106)[0])
+        self.assertEqual(hit, [
+            (combat.HIT, {"+0x78": {"+0x0": {"+0x0": self.entity}, "+0x4": int(self.target.owner.health),
+                                      "+0x8": combat.KILLING}, "+0x84": 104}),
+        ])
+        self.assertEqual(self.mode_chunks, [])
+        self.ack()  # Report the lost baseline and the successfully delivered hit.
+        self.assertEqual(self.notices(self.send(109)[0]), [])
+        self.assertEqual(self.mode_chunks, [baseline])
+        self.ack()
+        self.ack()  # An unchanged ACK window must not issue the notice twice.
+        self.assertEqual(self.notices(self.send(112)[0]), [
+            (combat.KILL_NOTICE, {"+0x78": 0, "+0x80": {"+0x0": self.player.body},
+                                  "+0x84": {"+0x0": self.entity}, "+0x88": 0, "+0x89": False}),
+        ])
+        self.ack()
+        self.assertEqual(self.notices(self.send(115)[0]), [])
+
+    def test_self_death_notice_waits_for_mode_baseline_ack(self):
+        self.prepare(single=True, mode_ready=False)
+        self.queue_mode_create()
+        self.send(100)
+        self.ack()
+        self.match.combat.spawned(self.player)
+        self.match.combat._died(self.player, self.player, False, None)
+
+        self.assertEqual(self.send(103)[0], [])
+        self.assert_mode_baseline()
+        self.ack()
+        self.assertEqual(self.send(106)[0], [
+            (0, combat.DEATH_NOTICE, {"+0x78": 0, "+0x7C": {"+0x0": self.player.body}}),
+        ])
+
+    def test_victim_death_notice_waits_for_the_victims_mode_baseline(self):
+        victim_peer = self.prepare_player_target(mode_ready=False)
+        attacker, attacker_peer = self.client, self.peer
+        self.queue_mode_create()
+        self.send(100)
+        self.ack()
+        self.match.combat.spawned(self.player)
+        self.send(103)
+        self.assert_mode_baseline()
+        self.ack()
+
+        self.client, self.peer = self.victim.client, victim_peer
+        self.window, self.seq = ReceiveWindow(), 0
+        source = self.player.body
+        self.client.queue_entities([self.match.remote_body_create(self.victim, self.player)])
+        self.queue_mode_create()
+        self.assertIn((source, world.OP_CREATE), self.send(104)[1])
+        self.ack()
+        self.match.combat.spawned(self.victim)
+        self.match.combat._damage(self.player, self.target, 200, False, None, 105)
+        self.assertEqual(self.send(106)[0], [])
+        self.assert_mode_baseline()
+
+        attacker.send_frame(106, 10.0)
+        _, _, reliable, _, _, _ = decoded(self, attacker_peer, self.server.sock.sent[-1][0])
+        self.assertEqual([number for _, number, _ in reliable], [combat.HIT, combat.KILL_NOTICE])
+
+        self.ack()
+        self.assertEqual(self.send(109)[0], [
+            (0, combat.DEATH_NOTICE, {"+0x78": combat.KILLED_BY, "+0x7C": {"+0x0": source}}),
+        ])
+
+    def test_mode_notice_holds_retired_target_until_the_notice_is_acknowledged(self):
+        self.prepare_player_target(mode_ready=False)
+        self.queue_mode_create()
+        self.send(100)
+        self.ack()
+        self.match.combat._damage(self.player, self.target, 200, False, None, 101)
+        self.assertEqual([number for _, number, _ in self.send(101)[0]], [combat.HIT])
+        self.ack()  # The hit is no longer an independent reason to hold the destroy.
+        self.assertTrue(self.match.switch_hero(self.victim, heroes()[SOLDIER]))
+
+        self.match.combat.spawned(self.player)
+        old_destroy = (self.entity, world.OP_DESTROY)
+        reliable, records = self.send(104)
+        self.assertEqual(self.notices(reliable), [])
+        self.assertNotIn(old_destroy, records)
+        self.assert_mode_baseline()
+        self.ack()
+        reliable, records = self.send(107)
+        self.assertEqual([(number, value["+0x84"]) for _, number, value in reliable], [
+            (combat.KILL_NOTICE, {"+0x0": self.entity}),
+        ])
+        self.assertNotIn(old_destroy, records)
+        self.ack()
+        self.assertIn(old_destroy, self.send(110)[1])
+
+    def test_expired_target_mode_notice_is_discarded_before_the_baseline_ack(self):
+        self.prepare(single=True, mode_ready=False)
+        self.queue_mode_create()
+        self.send(100)
+        self.ack()
+        self.kill_bot()
+        self.assertEqual([number for _, number, _ in self.send(101)[0]], [combat.HIT])
+        self.ack()  # The hit and terminal health are already delivered.
+        self.match.combat.spawned(self.player)
+        self.send(104, deliver=False)
+        baseline = self.assert_mode_baseline()
+
+        self.respawn_target(289)
+        old_destroy = (self.entity, world.OP_DESTROY)
+        expiry = 289 + round(SILENCE_SECONDS / TICK_SECONDS)
+        self.assertNotIn(old_destroy, self.send(expiry - 4)[1])
+        self.ack()  # Report the missing mode baseline packet.
+        self.assertNotIn(old_destroy, self.send(expiry - 1)[1])
+        self.assertEqual(self.mode_chunks, [baseline])
+        self.match.tick = expiry
+        self.ack()  # The retirement deadline passed before the baseline ACK was processed.
+        self.assertEqual(self.player.mode_script.delivered, 1)
+
+        reliable, records = self.send(expiry)
+        self.assertIn(old_destroy, records)
+        self.assertEqual(self.notices(reliable), [])
+        self.ack()
+        self.assertEqual(self.notices(self.send(expiry + 1)[0]), [])
+
+    def test_latest_countdown_replaces_unsent_mode_state_and_later_countdown_keeps_notices_ready(self):
+        self.prepare(single=True, mode_ready=False)
+        self.queue_mode_create()
+        self.match.assemble_ends = 20.0
+        self.match._send_countdown(self.player, 10.0)
+        self.match._send_countdown(self.player, 15.0)
+
+        self.send(100)
+        self.assertEqual(self.mode_chunks, [])
+        self.ack()
+        self.send(103)
+        baseline = self.assert_mode_baseline()
+        self.assertEqual(decode.read_chunk(*baseline).entity_vars[COUNTDOWN], (5.0, ()))
+        self.ack()
+
+        self.match._send_countdown(self.player, 20.0)
+        self.send(106, deliver=False)
+        countdown = self.assert_mode_baseline()
+        self.assertEqual(decode.read_chunk(*countdown).entity_vars[COUNTDOWN], (0.0, ()))
+        self.damage_bot(self.target.owner.health, 107)
+        self.assertEqual([number for _, number, _ in self.send(109)[0]], [combat.HIT, combat.KILL_NOTICE])
+
+    def test_assemble_end_keeps_only_zero_countdown_while_mode_create_is_lost(self):
+        self.prepare(single=True, mode_ready=False)
+        self.match.game_map = replace(self.match.game_map, mode_guid=0x0230000000000002, mode_name="Control")
+        self.match.controller = heroselect.controller_of(self.match.game_map.mode_guid)
+        self.match.assemble_ends = 20.0
+        self.player.steps_done = 4
+        self.player.select_open = True
+        self.queue_mode_create()
+        self.match._send_countdown(self.player, 10.0)
+        mode_create = (world.GAME_MODE_ENTITY, world.OP_CREATE)
+        self.assertIn(mode_create, self.send(100, deliver=False)[1])
+        self.assertEqual(self.mode_chunks, [])
+
+        self.match._end_assemble(20.0)
+        self.assertTrue(self.match.assembled)
+        self.assertFalse(self.player.select_open)
+        self.assertNotIn(mode_create, self.send(103)[1])
+        self.assertEqual(self.mode_chunks, [])
+        self.ack()
+        self.assertIn(mode_create, self.send(106)[1])
+        self.assertEqual(self.mode_chunks, [])
+        self.ack()
+
+        self.send(109)
+        frame = decode.read_chunk(*self.assert_mode_baseline())
+        self.assertEqual((frame.last, frame.entity_vars[COUNTDOWN]), (1, (0.0, ())))
+        self.ack()
+        self.send(112)
+        self.assertEqual(self.mode_chunks, [])
 
     def test_budget_delayed_create_and_duplicate_ack(self):
         self.prepare(last=True)

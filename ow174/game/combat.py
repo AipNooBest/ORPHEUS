@@ -437,7 +437,7 @@ class Combat:
         """The player's client has the world: the game mode entity gets its UI graph (mode_frame). While
         heroes are assembled the countdown's frames carry it."""
         if player.client is not None and not self.match.assembling():
-            player.client.queue_entities([player.mode_script.full_frame(mode_frame({}))])
+            player.client.queue_mode_frame(mode_frame({}))
         self.voice.spawned(player, self.now)
 
     def command(self, player, command: Command | None) -> None:
@@ -915,7 +915,7 @@ class Combat:
             if how == KILLED_BY:
                 self._queue_notice(victim, killer, source, DEATH_NOTICE, notice)
             else:  # the native "you died" event does not resolve a killer
-                victim.client.queue_reliable(DEATH_NOTICE, notice)
+                victim.client.queue_combat_notice(None, DEATH_NOTICE, notice)
         script = victim.body_script
         if script is not None:
             try:

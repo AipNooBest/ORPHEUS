@@ -46,8 +46,11 @@ class FakeClient:
     def queue_bot_live(self, entity: int, snapshot) -> None:
         pass  # the combat model leaves NPC body decoding to the link tests
 
-    def queue_combat_notice(self, entity: int, msg_id: int, value: dict) -> None:
+    def queue_combat_notice(self, entity: int | None, msg_id: int, value: dict) -> None:
         self.queue_reliable(msg_id, value)
+
+    def queue_mode_frame(self, frame: BitWriter) -> None:
+        self.queue_entities([self.player.mode_script.full_frame(frame)])
 
     def queue_bot_health(self, entity: int, components: dict) -> None:
         self.queue_entities([

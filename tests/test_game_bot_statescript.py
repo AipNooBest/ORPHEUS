@@ -319,6 +319,9 @@ class BotStatescriptTests(unittest.TestCase):
         self.shooting_peer = WirePeer(client, cipher)
         self.watching_peer = self.add_observer(2)
         for peer in (self.shooting_peer, self.watching_peer):
+            # The fixture starts with the mode UI loaded and tests NPC stream loss.
+            peer.client._mode_create_acked = True
+            peer.client.player.mode_script.delivered = 1
             self.show_bots(peer)
 
     def add_observer(self, number):

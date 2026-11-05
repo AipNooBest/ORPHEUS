@@ -880,7 +880,7 @@ class Match:
         player.next_countdown = now + COUNTDOWN_EVERY
         seconds = max(0.0, self.assemble_ends - now)
         frame = combat.mode_frame({COUNTDOWN: float(seconds)})  # with the mode's UI graph (combat.py)
-        player.client.queue_entities([player.mode_script.full_frame(frame)])
+        player.client.queue_mode_frame(frame)
 
     def _end_assemble(self, now: float) -> None:
         """The countdown is over: the screens of the players who have a hero close, and the skin

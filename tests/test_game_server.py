@@ -64,7 +64,7 @@ class PretendGame:
         self.expected = packet.seq + 1
         return packet
 
-    def frames_until(self, wanted, seconds: float = 3.0):
+    def frames_until(self, wanted, seconds: float = 3.0, *, acknowledge: bool = False):
         """Read frames until wanted(messages, entity count) is true; returns what it saw."""
         seen = []
         deadline = time.time() + seconds
@@ -79,6 +79,8 @@ class PretendGame:
             reader.bits(4 + 1 + 1 + 1)
             count = reader.bits(7)
             seen.append(([msg_id for _, msg_id, _ in reliable], count))
+            if acknowledge:
+                self.send(ACK)
             if wanted(seen[-1][0], count):
                 return seen
         raise AssertionError(f"not seen in time: {seen[-5:]}")
@@ -187,14 +189,17 @@ class GameServerTests(unittest.TestCase):
             game.receive()
             game.send(ACK)
             game.send_message(21601, {})
-            game.frames_until(lambda ids, count: match.assembling())
-            game.frames_until(lambda ids, count: player.steps_done >= 4)
+            game.frames_until(lambda ids, count: match.assembling(), acknowledge=True)
+            game.frames_until(lambda ids, count: player.mode_script.delivered > 0, acknowledge=True)
+            first_countdown = player.mode_script.delivered
             game.send_message(21616, pick(0xA0000100, REAPER))
             game.frames_until(lambda ids, count: player.has_body)
             self.assertTrue(player.select_open)  # still assembling
-            game.frames_until(lambda ids, count: match.assembled, seconds=2.0)
+            game.frames_until(
+                lambda ids, count: match.assembled and player.mode_script.delivered > first_countdown,
+                seconds=2.0, acknowledge=True,
+            )
             self.assertFalse(player.select_open)
-            self.assertGreater(player.mode_script.last, 0)  # the countdown went to the game mode entity
 
     def test_a_game_that_never_connects_leaves_the_match(self):
         with mock.patch.object(server_module, "HANDOFF_SECONDS", 0.2):

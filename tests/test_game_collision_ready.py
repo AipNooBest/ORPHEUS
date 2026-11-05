@@ -51,8 +51,8 @@ class ControlledProvider:
 
 
 class HomeClient(FakeClient):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, player):
+        super().__init__(player)
         self.home = []
 
     def go_home(self, now):
@@ -62,7 +62,7 @@ class HomeClient(FakeClient):
 def players_in(match):
     players = [match.add_player(i + 1, name, SOLDIER, i, False) for i, name in enumerate(("A", "B"))]
     for player in players:
-        player.client = HomeClient()
+        player.client = HomeClient(player)
         match.map_loaded(player, 10.0)
         match.switch_hero(player, heroes()[SOLDIER])
     return players

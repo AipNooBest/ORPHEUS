@@ -59,7 +59,8 @@ def card(number: int, tag: str) -> dict:
 
 
 class FakeClient:
-    def __init__(self) -> None:
+    def __init__(self, player) -> None:
+        self.player = player
         self.reliable: list[tuple[int, dict]] = []
         self.entities: list = []
 
@@ -69,13 +70,16 @@ class FakeClient:
     def queue_entities(self, updates: list) -> None:
         self.entities.extend(updates)
 
+    def queue_mode_frame(self, frame: BitWriter) -> None:
+        self.queue_entities([self.player.mode_script.full_frame(frame)])
+
     def body_id_available(self, entity: int) -> bool:
         return True  # the lobby notification model has no transport reservations
 
 
 def into_world(match: Match, player, tick: int) -> None:
     """A player whose game loaded and got its controller."""
-    player.client = FakeClient()
+    player.client = FakeClient(player)
     player.spawned = True
     player.steps_done = 4
     match.tick = tick
