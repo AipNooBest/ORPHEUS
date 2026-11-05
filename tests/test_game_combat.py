@@ -14,6 +14,7 @@ from ow174.game.combat import Combat, HitDef, Target, Vitals
 from ow174.game.commands import FIRE, Command, read_commands
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
 from ow174.game.match import Match
+from ow174.game.script import graph, runtime
 from ow174.game.script.decode import read_chunk
 from ow174.game.world import ARMOUR_POOL, HEALTH_POOL, SHIELDS_POOL
 
@@ -336,6 +337,19 @@ class ModeFrameTests(unittest.TestCase):
         decoded = read_chunk(_chunk(frame), _chunk_bits(frame), {})
         self.assertEqual({key: item.graph for key, item in decoded.instances.items()}, {1: combat.MODE_UI})
         self.assertEqual(decoded.entity_vars[1303][0], 12.5)
+
+    def test_mode_ui_shared_variables_start_in_both_initial_and_countdown_frames(self):
+        ui = graph.graph(combat.MODE_UI)
+        component = runtime.Component(0xA0000100)
+        instance = component.create(ui)
+        component.run_frame(1)
+        self.assertTrue(instance.states[21].active)
+
+        for values in ({}, {1303: 12.5}):
+            with self.subTest(values=values):
+                frame = combat.mode_frame(values)
+                decoded = read_chunk(_chunk(frame), _chunk_bits(frame), {})
+                self.assertEqual(decoded.instances[1].states[21], (instance.states[21].active, {}))
 
 
 def _chunk(frame: BitWriter) -> bytes:

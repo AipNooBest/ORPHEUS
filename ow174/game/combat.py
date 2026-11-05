@@ -55,7 +55,7 @@ from ow174.game.bits import BitWriter
 from ow174.game.collision import AX, AY, AZ, BX, BY, BZ, CELL, CX, CY, CZ, MASK, MOVER, NUMBER
 from ow174.game.mover import mover_data
 from ow174.game.script import expr, graph, runtime
-from ow174.game.statescript import InstanceWire, body_full_frame
+from ow174.game.statescript import InstanceWire, StateWire, remote_full_frame
 from ow174.game.world import ARMOUR_POOL, HEALTH_POOL, OP_DESTROY, OP_UPDATE, POOLS, SHIELDS_POOL
 
 log = logging.getLogger("ow174.game")
@@ -893,5 +893,8 @@ def mode_frame(entity_vars: dict) -> BitWriter:
     client-only Entries make the kill feed 0DEA and the notices 1FC0) and the entity variables given (the
     PvP countdown). Every full frame of this entity has to list 0CB6, or it would destroy it."""
     ui = graph.graph(MODE_UI)
+    # EntryClientOnlySharedVars starts the mode UI's sole remote state, st21.
+    shared = ui.state(21)
+    instance = InstanceWire(1, ui, states={21: StateWire(shared.cls, True)})
     values = {var: (value, ()) for var, value in entity_vars.items()}
-    return body_full_frame([InstanceWire(1, ui)], values, {1: ui})
+    return remote_full_frame([instance], values, {1: ui})
