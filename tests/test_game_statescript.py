@@ -8,6 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ow174.game import heroselect
 from ow174.game.bits import BitWriter
+from ow174.game.content import SOLDIER
+from ow174.game.script import decode, graph, runtime
 from ow174.game.statescript import Graph, Instance, chunk, owner_ack, owner_full_frame
 from ow174.game.world import EntityUpdate, _write_entity
 
@@ -35,7 +37,7 @@ class StatescriptTests(unittest.TestCase):
                 446,
                 "05 10 70 00 00 04 c8 37 40 03 89 07 00 88 e0 09 10 8a 28 14 60 85 58 44 21 01 00 04 39 08 05"
                 " 50 21 1a 51 48 40 00 30 c3 04 a8 65 3d 08 00 08 01 00 00 00 04 20 92 00 6b 54 e0 10 00 00"
-                " 00 00 b3 01",
+                " 00 00 bb 01",
             ),
             heroselect.PVP: (
                 485,
@@ -50,6 +52,22 @@ class StatescriptTests(unittest.TestCase):
             block = BitWriter()
             _write_entity(block, EntityUpdate(0xA0000100, chunk=chunk(frame, 0, 1)))
             self.assertEqual(block.getvalue().hex(" "), data)
+
+    def test_practice_hud_keeps_its_initialized_shared_vars_state(self):
+        hud_graph = graph.graph(0x20E4)
+        component = runtime.Component(0xA0000100)
+        hud = component.create(hud_graph)
+        component.run_frame(1)
+        expected = hud.states[25].active
+        self.assertTrue(expected)
+
+        for select_open, hero in ((True, None), (False, SOLDIER), (True, SOLDIER)):
+            with self.subTest(select_open=select_open, hero=hero):
+                frame = heroselect.controller_frame(heroselect.PRACTICE, 123456, select_open, hero=hero)
+                packet = chunk(frame, 0, 1)
+                actual = decode.read_chunk(packet.getvalue(), packet.count, {}).instances[4]
+                self.assertEqual(actual.graph, hud_graph.index)
+                self.assertEqual(actual.states[25], (expected, {}))
 
     def test_the_practice_range_hides_the_assemble_title(self):
         # v8535 in 288B's extra ids: its bit turns on, then w_var 8535 (18 bits), bool true (4 + 1),

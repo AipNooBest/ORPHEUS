@@ -106,7 +106,8 @@ def controller_frame(
     ]
     if controller.hud_bit is not None:
         active[controller.hud_bit] = subscript(4)
-        instances.append(Instance(4, HUD, parent=(1, controller.hud_state)))
+        # 20E4's EntryClientOnlySharedVars starts st25, its only owner state.
+        instances.append(Instance(4, HUD, parent=(1, controller.hud_state), active={0: None}))
     entry = len(instances) + 1
     host.active[1] = subscript(entry)
     instances.append(Instance(entry, TEAM_ENTRY, parent=(2, 1)))
