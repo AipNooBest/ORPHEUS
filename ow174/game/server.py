@@ -538,7 +538,8 @@ class Client:
         if tail is not None and oldest <= tail:
             return True  # the receiver can park a notice behind an earlier reliable gap
         script = self._bot_scripts.get(entity)
-        if script is None:
+        # A frozen bot script must not keep retrying the create of a retired body.
+        if script is None or not self.bot_create_acked(entity):
             return False
         return bool(
             (script.stream.pending and script.nameplate_update is None)

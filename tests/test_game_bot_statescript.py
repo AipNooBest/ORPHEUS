@@ -1041,6 +1041,45 @@ class BotStatescriptTests(unittest.TestCase):
         self.assertNotIn(old, late.models)
         self.assertEqual(late.pulses, [])
 
+    def test_respawn_discards_a_lost_create_for_only_the_unacknowledged_peer(self):
+        shooter, watcher, old = self.shooting_peer, self.watching_peer, self.bot.entity
+        self.acknowledge_baseline(watcher, old)
+        lost, _, records = self.send(shooter, receive=False)
+        self.assertEqual(self.entities(records, world.OP_CREATE), [old])
+        _, _, gap = self.send(shooter)
+        self.assertEqual(self.entities(gap, world.OP_CREATE), [])
+        shooter.ack()  # later frame reports the old create lost and queues its retry
+        self.assertTrue(
+            any(item.entity == old and item.op == world.OP_CREATE for item in shooter.client.entities)
+        )
+        self.assertFalse(shooter.client.bot_create_acked(old))
+
+        self.kill_bot()
+        pending = shooter.client._combat_notices[old]
+        self.assertEqual([number for number, _ in pending], [combat.HIT, combat.KILL_NOTICE])
+        fresh = self.respawn()
+
+        _, reliable, replacement = self.send(shooter)
+        self.assertEqual(self.entities(replacement, world.OP_CREATE), [fresh])
+        self.assertEqual(self.entities(replacement, world.OP_DESTROY), [old])
+        self.assertEqual(self.chunks(replacement, old), [])
+        self.assertFalse(any(number in (combat.HIT, combat.KILL_NOTICE) for _, number, _ in reliable))
+        shooter.window.accept(lost.seq)  # stale positive ACK cannot reactivate this body
+        shooter.ack()
+        self.assertNotIn(old, shooter.client._bot_scripts)
+        self.assertFalse(shooter.client.bot_create_acked(old))
+        self.assertTrue(shooter.client.bot_create_acked(fresh))
+        _, _, full = self.send(shooter)
+        self.assert_pulse(self.only_chunk(full, fresh), first=0, last=1, count=0)
+
+        _, _, terminal = self.send(watcher)
+        self.assertEqual(self.entities(terminal, world.OP_CREATE), [fresh])
+        self.assertNotIn(old, self.entities(terminal, world.OP_DESTROY))
+        self.assert_pulse(self.only_chunk(terminal, old), first=2, last=2, count=1)
+        watcher.ack()
+        _, _, retired = self.send(watcher)
+        self.assertIn(old, self.entities(retired, world.OP_DESTROY))
+
     def test_expiry_retires_pending_script_and_old_full_ack_cannot_unlock_reused_id(self):
         peer, old = self.watching_peer, self.bot.entity
         _, _, create = self.send(peer)
