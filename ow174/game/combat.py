@@ -82,6 +82,7 @@ RANGE = 200.0  # m a hitscan shot reaches when its volley names none (unverified
 RESPAWN = 10.0  # s a hero waits in the PvP modes (0F4A and 0EC2 send 06FD.025 {10}: DATA)
 PRACTICE_RESPAWN = 3.0  # s in the Practice Range (13C0 sends 06FD.025 {3}: DATA)
 BOT_RESPAWN = 3.0  # s a training bot lies dead (unverified: OW2 made two killed bots again after 2.98 s)
+RESPAWN_RETRY = 0.25  # s between attempts when all player body IDs are still reserved
 MELEE = {0x0043: (4, 1.5, 1.0)}  # graph -> (its ModifyHealth state, metres ahead of the eye, radius): DATA
 ARMOUR_BLOCK = 5.0  # damage armour stops per hit (unverified: OW1's rule; the client has no damage code)
 TICK = 0.016
@@ -935,7 +936,9 @@ class Combat:
         player = who
         if player.gone or not player.has_body or not self.is_dead(player):
             return
-        self.match.switch_hero(player, player.hero)  # a new body at the spawn point, the old one goes
+        if not self.match.switch_hero(player, player.hero):
+            self.respawns.append((self.now + RESPAWN_RETRY, player))
+            return
         self.voice.spawned(player, self.now)
         log.info("[game] %s: %s respawned", self.match.label(), player.name)
 

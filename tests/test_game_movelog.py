@@ -137,7 +137,7 @@ class LogTests(unittest.TestCase):
     def test_a_new_body_starts_a_new_run_of_frames(self):
         self.enable()
         self.player.take_commands([Command(7000 + n, forward=127) for n in range(3)])
-        self.player.new_body()
+        self.player.new_body(self.player.body + 1)
         self.player.take_commands([Command(7003 + n, forward=127) for n in range(2)])
         lines = self.lines()
         bodies = [line for line in lines if line["k"] == "body"]

@@ -202,7 +202,7 @@ class PacketBudgetTests(unittest.TestCase):
                 update = correction.own_record(player, 107)
                 old_mover = player.mover
                 if retire == "mover":
-                    player.new_body()
+                    player.new_body(player.body + 1)
                 else:
                     player.body += 1
                 before = player.mover.corrected

@@ -17,14 +17,26 @@ from ow174.game.server import SILENCE_SECONDS, TICK_SECONDS, Client
 
 class BotNoticeTests(unittest.TestCase):
     def setUp(self):
+        self.monotonic_override = None
         for module in (bodytrace, movelog):
             edit = patch.object(module, "ENABLED", False)
             edit.start()
             self.addCleanup(edit.stop)
 
-    def prepare(self, *, last=False, single=False):
+    def connection_time(self, *, callsite):
+        if self.monotonic_override is not None:
+            return self.monotonic_override
+        return self.match.tick * TICK_SECONDS
+
+    def connect(self):
         self.server, self.client, self.player, self.peer = connection()
         self.match = self.player.match
+        clock = patch.object(self.server.environment, "monotonic", side_effect=self.connection_time)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def prepare(self, *, last=False, single=False):
+        self.connect()
         self.match.bots = bots.make(PRACTICE_RANGE.map_guid)
         self.match.combat.next_bot = bots.BOT_ENTITY + len(self.match.bots)
         self.match.tick = 100
@@ -40,8 +52,7 @@ class BotNoticeTests(unittest.TestCase):
         self.seq = 0
 
     def prepare_player_target(self):
-        self.server, self.client, self.player, self.peer = connection()
-        self.match = self.player.match
+        self.connect()
         self.match.tick = 100
         self.player.spawned = self.player.has_body = True
         self.victim = self.match.add_player(2, "Target", SOLDIER, 1, False)
@@ -234,6 +245,132 @@ class BotNoticeTests(unittest.TestCase):
         self.assertNotIn((self.entity, world.OP_DESTROY), records)
         self.ack()
         self.assertIn((self.entity, world.OP_DESTROY), self.send(110)[1])
+
+    def retire_player_with_lost_hit(self):
+        self.prepare_player_target()
+        self.send(100)
+        self.ack()
+        self.match.combat._tell_hit(self.player, self.target, 20, 0, 101)
+        lost = self.notices(self.send(101, deliver=False)[0])
+        self.assertEqual(lost, [
+            (combat.HIT, {"+0x78": {"+0x0": {"+0x0": self.entity}, "+0x4": 20, "+0x8": 0}, "+0x84": 101}),
+        ])
+        self.match.switch_hero(self.victim, self.victim.hero)
+        self.assertNotEqual(self.victim.body, self.entity)
+        return lost
+
+    def switch_at_body_id_wrap(self):
+        # Exercise the real wrap selection without creating 253 unrelated bodies.
+        self.victim.body = self.victim.entity | 0xFF
+        self.match.switch_hero(self.victim, self.victim.hero)
+        self.match.ensure_remote_body(self.player, self.victim)
+        return self.victim.body
+
+    def test_wrap_skips_the_body_with_a_lost_promoted_hit(self):
+        lost = self.retire_player_with_lost_hit()
+        fresh = self.switch_at_body_id_wrap()
+        self.assertNotEqual(fresh, self.entity)
+        reliable, records = self.send(104)
+        self.assertIn((fresh, world.OP_CREATE), records)
+        self.assertNotIn((self.entity, world.OP_CREATE), records)
+        self.assertEqual(self.notices(reliable), [])
+        self.ack()
+        retry, records = self.send(107)
+        self.assertEqual(self.notices(retry), lost)
+        self.assertNotIn((self.entity, world.OP_CREATE), records)
+
+    def test_timeout_destroy_and_tombstone_do_not_clear_the_reliable_tail(self):
+        lost = self.retire_player_with_lost_hit()
+        timeout = 101 + round(SILENCE_SECONDS / TICK_SECONDS)
+        reliable, records = self.send(timeout)
+        self.assertEqual(self.notices(reliable), [])
+        self.assertIn((self.entity, world.OP_DESTROY), records)
+        self.ack()  # the destroy arrived, and the earlier hit is now queued for retry
+        after_tombstone = timeout + round(30 / TICK_SECONDS) + 1
+        self.match.tick = after_tombstone
+        fresh = self.switch_at_body_id_wrap()
+        self.assertNotEqual(fresh, self.entity)
+        reliable, records = self.send(after_tombstone)
+        self.assertEqual(self.notices(reliable), lost)
+        self.assertIn((fresh, world.OP_CREATE), records)
+        self.assertNotIn((self.entity, world.OP_CREATE), records)
+        self.ack()
+
+        self.assertEqual(self.switch_at_body_id_wrap(), self.entity)
+        reliable, records = self.send(after_tombstone + 3)
+        self.assertEqual(self.notices(reliable), [])
+        self.assertIn((self.entity, world.OP_CREATE), records)
+
+    def test_body_tombstone_starts_at_the_retried_destroy_ack(self):
+        self.prepare_player_target()
+        self.send(100)
+        self.ack()
+        self.match.switch_hero(self.victim, self.victim.hero)
+        self.assertIn((self.entity, world.OP_DESTROY), self.send(101, deliver=False)[1])
+
+        late = 101 + round(30 / TICK_SECONDS) + 1
+        self.match.tick = late
+        self.assertNotEqual(self.switch_at_body_id_wrap(), self.entity)
+        self.assertNotIn((self.entity, world.OP_CREATE), self.send(late)[1])
+        self.ack()  # only now does the old lost destroy enter the retry queue
+        self.assertIn((self.entity, world.OP_DESTROY), self.send(late + 3)[1])
+
+        # The retry is acknowledged before the scheduler catches up after a pause.
+        self.monotonic_override = (late + 3) * TICK_SECONDS + 31.0
+        self.ack()
+        self.monotonic_override += TICK_SECONDS
+        self.match.tick = late + 3 + round(31 / TICK_SECONDS)
+        self.assertNotEqual(self.switch_at_body_id_wrap(), self.entity)
+        self.assertNotIn((self.entity, world.OP_CREATE), self.send(self.match.tick)[1])
+
+        self.monotonic_override += 30.0
+        self.match.tick += round(30 / TICK_SECONDS)
+        self.assertEqual(self.switch_at_body_id_wrap(), self.entity)
+        self.assertIn((self.entity, world.OP_CREATE), self.send(self.match.tick)[1])
+
+    def test_body_id_exhaustion_leaves_the_current_body_and_vitals_intact(self):
+        self.prepare_player_target()
+        self.send(100)
+        self.ack()
+        with patch("ow174.game.match.BODY_SCRIPT_HEROES", set()):
+            seen = {self.victim.body}
+            for _ in range(254):
+                self.match.switch_hero(self.victim, self.victim.hero)
+                self.assertNotIn(self.victim.body, seen)
+                seen.add(self.victim.body)
+            body, hero, mover, script = (
+                self.victim.body, self.victim.hero, self.victim.mover, self.victim.body_script,
+            )
+            target = next(target for target in self.match.combat._targets() if target.owner is self.victim)
+            vitals = self.match.combat.vitals_of(target)
+            vitals.damage(20)
+            self.assertFalse(self.match.switch_hero(self.victim, self.player.hero))
+        self.assertEqual((self.victim.body, self.victim.hero), (body, hero))
+        self.assertIs(self.victim.mover, mover)
+        self.assertIs(self.victim.body_script, script)
+        self.assertIs(self.match.combat.vitals[self.victim.body], vitals)
+
+        fight = self.match.combat
+        fight.now = self.match.tick * TICK_SECONDS
+        fight._damage(self.player, target, vitals.total, False, None, self.match.tick)
+        [(due, victim)] = fight.respawns
+        self.assertIs(victim, self.victim)
+        self.match.tick = int(due / TICK_SECONDS) + 1
+        fight.update(due, self.match.tick, frames=False)
+        self.assertEqual(fight.respawns, [(due + combat.RESPAWN_RETRY, self.victim)])
+        self.assertEqual(self.victim.body, body)
+        self.assertTrue(fight.is_dead(self.victim))
+
+        # Only the old ID on the observer's link gets a destroy ACK. The owner's
+        # queued destroys for all other candidates remain unacknowledged.
+        ack_tick = self.match.tick + 1
+        self.assertIn((self.entity, world.OP_DESTROY), self.send(ack_tick)[1])
+        self.ack()
+        self.match.tick = ack_tick + round(30 / TICK_SECONDS) + 1
+        fight.update(self.match.tick * TICK_SECONDS, self.match.tick, frames=False)
+        self.assertEqual(self.victim.body, self.entity)
+        self.assertFalse(fight.is_dead(self.victim))
+        self.assertFalse(fight.respawns)
 
     def assert_movement_waits_for_create_ack(self, bot, tick):
         bot.moved_tick = tick  # make the production movement record due on each send tick

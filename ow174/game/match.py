@@ -309,10 +309,9 @@ class Player:
         script = self.body_script
         self.mover.track_mods(statescript_mods(script.component) if script else {}, command.frame)
 
-    def new_body(self) -> None:
-        """The next body id, at the spawn point, where the new body is created. Ids cycle through the
-        player's 255."""
-        self.body = self.entity | ((self.body & 0xFF) % 255 + 1)
+    def new_body(self, entity: int) -> None:
+        """Set up the allocated body at the spawn point."""
+        self.body = entity
         self.mover = self.new_mover()
 
     def new_mover(self) -> Mover:
@@ -1037,8 +1036,9 @@ class Match:
                 return
             skin = self.skin_of(player.account_lo, hero.guid)
             needs_body = not player.has_body or player.body_script_failed
-            if needs_body or hero is not player.hero or skin != player.skin:
-                self.switch_hero(player, hero)
+            if ((needs_body or hero is not player.hero or skin != player.skin)
+                    and not self.switch_hero(player, hero)):
+                return
             if self.assembling():
                 return  # the screen stays open until the heroes are assembled, as in retail
             player.select_open = False
@@ -1057,15 +1057,24 @@ class Match:
             return False
         if self.skin_of(player.account_lo, hero_guid) == player.skin:
             return False
-        self.switch_hero(player, player.hero)
-        return True
+        return self.switch_hero(player, player.hero)
 
     def map_loaded(self, player: Player, now: float) -> None:
         if player.loaded_at is None:
             player.loaded_at = now
             log.info("[game] %s: %s loaded the map", self.label(), player.name)
 
-    def switch_hero(self, player: Player, hero: Hero) -> None:
+    def _next_body_id(self, player: Player) -> int | None:
+        """Walk the player's ID ring, excluding bodies any connected peer still retains."""
+        clients = [viewer.client for viewer in self.players if viewer.client is not None]
+        suffix = player.body & 0xFF
+        for offset in range(254):
+            entity = player.entity | ((suffix + offset) % 255 + 1)
+            if all(client.body_id_available(entity) for client in clients):
+                return entity
+        return None
+
+    def switch_hero(self, player: Player, hero: Hero) -> bool:
         """The body of a picked hero. The first one just comes. A switch creates the new body under a
         new id at the spawn point, moves the player's components 44 and 75 to it and destroys the old
         body in the same frame: retail drops the old one at once too (OW2 traffic); kept 0.5 s longer it
@@ -1073,8 +1082,11 @@ class Match:
         old = player.body if player.has_body else None
         old_hero = player.hero.guid if old is not None else None
         if old is not None:
+            entity = self._next_body_id(player)
+            if entity is None:
+                return False
             self.combat.retire_player_body(player)
-            player.new_body()
+            player.new_body(entity)
         player.hero = hero
         player.skin = self.skin_of(player.account_lo, hero.guid)
         player.has_body = True
@@ -1093,6 +1105,7 @@ class Match:
         theme, golden = player.skin
         look = f", skin theme {theme:X}{' + golden weapon' if golden else ''}" if theme else ""
         log.info("[game] %s: %s plays %s%s", self.label(), player.name, hero.name, look)
+        return True
 
     def leave(self, player: Player, reason: str = "left") -> None:
         """The player's game left the match, or never came: the lobby takes the player back (the match

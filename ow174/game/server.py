@@ -60,6 +60,7 @@ HANDOFF_SECONDS = 60.0
 MAX_PAYLOAD = MAX_DATAGRAM - HEADER_SIZE
 MAX_PENDING_COMBAT_NOTICES = 256  # per body create, retain the newest notices during prolonged loss
 BOT_DESTROY_GRACE_TICKS = round(SILENCE_SECONDS / TICK_SECONDS)  # bound waits by the transport silence budget
+PLAYER_BODY_REUSE_SECONDS = 30.0  # the client retains destroyed entity IDs
 PING = 21610
 MAP_LOADED = (21601, 21602)
 GAME_MESSAGE = 21616
@@ -177,6 +178,7 @@ class Client:
         self._combat_notice_tail: dict[int, int] = {}  # last promoted reliable ordinal per body
         self._bot_scripts: dict[int, _BotScriptDelivery] = {}
         self._body_destroy_wait: dict[int, tuple[world.EntityUpdate, int]] = {}
+        self._player_body_reuse_after: dict[int, float | None] = {}  # None until destroy ACK
         self.expected_in = 0  # the client's next reliable message
         self.parked_in = {}
         self.leaving_since: float | None = None  # when go_home sent 20304
@@ -345,6 +347,18 @@ class Client:
         in_flight = (batch[0][0] for batch, _ in self.in_flight.values() if batch)
         return min(queued, min(in_flight, default=queued))
 
+    def body_id_available(self, entity: int) -> bool:
+        """Whether a previous player body can no longer be referenced by this peer."""
+        if entity not in self._player_body_reuse_after:
+            return True
+        ready = self._player_body_reuse_after[entity]
+        tail = self._combat_notice_tail.get(entity)
+        return (
+            ready is not None
+            and (tail is None or self._oldest_pending_reliable() > tail)
+            and self.server.environment.monotonic(callsite="client.body_id_available") >= ready
+        )
+
     def _body_destroy_pending(self, entity: int, oldest: int) -> bool:
         tail = self._combat_notice_tail.get(entity)
         health_pending = entity in self._bot_health
@@ -391,7 +405,8 @@ class Client:
     def _forget_body(self, entity: int) -> None:
         self._combat_notices.pop(entity, None)
         self._bot_health.pop(entity, None)
-        self._combat_notice_tail.pop(entity, None)
+        if entity not in self._player_body_reuse_after:
+            self._combat_notice_tail.pop(entity, None)
         self._bot_scripts.pop(entity, None)
         self._body_destroy_wait.pop(entity, None)
 
@@ -445,8 +460,11 @@ class Client:
     def _track_body_create(self, entity: int) -> None:
         match = self.player.match
         bot = next((bot for bot in match.bots if bot.entity == entity), None)
-        if bot is None and not any(player.has_body and player.body == entity for player in match.players):
-            return
+        if bot is None:
+            if not any(player.has_body and player.body == entity for player in match.players):
+                return
+            self._player_body_reuse_after[entity] = None
+            self._combat_notice_tail.pop(entity, None)
         self._combat_notices[entity] = deque(maxlen=MAX_PENDING_COMBAT_NOTICES)
         script = getattr(bot, "body_script", None)
         if script is not None:
@@ -546,6 +564,10 @@ class Client:
                         continue
                     if item.op == world.OP_CREATE:
                         self._ack_body_create(item.entity)
+                    elif item.op == world.OP_DESTROY and item.entity in self._player_body_reuse_after:
+                        # ACKs can arrive before the server catches up on missed simulation ticks.
+                        now = self.server.environment.monotonic(callsite="client.body_destroy_ack")
+                        self._player_body_reuse_after[item.entity] = now + PLAYER_BODY_REUSE_SECONDS
                     elif self._bot_health.get(item.entity) is item:
                         del self._bot_health[item.entity]
                     if item.stream is not None:
@@ -800,8 +822,7 @@ class GameServer:
             for match in self.matches:
                 for player in match.players:
                     if player.account_lo == account_lo and player.client is not None:
-                        match.switch_hero(player, hero)
-                        return True
+                        return match.switch_hero(player, hero)
         return False
 
     def skin_changed(self, account_lo: int, hero_guid: int) -> bool:
@@ -1094,6 +1115,7 @@ class GameServer:
         client._combat_notice_tail.clear()
         client._bot_scripts.clear()
         client._body_destroy_wait.clear()
+        client._player_body_reuse_after.clear()
         if self.clients.get(client.conn) is client:
             del self.clients[client.conn]
         movelog.close(client.player)

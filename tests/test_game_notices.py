@@ -69,6 +69,9 @@ class FakeClient:
     def queue_entities(self, updates: list) -> None:
         self.entities.extend(updates)
 
+    def body_id_available(self, entity: int) -> bool:
+        return True  # the lobby notification model has no transport reservations
+
 
 def into_world(match: Match, player, tick: int) -> None:
     """A player whose game loaded and got its controller."""
