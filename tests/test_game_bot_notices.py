@@ -75,6 +75,8 @@ class BotNoticeTests(unittest.TestCase):
         self.target = next(target for target in self.match.combat._targets() if target.owner is self.victim)
         self.entity = self.target.entity
         self.client.queue_entities([self.match.remote_body_create(self.player, self.victim)])
+        # These tests isolate body and mode delivery from the name association gate.
+        self.client._confirmed_possessions[self.victim.entity] = self.victim.body
         if mode_ready:
             self.assume_mode_ready(self.client)
             self.assume_mode_ready(victim_client)
@@ -215,6 +217,7 @@ class BotNoticeTests(unittest.TestCase):
         self.window, self.seq = ReceiveWindow(), 0
         source = self.player.body
         self.client.queue_entities([self.match.remote_body_create(self.victim, self.player)])
+        self.client._confirmed_possessions[self.player.entity] = source
         self.queue_mode_create()
         self.assertIn((source, world.OP_CREATE), self.send(104)[1])
         self.ack()
@@ -406,6 +409,7 @@ class BotNoticeTests(unittest.TestCase):
         self.client, self.peer = self.victim.client, peer
         source = self.player.body
         self.client.queue_entities([self.match.remote_body_create(self.victim, self.player)])
+        self.client._confirmed_possessions[self.player.entity] = source
         self.assertIn((source, world.OP_CREATE), self.send(100, deliver=False)[1])
         self.match.combat._damage(self.player, self.target, 200, False, None, 101)
         self.assertEqual(self.send(104)[0], [])

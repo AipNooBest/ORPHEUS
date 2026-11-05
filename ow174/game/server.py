@@ -177,10 +177,11 @@ class Client:
         self._bot_scripts: dict[int, _BotScriptDelivery] = {}
         self._body_destroy_wait: dict[int, tuple[world.EntityUpdate, int]] = {}
         self._player_body_reuse_after: dict[int, float | None] = {}  # None until destroy ACK
-        self._pending_possessions: dict[int, world.EntityUpdate] = {}  # one pending write per controller
+        self._pending_possessions: dict[int, tuple[int, world.EntityUpdate]] = {}
+        self._confirmed_possessions: dict[int, int] = {}  # remote controller -> body named by its ACKed write
         self._mode_create_acked = False
         self._pending_mode_frame: BitWriter | None = None
-        self._mode_notices: deque[tuple[int | None, int, bytes]] = deque(maxlen=MAX_PENDING_COMBAT_NOTICES)
+        self._display_notices: deque[tuple[int | None, int, bytes]] = deque(maxlen=MAX_PENDING_COMBAT_NOTICES)
         self.expected_in = 0  # the client's next reliable message
         self.parked_in = {}
         self.leaving_since: float | None = None  # when go_home sent 20304
@@ -193,7 +194,7 @@ class Client:
         link. GameServer._tick drops it after LEAVE_GRACE_SECONDS if it does not."""
         if self.leaving_since is None:
             self._pending_mode_frame = None
-            self._mode_notices.clear()
+            self._display_notices.clear()
             self.queue_reliable(LEAVE_GAME, {"+0x78": 0, "+0x79": False})
             self.leaving_since = now
 
@@ -254,15 +255,38 @@ class Client:
         if self.leaving_since is not None:
             return
         if msg_id in (combat.KILL_NOTICE, combat.DEATH_NOTICE):
+            identity_ready = self.combat_identity_ready(entity)
             destroy = self._body_destroy_wait.get(entity)
-            if destroy is not None and self.player.match.tick >= destroy[1]:
+            if destroy is not None and (not identity_ready or self.player.match.tick >= destroy[1]):
                 return
-            if not self.player.mode_script.delivered:
-                self._mode_notices.append((entity, msg_id, payload))
+            if not identity_ready or not self.player.mode_script.delivered:
+                self._display_notices.append((entity, msg_id, payload))
                 return
         ordinal = self._queue_encoded_reliable(msg_id, payload)
         if entity is not None:
             self._combat_notice_tail[entity] = ordinal
+
+    def combat_identity_ready(self, body: int | None) -> bool:
+        """Remote human bodies acquire their names from an acknowledged possession."""
+        if self.leaving_since is not None:
+            return False
+        if body is None:
+            return True
+        controller = body & ~0xFF  # player body IDs keep their controller's upper 24 bits
+        if controller == self.player.entity:
+            return self.player.body == body
+        if not any(player.entity == controller for player in self.player.match.players):
+            return True  # NPC names have a separate native path
+        return self._confirmed_possessions.get(controller) == body
+
+    def _flush_combat_ui(self) -> None:
+        if self.leaving_since is not None or not self.player.mode_script.delivered:
+            return
+        for _ in range(len(self._display_notices)):
+            self._promote_combat_notice(*self._display_notices.popleft())
+        for script in self._bot_scripts.values():
+            if script.death_frames is not None:
+                self._flush_bot_frames(script)
 
     def queue_bot_health(self, entity: int, components: dict) -> None:
         """Keep the latest complete pool snapshot for this connection's current bot."""
@@ -404,7 +428,7 @@ class Client:
         )
 
     def _body_destroy_pending(self, entity: int, oldest: int) -> bool:
-        if any(body == entity for body, _, _ in self._mode_notices):
+        if any(body == entity for body, _, _ in self._display_notices):
             return True
         tail = self._combat_notice_tail.get(entity)
         health_pending = entity in self._bot_health
@@ -450,16 +474,22 @@ class Client:
 
     def _forget_body(self, entity: int) -> None:
         self._combat_notices.pop(entity, None)
-        if self._mode_notices:
-            self._mode_notices = deque(
-                (notice for notice in self._mode_notices if notice[0] != entity),
-                maxlen=MAX_PENDING_COMBAT_NOTICES,
-            )
+        self._discard_display_notices(entity)
+        controller = entity & ~0xFF
+        if self._confirmed_possessions.get(controller) == entity:
+            del self._confirmed_possessions[controller]
         self._bot_health.pop(entity, None)
         if entity not in self._player_body_reuse_after:
             self._combat_notice_tail.pop(entity, None)
         self._bot_scripts.pop(entity, None)
         self._body_destroy_wait.pop(entity, None)
+
+    def _discard_display_notices(self, entity: int) -> None:
+        if self._display_notices:
+            self._display_notices = deque(
+                (notice for notice in self._display_notices if notice[0] != entity),
+                maxlen=MAX_PENDING_COMBAT_NOTICES,
+            )
 
     def queue_unreliable(self, msg_id: int, value: dict) -> None:
         self.unreliable.append(messages.encode(msg_id, value))
@@ -472,12 +502,16 @@ class Client:
     def cancel_possession(self, controller: int) -> None:
         previous = self._pending_possessions.pop(controller, None)
         if previous is not None:
-            self.cancel_entity_record(previous)
+            self.cancel_entity_record(previous[1])
 
-    def queue_possession(self, update: world.EntityUpdate) -> None:
+    def queue_possession(self, update: world.EntityUpdate, body: int) -> None:
         """Replace an unacknowledged component 44/75 write for this controller."""
         self.cancel_possession(update.entity)
-        self._pending_possessions[update.entity] = update
+        old = self._confirmed_possessions.get(update.entity)
+        if old is not None and old != body:
+            del self._confirmed_possessions[update.entity]
+            self._discard_display_notices(old)
+        self._pending_possessions[update.entity] = (body, update)
         self.queue_entities([update])
 
     def queue_entities(self, updates: list) -> None:
@@ -492,8 +526,11 @@ class Client:
         for item in updates:
             generation, alive = lifecycles.get(item.entity, (0, True))
             if item not in generations:
-                if item.op == world.OP_DESTROY and self._hold_body_destroy(item):
-                    continue
+                if item.op == world.OP_DESTROY:
+                    if self._display_notices and not self.combat_identity_ready(item.entity):
+                        self._discard_display_notices(item.entity)
+                    if self._hold_body_destroy(item):
+                        continue
                 if item.op in (world.OP_CREATE, world.OP_DESTROY):
                     # Preserve the generation of already-sent records, even for an older
                     # producer that did not put them through queue_entities first.
@@ -507,6 +544,9 @@ class Client:
                     alive = item.op == world.OP_CREATE
                     lifecycles[item.entity] = (generation, alive)
                     self._pending_possessions.pop(item.entity, None)
+                    old = self._confirmed_possessions.pop(item.entity, None)
+                    if old is not None:
+                        self._discard_display_notices(old)
                     self._forget_body(item.entity)
                     if alive:
                         self._track_body_create(item.entity)
@@ -639,8 +679,13 @@ class Client:
                         self._player_body_reuse_after[item.entity] = now + PLAYER_BODY_REUSE_SECONDS
                     elif self._bot_health.get(item.entity) is item:
                         del self._bot_health[item.entity]
-                    elif self._pending_possessions.get(item.entity) is item:
-                        del self._pending_possessions[item.entity]
+                    else:
+                        pending = self._pending_possessions.get(item.entity)
+                        if pending is not None and pending[1] is item:
+                            del self._pending_possessions[item.entity]
+                            if item.entity != self.player.entity:
+                                self._confirmed_possessions[item.entity] = pending[0]
+                                self._flush_combat_ui()
                     if item.stream is not None:
                         first_mode = (
                             item.entity == world.GAME_MODE_ENTITY
@@ -649,11 +694,7 @@ class Client:
                         )
                         item.stream.arrived(item.chunk_last)
                         if first_mode and item.stream.delivered:
-                            while self._mode_notices:
-                                self._promote_combat_notice(*self._mode_notices.popleft())
-                            for bot_delivery in self._bot_scripts.values():
-                                if bot_delivery.death_frames is not None:
-                                    self._flush_bot_frames(bot_delivery)
+                            self._flush_combat_ui()
                         script = self._bot_scripts.get(item.entity)
                         if script is not None and item.stream is script.stream:
                             self._flush_bot_frames(script)
@@ -1199,8 +1240,9 @@ class GameServer:
         client._body_destroy_wait.clear()
         client._player_body_reuse_after.clear()
         client._pending_possessions.clear()
+        client._confirmed_possessions.clear()
         client._pending_mode_frame = None
-        client._mode_notices.clear()
+        client._display_notices.clear()
         if self.clients.get(client.conn) is client:
             del self.clients[client.conn]
         movelog.close(client.player)

@@ -803,7 +803,7 @@ class Match:
         shown.possession = possession
         components = self._possession(other)
         update = EntityUpdate(other.entity, OP_UPDATE, lambda origin: world.update(origin, components))
-        viewer.client.queue_possession(update)
+        viewer.client.queue_possession(update, other.body)
 
     # --- lifetime ------------------------------------------------------------------------------
 
@@ -1115,7 +1115,8 @@ class Match:
             components = self._possession(player)
             player.client.queue_entities(self.own_body_updates(player))
             player.client.queue_possession(
-                EntityUpdate(player.entity, OP_UPDATE, lambda origin: world.update(origin, components))
+                EntityUpdate(player.entity, OP_UPDATE, lambda origin: world.update(origin, components)),
+                player.body,
             )
             if old is not None:
                 player.client.queue_entities([EntityUpdate(old, OP_DESTROY)])

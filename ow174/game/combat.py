@@ -434,7 +434,11 @@ class Combat:
         if not viewer.mode_script.delivered or vitals is None or vitals.death_tick is None:
             return False
         age = (self.match.tick - vitals.death_tick) * TICK * 1000
-        return 0 <= age <= nodes.ClientOnlyPulser.FRESH_MS
+        return (
+            0 <= age <= nodes.ClientOnlyPulser.FRESH_MS
+            and viewer.client.combat_identity_ready(entity)
+            and viewer.client.combat_identity_ready(vitals.killer)
+        )
 
     def retire_player_body(self, player) -> None:
         """Discard the old body's health, history and respawn when its lifetime ends."""

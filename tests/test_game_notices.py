@@ -73,7 +73,7 @@ class FakeClient:
     def queue_mode_frame(self, frame: BitWriter) -> None:
         self.queue_entities([self.player.mode_script.full_frame(frame)])
 
-    def queue_possession(self, update: world.EntityUpdate) -> None:
+    def queue_possession(self, update: world.EntityUpdate, body: int) -> None:
         self.queue_entities([update])
 
     def cancel_possession(self, controller: int) -> None:

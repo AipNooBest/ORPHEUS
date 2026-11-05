@@ -17,7 +17,7 @@ from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
 from ow174.game.script import decode, expr, graph, runtime
 from ow174.game.script.bot import DIED, FIRING_GRAPH, RESET, BotScript, BotWorld
 from ow174.game.script.driver import OWNER_HEALTH, BodyStream, Snapshot
-from ow174.game.server import BOT_DESTROY_GRACE_TICKS, Client
+from ow174.game.server import BOT_DESTROY_GRACE_TICKS, LEAVE_GAME, Client
 
 GRAPH = 0xF0FE
 PULSER = "STU_B9898052"
@@ -484,8 +484,37 @@ class BotStatescriptTests(unittest.TestCase):
         ]
         self.assertEqual(values, [0.0])
 
+    def shooter_possession(self, records):
+        return [
+            (fields[44], fields[75][0])
+            for record, fields in records if record.entity == self.shooter.entity and 44 in fields
+        ]
+
+    def show_shooter_identity(self, *, receive_possession=True):
+        watcher = self.watching_peer
+        viewer = watcher.client.player
+        self.match._show_players(viewer)
+        self.match.ensure_remote_body(viewer, self.shooter)
+        _, _, creates = self.send(watcher)
+        self.assertIn(self.shooter.body, self.entities(creates, world.OP_CREATE))
+        names = [
+            fields[29][1] for record, fields in creates
+            if record.entity == self.shooter.entity and record.op == world.OP_CREATE
+        ]
+        self.assertEqual(names, [self.shooter.name])
+        watcher.ack()
+        self.match._show_players(viewer)
+        _, _, records = self.send(watcher, receive=receive_possession)
+        possession = self.shooter_possession(records)
+        body = self.shooter.body
+        self.assertEqual(possession, [({0: body, 1: body, 2: body}, self.shooter.hero.guid)])
+        if receive_possession:
+            watcher.ack()
+        return possession
+
     def test_kill_feed_pulse_waits_for_mode_ack_without_delaying_other_death_state(self):
         self.install_kill_feed_bot()
+        self.show_shooter_identity()
         shooter, watcher, old = self.shooting_peer, self.watching_peer, self.bot.entity
         watcher.client.queue_mode_frame(combat.mode_frame({}))
         _, _, lost_mode = self.send(watcher, receive=False)
@@ -529,6 +558,7 @@ class BotStatescriptTests(unittest.TestCase):
 
     def test_expired_kill_feed_pulse_is_not_released_by_a_late_mode_ack(self):
         self.install_kill_feed_bot()
+        self.show_shooter_identity()
         watcher, old = self.watching_peer, self.bot.entity
         watcher.client.queue_mode_frame(combat.mode_frame({}))
         _, _, mode = self.send(watcher)
@@ -553,6 +583,108 @@ class BotStatescriptTests(unittest.TestCase):
         _, _, retired = self.send(watcher)
         self.assertIn(old, self.entities(retired, world.OP_DESTROY))
         self.assertEqual(self.chunks(retired, old), [])
+
+    def kill_with_lost_shooter_possession(self):
+        self.install_kill_feed_bot()
+        watcher, old = self.watching_peer, self.bot.entity
+        watcher.client.queue_mode_frame(combat.mode_frame({}))
+        _, _, mode = self.send(watcher)
+        self.only_chunk(mode, world.GAME_MODE_ENTITY)
+        watcher.ack()
+        lost = self.show_shooter_identity(receive_possession=False)
+        self.kill_feed_bot()
+
+        _, _, immediate = self.send(watcher)
+        self.assert_terminal_health(immediate)
+        self.assertEqual(watcher.pulses, [(old, 2, 1)])
+        self.assertEqual(watcher.feed_pulses, [])
+        return lost
+
+    def test_npc_kill_feed_waits_for_remote_killer_possession_ack(self):
+        lost = self.kill_with_lost_shooter_possession()
+        shooter, watcher, old = self.shooting_peer, self.watching_peer, self.bot.entity
+        _, _, local = self.send(shooter)
+        self.assert_terminal_health(local)
+        self.assertEqual(shooter.pulses, [(old, 2, 1)])
+        self.assertEqual(shooter.feed_pulses, [(old, 2, 1)])
+        shooter.ack()
+
+        watcher.ack()  # Reports the lost possession while confirming ordinary terminal state.
+        _, _, retry = self.send(watcher)
+        self.assertEqual(self.shooter_possession(retry), lost)
+        self.assertEqual(self.chunks(retry, old), [])
+        _, _, before_ack = self.send(watcher)
+        self.assertEqual(self.chunks(before_ack, old), [])
+        self.assertEqual(watcher.feed_pulses, [])
+        watcher.ack()
+        _, _, restored = self.send(watcher)
+        chunk = self.only_chunk(restored, old)
+        model = watcher.models[old]
+        frame = decode.read_chunk(chunk.getvalue(), chunk.count, model.graphs)
+        feed_id, = (number for number, index in model.graphs.items() if index == FEED_GRAPH)
+        self.assertFalse(frame.owner)
+        self.assertEqual(model.vars[(feed_id, FEED_KILLER)], expr.Entity(self.shooter.body))
+        self.assertEqual(watcher.feed_pulses, [(old, frame.last, 1)])
+        self.assertEqual(watcher.pulses, [(old, 2, 1)])
+        watcher.ack()
+        _, _, after = self.send(watcher)
+        self.assertEqual(self.chunks(after, old), [])
+
+    def test_late_killer_possession_ack_does_not_admit_feed_after_go_home(self):
+        lost = self.kill_with_lost_shooter_possession()
+        watcher, old = self.watching_peer, self.bot.entity
+        watcher.client.go_home(10.0)
+        watcher.ack()  # The old loss is still processed while leaving.
+        _, reliable, retry = self.send(watcher)
+        self.assertIn(LEAVE_GAME, [msg_id for _, msg_id, _ in reliable])
+        self.assertEqual(self.shooter_possession(retry), lost)
+        self.assertEqual(self.chunks(retry, old), [])
+
+        watcher.ack()  # Positive ACK of the current association after go_home.
+        _, _, after = self.send(watcher)
+        self.assertEqual(self.chunks(after, old), [])
+        self.assertEqual(watcher.feed_pulses, [])
+
+    def test_deferred_npc_feed_does_not_name_a_destroyed_local_killer_body(self):
+        self.install_kill_feed_bot()
+        shooter, player = self.shooting_peer, self.shooter
+        old = player.body
+        shooter.client._mode_create_acked = False
+        player.mode_script.delivered = 0
+        shooter.client.queue_entities([
+            *self.match.own_body_updates(player),
+            world.EntityUpdate(
+                player.entity, world.OP_CREATE, lambda origin: self.match._player_create(origin, player)
+            ),
+            world.EntityUpdate(world.GAME_MODE_ENTITY, world.OP_CREATE, self.match._game_mode_create),
+        ])
+        _, _, creates = self.send(shooter)
+        self.assertIn(old, self.entities(creates, world.OP_CREATE))
+        self.assertEqual(self.shooter_possession(creates), [({0: old, 1: old, 2: old}, player.hero.guid)])
+        shooter.ack()
+
+        self.kill_feed_bot()
+        _, _, terminal = self.send(shooter)
+        self.assert_terminal_health(terminal)
+        self.assertEqual(shooter.feed_pulses, [])
+        shooter.ack()
+        self.assertTrue(self.match.switch_hero(player, player.hero))
+        _, _, retired = self.send(shooter)
+        self.assertIn(old, self.entities(retired, world.OP_DESTROY))
+        self.assertNotIn(old, shooter.models)
+        self.assertNotEqual(player.body, old)
+        shooter.ack()
+
+        # The mode becomes ready just a few ticks after death. The body named
+        # in that pending pulse is already gone from this peer.
+        shooter.client.queue_mode_frame(combat.mode_frame({}))
+        _, _, mode = self.send(shooter)
+        self.only_chunk(mode, world.GAME_MODE_ENTITY)
+        shooter.ack()
+        self.assertEqual(player.mode_script.delivered, 1)
+        _, _, after = self.send(shooter)
+        self.assertEqual(self.chunks(after, self.bot.entity), [])
+        self.assertEqual(shooter.feed_pulses, [])
 
     def test_initial_bot_scripts_are_prepared_one_per_update_before_world_spawn(self):
         batch = [bots.respawned(self.bot, self.bot.entity + offset, 0) for offset in range(3)]

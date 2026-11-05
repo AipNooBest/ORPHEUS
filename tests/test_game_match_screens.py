@@ -14,7 +14,7 @@ from test_game_packet_budget import connection, decoded
 from test_game_repeated_lifecycles import wire_frame
 from test_game_team_list import read_create
 
-from ow174.game import heroselect, stats, world
+from ow174.game import combat, heroselect, stats, world
 from ow174.game.bits import BitReader
 from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
@@ -262,9 +262,16 @@ class EncryptedPossessionTests(unittest.TestCase):
         self.match._show_players(self.viewer)
         self.match.ensure_remote_body(self.viewer, self.other)
         self.client.send_frame(tick, 10.0)
-        packet, frame_tick, _, _, _, count = decoded(self, self.cipher, self.server.sock.sent[-1][0])
-        _, records = wire_frame(packet)
+        packet, frame_tick, reliable, _, _, count = decoded(self, self.cipher, self.server.sock.sent[-1][0])
+        ids, records = wire_frame(packet)
         self.assertEqual((frame_tick, len(records)), (tick, count))
+        self.assertEqual(ids, [number for _, number, _ in reliable])
+        self.last_packet_seq = packet.seq
+        self.combat_notices = [
+            (number, value)
+            for _, number, value in reliable
+            if number in (combat.HIT, combat.KILL_NOTICE, combat.DEATH_NOTICE)
+        ]
         if receive:
             self.assertTrue(self.window.accept(packet.seq))
         return records
@@ -341,6 +348,106 @@ class EncryptedPossessionTests(unittest.TestCase):
 
         self.ack()
         self.assert_possession(self.send(115))
+
+    def lose_remote_possession(self):
+        mode_create = world.EntityUpdate(
+            world.GAME_MODE_ENTITY, world.OP_CREATE, self.match._game_mode_create
+        )
+        self.client.queue_entities([mode_create])
+        self.client.queue_mode_frame(combat.mode_frame({}))
+        creates = self.creates(self.send(100))
+        self.assertIn(world.GAME_MODE_ENTITY, creates)
+        self.assertIn(self.other.entity, creates)
+        self.ack()
+
+        self.assertTrue(self.match.switch_hero(self.viewer, heroes()[SOLDIER]))
+        self.assertTrue(self.match.switch_hero(self.other, heroes()[REAPER]))
+        before_link = self.send(103)
+        self.assertIn(self.other.body, self.creates(before_link))
+        (mode,) = [
+            read_chunk(record.chunk.getvalue(), record.chunk.count)
+            for record, _ in before_link
+            if record.entity == world.GAME_MODE_ENTITY and record.chunk is not None
+        ]
+        self.assertTrue(mode.full)
+        self.assertEqual(mode.instances[1].graph, combat.MODE_UI)
+        self.assertEqual(self.possessions(before_link), [])
+        self.ack()
+
+        self.assert_possession(self.send(106, receive=False))
+        return self.last_packet_seq
+
+    def hit(self, shooter, victim, tick, *, lethal=False):
+        self.match.tick = tick
+        engine = self.match.combat
+        target = next(target for target in engine._targets() if target.owner is victim)
+        amount = engine.vitals_of(target).now[combat.HEALTH_POOL] if lethal else 1
+        engine._damage(shooter, target, amount, False, None, tick)
+        return int(amount)
+
+    def acknowledge_retried_possession(self):
+        self.ack()  # Report the missing association while ACKing the later frame.
+        self.assert_possession(self.send(112))
+        self.assertEqual(self.combat_notices, [])
+        self.ack()
+        self.ack()
+
+    def test_elimination_waits_for_target_possession_ack_but_hits_do_not(self):
+        self.lose_remote_possession()
+        self.hit(self.viewer, self.other, 107)
+        dealt = self.hit(self.viewer, self.other, 108, lethal=True)
+        self.assertEqual(self.possessions(self.send(109)), [])
+        body_ref = {"+0x0": self.other.body}
+        hit = {"+0x78": {"+0x0": body_ref, "+0x4": 1, "+0x8": 0}, "+0x84": 107}
+        lethal = {"+0x78": {"+0x0": body_ref, "+0x4": dealt, "+0x8": combat.KILLING}, "+0x84": 108}
+        self.assertEqual(self.combat_notices, [(combat.HIT, hit), (combat.HIT, lethal)])
+
+        self.acknowledge_retried_possession()
+        self.send(115)
+        notice = {
+            "+0x78": 0, "+0x80": {"+0x0": self.viewer.body}, "+0x84": body_ref, "+0x88": 0, "+0x89": False
+        }
+        self.assertEqual(self.combat_notices, [(combat.KILL_NOTICE, notice)])
+        self.ack()
+        self.send(118)
+        self.assertEqual(self.combat_notices, [])
+
+    def test_death_notice_waits_for_viewers_killer_possession_ack(self):
+        self.lose_remote_possession()
+        self.hit(self.other, self.viewer, 108, lethal=True)
+        self.assertEqual(self.possessions(self.send(109)), [])
+        self.assertEqual(self.combat_notices, [])
+
+        self.acknowledge_retried_possession()
+        self.send(115)
+        notice = {"+0x78": combat.KILLED_BY, "+0x7C": {"+0x0": self.other.body}}
+        self.assertEqual(self.combat_notices, [(combat.DEATH_NOTICE, notice)])
+        self.ack()
+        self.send(118)
+        self.assertEqual(self.combat_notices, [])
+
+    def test_retiring_unconfirmed_body_discards_notice_before_delayed_possession_ack(self):
+        delayed = self.lose_remote_possession()
+        old_body = self.other.body
+        self.hit(self.viewer, self.other, 108, lethal=True)
+        self.assertTrue(self.match.switch_hero(self.other, heroes()[REAPER]))
+        self.assertNotEqual(self.other.body, old_body)
+
+        self.assertTrue(self.window.accept(delayed))
+        self.ack()
+        replacement = self.send(109)
+        self.assertIn(self.other.body, self.creates(replacement))
+        self.assertEqual(self.possessions(replacement), [])
+        self.assertEqual([number for number, _ in self.combat_notices], [combat.HIT])
+        self.ack()
+
+        ready = self.send(112)
+        self.assertIn(old_body, [record.entity for record, _ in ready if record.op == world.OP_DESTROY])
+        self.assert_possession(ready)
+        self.assertEqual(self.combat_notices, [])
+        self.ack()
+        self.send(115)
+        self.assertEqual(self.combat_notices, [])
 
 
 class HeroInfoTests(unittest.TestCase):
