@@ -42,6 +42,7 @@ from ow174.game.statescript import (
     owner_delta,
     sendable,
 )
+from ow174.game.world import UNIT_ENTITY_SCALE
 
 if TYPE_CHECKING:
     from ow174.game.match import Match
@@ -78,6 +79,7 @@ ACTION_BUTTONS.update({action: 81 + action for action in range(10, 16)})  # 10..
 # Entity variables no graph of the body writes: the server's own code sets them.
 WEAPON_SLOTS, DEFAULT_SLOT, OWNER_HEALTH, HUD_HEALTH, HUD_MAX_HEALTH = 29, 16515, 253, 1732, 1737
 NOT_SENT = {OWNER_HEALTH}  # the client derives it itself (never sent)
+BODY_SCALE_OVERRIDE = 31210  # the common body graph's size modifier input
 # The world's config vars whose server answer is the client's for a human player's own body (computed, or
 # answered null/false). A BooleanSwitch that reads any other one is uncertain and is not sent.
 TRUSTED_NATIVES = {
@@ -132,6 +134,17 @@ class BodyWorld(runtime.World):
             return Vec3(f32(right * THROTTLE_UNIT), f32(forward * THROTTLE_UNIT), 0.0)
         if cls == "STU_37F20D24":  # GetGameMode: the match's mode (what component 114 announces)
             return Asset(self.mode)
+        if cls == "STU_FDBB0B67":  # entity size used by the authored movement and effect graphs
+            target = cfg.get("m_entity")
+            component = instance.component
+            if (component.entity == self.body and expr.valid_entity(self.body)
+                    and isinstance(target, dict)
+                    and target.get("$") in {"STU_B5A0CAF0", "STUConfigVarDynamic"}
+                    and instance.evaluate(target) == Entity(self.body)):
+                override = component.entity_var(BODY_SCALE_OVERRIDE, create=False)
+                scale = override.value() if override is not None else None
+                if scale is None or (expr.kind(scale) in ("int", "float") and scale == UNIT_ENTITY_SCALE):
+                    return UNIT_ENTITY_SCALE
         if cls == "STU_4A101787":  # its evaluator (0x7FF789BFF730) always answers false
             return False
         if cls == "STU_AC829876":  # does an entity pass a filter (teams, tags): not modelled

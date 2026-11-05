@@ -15,7 +15,7 @@ from ow174.game.content import PRACTICE_RANGE, Spawn, heroes
 from ow174.game.match import Match
 from ow174.game.mover import STEP
 from ow174.game.script import runtime
-from ow174.game.script.expr import INSTANCE, Vec3
+from ow174.game.script.expr import INSTANCE, Entity, Vec3
 
 START = 100
 DESTINATION = Vec3(0.0, 1.0, 3.0)
@@ -31,37 +31,30 @@ class FixedTargetMoveToTests(unittest.TestCase):
         self.enterContext(patch.object(bodytrace, "ENABLED", False))
         self.enterContext(patch.object(movelog, "ENABLED", False))
 
-    def start(self, case, geometry, destination=DESTINATION):
-        hero_guid, graph_id, state_index, target_var, speed = case
+    def spawn(self, hero_guid, graph_id, geometry):
         hero = heroes()[hero_guid]
         match = Match(SCENE, collision_provider=StaticCollisionProvider(geometry))
         player = match.add_player(1, hero.name, hero.guid, 0, False)
         into_world(match, player, START)
         self.assertTrue(match.switch_hero(player, hero))
-        script = player.body_script
-        component = script.component
-        instance = next(
-            instance for instance in component.instances.values() if instance.graph.index == graph_id
-        )
+        instances = player.body_script.component.instances.values()
+        instance = next(instance for instance in instances if instance.graph.index == graph_id)
+        return player, instance
+
+    def start(self, case, geometry, destination=DESTINATION):
+        hero_guid, graph_id, state_index, target_var, speed = case
+        player, instance = self.spawn(hero_guid, graph_id, geometry)
         state = instance.state(state_index)
         self.assertEqual(state.node.cls, "STUStatescriptStateMoveTo")
         self.assertIsNone(state.node.fields["m_destinationEntity"])
         self.assertIsNone(state.node.fields["m_destinationBone"])
-        original_native = script.world.native
-
-        def native(config, caller):
-            if caller is instance and config.get("$") == "STU_FDBB0B67":
-                return 1.0
-            return original_native(config, caller)
-
-        self.enterContext(patch.object(script.world, "native", side_effect=native))
         # The ray and ally selection use independent engine queries. Supply only their resolved endpoint.
         instance.write((INSTANCE, target_var), destination)
         self.assertEqual(state.evaluate(state.node.fields["m_865F3D01"]), destination)
         self.assertEqual(state.evaluate(state.node.fields["m_speed"]), speed)
         ended = self.enterContext(patch.object(state, "on_end", wraps=state.on_end))
         state.request(runtime.BEGIN)
-        component.run_now()
+        instance.component.run_now()
         self.assertTrue(state.active)
         self.assertEqual(player.mover.position, [0.0, 1.0, 0.0])
         return player, state, ended
@@ -72,6 +65,48 @@ class FixedTargetMoveToTests(unittest.TestCase):
             player.match.tick = frame
             player.take_commands([Command(frame)])
         return list(player.mover.history)
+
+    def test_genji_first_shift_reads_unit_scaled_cast_length(self):
+        hero_guid, graph_id, state_index, _, speed = AUTHORED_STATES[0]
+        player, instance = self.spawn(hero_guid, graph_id, flat_world(1.0))
+        self.assertEqual(instance.vars[1648].value(), 15.0)
+        cast_lengths = []
+
+        def observe_ray(caller, node, _state):
+            if caller is instance:
+                cast_lengths.append(caller.evaluate(node.field("m_castLength")))
+            caller.follow(node, "m_outPlug", None)
+            return True
+
+        with patch.dict(runtime.HANDLERS, {"STU_08D6BA6E": observe_ray}):
+            player.match.tick = START + 1
+            player.take_commands([Command(START + 1, buttons=0x08)])
+
+        self.assertEqual(cast_lengths, [15.0])
+        state = instance.state(state_index)
+        self.assertTrue(state.active)
+        self.assertEqual(state.evaluate(state.node.field("m_speed")), speed)
+        self.assertIsNone(state.move_request())
+
+    def test_entity_scale_requires_own_body_and_unit_override(self):
+        hero_guid, graph_id, *_ = AUTHORED_STATES[0]
+        _, instance = self.spawn(hero_guid, graph_id, flat_world(1.0))
+        owner_scale = {"$": "STU_FDBB0B67", "m_entity": {"$": "STU_B5A0CAF0"}}
+        dynamic_scale = {
+            "$": "STU_FDBB0B67",
+            "m_entity": {"$": "STUConfigVarDynamic", "m_identifier": 38, "m_60DB8F99": INSTANCE},
+        }
+        self.assertEqual(instance.evaluate(owner_scale), 1.0)
+        self.assertIsNone(instance.evaluate(dynamic_scale))
+        instance.write((INSTANCE, 38), Entity(instance.component.entity + 1))
+        self.assertIsNone(instance.evaluate(dynamic_scale))
+        instance.write((INSTANCE, 38), Entity(instance.component.entity))
+        self.assertEqual(instance.evaluate(dynamic_scale), 1.0)
+
+        for override, result in ((0.5, None), (True, None), (1.0, 1.0), (None, 1.0)):
+            with self.subTest(override=override):
+                instance.component.set(31210, override)
+                self.assertEqual(instance.evaluate(owner_scale), result)
 
     def test_both_authored_states_reach_and_hold_the_resolved_endpoint(self):
         for case in AUTHORED_STATES:

@@ -95,6 +95,7 @@ ANGLE_UNITS = 65536 / (2 * math.pi)  # s16 angle units per radian (the commands'
 POSITION_UNITS = 1024  # movement states hold positions and velocities on a 1/1024 m grid
 MOVEMENT_AXIS_BITS = 24
 MAX_MOVEMENT_AXIS = ((1 << (MOVEMENT_AXIS_BITS - 1)) - 1) / POSITION_UNITS
+UNIT_ENTITY_SCALE = 1.0  # the uniform scale written by the server's entity creates
 
 
 class RecordWriter(BitWriter):
@@ -465,7 +466,7 @@ def create(
             out.f32(value)
     if flags & (WITH_TRANSFORM | WITH_SCALE):
         for _ in range(3):
-            out.f32(1.0)
+            out.f32(UNIT_ENTITY_SCALE)
     if movement is not None:
         write_movement(out, movement, frame_back, CREATE_BASE, parent=movement_parent)
     _write_components(out, components)
