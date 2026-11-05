@@ -25,9 +25,9 @@ keeps the shapes the way the client's physics engine has them (contacts.py): eac
 chunk order with their wing vertices, the polytopes whole, the props as their models' shapes placed with
 the placeable's translation, rotation and scale.
 
-Queries: the ground under a point (a vertical segment, what the mover's probe casts) on a grid of 2 m
-columns of triangles (the polytopes as the fans of their faces, capsule and sphere props as prisms), and
-`World.engine`, the engine's shapes for the character's contacts.
+Queries: the ground under a point and rays on a grid of 2 m columns of triangles (the polytopes as
+the fans of their faces, capsule and sphere props as prisms), and `World.engine`, the engine's shapes
+for the character's contacts.
 """
 
 import json
@@ -62,6 +62,7 @@ CELL = 2.0  # metres per grid column
 CELL_CACHE = 1024  # columns kept as ready triangle lists
 LARGE = 4096  # a triangle over more columns than this is checked by every query instead
 EDGE = 1e-7  # tolerance of the inside test, so a point on a seam between two triangles hits one
+RAY_EPSILON = 1e-9
 
 # A triangle as the queries use it.
 MINX, MAXX, MINY, MAXY, MINZ, MAXZ = range(6)
@@ -448,6 +449,15 @@ class Ground:
         return (d - nx * x - nz * z) / ny
 
 
+@dataclass(frozen=True)
+class RayHit:
+    distance: float
+    point: tuple[float, float, float]
+    normal: tuple[float, float, float]
+    mask: int
+    surface: int
+
+
 class World:
     """Triangles on a grid of vertical columns."""
 
@@ -557,6 +567,73 @@ class World:
             if inside_xz(t, x, z):
                 best, hit = y, t
         return Ground(best, hit) if hit is not None else None
+
+    def cast_ray(self, origin, direction, length: float, category: int = MOVER) -> RayHit | None:
+        """First static hit along a unit direction in the supplied geometry and category."""
+        ox, oy, oz = origin
+        dx, dy, dz = direction
+        if (
+            not all(math.isfinite(value) for value in (ox, oy, oz, dx, dy, dz, length))
+            or length <= 0.0
+            or (dx == dy == dz == 0.0)
+        ):
+            return None
+        i, j = math.floor(ox / CELL), math.floor(oz / CELL)
+        step_i, step_j = (1 if dx > 0 else -1), (1 if dz > 0 else -1)
+        big = math.inf
+        next_x = ((i + (step_i > 0)) * CELL - ox) / dx if abs(dx) > RAY_EPSILON else big
+        next_z = ((j + (step_j > 0)) * CELL - oz) / dz if abs(dz) > RAY_EPSILON else big
+        delta_x = CELL / abs(dx) if abs(dx) > RAY_EPSILON else big
+        delta_z = CELL / abs(dz) if abs(dz) > RAY_EPSILON else big
+        seen: set[int] = set()
+        best, triangle = big, None
+        start = 0.0
+        while start <= length:
+            end = min(next_x, next_z, length)
+            low, high = oy + dy * start, oy + dy * end
+            low, high = min(low, high) - RAY_EPSILON, max(low, high) + RAY_EPSILON
+            for t in self.column(i, j):
+                number = t[NUMBER]
+                if number in seen or not t[MASK] & category or t[MAXY] < low or t[MINY] > high:
+                    continue
+                seen.add(number)
+                hit = _ray_triangle(ox, oy, oz, dx, dy, dz, t)
+                if hit is not None and hit < best:
+                    best, triangle = hit, t
+            if best <= end:
+                break
+            if next_x < next_z:
+                start, next_x, i = next_x, next_x + delta_x, i + step_i
+            else:
+                start, next_z, j = next_z, next_z + delta_z, j + step_j
+        if triangle is None or best > length:
+            return None
+        point = (ox + dx * best, oy + dy * best, oz + dz * best)
+        nx, ny, nz = triangle[NX], triangle[NY], triangle[NZ]
+        normal = (-nx, -ny, -nz) if nx * dx + ny * dy + nz * dz > 0.0 else (nx, ny, nz)
+        return RayHit(best, point, normal, triangle[MASK], triangle[SURFACE])
+
+
+def _ray_triangle(ox, oy, oz, dx, dy, dz, t) -> float | None:
+    """Moeller-Trumbore intersection, both sides."""
+    ax, ay, az = t[AX], t[AY], t[AZ]
+    e1x, e1y, e1z = t[BX] - ax, t[BY] - ay, t[BZ] - az
+    e2x, e2y, e2z = t[CX] - ax, t[CY] - ay, t[CZ] - az
+    px, py, pz = dy * e2z - dz * e2y, dz * e2x - dx * e2z, dx * e2y - dy * e2x
+    det = e1x * px + e1y * py + e1z * pz
+    if -1e-12 < det < 1e-12:
+        return None
+    inv = 1.0 / det
+    sx, sy, sz = ox - ax, oy - ay, oz - az
+    u = (sx * px + sy * py + sz * pz) * inv
+    if u < 0.0 or u > 1.0:
+        return None
+    qx, qy, qz = sy * e1z - sz * e1y, sz * e1x - sx * e1z, sx * e1y - sy * e1x
+    v = (dx * qx + dy * qy + dz * qz) * inv
+    if v < 0.0 or u + v > 1.0:
+        return None
+    hit = (e2x * qx + e2y * qy + e2z * qz) * inv
+    return hit if hit > 1e-6 else None
 
 
 def inside_xz(t: tuple, x: float, z: float) -> bool:

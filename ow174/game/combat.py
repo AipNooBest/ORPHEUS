@@ -52,7 +52,7 @@ from dataclasses import dataclass
 
 from ow174.game import bots, observers, pools, projectiles, stats, voicelines, world
 from ow174.game.bits import BitWriter
-from ow174.game.collision import AX, AY, AZ, BX, BY, BZ, CELL, CX, CY, CZ, MASK, MOVER, NUMBER
+from ow174.game.collision import MOVER, World
 from ow174.game.commands import Command
 from ow174.game.mover import mover_data
 from ow174.game.script import expr, graph, nodes, runtime
@@ -154,66 +154,12 @@ def segment_distance(point, a, b) -> float:
     return math.sqrt(_dot(d, d))
 
 
-def ray_world(collision, origin, direction, length: float, category: int = MOVER) -> float | None:
-    """The distance along a ray to the first triangle of the map's collision within `length` (the grid
-    columns the ray crosses, nearest first), None when nothing is in the way."""
-    if collision is None or length <= 0.0:
-        return None
-    ox, oy, oz = origin
-    dx, dy, dz = direction
-    i, j = math.floor(ox / CELL), math.floor(oz / CELL)
-    step_i, step_j = (1 if dx > 0 else -1), (1 if dz > 0 else -1)
-    big = math.inf
-    next_x = ((i + (step_i > 0)) * CELL - ox) / dx if abs(dx) > EPSILON else big
-    next_z = ((j + (step_j > 0)) * CELL - oz) / dz if abs(dz) > EPSILON else big
-    delta_x = CELL / abs(dx) if abs(dx) > EPSILON else big
-    delta_z = CELL / abs(dz) if abs(dz) > EPSILON else big
-    seen: set[int] = set()
-    best = math.inf
-    start = 0.0
-    while start <= length:
-        end = min(next_x, next_z, length)
-        low, high = oy + dy * start, oy + dy * end
-        low, high = min(low, high) - EPSILON, max(low, high) + EPSILON
-        for t in collision.column(i, j):
-            number = t[NUMBER]
-            if number in seen or not t[MASK] & category or t[3] < low or t[2] > high:
-                continue
-            seen.add(number)
-            hit = _ray_triangle(ox, oy, oz, dx, dy, dz, t)
-            if hit is not None and hit < best:
-                best = hit
-        if best <= end:
-            return best if best <= length else None
-        if next_x < next_z:
-            start, next_x, i = next_x, next_x + delta_x, i + step_i
-        else:
-            start, next_z, j = next_z, next_z + delta_z, j + step_j
-        if start == big:
-            break
-    return best if best <= length else None
-
-
-def _ray_triangle(ox, oy, oz, dx, dy, dz, t) -> float | None:
-    """Moeller-Trumbore, both sides."""
-    ax, ay, az = t[AX], t[AY], t[AZ]
-    e1x, e1y, e1z = t[BX] - ax, t[BY] - ay, t[BZ] - az
-    e2x, e2y, e2z = t[CX] - ax, t[CY] - ay, t[CZ] - az
-    px, py, pz = dy * e2z - dz * e2y, dz * e2x - dx * e2z, dx * e2y - dy * e2x
-    det = e1x * px + e1y * py + e1z * pz
-    if -1e-12 < det < 1e-12:
-        return None
-    inv = 1.0 / det
-    sx, sy, sz = ox - ax, oy - ay, oz - az
-    u = (sx * px + sy * py + sz * pz) * inv
-    if u < 0.0 or u > 1.0:
-        return None
-    qx, qy, qz = sy * e1z - sz * e1y, sz * e1x - sx * e1z, sx * e1y - sy * e1x
-    v = (dx * qx + dy * qy + dz * qz) * inv
-    if v < 0.0 or u + v > 1.0:
-        return None
-    hit = (e2x * qx + e2y * qy + e2z * qz) * inv
-    return hit if hit > 1e-6 else None
+def ray_world(
+    collision: World | None, origin, direction, length: float, category: int = MOVER,
+) -> float | None:
+    """The distance to the first static hit, for callers that only need occlusion."""
+    hit = collision.cast_ray(origin, direction, length, category) if collision is not None else None
+    return hit.distance if hit is not None else None
 
 
 # --- health -------------------------------------------------------------------------------------------
