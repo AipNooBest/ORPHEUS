@@ -363,7 +363,7 @@ class Combat:
         self.next_bot = bots.BOT_ENTITY + len(match.bots)
         self.now = 0.0
         self.tick = 0
-        self.melee_seen: dict[tuple, int] = {}  # (body, instance, state) -> the melee state's last counter
+        self.melee_seen: dict[int, dict[tuple[int, int], int]] = {}  # body -> counters by instance/state
         self.projectiles = projectiles.Projectiles(self)  # leases, confirmations, the Biotic Field
         self.observers = observers.Observers(match)  # the bodies' statescript for the other clients
         self.voice = voicelines.VoiceLines(match)  # the hero's spawn voice line (voicelines.py)
@@ -387,9 +387,10 @@ class Combat:
         )
 
     def retire_player_body(self, player) -> None:
-        """Discard the old body's health, history and respawn when its lifetime ends."""
+        """Discard the old body's health, history, melee counters and respawn when its lifetime ends."""
         self.vitals.pop(player.body, None)
         self.history.pop(player.body, None)
+        self.melee_seen.pop(player.body, None)
         self.respawns[:] = [(when, who) for when, who in self.respawns if who is not player]
 
     def spawned(self, player) -> None:
@@ -432,9 +433,10 @@ class Combat:
             state = instance.states.get(index)
             if state is None:
                 continue
-            key = (script.entity, instance.id, index)
-            seen = self.melee_seen.get(key, 0)
-            self.melee_seen[key] = state.counter
+            counters = self.melee_seen.setdefault(script.entity, {})
+            key = (instance.id, index)
+            seen = counters.get(key, 0)
+            counters[key] = state.counter
             if state.counter == seen or not state.active or command is None:
                 continue
             modify = state.node.field("m_modifyHealth") or {}

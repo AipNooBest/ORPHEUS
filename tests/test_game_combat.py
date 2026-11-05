@@ -588,6 +588,30 @@ class DeathTests(unittest.TestCase):
         self.assertEqual(self.run.match.combat.vitals[self.b.body].now[HEALTH_POOL], 170.0)
         self.assertEqual([hit["+0x78"]["+0x4"] for hit in self.a.client.messages(combat.HIT)], [30])
 
+    def test_reused_body_id_starts_a_new_melee_activation_history(self):
+        match = self.run.match
+        old = self.a.body
+
+        def melee():
+            x, y, z = self.b.mover.position
+            yaw, pitch = aim(match.combat._eye(self.a), (x, y + 1.0, z))
+            self.run.step({self.a: (yaw, pitch, 0x800)})
+            for _ in range(40):
+                self.run.step({self.a: (yaw, pitch, 0)})
+
+        melee()
+        self.assertEqual(match.combat.vitals[self.b.body].total, 170)
+        self.assertTrue(match.switch_hero(self.a, self.a.hero))
+        self.assertNotEqual(self.a.body, old)
+        # Model the ring after every other ID has recently been retired.
+        with patch.object(self.a.client, "body_id_available", side_effect=lambda entity: entity == old):
+            self.assertTrue(match.switch_hero(self.a, self.a.hero))
+        self.assertEqual(self.a.body, old)
+
+        melee()
+        self.assertEqual(match.combat.vitals[self.b.body].total, 140)
+        self.assertEqual([hit["+0x78"]["+0x4"] for hit in self.a.client.messages(combat.HIT)], [30, 30])
+
     def test_respawn_after_the_modes_time(self):
         self.kill_b()
         old = self.b.body
