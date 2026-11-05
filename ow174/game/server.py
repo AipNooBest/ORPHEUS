@@ -717,14 +717,48 @@ class Client:
             return False
         return True
 
+    def _ready_entity_records(self) -> list[world.EntityUpdate]:
+        if not self.player.has_body:
+            return self.entities
+        controller, body = self.player.entity, self.player.body
+        pending = self._pending_possessions.get(controller)
+        created = self.bot_create_acked(body)
+        if created and pending is None:
+            return self.entities
+
+        possession = pending[1] if pending is not None else None
+        bound = possession is None
+        records = []
+        for item in self.entities:
+            if item is possession:
+                if not created:
+                    continue
+                bound = True
+            elif item.op == world.OP_CREATE:
+                if item.entity == body:
+                    created = True
+                elif item.entity == controller and not created:
+                    continue  # the initial controller create also carries 44/75
+            elif (
+                not bound and item.op == world.OP_DESTROY
+                and item.entity not in (controller, body) and item.entity & ~0xFF == controller
+            ):
+                continue
+            records.append(item)
+        # Budget selection only removes a suffix, so a dependent record cannot
+        # be sent without a prerequisite admitted earlier in this list.
+        return records
+
     def send_frame(self, tick: int, now: float, *, reliable_only: bool = False) -> None:
+        queued = []
         if reliable_only:
             unreliable, entities = [], []
         else:
             self._release_body_destroys(tick)
             self._flush_bot_nameplates()
             unreliable = self.unreliable[: messages.MAX_PER_KIND]
-            entities = (self.entities + self.player.match.remote_movements(self.player))[:127]
+            queued = self._ready_entity_records()
+            entities = (queued + self.player.match.remote_movements(self.player))[:127]
         reliable = self.reliable[: messages.MAX_PER_KIND]
         try:
             payload = self._payload(tick, reliable, unreliable, entities)
@@ -755,7 +789,7 @@ class Client:
             self._frame_rejected(f"frame encoding failed: {type(error).__name__}")
             return
         if not reliable_only and not reliable and not unreliable and not entities and (
-            self.reliable or self.unreliable or self.entities
+            self.reliable or self.unreliable or queued
         ):
             self._frame_rejected("oldest queued entity exceeds datagram budget; fragmentation required")
             return

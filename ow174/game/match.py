@@ -1161,8 +1161,8 @@ class Match:
     def switch_hero(self, player: Player, hero: Hero) -> bool:
         """The body of a picked hero. The first one just comes. A switch creates the new body under a
         new id at the spawn point, moves the player's components 44 and 75 to it and destroys the old
-        body in the same frame: retail drops the old one at once too (OW2 traffic); kept 0.5 s longer it
-        shows when the hero select screen closes."""
+        body. These records can share a datagram in that order. When the packet budget splits them,
+        the later records wait for acknowledgement of their prerequisites."""
         old = player.body if player.has_body else None
         old_hero = player.hero.guid if old is not None else None
         if old is not None:

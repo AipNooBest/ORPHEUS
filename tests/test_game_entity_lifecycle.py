@@ -3,25 +3,27 @@
 import copy
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from test_game_packet_budget import connection, decoded
 from test_game_repeated_lifecycles import wire_frame
-from test_game_server import REAPER
+from test_game_server import REAPER, pick
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ow174.game import messages, world
 from ow174.game.bits import BitWriter
 from ow174.game.content import SOLDIER, heroes
 from ow174.game.environment import SystemEnvironment
-from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
-from ow174.game.match import Match
+from ow174.game.link import ACK, KIND_CONTROL, KIND_FRAME, LinkCipher, Packet, ReceiveWindow
+from ow174.game.match import Match, card_message
 from ow174.game.observers import Observers
 from ow174.game.script.driver import BodyScript
-from ow174.game.server import Client
-from ow174.game.world import OP_CREATE, OP_DESTROY, EntityUpdate, Movement
+from ow174.game.server import MAX_PAYLOAD, Client
+from ow174.game.world import OP_CREATE, OP_DESTROY, OP_UPDATE, EntityUpdate, Movement
 
 
 def client() -> Client:
@@ -227,6 +229,174 @@ class ReliableLifecycleTests(unittest.TestCase):
 
 
 class PossessionDeliveryTests(unittest.TestCase):
+    def queue_split_budget(self, peer, first, dependent):
+        actor = peer.player
+        card = card_message(actor)
+        card["+0x80"] = dict(card["+0x80"])
+
+        def card_at(length):
+            card["+0x80"]["+0x40"] = "A" * length
+            return [(peer.next_reliable, messages.encode(20308, card))]
+
+        def size(reliable, entities):
+            return len(peer._payload(actor.match.tick + 1, reliable, [], entities))
+
+        low, high = 1, MAX_PAYLOAD
+        while low < high:
+            middle = (low + high + 1) // 2
+            if size(card_at(middle), [first]) <= MAX_PAYLOAD:
+                low = middle
+            else:
+                high = middle - 1
+        reliable = card_at(low)
+        self.assertLessEqual(size(reliable, [first]), MAX_PAYLOAD)
+        self.assertGreater(size(reliable, [first, dependent]), MAX_PAYLOAD)
+        peer.queue_reliable(20308, card)
+
+    def test_preselected_body_must_create_before_initial_controller_with_possession(self):
+        for split in (False, True):
+            with self.subTest(split=split):
+                self.check_initial_possession(split=split)
+
+    def check_initial_possession(self, *, split):
+        server, peer, actor, cipher = connection()
+        match = actor.match
+        match.tick = 100
+        match.game_map = replace(match.game_map, placeables=())
+        window = ReceiveWindow()
+        sequence = 1
+
+        def emit():
+            match.tick += 1
+            peer.send_frame(match.tick, 10.0)
+            packet = decoded(self, cipher, server.sock.sent[-1][0])[0]
+            return packet, wire_frame(packet)[1]
+
+        def acknowledge(packet):
+            nonlocal sequence
+            self.assertTrue(window.accept(packet.seq))
+            ack = Packet(peer.conn, KIND_CONTROL, sequence, window.expected, window.bits, ACK)
+            sequence += 1
+            server._datagram(cipher.seal(ack), peer.address, 10.0)
+
+        def creates(records):
+            return [(item.entity, fields) for item, fields in records if item.op == OP_CREATE]
+
+        def assert_possessed(fields):
+            self.assertEqual(fields[44], {0: actor.body, 1: actor.body, 2: actor.body})
+            self.assertEqual(fields[75], {0: SOLDIER, 3: SOLDIER})
+
+        payload = BitWriter()
+        messages.write_channel(payload, [(0, messages.encode(21616, pick(actor.entity, SOLDIER)))])
+        request = Packet(peer.conn, KIND_FRAME, 0, 0, 0, ACK, payload.getvalue())
+        server._datagram(cipher.seal(request), peer.address, 10.0)
+        self.assertTrue(actor.has_body)
+        self.assertFalse(actor.spawned)
+        updates = match.spawn_updates(actor)
+        peer.queue_entities(updates)
+        actor.spawned = True
+        if split:
+            self.queue_split_budget(peer, updates[0], updates[1])
+
+        packet, records = emit()
+        if not split:
+            self.assertEqual([entity for entity, _ in creates(records)],
+                             [actor.body, actor.entity, world.GAME_MODE_ENTITY])
+            assert_possessed(creates(records)[1][1])
+            return
+
+        self.assertEqual([entity for entity, _ in creates(records)], [actor.body])
+        # Drop the body datagram. The separate mode create can arrive and be ACKed.
+        packet, records = emit()
+        self.assertEqual([entity for entity, _ in creates(records)], [world.GAME_MODE_ENTITY])
+        acknowledge(packet)
+        retry, records = emit()
+        self.assertEqual([entity for entity, _ in creates(records)], [actor.body])
+        self.assertFalse(actor.body_script.create_arrived)
+        acknowledge(retry)
+        self.assertTrue(actor.body_script.create_arrived)
+        _, records = emit()
+        (entity, fields), = creates(records)
+        self.assertEqual(entity, actor.entity)
+        assert_possessed(fields)
+
+    def test_own_possession_shares_body_create_or_waits_for_the_exact_create_ack(self):
+        server, peer, actor, cipher = connection()
+        match = actor.match
+        match.tick, actor.spawned = 100, True
+        window = ReceiveWindow()
+        sequence = 0
+
+        def emit():
+            match.tick += 1
+            peer.send_frame(match.tick, 10.0)
+            packet = decoded(self, cipher, server.sock.sent[-1][0])[0]
+            ids, records = wire_frame(packet)
+            return packet, ids, records
+
+        def acknowledge(packet):
+            nonlocal sequence
+            self.assertTrue(window.accept(packet.seq))
+            ack = Packet(peer.conn, KIND_CONTROL, sequence, window.expected, window.bits, ACK)
+            sequence += 1
+            server._datagram(cipher.seal(ack), peer.address, 10.0)
+
+        def relevant(records, old=None):
+            return [
+                (item.entity, item.op, fields.get(44), fields.get(75))
+                for item, fields in records
+                if (item.entity == actor.body and item.op == OP_CREATE)
+                or (item.entity == actor.entity and (44 in fields or 75 in fields))
+                or (item.entity == old and item.op == OP_DESTROY)
+            ]
+
+        def expected(hero):
+            body = actor.body
+            return (actor.entity, OP_UPDATE, {0: body, 1: body, 2: body}, {0: hero, 3: hero})
+
+        peer.queue_entities([
+            EntityUpdate(actor.entity, OP_CREATE, lambda origin: match._player_create(origin, actor)),
+        ])
+        packet, _, _ = emit()
+        acknowledge(packet)
+        for hero in (SOLDIER, REAPER):
+            old = actor.body if actor.has_body else None
+            self.assertTrue(match.switch_hero(actor, heroes()[hero]))
+            packet, _, records = emit()
+            ordered = [(actor.body, OP_CREATE, None, None), expected(hero)]
+            if old is not None:
+                ordered.append((old, OP_DESTROY, None, None))
+            self.assertEqual(relevant(records, old), ordered)
+            acknowledge(packet)
+
+        old = actor.body
+        self.assertTrue(match.switch_hero(actor, heroes()[SOLDIER]))
+        create = next(item for item in peer.entities if item.entity == actor.body and item.op == OP_CREATE)
+        components = match._possession(actor)
+        possession = EntityUpdate(actor.entity, OP_UPDATE, lambda origin: world.update(origin, components))
+        self.queue_split_budget(peer, create, possession)
+        _, _, records = emit()  # drop the actual budget-split create datagram
+        self.assertEqual(relevant(records, old), [(actor.body, OP_CREATE, None, None)])
+
+        peer.queue_reliable(20308, card_message(actor))
+        packet, ids, records = emit()
+        self.assertIn(20308, ids)
+        self.assertEqual(relevant(records, old), [])
+        acknowledge(packet)  # confirms another packet and reports the create missing
+        retry, _, records = emit()
+        self.assertEqual(relevant(records, old), [(actor.body, OP_CREATE, None, None)])
+        self.assertTrue(window.accept(retry.seq))
+        self.assertFalse(actor.body_script.create_arrived)
+        packet, _, records = emit()
+        self.assertEqual(relevant(records, old), [])
+        acknowledge(packet)  # includes a positive ACK for the exact create retry
+        self.assertTrue(actor.body_script.create_arrived)
+        packet, _, records = emit()
+        self.assertEqual(relevant(records, old), [expected(SOLDIER), (old, OP_DESTROY, None, None)])
+        acknowledge(packet)
+        _, _, records = emit()
+        self.assertEqual(relevant(records, old), [])
+
     def check_superseded_possession(self, *, own, lose_current=False):
         server, observer_client, observer, observer_cipher = connection()
         match = observer.match
