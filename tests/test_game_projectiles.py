@@ -6,18 +6,22 @@ import struct
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from test_game_combat import KANEZAKA_DM, Run
+from test_game_packet_budget import MemorySocket, decoded
 from test_game_world import read_movement
 
-from ow174.game import combat, projectiles, world
+from ow174.game import bodytrace, combat, movelog, projectiles, world
 from ow174.game.bits import BitReader
 from ow174.game.commands import Command
 from ow174.game.content import SOLDIER, heroes
+from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
 from ow174.game.script.decode import ClientBody, read_chunk
+from ow174.game.server import Client, GameServer
 from ow174.game.world import HEALTH_POOL, OP_CREATE, OP_DESTROY
 
 HELIX, HELIX_VISOR, CANISTER = 0x040000000000072C, 0x0400000000001C86, 0x040000000000072D
@@ -194,6 +198,171 @@ class ProjectileRangeTests(unittest.TestCase):
                 self.assertFalse(fight.rockets)
                 self.assertEqual(vitals.total < before, hit)
                 self.assertAlmostEqual(rocket.flown * rocket.speed, min(contact, reach))
+
+
+class ObserverProjectileDeliveryTests(unittest.TestCase):
+    def setUp(self):
+        for module in (bodytrace, movelog):
+            edit = patch.object(module, "ENABLED", False)
+            edit.start()
+            self.addCleanup(edit.stop)
+        run = Run(KANEZAKA_DM, ("Shooter", "Viewer"))
+        self.match = run.match
+        self.match.bots.clear()
+        for _ in range(20):
+            run.step({})
+        self.shooter, self.viewer = run.players
+        self.tick = run.frame
+        self.fight = self.match.combat
+        watch = self.fight.observers.watches[(self.viewer.slot, self.shooter.body)]
+        self.known = {index: item[0] for index, item in watch.stream.base.instances.items()}
+
+        self.server = GameServer()
+        self.server.sock = MemorySocket()
+        key_in, key_out = b"i" * 32, b"o" * 32
+        self.client = Client(
+            self.server, ("memory.test", 40002), 2, LinkCipher(key_in, key_out), self.viewer,
+        )
+        self.server.clients[2] = self.client
+        self.client.open = True
+        self.viewer.client = self.client
+        self.cipher = LinkCipher(key_out, key_in)
+        self.window = ReceiveWindow()
+        self.seq = 0
+
+    def fire(self, *, nearby=False):
+        x, y, z = self.shooter.mover.position
+        self.viewer.mover.position = [x if nearby else x + 10.0, y, z + 2.0]
+        self.shot_frame = self.tick + 1
+        self.shooter.take_commands([Command(self.shot_frame, buttons=SECONDARY)])
+        self.assertEqual(len(self.fight.rockets), 1)
+
+    def advance(self, count):
+        for _ in range(count):
+            self.tick += 1
+            self.match.update(self.tick * combat.TICK, self.tick)
+
+    def send(self, *, lose=False):
+        self.client.send_frame(self.tick, self.tick * combat.TICK)
+        packet, _, _, _, _, _ = decoded(self, self.cipher, self.server.sock.sent[-1][0])
+        if not lose:
+            self.assertTrue(self.window.accept(packet.seq))
+        return self.client.in_flight[packet.seq][1]  # reliable records in the authenticated send
+
+    def ack(self):
+        packet = Packet(self.client.conn, KIND_CONTROL, self.seq, self.window.expected, self.window.bits, ACK)
+        self.seq += 1
+        self.server._datagram(self.cipher.seal(packet), self.client.address, self.tick * combat.TICK)
+
+    def launches(self, records):
+        return [item for item in records if item.entity == self.shooter.body and item.ch2 is not None]
+
+    def projectile_ops(self, records):
+        return [item.op for item in records if item.entity == projectiles.SEEN_FIRST]
+
+    def assert_launch(self, records):
+        events = self.launches(records)
+        self.assertEqual(len(events), 1)
+        record = bits_of(events[0].ch2)
+        self.assertEqual((record.bit(), record.bit(), record.var_b()), (1, 1, self.shot_frame))
+        shot = read_shot(record)
+        self.assertEqual(
+            (shot["instance"], shot["state"], shot["activation"], shot["ids"]),
+            (11, 16, 1, [projectiles.SEEN_FIRST]),
+        )
+        self.assertEqual((record.bit(), record.bit()), (0, 0))
+        return events[0].ch2.getvalue()
+
+    def assert_retired(self, records, *, explode):
+        self.assertEqual(self.launches(records), [])
+        self.assertEqual(self.projectile_ops(records), [OP_DESTROY])
+        (release,) = [item for item in records if item.entity == projectiles.SEEN_FIRST]
+        if explode:
+            record = bits_of(release.ch2)
+            self.assertEqual((record.bit(), record.bit()), (0, 1))
+        else:
+            self.assertIsNone(release.ch2)
+
+    def test_create_volley_and_launch_ack_gate_observer_helix_retirement(self):
+        # The packet prefix ends exactly at the create on the old path.
+        self.client.queue_entities([world.EntityUpdate(0x80001000 + index) for index in range(126)])
+        self.fire()
+        self.assertEqual(self.projectile_ops(self.send(lose=True)), [OP_CREATE])
+        self.assertEqual(self.launches(self.send()), [])
+        self.ack()
+        retry = self.send()
+        self.assertEqual(self.projectile_ops(retry), [OP_CREATE])
+        self.assertEqual(self.launches(retry), [])
+        self.ack()
+        self.assertEqual(self.launches(self.send()), [])  # create alone does not install the volley
+        self.ack()
+
+        self.advance(3)
+        volley = self.send()
+        self.assertEqual(self.launches(volley), [])
+        frames = [
+            read_chunk(item.chunk.getvalue(), item.chunk.count, self.known)
+            for item in volley if item.entity == self.shooter.body and item.chunk is not None
+        ]
+        self.assertTrue(any(
+            not frame.owner and frame.instances[11].states.get(16) == (
+                False, {"offset": 0, "counter": 1, "volleys": 1},
+            )
+            for frame in frames if 11 in frame.instances
+        ))
+        self.ack()
+        self.advance(3)
+        original = self.assert_launch(self.send(lose=True))
+
+        self.advance(140)
+        self.assertFalse(self.fight.rockets)
+        waiting = self.send()
+        self.assertEqual(self.projectile_ops(waiting), [])
+        self.assertEqual(self.launches(waiting), [])
+        self.ack()  # report that the later frame arrived without the launch
+        retried = self.send()
+        self.assertEqual(self.assert_launch(retried), original)
+        self.assertEqual(self.projectile_ops(retried), [])
+        self.ack()
+        self.advance(3)
+        self.assert_retired(self.send(), explode=True)
+
+    def send_finished_short_shot(self, *, lose=False):
+        self.fire(nearby=True)
+        self.advance(60)  # the real combat sweep hits the nearby enemy and ends the short flight
+        self.assertFalse(self.fight.rockets)
+        self.assertFalse(self.fight.projectiles.shots)
+        created = self.send()
+        self.assertEqual(self.projectile_ops(created), [OP_CREATE])
+        self.assertEqual(self.launches(created), [])
+        self.ack()
+        self.advance(3)
+        launch = self.send(lose=lose)
+        self.assert_launch(launch)
+        self.assertEqual(self.projectile_ops(launch), [])
+
+    def test_ended_before_first_send_catches_up_in_create_launch_release_order(self):
+        self.send_finished_short_shot()
+        self.ack()
+        self.advance(3)
+        self.assert_retired(self.send(), explode=True)
+
+    def test_unacknowledged_launch_expires_without_resending_or_exploding(self):
+        self.send_finished_short_shot(lose=True)
+        self.advance(70)  # beyond the 64-tick grace after the short flight ended
+        self.assert_retired(self.send(), explode=False)
+        self.ack()  # a loss report for the canceled launch must not restore it
+        self.assertEqual(self.launches(self.send()), [])
+
+    def test_replacing_the_shooter_body_retires_an_in_flight_launch(self):
+        self.send_finished_short_shot(lose=True)
+        old_body = self.shooter.body
+        self.match.switch_hero(self.shooter, heroes()[SOLDIER])
+        self.assertNotEqual(self.shooter.body, old_body)
+        self.advance(3)
+        self.assert_retired(self.send(), explode=False)
+        self.ack()
+        self.assertFalse(any(item.entity == old_body and item.ch2 is not None for item in self.send()))
 
 
 class BioticFieldTests(unittest.TestCase):

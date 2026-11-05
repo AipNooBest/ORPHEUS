@@ -231,8 +231,7 @@ class Client:
         previous = self._bot_health.get(entity)
         if previous is not None:
             # Each viewer owns its record. Supersession must not disable another client's resend.
-            previous.resend = False
-            self.entities = [item for item in self.entities if item is not previous]
+            self.cancel_entity_record(previous)
         update = world.EntityUpdate(entity, world.OP_UPDATE, lambda origin: world.update(origin, components))
         self._bot_health[entity] = update
         if self.bot_create_acked(entity):
@@ -335,6 +334,11 @@ class Client:
 
     def queue_unreliable(self, msg_id: int, value: dict) -> None:
         self.unreliable.append(messages.encode(msg_id, value))
+
+    def cancel_entity_record(self, update: world.EntityUpdate) -> None:
+        """Cancel a queued record and prevent an earlier send from being retried."""
+        update.resend = False
+        self.entities = [item for item in self.entities if item is not update]
 
     def queue_entities(self, updates: list) -> None:
         # A destroy retires all older records of this entity for this client, including

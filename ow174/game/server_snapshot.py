@@ -91,7 +91,7 @@ FIELDS = {
         "projectiles observers voice"
     ),
     combat.Vitals: _names("entity most now ids changed died_at killer"),
-    projectiles.Projectiles: _names("combat match shots next_field next_seen"),
+    projectiles.Projectiles: _names("combat match shots observed next_field next_seen"),
     projectiles.FieldArrived: _names("shot viewer stream done"),
     observers.Observers: _names("match watches"),
     observers.Watch: _names("body arrived stream sent next_lazy"),
@@ -126,7 +126,8 @@ OPTIONAL_FIELDS = {Client: _names("_entity_lifecycles _entity_record_generations
 DATACLASSES = (
     GameMap, Hero, Spawn, Handoff, LoadState, correction.SendToken, MoverData,
     heroselect.Controller, notices.Switch, combat.HitDef, combat.Target, combat.Rocket,
-    projectiles.Shot, projectiles.ShotRecord, driver.Snapshot, statescript.Graph,
+    projectiles.Shot, projectiles.ShotRecord, projectiles._ObservedProjectile, projectiles._ProjectileArrival,
+    driver.Snapshot, statescript.Graph,
     statescript.Bool, statescript.Int, statescript.Float, statescript.Asset, statescript.Entity,
     statescript.Instance, statescript.Binding, statescript.StateWire, statescript.EventWire,
     statescript.InstanceWire, expr.Asset, expr.Entity, expr.Vec3, expr.Handle, expr.Map,

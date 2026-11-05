@@ -112,6 +112,7 @@ DEFINITIONS_PER_BODY = 4  # leased definitions per slot (Soldier: 072C, 1C86, 07
 REPORT_WINDOW = 64  # frames after the shot in which an owner frame may report it
 CONFIRM_TICKS = 3  # at least this after the report (0.05 s)
 UNREPORTED_TICKS = 32  # a shot no owner frame reported gets lease(f) after this
+OBSERVER_GRACE_TICKS = 64  # server cleanup limit for pending observer delivery after a shot ends
 RELEASE_MARGIN = (
     6  # frames after the server's rocket ended before the release (unverified: the client's flies the same)
 )
@@ -208,19 +209,20 @@ class Shot:
     created_tick: int | None = None
     release_at: int | None = None  # the tick of the release and destroy
     field_ids: list = field(default_factory=list)  # (viewer slot, field entity id)
-    seen_ids: list = field(default_factory=list)  # (viewer slot, server projectile id) on the other clients
+    observers: list = field(default_factory=list)  # per-viewer launches of this projectile
     field_tick: int | None = None
     faded: bool = False
     arrivals: list = field(default_factory=list)  # the field entities whose create arrived
 
 
 class Projectiles:
-    """The match's predicted projectiles: leases, confirmations, releases and the Biotic Field."""
+    """Projectile leases, confirmations, observer delivery, and the Biotic Field."""
 
     def __init__(self, combat) -> None:
         self.combat = combat
         self.match = combat.match
         self.shots: list[Shot] = []
+        self.observed: list[_ObservedProjectile] = []
         self.next_field = 0
         self.next_seen = 0
 
@@ -290,13 +292,13 @@ class Projectiles:
         the map until a record starts it) and the shot record in the shooter's ch2 naming it."""
         observers = self.combat.observers
         for viewer in self.match.players:
-            if viewer is shot.player or viewer.client is None or not viewer.seen.get(shot.body):
+            if viewer is shot.player or viewer.client is None:
                 continue
-            if not observers.has(viewer, shot.body):
+            stream = observers.acknowledged_stream(viewer, shot.body)
+            if stream is None:
                 continue  # its client has no statescript of the body, so no volley record of it
             entity = SEEN_FIRST + self.next_seen % SEEN_SPAN
             self.next_seen += 1
-            shot.seen_ids.append((viewer.slot, entity))
             record = ShotRecord(
                 shot.frame,
                 shot.instance,
@@ -307,11 +309,16 @@ class Projectiles:
                 (entity,),
                 volleys=state.volleys & 0xFF,
             )
-            events = EntityUpdate(shot.body)
-            events.ch2 = shot_events([record])
-            viewer.client.queue_entities(
-                [EntityUpdate(entity, OP_CREATE, confirm_record(shot.definition)), events]
-            )
+            launch = EntityUpdate(shot.body)
+            launch.ch2 = shot_events([record])
+            deadline = self.match.tick + shot.bound + OBSERVER_GRACE_TICKS
+            delivery = _ObservedProjectile(viewer, viewer.client, stream, record, launch, deadline)
+            create = EntityUpdate(entity, OP_CREATE, confirm_record(shot.definition))
+            create.stream = delivery.creation
+            launch.stream = delivery.launch_arrival
+            shot.observers.append(delivery)
+            self.observed.append(delivery)
+            viewer.client.queue_entities([create])
 
     def flown(self, shot: Shot, seconds: float) -> None:
         """The server's rocket ended after `seconds`: the release goes a little after the client's would."""
@@ -326,8 +333,11 @@ class Projectiles:
                 self._step(shot, tick)
             except Exception:
                 log.exception("[game] %s: projectile %X failed", self.match.label(), shot.definition & 0xFFFF)
+                for delivery in shot.observers:
+                    delivery.finish(tick, False)
                 if shot in self.shots:
                     self.shots.remove(shot)
+        self.observed = [delivery for delivery in self.observed if delivery.advance(tick)]
 
     def _step(self, shot: Shot, tick: int) -> None:
         player = shot.player
@@ -390,17 +400,15 @@ class Projectiles:
         )
 
     def _end(self, shot: Shot, tick: int, explode: bool) -> None:
-        """Destroy the projectile's ids on its owner's client (with the release when it holds an
-        explosion) and its field entities on every client."""
+        """End the shot, release its owner copies and field entities, and retire observer deliveries."""
         if shot in self.shots:
             self.shots.remove(shot)
-        for slot, entity in shot.field_ids + shot.seen_ids:
+        for delivery in shot.observers:
+            delivery.finish(tick, explode)
+        for slot, entity in shot.field_ids:
             viewer = next((player for player in self.match.players if player.slot == slot), None)
             if viewer is not None and viewer.client is not None:
-                update = EntityUpdate(entity, OP_DESTROY)
-                if explode and (slot, entity) in shot.seen_ids:
-                    update.ch2 = release(tick + RELEASE_AHEAD)
-                viewer.client.queue_entities([update])
+                viewer.client.queue_entities([EntityUpdate(entity, OP_DESTROY)])
         client = shot.player.client
         if client is None or not shot.created:
             return
@@ -603,6 +611,65 @@ class ShotRecord:
     ids: tuple  # the projectile entities it starts
     shot: int = 0
     volleys: int = 1
+
+
+@dataclass
+class _ProjectileArrival:
+    received: bool = False
+
+    def arrived(self, last: int) -> None:
+        self.received = True
+
+
+@dataclass
+class _ObservedProjectile:
+    """One connection's create, shooter event and retirement for a remote projectile."""
+
+    viewer: object
+    client: object
+    stream: object
+    record: ShotRecord
+    launch: EntityUpdate
+    deadline: int
+    creation: _ProjectileArrival = field(default_factory=_ProjectileArrival)
+    launch_arrival: _ProjectileArrival = field(default_factory=_ProjectileArrival)
+    launch_queued: bool = False
+    finished: bool = False
+    explode: bool = False
+
+    def finish(self, tick: int, explode: bool) -> None:
+        self.finished = True
+        self.explode = explode
+        grace = OBSERVER_GRACE_TICKS if explode else 0
+        self.deadline = min(self.deadline, tick + grace)
+
+    def advance(self, tick: int) -> bool:
+        if self.viewer.client is not self.client:
+            return False
+        observers = self.viewer.match.combat.observers
+        source_live = observers.acknowledged_stream(self.viewer, self.launch.entity) is self.stream
+        launched = self.launch_arrival.received
+        if not source_live or tick >= self.deadline or (self.finished and launched):
+            if self.launch_queued and not launched:
+                self.client.cancel_entity_record(self.launch)
+            update = EntityUpdate(self.record.ids[0], OP_DESTROY)
+            if source_live and self.explode and launched:
+                update.ch2 = release(tick + RELEASE_AHEAD)
+            self.client.queue_entities([update])
+            return False
+        if not self.launch_queued and self.creation.received and self._volley_arrived():
+            self.launch_queued = True
+            self.client.queue_entities([self.launch])
+        return True
+
+    def _volley_arrived(self) -> bool:
+        base = self.stream.base
+        state = base.states.get((self.record.instance, self.record.state)) if base is not None else None
+        if state is None:
+            return False
+        payload = dict(state[2])
+        key = (payload.get("counter"), payload.get("volleys", 0) & 0xFF)
+        return key == (self.record.activation, self.record.volleys)
 
 
 def write_shot(out: BitWriter, shot: ShotRecord) -> None:
