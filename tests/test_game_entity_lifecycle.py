@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ow174.game import heroselect, messages, world
 from ow174.game.bits import BitWriter
+from ow174.game.commands import FIRE, Command
 from ow174.game.content import SOLDIER, heroes
 from ow174.game.environment import SystemEnvironment
 from ow174.game.link import ACK, KIND_CONTROL, KIND_FRAME, LinkCipher, Packet, ReceiveWindow
@@ -361,6 +362,9 @@ class PossessionDeliveryTests(unittest.TestCase):
                 for position, (item, _) in enumerate(records) if item.entity == actor.entity and item.chunk
             ]
 
+        def body_chunks(records):
+            return [item.chunk for item, _ in records if item.entity == actor.body and item.chunk]
+
         def assert_menu(records, hero, opened):
             (position, frame), = controller_frames(records)
             self.assertTrue(frame.full and frame.owner)
@@ -420,21 +424,57 @@ class PossessionDeliveryTests(unittest.TestCase):
         # waits if its prerequisite was only selected for an earlier datagram.
         _, binding = peer._pending_possessions[actor.entity]
         (close,) = [item for item in peer.entities if item.stream is actor.script]
+        script = actor.body_script
+        match._body_frames(actor, peer)
         self.queue_split_budget(peer, binding, close)
         _, _, records = emit()
         self.assertEqual(relevant(records, old), [expected(SOLDIER)])
         self.assertEqual(controller_frames(records), [])
+        self.assertEqual(body_chunks(records), [])
         packet, _, records = emit()
         self.assertEqual(relevant(records, old), [])
         self.assertEqual(controller_frames(records), [])
+        (tree,) = body_chunks(records)
+        frame = decode.read_chunk(tree.getvalue(), tree.count)
+        self.assertTrue(frame.full)
+        self.assertFalse(frame.owner)  # H0 can reach the existing body before binding
+        known = {number: item.graph for number, item in frame.instances.items()}
+        acknowledge(packet)
+        self.assertEqual(script.stream.base_last, 1)
+
+        command = script.frame + 1
+        actor.take_commands([Command(command, buttons=FIRE)])
+        self.assertEqual(script.component.instances[11].vars[53].value(), 29)
+        match._body_frames(actor, peer)
+        _, _, records = emit()  # lose the saturated binding retry too
+        self.assertEqual(relevant(records, old), [expected(SOLDIER)])
+        self.assertEqual(body_chunks(records), [])
+
+        first = script.stream.initial_owner
+        actor.take_commands([Command(command + 1, buttons=FIRE)])
+        match._body_frames(actor, peer)
+        self.assertIsNot(script.stream.initial_owner, first)
+        self.assertNotIn(first, peer.entities)
+        self.assertEqual(tuple(script.stream.pending), (script.stream.initial_owner.chunk_last,))
+        packet, _, records = emit()
+        self.assertEqual(relevant(records, old), [])
+        self.assertEqual(controller_frames(records), [])
+        self.assertEqual(body_chunks(records), [])
+        self.assertEqual(script.report_count, 0)
         acknowledge(packet)
         packet, _, records = emit()
         self.assertEqual(relevant(records, old), [expected(SOLDIER)])
         self.assertEqual(controller_frames(records), [])
+        self.assertEqual(body_chunks(records), [])
         acknowledge(packet)
         packet, _, records = emit()
         self.assertEqual(relevant(records, old), [(old, OP_DESTROY, None, None)])
         assert_menu(records, SOLDIER, False)
+        (initial,) = body_chunks(records)
+        frame = decode.read_chunk(initial.getvalue(), initial.count, known)
+        self.assertEqual((frame.owner, frame.correction, frame.cmfd), (True, False, command + 1))
+        self.assertTrue(frame.instances[11].states[70][0])  # authored ammo UXPresenter
+        self.assertEqual(script.report_count, 1)
         acknowledge(packet)
         _, _, records = emit()
         self.assertEqual(relevant(records, old), [])

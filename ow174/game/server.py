@@ -736,13 +736,19 @@ class Client:
 
         possession = pending[1] if pending is not None else None
         bound = possession is None
+        script = getattr(self.player, "body_script", None)
+        stream = script.stream if script is not None else None
         records = []
         for item in self.entities:
             if item is possession:
                 if not created:
                     continue
                 bound = True
-            elif item.controller_close and not bound:
+            elif not bound and (
+                item.controller_close
+                or (stream is not None and item.stream is stream and item is not stream.full_update)
+            ):
+                # The body's H0 tree is independent, but owner H1 starts after possession.
                 continue
             elif item.op == world.OP_CREATE:
                 if item.entity == body:
