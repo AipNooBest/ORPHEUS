@@ -484,7 +484,7 @@ def place(point, translation, scale, rotation) -> tuple:
     return (x + translation[0], y + translation[1], z + translation[2])
 
 
-def map_shapes(map_guid: int, read) -> tuple[list, list]:
+def map_shapes(map_guid: int, read, category: int = MOVER) -> tuple[list, list]:
     """A map's props: (models: each model's shapes (model_shapes), placements: [(model index, identifier
     (0 or the one the game mode must list), translation, scale, rotation)] in placeable order).
     `read(keys)` returns a file's bytes."""
@@ -501,7 +501,7 @@ def map_shapes(map_guid: int, read) -> tuple[list, list]:
             continue
         if model not in index:
             index[model] = len(models)
-            models.append(model_shapes(read(data["models"][model])))
+            models.append(model_shapes(read(data["models"][model]), category))
         if models[index[model]]:
             placed.append((index[model], identifier, translation, scale, rotation))
     return models, placed

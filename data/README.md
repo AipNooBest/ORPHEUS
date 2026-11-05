@@ -29,6 +29,18 @@ The server and its tests use the following data sets. The public source checkout
 
 The raw reference capture was from client 1.68 and was decoded using 1.74 schemas; templates are not a claim that every original live-service feature has been reproduced. The game client, raw captures and process dumps are not distributed here.
 
+### Optional static ray geometry
+
+In the prepared research checkout, use the local 104319 installation to generate the extra ray data for the selected maps.
+
+```powershell
+.\.venv\Scripts\python.exe tools\build_collision.py 0688 0CD3 --ray-geometry
+```
+
+The tool reads the installation from `game_path.txt` or an executable path given with `--game`. It writes `0688.rays.col` and `0CD3.rays.col` beside the existing movement caches. Runtime preparation copies each selected map's optional ray cache into the external pack and records its SHA-256.
+
+Explicit static queries can use `collision.RayWorld.load(map_guid, mode_guid)`. It verifies the map and original chunk key, then selects props for the requested mode. A missing or mismatched cache produces a load error. Coverage includes the core chunk and the supported static shapes in the existing prop index. Full prop indexing, dynamic objects and authored ability filter evaluation remain open. Keep the generated caches local.
+
 ### Local score event metadata
 
 Export the build 104319 `003F.054` settings from a DataTool `054` XML dump with the pinned OWLib checkout. Keep the output outside the repository.

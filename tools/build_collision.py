@@ -5,8 +5,12 @@ own copy of the game: each map's collision chunk and the physics shapes of its p
 are read straight from the game's storage (no DataTool needed) and only the part the mover collides with
 is kept. Caches of an older format are built again.
 
+--ray-geometry writes separate *.rays.col caches for static queries. These retain all masks from
+the original map chunk and indexed static props. The ordinary movement caches are still required.
+
     py tools/build_collision.py                  every map the server can host
     py tools/build_collision.py 0x688 0xD4       only these maps (GUID or index)
+    py tools/build_collision.py 0688 0CD3 --ray-geometry
     py tools/build_collision.py --game <path to Overwatch.exe> --force
 
 The game is found from game_path.txt unless --game names it. Maps are done one at a time. The server
@@ -45,6 +49,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("maps", nargs="*", help="map GUIDs or indexes (hex); default: every hosted map")
     parser.add_argument("--game", help="Overwatch.exe or the game folder (default: game_path.txt)")
     parser.add_argument("--force", action="store_true", help="rebuild caches that exist")
+    parser.add_argument(
+        "--ray-geometry", action="store_true", help="build optional expanded static ray caches",
+    )
     args = parser.parse_args(argv)
     sys.stdout.reconfigure(errors="replace")  # map names such as Estadio das Ras in any console
     try:
@@ -57,18 +64,24 @@ def main(argv: list[str]) -> int:
         return 1
     storage = Storage(root)
     total_size = total_time = 0.0
-    built = 0
+    built = failed = 0
     for guid in map_guids(args.maps):
         name = map_name(guid) or f"0x{guid:X}"
-        path = collision.cache_path(guid)
-        if collision.cache_version(path) == collision.VERSION and not args.force:
+        if args.ray_geometry:
+            path = collision.ray_cache_path(guid)
+            ready = collision.ray_cache_ready(guid)
+        else:
+            path = collision.cache_path(guid)
+            ready = collision.cache_version(path) == collision.VERSION
+        if ready and not args.force:
             print(f"{name}: already built ({path.stat().st_size / 1e6:.2f} MB)")
             continue
         started = time.monotonic()
         try:
-            path = collision.build(guid, storage, name)
+            path = collision.build(guid, storage, name, ray_geometry=args.ray_geometry)
         except (CascError, collision.CollisionError, OSError) as error:
             print(f"{name}: failed: {error}")
+            failed += 1
             continue
         seconds = time.monotonic() - started
         size = path.stat().st_size
@@ -79,7 +92,7 @@ def main(argv: list[str]) -> int:
         total_time += seconds
         built += 1
     print(f"{built} map(s) built, {total_size / 1e6:.1f} MB in {total_time:.0f} s -> {collision.CACHE_DIR}")
-    return 0
+    return int(failed > 0)
 
 
 if __name__ == "__main__":

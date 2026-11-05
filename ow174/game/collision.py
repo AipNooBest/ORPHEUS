@@ -35,11 +35,13 @@ import logging
 import lzma
 import math
 import struct
+import tempfile
 import threading
 import time
 from array import array
 from collections import OrderedDict
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Protocol
 
@@ -58,6 +60,10 @@ CACHE_DIR = COLLISION_CACHE_DIR
 MAGIC = b"OW174COL"
 VERSION = 5  # 2: props with their identifiers; 3: no client-only breakables; 4: the engine's shapes;
 # 5: only the props' static shapes, at their nodes (props.static_part, props.at_node)
+RAY_GEOMETRY = "expanded-static-rays"
+RAY_PROP_SCOPE = "indexed-static-models"
+ALL_CATEGORIES = 0xFFFF  # original per-triangle and per-shape masks are u16
+MAX_CACHE_HEADER = 1 << 20
 CELL = 2.0  # metres per grid column
 CELL_CACHE = 1024  # columns kept as ready triangle lists
 LARGE = 4096  # a triangle over more columns than this is checked by every query instead
@@ -261,15 +267,33 @@ def cache_version(path: Path) -> int | None:
     return struct.unpack_from("<I", head, 8)[0] if len(head) == 12 and head[:8] == MAGIC else None
 
 
-def unpack(blob: bytes) -> tuple[dict, list, list, list, list]:
-    """(header, meshes, polytopes, models, placements) of a cache file."""
-    if blob[:8] != MAGIC:
+def _read_cache_header(file) -> dict:
+    head = file.read(16)
+    if len(head) != 16 or head[:8] != MAGIC:
         raise CollisionError("not a collision cache file")
-    version, length = struct.unpack_from("<II", blob, 8)
+    version, length = struct.unpack_from("<II", head, 8)
     if version != VERSION:
         raise CollisionError(f"cache version {version}, this server reads {VERSION}")
-    header = json.loads(blob[16 : 16 + length])
-    raw = _Reader(lzma.decompress(blob[16 + length :]))
+    if not 0 < length <= MAX_CACHE_HEADER:
+        raise CollisionError("invalid collision cache header length")
+    text = file.read(length)
+    if len(text) != length:
+        raise CollisionError("truncated collision cache header")
+    header = json.loads(text)
+    if not isinstance(header, dict):
+        raise CollisionError("invalid collision cache header")
+    return header
+
+
+def unpack(blob: bytes) -> tuple[dict, list, list, list, list]:
+    """(header, meshes, polytopes, models, placements) of a cache file."""
+    file = BytesIO(blob)
+    header = _read_cache_header(file)
+    return header, *_unpack_geometry(file.read(), header)
+
+
+def _unpack_geometry(payload: bytes, header: dict) -> tuple[list, list, list, list]:
+    raw = _Reader(lzma.decompress(payload))
     meshes = [raw.mesh(vertex_count, triangle_count) for vertex_count, triangle_count in header["meshes"]]
     hulls = [raw.hull() for _ in range(header["hulls"])]
     models = []
@@ -293,7 +317,7 @@ def unpack(blob: bytes) -> tuple[dict, list, list, list, list]:
     for _ in range(header["placements"]):
         model, group, *values = raw.get("IH10f")
         placements.append((model, group, tuple(values[0:3]), tuple(values[3:6]), tuple(values[6:10])))
-    return header, meshes, hulls, models, placements
+    return meshes, hulls, models, placements
 
 
 # ---- the engine's shapes of a map (contacts.py)
@@ -358,8 +382,10 @@ def engine_world(meshes, hulls, models=(), placements=(), groups=frozenset({0}))
     return contacts.StaticWorld(shapes)
 
 
-def probe_triangles(meshes, hulls, models=(), placements=(), groups=frozenset({0})) -> tuple:
-    """The triangles of the ground probe: (triangles as 9-tuples, masks, surfaces)."""
+def probe_triangles(
+    meshes, hulls, models=(), placements=(), groups=frozenset({0}), *, prop_surfaces=False,
+) -> tuple:
+    """The static query triangles as (9-tuples of vertices, masks, surfaces)."""
     triangles, masks, surfaces = [], array("H"), array("H")
     for vertices, records in meshes:
         for a, b, c, _w0, _w1, _w2, mask, surface in records:
@@ -376,12 +402,16 @@ def probe_triangles(meshes, hulls, models=(), placements=(), groups=frozenset({0
         if group not in groups:
             continue
         if model not in shapes:
-            shapes[model] = [triangle for shape in models[model] for triangle in props.shape_triangles(shape)]
-        for a, b, c, mask in shapes[model]:
+            shapes[model] = [
+                (*triangle, shape[3][i][-1] if prop_surfaces and shape[0] == "mesh" else 0)
+                for shape in models[model]
+                for i, triangle in enumerate(props.shape_triangles(shape))
+            ]
+        for a, b, c, mask, surface in shapes[model]:
             corners = [props.place(p, translation, scale, rotation) for p in (a, b, c)]
             triangles.append(tuple(axis for corner in corners for axis in corner))
             masks.append(mask)
-            surfaces.append(0)
+            surfaces.append(surface)
     return triangles, masks, surfaces
 
 
@@ -458,10 +488,10 @@ class RayHit:
     surface: int
 
 
-class World:
-    """Triangles on a grid of vertical columns."""
+class _TriangleScene:
+    """Shared triangle queries on a grid of vertical columns."""
 
-    def __init__(self, triangles, masks=None, surfaces=None, name: str = "", engine=None) -> None:
+    def __init__(self, triangles, masks=None, surfaces=None, name: str = "") -> None:
         self.name = name
         count = len(triangles)
         self.data = array("d")
@@ -499,20 +529,6 @@ class World:
                     column.append(number)
         self.lowest = lowest if count else 0.0
         self.large_tuples = [self._triangle(number) for number in self.large]  # shared by every column
-        if engine is None:  # loose triangles (stand-in worlds): one mesh
-            mesh = soup_mesh(triangles, self.masks, self.surfaces)
-            engine = contacts.StaticWorld([contacts.StaticShape(mesh)] if len(triangles) else [])
-        self.engine = engine
-
-    @classmethod
-    def load(cls, path: str | Path, identifiers: frozenset[int] = frozenset()) -> "World":
-        """A cache file's world for a game mode that keeps these placeable identifiers."""
-        header, meshes, hulls, models, placements = unpack(Path(path).read_bytes())
-        listed = [k + 1 for k, text in enumerate(header["identifiers"]) if int(text, 16) in identifiers]
-        groups = frozenset([0, *listed])
-        engine = engine_world(meshes, hulls, models, placements, groups)
-        triangles, masks, surfaces = probe_triangles(meshes, hulls, models, placements, groups)
-        return cls(triangles, masks, surfaces, header.get("name", ""), engine)
 
     def __len__(self) -> int:
         return len(self.masks)
@@ -614,6 +630,55 @@ class World:
         return RayHit(best, point, normal, triangle[MASK], triangle[SURFACE])
 
 
+def _placement_groups(header: dict, identifiers: frozenset[int]) -> frozenset[int]:
+    return frozenset([0, *(k + 1 for k, text in enumerate(header["identifiers"])
+                          if int(text, 16) in identifiers)])
+
+
+class World(_TriangleScene):
+    """A movement world with the static physics engine for character contacts."""
+
+    def __init__(self, triangles, masks=None, surfaces=None, name: str = "", engine=None) -> None:
+        super().__init__(triangles, masks, surfaces, name)
+        if engine is None:  # loose triangles (stand-in worlds): one mesh
+            mesh = soup_mesh(triangles, self.masks, self.surfaces)
+            engine = contacts.StaticWorld([contacts.StaticShape(mesh)] if len(triangles) else [])
+        self.engine = engine
+
+    @classmethod
+    def load(cls, path: str | Path, identifiers: frozenset[int] = frozenset()) -> "World":
+        """A cache file's movement world for a mode that keeps these placeable identifiers."""
+        with Path(path).open("rb") as file:
+            header = _read_cache_header(file)
+            if header.get("geometry") == RAY_GEOMETRY:
+                raise CollisionError("a ray geometry cache cannot be loaded as a movement world")
+            meshes, hulls, models, placements = _unpack_geometry(file.read(), header)
+        groups = _placement_groups(header, identifiers)
+        engine = engine_world(meshes, hulls, models, placements, groups)
+        triangles, masks, surfaces = probe_triangles(meshes, hulls, models, placements, groups)
+        return cls(triangles, masks, surfaces, header.get("name", ""), engine)
+
+
+class RayWorld(_TriangleScene):
+    """Explicit static query geometry from the core chunk and indexed static props."""
+
+    @classmethod
+    def load(cls, map_guid: int, mode: int | None = None) -> "RayWorld":
+        """Load an expanded cache or report it unavailable before any query can return a miss."""
+        try:
+            with ray_cache_path(map_guid).open("rb") as file:
+                header = _read_cache_header(file)
+                _check_ray_header(header, map_guid)
+                meshes, hulls, models, placements = _unpack_geometry(file.read(), header)
+        except FileNotFoundError as error:
+            raise CollisionError(f"no expanded ray geometry for map {map_guid:#x}") from error
+        groups = _placement_groups(header, props.mode_identifiers(mode))
+        triangles, masks, surfaces = probe_triangles(
+            meshes, hulls, models, placements, groups, prop_surfaces=True,
+        )
+        return cls(triangles, masks, surfaces, header.get("name", ""))
+
+
 def _ray_triangle(ox, oy, oz, dx, dy, dz, t) -> float | None:
     """Moeller-Trumbore intersection, both sides."""
     ax, ay, az = t[AX], t[AY], t[AZ]
@@ -672,6 +737,34 @@ def cache_path(map_guid: int) -> Path:
     return CACHE_DIR / f"{map_guid & 0xFFFFFFFF:04X}.col"
 
 
+def ray_cache_path(map_guid: int) -> Path:
+    return cache_path(map_guid).with_suffix(".rays.col")
+
+
+def _check_ray_header(header: dict, map_guid: int) -> None:
+    key = collision_keys().get(map_guid)
+    if (
+        not key
+        or header.get("geometry") != RAY_GEOMETRY
+        or header.get("category_mask") != ALL_CATEGORIES
+        or header.get("prop_scope") != RAY_PROP_SCOPE
+        or header.get("map") != f"0x{map_guid:016X}"
+        or header.get("chunk") != f"0x{chunk_guid(map_guid):016X}"
+        or header.get("ckey") != key["ckey"]
+    ):
+        raise CollisionError(f"expanded ray geometry does not match map {map_guid:#x}")
+
+
+def ray_cache_ready(map_guid: int) -> bool:
+    """Whether the side cache header identifies the expected expanded geometry."""
+    try:
+        with ray_cache_path(map_guid).open("rb") as file:
+            _check_ray_header(_read_cache_header(file), map_guid)
+    except (OSError, CollisionError, ValueError):
+        return False
+    return True
+
+
 def installed_game() -> Path | None:
     """The game install the player picked on the first start (game_path.txt), if it has its data."""
     if not GAME_PATH_FILE.is_file():
@@ -682,16 +775,17 @@ def installed_game() -> Path | None:
         return None
 
 
-def build(map_guid: int, storage: Storage, name: str = "") -> Path:
+def build(map_guid: int, storage: Storage, name: str = "", *, ray_geometry: bool = False) -> Path:
     """Read a map's collision chunk and its props from the game and write its cache file; returns the
     path."""
     keys = collision_keys().get(map_guid)
     if keys is None:
         raise CollisionError(f"no collision chunk known for map {map_guid:#x}")
     data = storage.read_record(keys)
-    meshes, hulls = parse_chunk(data)
+    category = ALL_CATEGORIES if ray_geometry else MOVER
+    meshes, hulls = parse_chunk(data, category)
     try:
-        models, placed = props.map_shapes(map_guid, storage.read_record)
+        models, placed = props.map_shapes(map_guid, storage.read_record, category)
     except (props.PropError, struct.error, IndexError, KeyError) as error:
         raise CollisionError(f"the props of map {map_guid:#x}: {error}") from error
     identifiers = sorted({identifier for _, identifier, *_ in placed if identifier})
@@ -705,12 +799,18 @@ def build(map_guid: int, storage: Storage, name: str = "") -> Path:
         "ckey": keys["ckey"],
         "props": len(placements),
     }
+    if ray_geometry:
+        source.update(geometry=RAY_GEOMETRY, category_mask=category, prop_scope=RAY_PROP_SCOPE)
     blob = pack(name, meshes, hulls, source, models, placements, identifiers)
-    path = cache_path(map_guid)
+    path = ray_cache_path(map_guid) if ray_geometry else cache_path(map_guid)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_bytes(blob)
-    temporary.replace(path)
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".tmp", delete=False) as file:
+        temporary = Path(file.name)
+    try:
+        temporary.write_bytes(blob)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return path
 
 

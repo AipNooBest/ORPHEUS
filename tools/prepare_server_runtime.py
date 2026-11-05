@@ -34,6 +34,10 @@ def prepare(source: Path, destination: Path, maps: list[str], *, game_graphs: Pa
     if not caches:
         raise ValueError("No prepared collision caches were found")
     inputs.update({f"collision/{path.name}": path for path in caches})
+    for path in caches:
+        rays = path.with_suffix(".rays.col")
+        if rays.is_file():
+            inputs[f"collision/{rays.name}"] = rays
     missing = [name for name, path in inputs.items() if not path.is_file()]
     if missing:
         raise ValueError("Missing runtime inputs: " + ", ".join(missing))

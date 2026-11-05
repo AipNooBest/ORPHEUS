@@ -40,6 +40,7 @@ jobs:
             'test_game_commands.py',
             'test_game_link.py',
             'test_collision_ray.py',
+            'test_collision_ray_cache.py',
             'test_replay_values.py',
             'test_casc_bundle.py',
             'test_script_expr_budget.py',
