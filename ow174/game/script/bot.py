@@ -1,11 +1,10 @@
 """The NPC body's statescript, shared by all observers."""
 
 from ow174.game import observers
-from ow174.game.bits import BitWriter
 from ow174.game.bots import FIRING
 from ow174.game.content import PRACTICE_RANGE_MODE
 from ow174.game.script import expr, graph, runtime
-from ow174.game.script.driver import OWNER_HEALTH, BodyStream, ReplicatedBody, Snapshot, create_initial_graphs
+from ow174.game.script.driver import OWNER_HEALTH, ReplicatedBody, Snapshot, create_initial_graphs
 
 DIED = 0x024000000000003E  # 003E.025, the body's authoritative death message
 RESET = 0x0240000000000013  # 0013.025, the placement's eligibility reset
@@ -13,7 +12,6 @@ FIRING_GRAPH = FIRING & 0xFFFF
 PRACTICE_NAMEPLATE_PARENT = 0x0C18
 PRACTICE_BOT_HEROES = frozenset(range(0x02E000000000016B, 0x02E000000000016F))
 PRACTICE_NAMEPLATE_FILTER = {"$": "STUConfigVarFilter", "m_84065FD1": 0x3FFFFFFF, "m_4EA686DB": 0x100}
-_Payload = tuple[BitWriter, Snapshot, set]
 
 
 class BotWorld(runtime.World):
@@ -107,20 +105,13 @@ class BotScript(ReplicatedBody):
             self.component.world.owner_position = expr.Vec3(*position)
         self.component.run_frame(frame)
         self._report_shots()
-        snapshot = observers.snapshot(self)
-        before = self._produced
-        if (
-            snapshot.instances == before.instances
-            and snapshot.vars == before.vars
-            and snapshot.states == before.states
-        ):
-            return None
-        self.initial = observers.full_frame(self, snapshot), snapshot
-        self._produced = snapshot
+        snapshot = self._changed_snapshot()
+        if snapshot is not None:
+            self.initial = observers.full_frame(self, snapshot), snapshot
         return snapshot
 
-    def die(self, frame: int, params: dict, sender: int) -> _Payload | None:
-        """Deliver 003E.025 and encode the change that happens immediately."""
+    def die(self, frame: int, params: dict, sender: int) -> Snapshot | None:
+        """Deliver 003E.025 and capture the change that happens immediately."""
         component = self.component
         if component.owner_dead:
             return None
@@ -141,9 +132,9 @@ class BotScript(ReplicatedBody):
             return None
         component.run_now()
         self.death_frame = frame
-        return self._delta()
+        return self._changed_snapshot()
 
-    def advance_death(self, frame: int, lifetime_ticks: int) -> list[_Payload]:
+    def advance_death(self, frame: int, lifetime_ticks: int) -> list[Snapshot]:
         """Run due graph events within this death's lifetime and retain each frame's change in order."""
         if self.death_frame is None:
             return []
@@ -156,16 +147,19 @@ class BotScript(ReplicatedBody):
                 break
             self.frame = due_frame
             component.run_frame(due_frame)
-            payload = self._delta()
+            payload = self._changed_snapshot()
             if payload is not None:
                 payloads.append(payload)
         return payloads
 
-    def _delta(self) -> _Payload | None:
+    def _changed_snapshot(self) -> Snapshot | None:
         snapshot = observers.snapshot(self)
-        base = BodyStream(self.component.entity)
-        base.base = self._produced
-        delta, keys = observers.delta(self, base, snapshot)
-        if delta is not None:
-            self._produced = snapshot
-            return delta, snapshot, keys
+        before = self._produced
+        if (
+            snapshot.instances == before.instances
+            and snapshot.vars == before.vars
+            and snapshot.states == before.states
+        ):
+            return None
+        self._produced = snapshot
+        return snapshot

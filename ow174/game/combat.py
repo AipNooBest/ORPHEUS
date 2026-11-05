@@ -55,7 +55,7 @@ from ow174.game.bits import BitWriter
 from ow174.game.collision import AX, AY, AZ, BX, BY, BZ, CELL, CX, CY, CZ, MASK, MOVER, NUMBER
 from ow174.game.commands import Command
 from ow174.game.mover import mover_data
-from ow174.game.script import expr, graph, runtime
+from ow174.game.script import expr, graph, nodes, runtime
 from ow174.game.script.bot import DIED, BotScript
 from ow174.game.script.driver import Snapshot
 from ow174.game.statescript import InstanceWire, StateWire, remote_full_frame
@@ -235,6 +235,7 @@ class Vitals:
         self.ids[HEALTH_POOL] = pool_id
         self.changed: set[int] = set()  # pools that changed since the last update went out
         self.died_at: float | None = None
+        self.death_tick: int | None = None
         self.killer: int | None = None
 
     @property
@@ -426,6 +427,14 @@ class Combat:
     def is_dead(self, player) -> bool:
         vitals = self.vitals.get(player.body) if player.has_body else None
         return vitals is not None and vitals.dead
+
+    def kill_feed_allowed(self, viewer, entity: int) -> bool:
+        """First playback waits for the mode UI and uses the death's world clock."""
+        vitals = self.vitals.get(entity)
+        if not viewer.mode_script.delivered or vitals is None or vitals.death_tick is None:
+            return False
+        age = (self.match.tick - vitals.death_tick) * TICK * 1000
+        return 0 <= age <= nodes.ClientOnlyPulser.FRESH_MS
 
     def retire_player_body(self, player) -> None:
         """Discard the old body's health, history and respawn when its lifetime ends."""
@@ -808,6 +817,7 @@ class Combat:
         if killed:
             vitals.now[HEALTH_POOL] = 0.0
             vitals.died_at = self.now
+            vitals.death_tick = self.match.tick if world_tick is None else world_tick
             vitals.killer = _source_entity(shooter)
         if not isinstance(shooter, bots.Bot):
             flags = (CRITICAL if critical else 0) | (KILLING if killed else 0)
@@ -816,8 +826,7 @@ class Combat:
         victim = target.owner
         if killed and isinstance(victim, bots.Bot):
             # The NPC death script owns its terminal health change and death event ordering.
-            tick = self.match.tick if world_tick is None else world_tick
-            self._bot_died(shooter, victim, critical, loadout, tick)
+            self._bot_died(shooter, victim, critical, loadout, vitals.death_tick)
             return
         self._sync_body_health(victim, vitals)
         if killed:

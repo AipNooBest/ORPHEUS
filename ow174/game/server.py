@@ -141,16 +141,14 @@ class OpenMatch:
     started: float  # time.time() of its creation
 
 
-_BotDeathPayload = tuple[BitWriter, Snapshot, set]
-
-
 @dataclass
 class _BotScriptDelivery:
     stream: BodyStream
     source: object
     live: Snapshot | None = None  # newest snapshot waiting behind an unacknowledged frame
     volleys: deque[_ObservedProjectile] = field(default_factory=deque)
-    death_frames: deque[_BotDeathPayload] | None = None  # None until this viewer is registered for death
+    death_frames: deque[Snapshot] | None = None  # None until this viewer is registered for death
+    death_snapshot: Snapshot | None = None  # latest terminal state for a deferred feed pulse
 
 
 class Client:
@@ -298,7 +296,7 @@ class Client:
         if first and self.player.client is self:
             self._flush_bot_frames(script)
 
-    def queue_bot_death(self, entity: int, payload: _BotDeathPayload | None) -> None:
+    def queue_bot_death(self, entity: int, payload: Snapshot | None) -> None:
         """Register this lifetime's death, even when the first statescript changes are delayed."""
         script = self._bot_scripts.get(entity)
         if script is None or entity in self._body_destroy_wait or script.death_frames is not None:
@@ -306,7 +304,7 @@ class Client:
         script.death_frames = deque() if payload is None else deque([payload])
         self._flush_bot_frames(script)
 
-    def queue_bot_death_update(self, entity: int, payload: _BotDeathPayload) -> None:
+    def queue_bot_death_update(self, entity: int, payload: Snapshot) -> None:
         """Queue a continuation for a viewer already registered for this death."""
         script = self._bot_scripts.get(entity)
         if script is None or entity in self._body_destroy_wait or script.death_frames is None:
@@ -338,20 +336,34 @@ class Client:
                     states.pop(key, None)
             states[delivery.volley_key] = delivery.activation
             snapshot = replace(latest, states=states)
-            frame, keys = observers.delta(script.source, stream, snapshot)
-            if frame is not None:
-                self._queue_bot_frame(stream, frame, snapshot, keys)
+            self._queue_bot_snapshot(script, snapshot)
             return
         if script.live is not None:
             snapshot = script.live
             script.live = None
-            frame, keys = observers.delta(script.source, stream, snapshot)
-            if frame is not None:
-                self._queue_bot_frame(stream, frame, snapshot, keys)
+            if self._queue_bot_snapshot(script, snapshot):
                 return
-        frames = script.death_frames
-        if frames:
-            self._queue_bot_frame(stream, *frames.popleft())
+        if script.death_frames:
+            while script.death_frames:
+                snapshot = script.death_snapshot = script.death_frames.popleft()
+                if self._queue_bot_death_snapshot(script, snapshot):
+                    return
+        elif script.death_snapshot is not None:
+            self._queue_bot_death_snapshot(script, script.death_snapshot)
+
+    def _queue_bot_death_snapshot(self, script: _BotScriptDelivery, snapshot: Snapshot) -> bool:
+        stream = script.stream
+        allowed = self.player.match.combat.kill_feed_allowed(self.player, stream.entity)
+        snapshot = stream.kill_feed_snapshot(snapshot, allowed=allowed)
+        return self._queue_bot_snapshot(script, snapshot)
+
+    def _queue_bot_snapshot(self, script: _BotScriptDelivery, snapshot: Snapshot) -> bool:
+        stream = script.stream
+        frame, keys = observers.delta(script.source, stream, snapshot)
+        if frame is None:
+            return False
+        self._queue_bot_frame(stream, frame, snapshot, keys)
+        return True
 
     def _queue_bot_frame(self, stream, frame, snapshot, keys) -> None:
         # The next frame depends on this baseline even when this datagram is lost.
@@ -614,11 +626,18 @@ class Client:
                     elif self._bot_health.get(item.entity) is item:
                         del self._bot_health[item.entity]
                     if item.stream is not None:
+                        first_mode = (
+                            item.entity == world.GAME_MODE_ENTITY
+                            and item.stream is self.player.mode_script
+                            and not item.stream.delivered
+                        )
                         item.stream.arrived(item.chunk_last)
-                        if (item.entity == world.GAME_MODE_ENTITY
-                                and item.stream is self.player.mode_script and item.stream.delivered):
+                        if first_mode and item.stream.delivered:
                             while self._mode_notices:
                                 self._promote_combat_notice(*self._mode_notices.popleft())
+                            for bot_delivery in self._bot_scripts.values():
+                                if bot_delivery.death_frames is not None:
+                                    self._flush_bot_frames(bot_delivery)
                         script = self._bot_scripts.get(item.entity)
                         if script is not None and item.stream is script.stream:
                             self._flush_bot_frames(script)

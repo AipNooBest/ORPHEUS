@@ -21,7 +21,7 @@ chunks sent after it carried (the client may have applied them), so a lost datag
 
 import logging
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from ow174.game import pools
@@ -66,6 +66,7 @@ SETTLE_FRAMES = 16  # 0.25 s after the first owner frame, before the first C = 1
 MAX_GAP = 256  # command frames run at most to catch up
 MAX_SHOTS = 256  # shots kept on the component's list for combat.py
 MAX_REPORTS = 128  # owner frames kept on the reports list for projectiles.py
+KILL_FEED_PULSERS = {0x01CF: 108, 0x0C18: 8}  # their client-only plug posts 0765.025 to the mode UI
 EDGE_BITS = (  # command button bit -> logical button, in the client's order (0x7FF789C66AA0)
     (0x40, 11), (0x80, 12), (0x01, 20), (0x02, 29), (0x08, 35), (0x10, 36), (0x20, 37), (0x04, 30),
     (0x800, 31), (0x400, 14), (0x01, 111), (0x02, 112), (0x04, 113), (0x08, 114), (0x10, 110), (0x20, 116),
@@ -397,10 +398,14 @@ class BodyScript(ReplicatedBody):
             base.vars[(owner, var)] = (value, ())
         return body_full_frame(list(wires.values()), entity_vars, graphs), base
 
-    def delta(self, base: Snapshot, touched: set, cmfd: int, correction: bool):
+    def delta(
+        self, base: Snapshot, touched: set, cmfd: int, correction: bool, *, kill_feed: bool | None = None,
+    ):
         """An owner delta at CmFD from `base`; `touched` are the keys sent since `base`. Returns the frame,
         the keys it carries and the snapshot it leaves the client with."""
         snap = self.snapshot()
+        if kill_feed is not None:
+            snap = self.stream.kill_feed_snapshot(snap, allowed=kill_feed)
         graphs = self.graphs()
         wires: dict[int, InstanceWire] = {}
 
@@ -501,7 +506,7 @@ class BodyScript(ReplicatedBody):
         frame, base = self.tree_frame()
         return [self.stream.full(frame, base)]
 
-    def frames(self) -> list:
+    def frames(self, *, kill_feed: bool | None = None) -> list:
         """This tick's body frames: the full frame once the body's create arrived (see `created`), the first
         owner frame (C = 0) once the full frame arrived, then, after SETTLE_FRAMES, a C = 1 frame whenever the
         client's command frame moved on."""
@@ -520,7 +525,9 @@ class BodyScript(ReplicatedBody):
             return []
         else:
             correction = True
-        frame, keys, snap = self.delta(stream.base, stream.touched(), self.frame, correction)
+        frame, keys, snap = self.delta(
+            stream.base, stream.touched(), self.frame, correction, kill_feed=kill_feed,
+        )
         update = stream.delta(frame, snap, keys, self.frame)
         self.report_count += 1
         self.reports.append((self.report_count, self.frame, stream.last, keys))
@@ -614,6 +621,38 @@ class BodyStream:
         for _, keys in self.pending.values():
             found |= keys
         return found
+
+    def kill_feed_snapshot(self, snap: Snapshot, *, allowed: bool) -> Snapshot:
+        """Gate the first new death pulse and keep its wire value until acknowledged."""
+        pending = self.pending[self.last][0] if self.pending else None
+        states = None
+        for owner, (graph_index, _) in snap.instances.items():
+            index = KILL_FEED_PULSERS.get(graph_index)
+            if index is None:
+                continue
+            key = (owner, index)
+            before = self.base.states.get(key) if self.base is not None else None
+            sent = pending.states.get(key) if pending is not None else None
+            current = snap.states.get(key)
+            count = dict(before[2])["count"] if before is not None and before[1] else None
+            current_count = dict(current[2])["count"] if current is not None and current[1] else None
+            if sent is not None and sent[1] and dict(sent[2])["count"] != count:
+                value = sent
+            elif current_count is not None and current_count != count:
+                value = before
+                if allowed:
+                    value = (current[0], True, (("count", current_count), ("fresh", True)))
+            else:
+                continue
+            if value == current:
+                continue
+            if states is None:
+                states = dict(snap.states)
+            if value is None:
+                del states[key]
+            else:
+                states[key] = value
+        return snap if states is None else replace(snap, states=states)
 
     def arrived(self, last: int) -> None:
         """The client acknowledged the datagram with the chunk that ends at `last`."""

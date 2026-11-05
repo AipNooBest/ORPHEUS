@@ -149,7 +149,8 @@ def delta(script, stream: BodyStream, snap: Snapshot):
         if now == was and key not in touched_states:
             continue
         if now is None:
-            cls = graphs[owner].states[index].cls
+            owner_graph = graphs.get(owner) or graph.graph(snap.instances[owner][0])
+            cls = owner_graph.states[index].cls
             if cls in stec_classes():
                 continue  # it never reached the client as on
             state = StateWire(cls, False)
@@ -257,6 +258,9 @@ class Observers:
         script = other.body_script
         stream = watch.stream
         tick = self.match.tick
+        if self.match.combat.is_dead(other):
+            allowed = self.match.combat.kill_feed_allowed(viewer, other.body)
+            snap = stream.kill_feed_snapshot(snap, allowed=allowed)
         if not stream.last:
             update = stream.full(full_frame(script, snap), snap)
             viewer.client.queue_entities([update])

@@ -1,5 +1,6 @@
 """Bot statescript delivery through the encrypted Client path and a modeled peer."""
 
+import struct
 import unittest
 from unittest.mock import patch
 
@@ -9,19 +10,20 @@ from test_game_packet_budget import connection, decoded
 from test_game_projectiles import ABILITY_2
 from test_game_repeated_lifecycles import wire_frame
 
-from ow174.game import bodytrace, bots, combat, movelog, projectiles, statescript, world
+from ow174.game import bodytrace, bots, combat, movelog, observers, projectiles, statescript, world
 from ow174.game.body_vm_snapshot import export_component_vm
 from ow174.game.content import PRACTICE_RANGE_MODE, SOLDIER
 from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
-from ow174.game.script import decode, graph, runtime
+from ow174.game.script import decode, expr, graph, runtime
 from ow174.game.script.bot import DIED, FIRING_GRAPH, RESET, BotScript, BotWorld
-from ow174.game.script.driver import OWNER_HEALTH, Snapshot
+from ow174.game.script.driver import OWNER_HEALTH, BodyStream, Snapshot
 from ow174.game.server import BOT_DESTROY_GRACE_TICKS, Client
 
 GRAPH = 0xF0FE
 PULSER = "STU_B9898052"
 PULSE_KEY = (1, 0)
 LIVE_VAR = 32
+FEED_GRAPH, FEED_STATE, FEED_KILLER = 0x0C18, 8, 392
 
 
 class AIFireWeaponTests(unittest.TestCase):
@@ -110,7 +112,7 @@ class AIFireWeaponTests(unittest.TestCase):
             self.assertNotIn((ai.id, LIVE_VAR), snapshot.vars)
 
             script.component.edges([(20, True)])
-            death, final, _ = script.die(101, {}, 0xA0000101)
+            final = script.die(101, {}, 0xA0000101)
             self.assertTrue(script.component.owner_dead)
             self.assertIsNone(script.behavior)
             self.assertTrue(ai.stopped)
@@ -118,6 +120,9 @@ class AIFireWeaponTests(unittest.TestCase):
             self.assertFalse(script.component.held)
             self.assertFalse(script.component.shots)
             self.assertNotIn((1, 1), final.states)
+            stream = BodyStream(script.component.entity)
+            stream.base = snapshot
+            death, _ = observers.delta(script, stream, final)
             chunk = statescript.chunk(death, 2, 0)
             decoded = decode.read_chunk(chunk.getvalue(), chunk.count, {1: GRAPH})
             self.assertEqual(tuple(decoded.instances), (1,))
@@ -191,25 +196,25 @@ class SyntheticScript:
     def __init__(self, graph):
         self.graph = graph
         self.deaths = []
-        self.initial = self.frame(0, full=True)
+        self.initial = self.frame()
 
     def graphs(self):
         return {1: self.graph}
 
-    def frame(self, count, *, full, tick=0, live=None):
-        payload = {"fresh": count > 0, "count": count}
+    def snapshot(self, count, tick=0, live=None):
+        payload = (("count", count), ("fresh", count > 0))
         variables = {} if live is None else {LIVE_VAR: (live, ())}
-        snap = Snapshot(
+        return Snapshot(
             tick, instances={1: (GRAPH, None)}, states={PULSE_KEY: (PULSER, True, payload)},
             vars={(1, var): value for var, value in variables.items()},
         )
-        state = statescript.StateWire(PULSER, True, payload)
-        item = statescript.InstanceWire(1, self.graph, vars=variables, states={0: state})
-        encode = statescript.remote_full_frame if full else statescript.remote_delta
-        return encode([item], {}, self.graphs()), snap
+
+    def frame(self, *, tick=0, live=None):
+        snap = self.snapshot(0, tick, live)
+        return observers.full_frame(self, snap), snap
 
     def live(self, value, tick):
-        self.initial = self.frame(0, full=True, tick=tick, live=value)
+        self.initial = self.frame(tick=tick, live=value)
         return self.initial[1]
 
     def die(self, frame, params, sender):
@@ -217,9 +222,9 @@ class SyntheticScript:
         return self.delta(len(self.deaths), frame)
 
     def delta(self, count, frame):
-        data, snap = self.frame(count, full=False, tick=frame)
+        snap = self.snapshot(count, frame)
         snap.vars.update(self.initial[1].vars)
-        return data, snap, {("state", *PULSE_KEY)}
+        return snap
 
     def advance_death(self, frame, lifetime_ticks):
         return ()
@@ -256,6 +261,7 @@ class WirePeer:
         self.seq = 0
         self.models = {}
         self.pulses = []
+        self.feed_pulses = []
 
     def receive(self, packet, records):
         if not self.window.accept(packet.seq):
@@ -274,9 +280,16 @@ class WirePeer:
             if not frame.full and frame.first > model.applied + 1:
                 raise AssertionError("a bot delta arrived before the receiver's baseline")
             model.apply(record)
-            pulse = frame.instances[1].states.get(0)
-            if pulse is not None and pulse[0] and pulse[1].get("fresh"):
-                self.pulses.append((record.entity, frame.last, pulse[1]["count"]))
+            for instance in frame.instances.values():
+                if instance.graph == GRAPH:
+                    state, pulses = 0, self.pulses
+                elif instance.graph == FEED_GRAPH:
+                    state, pulses = FEED_STATE, self.feed_pulses
+                else:
+                    continue
+                pulse = instance.states.get(state)
+                if pulse is not None and pulse[0] and pulse[1].get("fresh"):
+                    pulses.append((record.entity, frame.last, pulse[1]["count"]))
 
     def ack(self):
         packet = Packet(
@@ -409,6 +422,137 @@ class BotStatescriptTests(unittest.TestCase):
     def advance_combat(self, now, tick):
         self.tick = self.match.tick = tick
         self.match.combat.update(now, tick, frames=False)
+
+    def install_kill_feed_bot(self):
+        def death_graph(index, state, params=(), variables=()):
+            entry = node(0, "STUStatescriptEntryGameMessage", fields={
+                "m_gameMessage": {"$": "STUConfigVarGameMessage", "m_gameMessage": f"0x{DIED:016X}"},
+                "m_params": list(params),
+                "m_outPlug": output([1, "m_beginPlug"]),
+            })
+            return make_graph(index, [entry, node(1, PULSER, state=state, remote=0)],
+                              states=[None] * state + [1], remote=[1], entries=[0], variables=variables)
+
+        killer = {"m_B5051BCE": "0x0A40000000000012", "m_out_Var": {
+            "$": "STUConfigVarDynamic", "m_identifier": FEED_KILLER,
+        }}
+        feed = death_graph(FEED_GRAPH, FEED_STATE, (killer,), ((FEED_KILLER, 0, 1),))
+        ordinary = death_graph(GRAPH, 0)
+        definitions = {feed.index: feed, ordinary.index: ordinary}
+        original_graph, original_decode = graph.graph, decode.graph_of
+        load = patch.object(graph, "graph", lambda index: definitions.get(index) or original_graph(index))
+        read = patch.object(
+            decode, "graph_of", lambda index: definitions.get(index) or original_decode(index),
+        )
+        for edit in (load, read):
+            edit.start()
+            self.addCleanup(edit.stop)
+        with patch.object(graph, "entity_body", return_value={"graphs": [{"graph": i} for i in definitions]}):
+            self.bot.body_script = BotScript(
+                self.bot.body, self.bot.hero, self.bot.entity, self.tick, self.match.game_map.mode_guid,
+                self.bot.health,
+            )
+
+        watcher = self.watching_peer
+        watcher.client._mode_create_acked = False
+        watcher.client.player.mode_script.delivered = 0
+        watcher.client.queue_entities([
+            world.EntityUpdate(world.GAME_MODE_ENTITY, world.OP_CREATE, self.match._game_mode_create),
+        ])
+        for peer in (self.shooting_peer, watcher):
+            self.show_bots(peer)
+            _, _, create = self.send(peer)
+            self.assertIn(self.bot.entity, self.entities(create, world.OP_CREATE))
+            peer.ack()
+            _, _, full = self.send(peer)
+            chunk = self.only_chunk(full, self.bot.entity)
+            frame = decode.read_chunk(chunk.getvalue(), chunk.count)
+            self.assertTrue(frame.full)
+            self.assertEqual({item.graph for item in frame.instances.values()}, set(definitions))
+            peer.ack()
+
+    def kill_feed_bot(self):
+        target = next(target for target in self.match.combat._targets() if target.owner is self.bot)
+        self.match.combat._damage(self.shooter, target, 200, False, None, self.tick)
+        self.match.combat._send_health()
+        self.assertEqual(self.bot.body_script.death_frame, self.tick)
+
+    def assert_terminal_health(self, records):
+        values = [
+            struct.unpack_from("<Iff", fields[51][0])[2]
+            for record, fields in records if record.entity == self.bot.entity and 51 in fields
+        ]
+        self.assertEqual(values, [0.0])
+
+    def test_kill_feed_pulse_waits_for_mode_ack_without_delaying_other_death_state(self):
+        self.install_kill_feed_bot()
+        shooter, watcher, old = self.shooting_peer, self.watching_peer, self.bot.entity
+        watcher.client.queue_mode_frame(combat.mode_frame({}))
+        _, _, lost_mode = self.send(watcher, receive=False)
+        mode = self.only_chunk(lost_mode, world.GAME_MODE_ENTITY)
+        self.kill_feed_bot()
+        death_tick = self.tick
+
+        _, _, immediate = self.send(watcher)
+        self.assert_terminal_health(immediate)
+        self.assertEqual(watcher.pulses, [(old, 2, 1)])
+        self.assertEqual(watcher.feed_pulses, [])
+        _, _, shooter_death = self.send(shooter)
+        self.assert_terminal_health(shooter_death)
+        self.assertEqual(shooter.pulses, [(old, 2, 1)])
+        self.assertEqual(shooter.feed_pulses, [(old, 2, 1)])
+
+        watcher.ack()
+        _, _, mode_retry = self.send(watcher)
+        self.assert_same_chunk(mode, self.only_chunk(mode_retry, world.GAME_MODE_ENTITY))
+        self.assertEqual(self.chunks(mode_retry, old), [])
+        watcher.ack()
+        watcher.ack()
+        _, _, lost_feed = self.send(watcher, receive=False)
+        lost = self.only_chunk(lost_feed, old)
+        self.tick = death_tick + 29  # The admitted pulse is still retryable after 500 ms.
+        _, _, gap = self.send(watcher)
+        self.assertEqual(self.chunks(gap, old), [])
+        watcher.ack()
+        _, _, feed = self.send(watcher)
+        chunk = self.only_chunk(feed, old)
+        self.assert_same_chunk(lost, chunk)
+        model = watcher.models[old]
+        frame = decode.read_chunk(chunk.getvalue(), chunk.count, model.graphs)
+        feed_id, = (number for number, index in model.graphs.items() if index == FEED_GRAPH)
+        self.assertEqual(model.vars[(feed_id, FEED_KILLER)], expr.Entity(self.shooter.body))
+        self.assertEqual(watcher.feed_pulses, [(old, frame.last, 1)])
+        self.assertEqual(watcher.pulses, [(old, 2, 1)])
+        watcher.ack()
+        _, _, after = self.send(watcher)
+        self.assertEqual(self.chunks(after, old), [])
+
+    def test_expired_kill_feed_pulse_is_not_released_by_a_late_mode_ack(self):
+        self.install_kill_feed_bot()
+        watcher, old = self.watching_peer, self.bot.entity
+        watcher.client.queue_mode_frame(combat.mode_frame({}))
+        _, _, mode = self.send(watcher)
+        self.only_chunk(mode, world.GAME_MODE_ENTITY)
+        self.kill_feed_bot()
+        death_tick = self.tick
+        _, _, immediate = self.send(watcher)
+        self.assert_terminal_health(immediate)
+        self.assertEqual(watcher.pulses, [(old, 2, 1)])
+        self.assertEqual(watcher.feed_pulses, [])
+
+        self.tick = death_tick + 29  # ACK arrives 32 ticks (512 ms) after death, before respawn.
+        self.send(watcher)
+        watcher.ack()
+        self.assertEqual(watcher.client.player.mode_script.delivered, 1)
+        _, _, after = self.send(watcher)
+        self.assertEqual(self.chunks(after, old), [])
+        self.assertIn(old, watcher.models)
+        self.assertEqual(watcher.feed_pulses, [])
+
+        self.respawn()
+        _, _, retired = self.send(watcher)
+        self.assertIn(old, self.entities(retired, world.OP_DESTROY))
+        self.assertEqual(self.chunks(retired, old), [])
 
     def test_initial_bot_scripts_are_prepared_one_per_update_before_world_spawn(self):
         batch = [bots.respawned(self.bot, self.bot.entity + offset, 0) for offset in range(3)]
@@ -619,7 +763,7 @@ class BotStatescriptTests(unittest.TestCase):
         peer.client.queue_bot_live(old, script.live(30.0, self.tick))
         self.kill_bot()
         fresh = self.respawn()
-        peer.client.queue_bot_live(old, script.frame(0, full=False, tick=self.tick, live=99.0)[1])
+        peer.client.queue_bot_live(old, script.snapshot(0, tick=self.tick, live=99.0))
         _, _, gap = self.send(peer)
         self.assertEqual(self.entities(gap, world.OP_CREATE), [fresh])
         self.assertNotIn(old, self.entities(gap, world.OP_DESTROY))

@@ -2,6 +2,7 @@
 
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -68,6 +69,43 @@ class ClientOnlyPulserTests(unittest.TestCase):
         self.assertFalse(wire.owner)
         self.assertEqual(wire.instances[instance.id].states[34], (True, {"fresh": False, "count": 1}))
 
+    def test_death_in_the_spawn_frame_uses_the_world_freshness_gate(self):
+        script = BodyScript(SOLDIER, BODY, START, ult_seconds=0)
+        instance = next(item for item in script.component.instances.values() if item.graph.index == 0x01CF)
+        known = {item: graph.index for item, graph in script.graphs().items()}
+        initial, = script.spawn_frames()
+        script.stream.arrived(initial.chunk_last)
+
+        script.set_health(0, 200)
+        params = {KILLER: expr.Entity(OTHER_BODY), CRIT: False, LOADOUT: None, ASSISTS: ()}
+        runtime.send_message(script.component, DIED, params, OTHER_BODY)
+        script.component.run_now()
+        self.assertEqual(instance.states[108].payload(), {"fresh": False, "count": 1})
+
+        update, = script.frames(kill_feed=True)
+        wire = read_chunk(update.chunk.getvalue(), update.chunk.count, known)
+        self.assertEqual(wire.instances[instance.id].states[108], (True, {"fresh": True, "count": 1}))
+
+    def test_old_observer_snapshot_can_clear_a_state_after_the_live_instance_is_gone(self):
+        script = BodyScript(SOLDIER, BODY, START, ult_seconds=0)
+        before = observers.snapshot(script)
+        owner = next(item for item, (index, _) in before.instances.items() if index == 0x01CF)
+        key = (owner, 108)
+        before.states[key] = ("STU_B9898052", True, (("count", 1), ("fresh", True)))
+        states = dict(before.states)
+        del states[key]
+        after = replace(before, states=states)
+        stream = BodyStream(BODY)
+        stream.base = before
+        known = {item: index for item, (index, _) in before.instances.items()}
+        live_graphs = {item: g for item, g in script.graphs().items() if item != owner}
+
+        with patch.object(script, "graphs", return_value=live_graphs):
+            frame, keys = observers.delta(script, stream, after)
+        update = stream.delta(frame, after, keys, 0)
+        wire = read_chunk(update.chunk.getvalue(), update.chunk.count, known)
+        self.assertEqual(wire.instances[owner].states[108], (False, {}))
+
     def test_bot_death_in_its_spawn_tick_is_fresh_after_the_initial_frame(self):
         # Use the available body lifecycle graph to exercise the same pulser
         # semantics with a real bot stream, without the external NPC graph pack.
@@ -80,7 +118,8 @@ class ClientOnlyPulserTests(unittest.TestCase):
         stream.arrived(full.chunk_last)
 
         params = {KILLER: expr.Entity(OTHER_BODY), CRIT: False, LOADOUT: None, ASSISTS: ()}
-        frame, snapshot, keys = script.die(START, params, OTHER_BODY)
+        snapshot = script.die(START, params, OTHER_BODY)
+        frame, keys = observers.delta(script, stream, snapshot)
         chunk = stream.delta(frame, snapshot, keys, 0).chunk
         wire = read_chunk(chunk.getvalue(), chunk.count, known)
         feed = next(item for item in wire.instances.values() if item.graph == 0x01CF)

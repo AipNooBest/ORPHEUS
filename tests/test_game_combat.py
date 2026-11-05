@@ -10,17 +10,17 @@ from test_game_graph_analysis import make_graph, node, output
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ow174.game import bots, combat, observers, stats, world
+from ow174.game import bodytrace, bots, combat, movelog, observers, stats, world
 from ow174.game.bits import BitReader, BitWriter
 from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.combat import Combat, HitDef, Target, Vitals
 from ow174.game.commands import FIRE, SUBFRAME, Command, read_commands
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
 from ow174.game.match import Match
-from ow174.game.script import expr, graph, runtime
+from ow174.game.script import expr, graph, nodes, runtime
 from ow174.game.script.bot import BotScript
 from ow174.game.script.decode import read_chunk
-from ow174.game.script.driver import BodyStream
+from ow174.game.script.driver import HUD_HEALTH, BodyStream
 from ow174.game.statescript import chunk
 from ow174.game.world import ARMOUR_POOL, HEALTH_POOL, SHIELDS_POOL
 
@@ -612,6 +612,168 @@ class DeathTests(unittest.TestCase):
         fight.update(101.0 + delay, 1250, frames=False)
         self.assertNotEqual(self.b.body, current)
         self.assertFalse(fight.is_dead(self.b))
+
+
+class PlayerDeathModeTests(unittest.TestCase):
+    def test_first_player_death_pulse_waits_for_mode_baseline_on_both_streams(self):
+        # The protocol harness imports this module through the projectile fixture.
+        from test_game_repeated_lifecycles import ModelLink, ProtocolHarness, wire_frame
+        from test_game_server import pick
+
+        from ow174.game.link import KIND_FRAME
+        from ow174.game.server import Client
+
+        for diagnostics in (bodytrace, movelog):
+            edit = patch.object(diagnostics, "ENABLED", False)
+            edit.start()
+            self.addCleanup(edit.stop)
+        run = ProtocolHarness()
+        self.addCleanup(run.close)
+        handoffs = run.server.create_match(
+            PRACTICE_RANGE, [(1, "Observer", SOLDIER, 0, False), (2, "Victim", SOLDIER, 0, False)]
+        )
+        match, = run.server.matches
+        match.bots.clear()
+        match._pending_bot_scripts.clear()
+        # Stage the original mode baseline after the healthy body streams are established.
+        # The subsequent frame encoding, loss, retransmission and ACKs are the production link.
+        staged = {}
+
+        def stage_mode(client, frame):
+            staged[client] = frame
+
+        with patch.object(Client, "queue_mode_frame", stage_mode):
+            (observer_link, observer), (owner_link, victim) = [run.connect(handoff) for handoff in handoffs]
+        for link, player in ((observer_link, observer), (owner_link, victim)):
+            run.message(link, 21616, pick(player.entity, SOLDIER))
+        fight = match.combat
+        body = victim.body
+        run.until(lambda: victim.body_script.stream.base is not None and fight.observers.has(observer, body))
+        for _ in range(24):
+            run.command(owner_link)
+            run.step()
+        views = ((owner_link, victim, True), (observer_link, observer, False))
+        links = (owner_link, observer_link)
+        for _, player, _ in views:
+            self.assertEqual(player.mode_script.delivered, 0)
+            player.client.queue_mode_frame(staged[player.client])
+
+        lost = {}
+        original_apply = ModelLink.apply
+
+        def mode_chunks(records):
+            return [
+                item.chunk for item in records
+                if item.entity == world.GAME_MODE_ENTITY and item.chunk is not None
+            ]
+
+        def received_mode(link):
+            return mode_chunks(item for _, item in link.records)
+
+        def lose_first_mode(link, packet):
+            if link in links and link not in lost and packet.kind == KIND_FRAME:
+                _, records = wire_frame(packet)
+                chunks = mode_chunks(item for item, _ in records)
+                if chunks:
+                    initial, = chunks
+                    lost[link] = (initial.getvalue(), initial.count)
+                    return
+            original_apply(link, packet)
+
+        with patch.object(ModelLink, "apply", lose_first_mode):
+            run.until(lambda: len(lost) == len(links), ack_except=links, limit=12)
+
+        feed_ids = {
+            link: next(index for index, graph_id in link.models[body].graphs.items() if graph_id == 0x01CF)
+            for link in links
+        }
+        cursors = {link: len(link.chunks) for link in links}
+
+        def active_pulse(link, frame):
+            feed = frame.instances.get(feed_ids[link])
+            state = feed.states.get(108) if feed is not None else None
+            return state if state is not None and state[0] else None
+
+        def pulses(link):
+            return [
+                (frame.owner, state)
+                for _, entity, frame in link.chunks[cursors[link]:]
+                if entity == body and (state := active_pulse(link, frame)) is not None
+            ]
+
+        target = next(target for target in fight._targets() if target.owner is victim)
+        loadout = 0x09E000000000008D
+        death_tick = match.tick
+        fight._damage(observer, target, 200.0, True, loadout, death_tick)
+        run.command(owner_link)
+        run.until(
+            lambda: all(link.models[body].vars.get((0, HUD_HEALTH)) == 0.0 for link in links),
+            ack_except=links, limit=12,
+        )
+        for link, player, owner in views:
+            with self.subTest(owner=owner, phase="mode missing"):
+                self.assertEqual(player.mode_script.delivered, 0)
+                self.assertEqual(received_mode(link), [])
+                self.assertIn((feed_ids[link], 12), link.models[body].on())  # the terminal graph still runs
+                self.assertEqual(pulses(link), [])
+
+        # Report loss of the mode packet while ACKing terminal body data. The mode retry
+        # must retain the original bytes and only its positive ACK opens the gate.
+        for link in links:
+            cursors[link] = len(link.chunks)
+            run.send(link)
+        run.until(lambda: all(received_mode(link) for link in links), ack_except=links, limit=12)
+        for link, player, owner in views:
+            with self.subTest(owner=owner, phase="mode received without ACK"):
+                retry, = received_mode(link)
+                self.assertEqual((retry.getvalue(), retry.count), lost[link])
+                self.assertEqual(player.mode_script.delivered, 0)
+                self.assertEqual(pulses(link), [])
+            run.send(link)
+
+        lost_pulses = {}
+
+        def lose_pulses(link, packet):
+            if link in links and packet.kind == KIND_FRAME:
+                _, records = wire_frame(packet)
+                for record, _ in records:
+                    if record.entity != body or record.chunk is None:
+                        continue
+                    frame = read_chunk(record.chunk.getvalue(), record.chunk.count, link.models[body].graphs)
+                    state = active_pulse(link, frame)
+                    if state is not None:
+                        lost_pulses.setdefault(link, (frame.owner, state))
+                        return
+            original_apply(link, packet)
+
+        stale_ticks = math.floor(nodes.ClientOnlyPulser.FRESH_MS / (1000 * combat.TICK)) + 1
+        with patch.object(ModelLink, "apply", lose_pulses):
+            run.command(owner_link)
+            run.until(lambda: len(lost_pulses) == len(links), ack_except=links, limit=12)
+            run.step(stale_ticks, ack_except=links)
+        self.assertGreaterEqual(match.tick - death_tick, stale_ticks)
+        for link, _, owner in views:
+            self.assertEqual(pulses(link), [])
+            self.assertEqual(lost_pulses[link], (owner, (True, {"fresh": True, "count": 1})))
+
+        # The originally admitted pulse stays fresh on the wire even when the body's own
+        # clock passes the local freshness window before a newer carrier can reach the peer.
+        run.command(owner_link, advance=stale_ticks)
+        script = victim.body_script
+        self.assertFalse(script.component.instances[feed_ids[owner_link]].state(108).payload()["fresh"])
+        run.until(lambda: all(pulses(link) for link in links), limit=12)
+        run.command(owner_link)
+        run.step(6)
+        for link, _, owner in views:
+            with self.subTest(owner=owner, phase="admitted pulse retried after freshness window"):
+                received = pulses(link)
+                self.assertEqual(received[0], lost_pulses[link])
+                self.assertEqual([item for item in received if item[1][1]["fresh"]], [received[0]])
+                self.assertTrue(all(state[1]["count"] == 1 for _, state in received))
+                model = link.models[body]
+                self.assertEqual(model.vars[(feed_ids[link], 392)], expr.Entity(observer.body))
+                self.assertEqual(model.vars[(feed_ids[link], 1821)], True)
+                self.assertEqual(model.vars[(feed_ids[link], 9300)], expr.Asset(loadout))
 
 
 class ModeFrameTests(unittest.TestCase):
