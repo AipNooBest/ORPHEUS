@@ -1,0 +1,160 @@
+Environment read tape v1 — in-memory external-read baseline (M0.8b subtask only)
+
+Scope
+
+ow174/game/environment_tape.py implements RecordingEnvironment and ReplayEnvironment
+against the existing ExecutionEnvironment protocol. It covers exactly six reads:
+wall_time, wall_time_ns, monotonic, randbits, randbelow and token_bytes.
+
+Nothing records by default. Callers must explicitly construct a recorder with an
+environment source and inject that wrapper through the existing environment=
+parameter. The module does not write files, log results, create sockets, start
+services, add a CLI flag or replace secure entropy with a seeded generator.
+Replay has no source or system fallback.
+
+This baseline does not capture datagrams, collision/assets, match state, body
+lifecycles, scheduling, combat decisions, projectiles or damage. It is separate
+from native_replay.py's body-script-only contract and does not enlarge that scope.
+Consuming this tape successfully is not proof of a complete battle/server replay.
+
+Lifecycle and explicit use
+
+  from ow174.game.environment import SystemEnvironment
+  from ow174.game.environment_tape import RecordingEnvironment, ReplayEnvironment
+  from ow174.game.server import GameServer
+
+  recording = RecordingEnvironment(SystemEnvironment())
+  server = GameServer(environment=recording)
+  # Drive the intended operations explicitly; stop them before ending recording.
+  private_tape = recording.finish()
+  recording.assert_complete()
+
+  replay = ReplayEnvironment(private_tape)
+  replay_server = GameServer(environment=replay)
+  # Drive precisely the same externally controlled operations in the same order.
+  replay.assert_complete()
+
+The constructor shown does not itself start a server. Tests use memory socket
+doubles and explicit collision fixtures. A test source can be supplied instead of
+SystemEnvironment; there is no implicit source and an explicit None is rejected.
+
+finish() ends a healthy recorder and returns an independent ordinary Python dict.
+It is idempotent: repeated exports contain the same completed sequence without
+sharing mutable rows. A read after finish is fatal to that recorder. An exported
+tape describes the operation interval ending at finish; callers must not treat an
+earlier export as certification of later operations.
+
+ReplayEnvironment validates the entire tape, including its end marker, during
+construction and stores independent immutable read values. Changing the original
+dict after construction does not change a replay. There is no partial-load mode.
+
+assert_complete() is the terminal success check, not a progress poll. On a recorder
+it requires finish(); on a replay it requires every read to be consumed. Calling it
+prematurely makes that object faulty. assert_healthy() checks only whether a fault
+has occurred; it does not certify that a recording or replay is complete.
+
+recording.read_count and replay.position / replay.remaining are read-only progress
+information, available even after failure. They are never success criteria alone.
+fault is None while healthy, otherwise the first EnvironmentTapeError.
+
+One RLock covers each read, its source invocation and the append/consume operation.
+Concurrent wrapper calls are serialized in their actual lock-acquisition order;
+the tape does not reproduce thread scheduling or establish that another execution
+will reach calls in that order. A source must not depend on another wrapper call
+finishing while its own read is in progress. Reentrant reads or finish() calls from
+the source fail immediately. If the source catches that failure and returns a
+plausible value, the outer recording still fails before appending a success row.
+
+Format
+
+The tape is an in-memory Python value with exactly these top-level fields:
+
+  schema: "ow174.environment-read-tape.v1"
+  build: "1.74.0.0.104319"
+  scope: "environment-reads-only"
+  reads: list of read rows in actual invocation order
+  end: {"seq": number_of_reads, "status": "complete"}
+
+All six methods share one sequence. Each row contains exactly:
+
+  seq: integer position, starting at 0 and increasing by exactly 1
+  operation: one of the six method names
+  callsite: nonempty string supplied by the production callsite
+  argument: None for the three clocks; the exact integer for each entropy method
+  result: {"type": "float" | "int" | "bytes", "value": encoded_string}
+
+Extra/missing fields, non-list reads, unknown schema/build/scope, missing or invalid
+end markers, duplicate/skipped/reordered seq values and malformed result encodings
+are rejected. Python bool is never accepted in place of int, even though bool is
+an int subclass. Callsite and argument comparisons are exact; there is no search,
+skipping, parameter normalization or tolerance for a different call order.
+
+The result codec preserves type and value without decimal float round trips:
+
+  float: lowercase 16-digit hex of big-endian IEEE-754 binary64 bytes.
+         For example -0.0 is "8000000000000000". Subnormals retain their bits.
+  int:   canonical Python hex(value), such as "0x0" or "-0x1". This also supports
+         results larger than decimal conversion limits without loss of bits.
+  bytes: lowercase hex, two digits per byte; the empty value is "".
+
+Noncanonical encodings, NaN and infinities are rejected. Result constraints follow
+the method: wall_time and monotonic require exact finite float; wall_time_ns
+requires exact int and may be negative; randbits requires a nonnegative result
+whose bit length does not exceed bits; randbelow requires 0 <= value < upper;
+token_bytes requires exact bytes of the requested length. Bytes-like substitutes
+and implicit int/float conversions are not accepted.
+
+bits and length must be exact nonnegative ints; upper must be a positive exact int.
+Zero-bit and zero-length reads are valid and recorded separately. The module does
+not infer clock monotonicity, convert wall_time into wall_time_ns or merge repeated
+reads from the same callsite. Every successful recording read invokes its original
+source exactly once and returns that exact immutable value.
+
+Failure is permanent for the wrapper
+
+Every invalid call, invalid source result, source exception, replay mismatch,
+unexpected read after end, incomplete recording and unconsumed terminal replay
+sets the first EnvironmentTapeError. No failed read advances the replay cursor or
+appends a recording success row. Every subsequent read, finish(), assert_healthy()
+or assert_complete() on that object raises the same first fault.
+
+A source KeyboardInterrupt/SystemExit is re-raised so interruption retains its
+normal control flow, but first marks the recorder faulty. Catching it does not
+permit a successful finish. Ordinary source errors are wrapped in a diagnostic
+that omits the source's potentially sensitive message and suppresses its exception
+context in standard traceback formatting.
+
+This matters because server._run deliberately catches Exception around ticks.
+The loop can return normally after a failed clock read, including when a replay
+cursor already equals the tape length. A harness must call assert_complete()
+after the intended operations. Catching the original error, observing an empty
+queue, or seeing a normally returned _run is insufficient.
+
+Tape content and privacy
+
+The recorder does not redact entropy because replay requires the original bytes.
+A tape can therefore contain real handoff keys. Keep it private in memory; do not
+print it, attach it to public logs/reports or add it to source control. The module
+never logs or persists tape content. Errors describe the failed boundary/sequence
+or constraint without interpolating return values, expected keys or actual keys.
+Tests use only synthetic bytes and do not export real environment tapes.
+
+The end marker establishes an explicit completed recording interval, not an
+authentication signature. A caller can intentionally construct another valid tape
+with different values; integrity/authenticity and durable storage are outside v1.
+
+Verification
+
+  .venv/Scripts/python.exe -B -m unittest discover -s tests -p test_game_environment_tape.py
+  .venv/Scripts/python.exe -m ruff check ow174/game/environment_tape.py tests/test_game_environment_tape.py
+
+The 15 dedicated tests cover global read order, exact float bits (including -0.0
+and the smallest subnormal), negative nanosecond time, a 20,000-bit integer, exact
+bytes, detached exports/replay state, strict schema/sequence/end/result parsing,
+bad call/result type and range, sticky mismatch/exhaustion/incompletion, swallowed
+source and reentrancy errors, interruption, real Match/handoff construction and a
+synchronous memory-only _run that catches errors but cannot pass completion.
+
+No production environment injection defaults or server/match/collision behavior
+are changed by this module. It is an opt-in external-read boundary for subsequent
+work on complete input and causal-state replay.

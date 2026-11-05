@@ -59,7 +59,7 @@ rejected. The live match handler retires that body's script; other players keep
 running. This prevents half-completed simulations from looking successful. It
 does not add automatic recovery or prove the cause of the reported live issues.
 
-The latest full Python regression ran 903 tests, all passing. The formerly skipped
+The latest full Python regression ran 930 tests, all passing. The formerly skipped
 King's Row physics case now runs with the locally built cache. A separate 62.448-second offline
 Soldier sequence applied/decoded 3903 owner chunks, observed ammo spending and
 seven refills, and ended with no active volley after release. This is a native
@@ -72,14 +72,28 @@ This proves cache extraction and loading inputs, not complete map collision fide
 
 All 95 catalog maps now have locally extracted, integrity-checked format-5 collision
 caches. Workshop Green Screen uses a checked slice of its original CASC bundle;
-both the container and asset content keys are verified. Disk cache availability
-does not yet guarantee that an asynchronously loaded World is ready before play.
+both the container and asset content keys are verified. Matches now gate spawning
+and simulation on an explicit ready state and keep their World after global LRU
+eviction. Pending requests also keep their own completion handle. Movement, bots
+and combat use the same match World. Load failure reports an unavailable state
+and returns players rather than continuing with empty collision. Nine regressions
+cover loading, walls, failed workers, concurrent matches and six pending requests.
 
 Server and Match clocks and secure entropy now share an explicitly injectable
 execution environment. The default still reads the original time/secrets sources
 at each call. Ordered-read tests cover initialization, handoffs, pings and the
-network loop. This is a boundary for full battle replay, not a complete recorder
-or deterministic Match replay.
+network loop. An explicit in-memory recording/replay wrapper preserves all six
+read types, argument/callsite order and float bits, with permanent failure after
+any mismatch. It has no default recording or file output; returned tapes can
+contain private handoff keys. Fifteen wrapper tests pass. These are boundaries for
+full battle replay, not a complete recorder or deterministic Match replay.
+
+Body observation hashes now include lazy state-allocation order because button
+resync, teardown and volley reporting traverse it. The isolated 975-command body
+example still matches. The real Match's projectile-lease discovery also allocates
+states after body creation; a body-only trace without that external operation now
+correctly reports an incomplete boundary instead of hiding the difference. Full
+Match capture must include that operation and its causal order.
 
 ## Research and regression boundary
 
