@@ -4,6 +4,7 @@ import math
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -198,7 +199,9 @@ class DamageTests(unittest.TestCase):
 
 
 class BotTests(unittest.TestCase):
-    def test_shooting_a_bot_until_it_dies_and_comes_back(self):
+    @patch.object(graph, "entity_body", return_value=None)
+    def test_shooting_a_bot_until_it_dies_and_comes_back(self, _entity_body):
+        # The combat fixture models health and movement. Script delivery uses the encrypted peer tests.
         run = Run()
         player = run.players[0]
         bot = min(run.match.bots, key=lambda b: math.dist(b.position, player.mover.position))

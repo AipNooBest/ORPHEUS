@@ -10,7 +10,7 @@ from test_game_repeated_lifecycles import wire_frame
 from ow174.game import bodytrace, bots, combat, movelog, statescript, world
 from ow174.game.content import SOLDIER
 from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
-from ow174.game.script import decode
+from ow174.game.script import decode, graph
 from ow174.game.script.driver import Snapshot
 from ow174.game.server import BOT_DESTROY_GRACE_TICKS, Client
 
@@ -114,6 +114,10 @@ class BotStatescriptTests(unittest.TestCase):
             edit = patch.object(module, "ENABLED", False)
             edit.start()
             self.addCleanup(edit.stop)
+        # Keep the synthetic scripts in the fixture even when an external pack has NPC definitions.
+        catalog = patch.object(graph, "entity_body", return_value=None)
+        catalog.start()
+        self.addCleanup(catalog.stop)
         self.graph = make_graph(GRAPH, [node(0, PULSER, state=0, remote=0)], states=[0], remote=[0])
         original_graph = decode.graph_of
         graph_patch = patch.object(decode, "graph_of", lambda index: self.graph if index == GRAPH

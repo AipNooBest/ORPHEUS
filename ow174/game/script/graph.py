@@ -20,6 +20,7 @@ The file is gzip JSON:
   when the target node is one DataTool could not read.
 - "bodies": per hero body (the 003 GUID): its statescript component's initial graphs in definition order
   (graph index and schema overrides m_1EB5A024) and its weapon component's manager and weapon scripts.
+- "mode_variables" (optional): per 0C5 mode GUID, its explicit mode entity values by 01C identifier index.
 - "missing": graph indexes referenced but not in the dump.
 
 Which states a frame carries (read in the client at 0x7FF78991BE30):
@@ -36,6 +37,7 @@ import re
 from dataclasses import dataclass
 from functools import cache
 
+from ow174.game.script.expr import Asset
 from ow174.paths import DATA_DIR
 
 GRAPHS_PATH = DATA_DIR / "game_graphs_174.json.gz"
@@ -289,6 +291,18 @@ def bodies() -> dict[int, dict]:
 def entity_body(body: int) -> dict | None:
     """An optional non-player body definition from the same graph bundle."""
     return (_data().get("entities") or {}).get(f"0x{body:016X}")
+
+
+@cache
+def mode_variables(mode: int) -> dict[int, bool | int | Asset] | None:
+    """Explicit initial mode entity values, or None when the bundle has no record for the mode."""
+    record = _data().get("mode_variables", {}).get(f"0x{mode:016X}")
+    if record is None:
+        return None
+    return {
+        int(key): Asset(int(value, 16)) if isinstance(value, str) else value
+        for key, value in record.items()
+    }
 
 
 def missing() -> list[int]:

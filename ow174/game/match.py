@@ -51,6 +51,7 @@ from ow174.game.script.driver import BodyScript, CommandEpochError
 from ow174.game.script.runtime import ScriptBudgetError
 from ow174.game.statescript import Stream, owner_ack
 from ow174.game.world import (
+    GAME_MODE_ENTITY,
     NO_INPUT,
     OP_CREATE,
     OP_DESTROY,
@@ -68,7 +69,6 @@ log = logging.getLogger("ow174.game")
 
 PLAYER_DEFINITION = 0x040000000000000E  # 000E.003, the player (controller) entity
 GAME_MODE_DEFINITION = 0x04000000000016B2
-GAME_MODE_ENTITY = 0xD0000010
 PLAYER_FLAGS = WITH_PARTICIPANT | PLAYER_PATH | WITH_TRANSFORM | WITH_SCALE
 BODY_FLAGS = WITH_TRANSFORM | WITH_SCALE
 

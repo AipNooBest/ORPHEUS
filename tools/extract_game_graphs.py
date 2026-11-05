@@ -9,6 +9,8 @@ graph reference (a GUID of type 01B anywhere in a kept graph).
     py -X utf8 tools/extract_game_graphs.py --xml <XML dump folder> --owlib <OWLib checkout>
 
 Additional entity definitions can be added to a separate bundle with repeated --entity options.
+Use --mode-xml <0C5 directory> with --output outside the repository to also export the mode entity's
+initial variables from the mode definitions.
 
 Per graph it keeps what a runtime needs and drops the editor layout (positions, comments, display names,
 colours). The file format is described in ow174/game/script/graph.py, which reads it.
@@ -408,7 +410,76 @@ def body_record(path: Path, enums: EnumTables, hero: str | None, name: str) -> t
     return record, {graph for graph in used if graph is not None}
 
 
-def collect(xml_dir: Path, enums: EnumTables, entity_indexes: tuple[int, ...] = ()) -> dict:
+def _mode_identifier(xml: StuXml, element: ET.Element, field: str) -> str:
+    ref = xml.field(element, field)
+    guid = ref.get("GUID", "") if ref is not None and tag(ref) == "ref" else ""
+    if not re.fullmatch(r"[0-9A-Fa-f]{1,12}\.01C", guid):
+        raise ValueError(f"{field} must reference a .01C identifier")
+    return guid
+
+
+def _mode_value(xml: StuXml, pair: ET.Element) -> bool | int | str:
+    element = xml.field(pair, "m_value")
+    kind = tag(element) if element is not None else "missing"
+    if kind == "STU_22BF1D21":
+        return guid_text(_mode_identifier(xml, element, "m_value"))
+    if kind in {"STU_43CA1D94", "STU_3ED2A372"}:
+        value = scalar(element.get("m_value"))
+        if type(value) is int:
+            if kind == "STU_43CA1D94" and value in (0, 1):
+                return bool(value)
+            if kind == "STU_3ED2A372" and -(1 << 31) <= value < (1 << 31):
+                return value
+        raise ValueError(f"invalid {kind} m_value")
+    raise ValueError(f"unsupported mode variable value type {kind}")
+
+
+def _mode_pairs(xml: StuXml) -> dict[str, bool | int | str]:
+    if tag(xml.root) != "STUGameMode":
+        raise ValueError("expected a STUGameMode root")
+    field = "m_3CE93B76"
+    array = xml.field(xml.root, field)
+    if xml.root.get(field) not in (None, "{null}") or (array is not None and tag(array) != "array"):
+        raise ValueError(f"invalid {field} array")
+    variables = {}
+    for item in array if array is not None else ():
+        pair = xml.resolve(item)
+        if tag(pair) != "STUGameModeVarValuePair":
+            raise ValueError(f"invalid {field} pair type {tag(pair)}")
+        key = guid_index(_mode_identifier(xml, pair, "m_3E783677"))
+        if not 0 < key <= 0xFFFF:
+            raise ValueError(f"mode variable identifier {key:X} is outside the entity variable range")
+        if str(key) in variables:
+            raise ValueError(f"duplicate mode variable identifier {key:X}")
+        variables[str(key)] = _mode_value(xml, pair)
+    return variables
+
+
+def mode_variables(folder: Path, enums: EnumTables) -> dict[str, dict[str, bool | int | str]]:
+    """Read the first mode variable table in each .0C5, keeping explicit empty modes."""
+    modes = {}
+    for path in sorted(folder.iterdir()):
+        if not path.is_file() or not path.name.upper().endswith(".0C5.XML"):
+            continue
+        name = path.name[:-4].upper()
+        if not re.fullmatch(r"[0-9A-F]{1,12}\.0C5", name):
+            raise ValueError(f"invalid mode asset filename {path.name}")
+        mode = guid_text(name)
+        if mode in modes:
+            raise ValueError(f"duplicate mode asset {mode} in {path.name}")
+        try:
+            modes[mode] = _mode_pairs(StuXml(path, enums))
+        except (ValueError, KeyError) as exc:
+            raise ValueError(f"{path.name}: {exc}") from exc
+    if not modes:
+        raise ValueError(f"no .0C5 XML files in {folder}")
+    return modes
+
+
+def collect(
+    xml_dir: Path, enums: EnumTables, entity_indexes: tuple[int, ...] = (), mode_xml: Path | None = None,
+) -> dict:
+    variables = mode_variables(mode_xml, enums) if mode_xml is not None else None
     heroes = json.loads(HEROES.read_text(encoding="utf-8"))
     bodies, reason, queue = {}, {}, []
     for hero, entry in heroes.items():
@@ -451,6 +522,8 @@ def collect(xml_dir: Path, enums: EnumTables, entity_indexes: tuple[int, ...] = 
     }
     if entities:
         data["entities"] = entities
+    if variables is not None:
+        data["mode_variables"] = variables
     return data
 
 
@@ -466,13 +539,16 @@ def main() -> None:
     parser.add_argument("--owlib", type=Path, required=True, help="the OWLib checkout that made the dump")
     parser.add_argument("--entity", action="append", type=entity_index, default=[],
                         help="additional 003 asset index such as 1403, repeatable")
+    parser.add_argument("--mode-xml", type=Path, help="directory of .0C5 XML files to export mode variables")
     parser.add_argument("--output", type=Path, help="destination bundle")
     args = parser.parse_args()
     output = args.output or OUT
     if args.entity and output.resolve() == OUT.resolve():
         parser.error("--entity requires --output outside the canonical hero bundle")
+    if args.mode_xml is not None and (args.output is None or output.resolve().is_relative_to(ROOT)):
+        parser.error("--mode-xml requires --output outside the repository")
     enums = EnumTables(args.owlib / "TankLib" / "STU" / "Types")
-    data = collect(args.xml, enums, tuple(args.entity))
+    data = collect(args.xml, enums, tuple(args.entity), mode_xml=args.mode_xml)
     for where, count in sorted(enums.missed.items()):
         print(f"  enum value without a member: {where} x{count}")
     reason = data.pop("_reason")

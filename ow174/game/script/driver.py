@@ -85,7 +85,7 @@ TRUSTED_NATIVES = {
     "STU_37F20D24",  # GetGameMode: the match's mode
     "STU_4A101787",  # always false
     "STU_A77AC2AC",  # false
-    "STU_A3DEF368",  # the game mode's settings: no ability or weapon is turned off in our modes
+    "STU_A3DEF368",  # the mode entity and its configured initial values, when present in the bundle
     "STU_DB742151",  # Sprint's #2333: IsEntityAIBot(the possessor) false for a player ...
     "STU_295D117D",  # ... GetPrimaryPossessorEntity ...
     "STU_D3EB8D87",  # ... AIIsPathFollowing: unused for a player

@@ -30,7 +30,8 @@ from dataclasses import dataclass
 
 from ow174.game.script import expr
 from ow174.game.script.expr import ENTITY, INSTANCE, Context, Entity
-from ow174.game.script.graph import Graph, Node, is_plug
+from ow174.game.script.graph import Graph, Node, is_plug, mode_variables
+from ow174.game.world import GAME_MODE_ENTITY
 
 log = logging.getLogger("ow174.script")
 
@@ -267,12 +268,18 @@ class World:
         return rulesets.default(key, self.hero, self.mode)
 
     def entity_var(self, entity: int, var: int):
+        if entity == GAME_MODE_ENTITY and self.mode:
+            variables = mode_variables(self.mode)
+            if variables is not None:
+                return variables.get(var)
         return None
 
     def position(self, entity: int):
         return expr.Vec3(0.0, 0.0, 0.0)
 
     def native(self, cfg: dict, instance: "Instance"):
+        if cfg.get("$") == "STU_A3DEF368" and self.mode and mode_variables(self.mode) is not None:
+            return Entity(GAME_MODE_ENTITY)
         return expr.default_native(cfg)
 
     def send_message(self, target: int, message: int, params: dict, sender: int) -> None:

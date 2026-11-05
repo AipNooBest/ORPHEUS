@@ -46,6 +46,7 @@ from ow174.game import messages
 from ow174.game.bits import BitWriter
 
 OP_CREATE, OP_UPDATE, OP_DESTROY = 1, 2, 3
+GAME_MODE_ENTITY = 0xD0000010
 
 # Create flags.
 WITH_SKIN = 0x01
