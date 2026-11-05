@@ -49,6 +49,7 @@ from ow174.jam.values import to_jsonable
 log = logging.getLogger("ow174.game")
 
 TICK_SECONDS = 0.016
+RECEIVE_BYTES = 4096
 FIRST_TICK = 1000
 SILENCE_SECONDS = 10.0  # the client sends at least every 250 ms; after this long it is gone
 # A game that has not connected this long after its 20600 is not coming (for example it could not
@@ -671,13 +672,13 @@ class GameServer:
 
     # --- the loop ------------------------------------------------------------------------------
 
-    def _run(self) -> None:
+    def _run(self, *, on_iteration_error=None) -> None:
         next_tick = self.environment.monotonic(callsite="server.run.start")
         while self.running:
             timeout = max(0.0, next_tick - self.environment.monotonic(callsite="server.run.timeout"))
             self.sock.settimeout(timeout or 0.0001)
             try:
-                data, address = self.sock.recvfrom(4096)
+                data, address = self.sock.recvfrom(RECEIVE_BYTES)
             except TimeoutError:
                 data = None
             except OSError as error:
@@ -695,7 +696,9 @@ class GameServer:
                         )
                         self.tick += missed
                         self._tick(self.environment.wall_time(callsite="server.run.tick"))
-            except Exception:
+            except Exception as error:
+                if on_iteration_error is not None:
+                    on_iteration_error(error)
                 log.exception("[game] tick failed")
             self._report_leaves()
         self.sock.close()

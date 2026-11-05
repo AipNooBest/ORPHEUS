@@ -15,8 +15,9 @@ from ow174.game.bits import BitWriter
 from ow174.game.collision import StaticCollisionProvider, World, flat_world
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, Spawn
 from ow174.game.environment import SystemEnvironment
+from ow174.game.environment_tape import EnvironmentTapeError
 from ow174.game.link import ACK, FIN, KIND_FRAME, SYN, LinkCipher, Packet, ReceiveWindow, peek_connection
-from ow174.game.server import GameServer
+from ow174.game.server import FIRST_TICK, HANDOFF_SECONDS, GameServer
 from ow174.game.server_journal import (
     RecordingServerSession,
     ServerJournalError,
@@ -57,6 +58,26 @@ class FixedSource:
     def token_bytes(self, length, *, callsite):
         self.counter += 1
         return bytes([self.counter % 256]) * length
+
+
+class SchedulerSource(FixedSource):
+    def __init__(self, *reads):
+        super().__init__()
+        self.reads = iter(reads)
+
+    def scheduler_read(self, callsite):
+        expected, value = next(self.reads)
+        if callsite != "server.run." + expected:
+            raise AssertionError(f"expected {expected}, got {callsite}")
+        return value
+
+    def wall_time(self, *, callsite):
+        if callsite.startswith("server.run."):
+            return self.scheduler_read(callsite)
+        return super().wall_time(callsite=callsite)
+
+    def monotonic(self, *, callsite):
+        return self.scheduler_read(callsite)
 
 
 def wall_world():
@@ -136,7 +157,7 @@ class ServerJournalTests(unittest.TestCase):
     def setUpClass(cls):
         logging.getLogger("ow174.script").setLevel(logging.ERROR)
 
-    def make(self, world=None, *, source=None, skin_of=None, sendto=None):
+    def make(self, world=None, *, source=None, skin_of=None, sendto=None, verify_stored_state=False):
         sent = []
 
         def send(data, address):
@@ -145,7 +166,8 @@ class ServerJournalTests(unittest.TestCase):
 
         args = {"environment": FixedSource() if source is None else source,
                 "collision_provider": StaticCollisionProvider(flat_world(0.0) if world is None else world),
-                "sendto": send if sendto is None else sendto}
+                "sendto": send if sendto is None else sendto,
+                "verify_stored_state": verify_stored_state}
         if skin_of is not None:
             args["skin_of"] = skin_of
         return RecordingServerSession(**args), sent
@@ -286,6 +308,171 @@ class ServerJournalTests(unittest.TestCase):
             [[replay_values.decode(effect)[1] for effect in row["effects"]] for row in callback_rows],
             [[], [{"kind": "left", "player": (first.match_id, 0)}]],
         )
+
+    def test_bounded_loop_replays_syn_before_the_due_tick_and_early_receives(self):
+        deadline = 100.0 + HANDOFF_SECONDS
+        source = SchedulerSource(
+            ("start", 10.0), ("timeout", 10.0), ("datagram", deadline - 0.001),
+            ("due", 10.030), ("next_tick", 10.034), ("tick", deadline),
+            ("timeout", 10.040), ("due", 10.045), ("timeout", 10.046), ("due", 10.047),
+        )
+        with (
+            mock.patch("socket.socket", side_effect=AssertionError("must not create sockets")),
+            self.assertLogs("ow174.game", level="WARNING") as logged,
+        ):
+            session, sent = self.make(source=source)
+            (handoff,) = session.create_match(MAP, [(1, "Alpha", SOLDIER, 0, False)])
+            peer = Peer(session, handoff, sent, ("127.0.0.1", 43000))
+            syn = peer.cipher.seal(Packet(handoff.conn, flags=SYN))
+            socket_before = session.server.sock
+            receives = [(syn, peer.address), ("error", (10054, "controlled receive failure")), None]
+            session.run_loop(receives)
+            document, replay, result = self.verify(session)
+        self.assertIs(session.server.sock, socket_before)
+        self.assertFalse(session.server.running)
+        self.assertEqual(result["send_attempts"], 1)
+        [(reply, address)] = sent
+        self.assertEqual(address, peer.address)
+        self.assertEqual(peer.cipher.open(reply).flags, SYN | ACK)
+        self.assertEqual(sum("controlled receive failure" in line for line in logged.output), 2)
+        for server in (session.server, replay.server):
+            self.assertIn(handoff.conn, server.clients)
+            self.assertNotIn(handoff.conn, server.handoffs)
+            self.assertEqual(server.tick, FIRST_TICK + 3)
+            self.assertEqual(server.clients[handoff.conn].heard, deadline - 0.001)
+        self.assertEqual([row["operation"] for row in document["roots"]], ["create_match", "run_loop"])
+        self.assertEqual(
+            [row["callsite"] for row in document["environment"]["reads"]
+             if row["callsite"].startswith("server.run.")],
+            ["server.run." + name for name in (
+                "start", "timeout", "datagram", "due", "next_tick", "tick",
+                "timeout", "due", "timeout", "due",
+            )],
+        )
+        effects = [replay_values.decode(effect)[1] for effect in document["roots"][-1]["effects"]]
+        socket_effects = [effect for effect in effects if effect["kind"].startswith("socket_")]
+        self.assertEqual(
+            [effect["kind"] for effect in socket_effects],
+            ["socket_timeout", "socket_receive"] * 3 + ["socket_close"],
+        )
+        self.assertEqual(socket_effects[0]["timeout"], 0.0001)
+        self.assertAlmostEqual(socket_effects[2]["timeout"], 0.008)
+        self.assertAlmostEqual(socket_effects[4]["timeout"], 0.002)
+        self.assertEqual([effect["size"] for effect in socket_effects[1:6:2]], [4096] * 3)
+        for replacement in (receives[:-1], [*receives, None]):
+            with self.subTest(receive_count=len(replacement)):
+                changed = copy.deepcopy(document)
+                args = replay_values.decode(changed["roots"][-1]["arguments"])
+                args["receives"] = replacement
+                changed["roots"][-1]["arguments"] = replay_values.encode(args)
+                with (
+                    self.assertLogs("ow174.game", level="WARNING"),
+                    self.assertRaises((EnvironmentTapeError, ServerJournalError)),
+                ):
+                    replay_server_session(changed, resolver=session.registry.resolve)
+
+    def test_bounded_loop_replays_callback_reentry_after_releasing_the_server_lock(self):
+        source = SchedulerSource(
+            ("start", 10.0), ("timeout", 10.0), ("due", 10.0), ("next_tick", 10.0), ("tick", 100.1),
+            ("timeout", 10.005), ("due", 10.010),
+        )
+        session, sent = self.make(source=source, verify_stored_state=True)
+        entries = [(1, "Alpha", SOLDIER, 0, False), (2, "Beta", SOLDIER, 1, False)]
+        first, second = session.create_match(MAP, entries)
+        self.assertTrue(session.apply("expire_handoff", {"conn": first.conn}))
+        alpha = (first.match_id, 0)
+        beta = (second.match_id, 1)
+        args = {"player": beta, "reason": "callback removed the second player"}
+        take_out = GameServer.take_out
+
+        def checked_take_out(server, player, reason):
+            self.assertFalse(server.lock._is_owned(), "callback reentry must start outside the game lock")
+            return take_out(server, player, reason)
+
+        with (
+            mock.patch("socket.socket", side_effect=AssertionError("must not create sockets")),
+            mock.patch.object(GameServer, "take_out", checked_take_out),
+        ):
+            session.run_loop([None, None], callback_actions=[("left", alpha, "take_out", args)])
+            document, replay, result = self.verify(session)
+        self.assertTrue(result["stored_state_verified"])
+        self.assertEqual(result["send_attempts"], 0)
+        self.assertEqual(sent, [])
+        for server in (session.server, replay.server):
+            self.assertEqual(server.tick, FIRST_TICK + 1)
+            self.assertIsNone(server.player_of(1))
+            self.assertIsNone(server.player_of(2))
+        effects = [replay_values.decode(effect)[1] for effect in document["roots"][-1]["effects"]]
+        kinds = ["left", "callback_action", "callback_result", "left"]
+        lifecycle = [effect for effect in effects if effect["kind"] in kinds]
+        self.assertEqual([effect["kind"] for effect in lifecycle], kinds)
+        self.assertEqual([lifecycle[0]["player"], lifecycle[-1]["player"]], [alpha, beta])
+        self.assertEqual(lifecycle[1]["callback"], "left")
+        self.assertEqual(lifecycle[1]["player"], alpha)
+        self.assertEqual(lifecycle[1]["operation"], "take_out")
+        self.assertEqual(lifecycle[1]["arguments"], args)
+        self.assertEqual(lifecycle[2]["result"], "left before its game connected")
+
+    def test_bounded_loop_rejects_malformed_receives_before_running(self):
+        for receives in ([], [b"not an outcome"], [("error", (True, "not a valid errno"))]):
+            with self.subTest(receives=receives):
+                session, _ = self.make()
+                with mock.patch.object(GameServer, "_run") as run, self.assertRaises(ServerJournalError):
+                    session.run_loop(receives)
+                run.assert_not_called()
+                self.assertEqual(session.server.tick, FIRST_TICK)
+                self.assertFalse(session.server.running)
+
+    def test_bounded_loop_rejects_unmatched_callback_actions(self):
+        session, sent = self.make()
+        (handoff,) = session.create_match(MAP, [(1, "Alpha", SOLDIER, 0, False)])
+        waiting = session.server.handoffs[handoff.conn]
+        actions = [("left", (handoff.match_id, 0), "expire_handoff", {"conn": handoff.conn})]
+        with self.assertRaisesRegex(ServerJournalError, "unconsumed callback actions") as caught:
+            session.run_loop([None], callback_actions=actions)
+        self.assertEqual(session.server.handoffs[handoff.conn], waiting)
+        self.assertFalse(session.server.running)
+        self.assertEqual(sent, [])
+        with self.assertRaises(ServerJournalError) as finish:
+            session.finish()
+        self.assertIs(finish.exception, caught.exception)
+
+    def test_bounded_loop_faults_if_the_production_tick_raises(self):
+        session, _ = self.make()
+        socket_before = session.server.sock
+        with (
+            mock.patch.object(GameServer, "_tick", side_effect=RuntimeError("controlled tick failure")),
+            self.assertRaises(ServerJournalError) as caught,
+        ):
+            session.run_loop([None])
+        self.assertIs(session.fault, caught.exception)
+        self.assertIs(session.server.sock, socket_before)
+        self.assertFalse(session.server.running)
+        with self.assertRaises(ServerJournalError) as finish:
+            session.finish()
+        self.assertIs(finish.exception, caught.exception)
+
+    def test_bounded_loop_fault_survives_a_callback_error_caught_by_the_server(self):
+        session, _ = self.make()
+        entries = [(1, "Alpha", SOLDIER, 0, False), (2, "Beta", SOLDIER, 1, False)]
+        first, second = session.create_match(MAP, entries)
+        self.assertTrue(session.apply("expire_handoff", {"conn": first.conn}))
+        socket_before = session.server.sock
+        action_args = {"player": (second.match_id, 1), "reason": "callback failed"}
+        actions = [("left", (first.match_id, 0), "take_out", action_args)]
+        with (
+            mock.patch.object(GameServer, "take_out", side_effect=RuntimeError("callback failure")),
+            self.assertLogs("ow174.game", level="ERROR") as logged,
+            self.assertRaisesRegex(ServerJournalError, "callback action failed") as caught,
+        ):
+            session.run_loop([None], callback_actions=actions)
+        self.assertIn("join or leave handler failed", "\n".join(logged.output))
+        self.assertIsNotNone(session.server.player_of(2))
+        self.assertIs(session.server.sock, socket_before)
+        self.assertFalse(session.server.running)
+        with self.assertRaises(ServerJournalError) as finish:
+            session.finish()
+        self.assertIs(finish.exception, caught.exception)
 
     def test_os_send_failure_is_replayed_as_an_attempt_not_as_packet_delivery(self):
         def refused(data, address):

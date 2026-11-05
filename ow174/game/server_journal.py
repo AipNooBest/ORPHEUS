@@ -1,14 +1,16 @@
 """Explicit in-memory controlled GameServer roots and raw-wire replay.
 
-This harness never starts the network loop or binds a socket. Both directions use
-the same production GameServer/Client/Match/Combat implementation. It verifies
-roots, external reads, wire attempts and callback order, NOT full internal state.
+This harness runs the production GameServer/Client/Match/Combat implementation
+in memory. It verifies controlled roots, external reads, wire attempts and callback
+order. The scheduler root supplies finite receive outcomes without a live socket.
 Private tapes contain handoff keys, account data and encrypted datagrams.
 """
 
 import dataclasses
 import hashlib
 import json
+from collections import deque
+from contextlib import nullcontext
 
 from ow174.game import replay_values
 from ow174.game.collision import CollisionProvider, LoadState
@@ -19,7 +21,7 @@ from ow174.game.environment import ExecutionEnvironment
 from ow174.game.environment_tape import RecordingEnvironment, ReplayEnvironment
 from ow174.game.match import RETAIL_QUANTA, no_skin
 from ow174.game.replay_manifest import assert_compatible, capture_manifest, runtime_configuration
-from ow174.game.server import GameServer, Handoff
+from ow174.game.server import RECEIVE_BYTES, GameServer, Handoff
 from ow174.paths import DATA_DIR, ROOT
 
 SCHEMA = "ow174.controlled-server-journal.v2"
@@ -37,7 +39,9 @@ OPERATIONS = {
     "send_home": {"account"},
     "take_out": {"player", "reason"},
     "report_callbacks": set(),
+    "run_loop": {"receives", "callback_actions"},
 }
+CALLBACK_OPERATIONS = {"take_out", "expire_handoff"}
 
 
 class ServerJournalError(RuntimeError):
@@ -91,6 +95,43 @@ class _MemorySocket:
         return self.session._send(data, address)
 
 
+class _LoopSocket(_MemorySocket):
+    """Finite receive outcomes for one synchronous production scheduler run."""
+
+    def __init__(self, session, receives):
+        super().__init__(session)
+        self.receives = deque(receives)
+        self.closed = False
+
+    def settimeout(self, timeout):
+        self.session._healthy()
+        self.session._observe({"kind": "socket_timeout", "timeout": timeout})
+
+    def recvfrom(self, size):
+        self.session._healthy()
+        if self.closed or not self.receives:
+            self.session._fail("scheduler consumed too many receive outcomes")
+        self.session._observe({"kind": "socket_receive", "size": size})
+        received = self.receives.popleft()
+        if not self.receives:
+            self.session.server.running = False
+        if received is None:
+            raise TimeoutError()
+        data, address = received
+        if data == "error":
+            raise OSError(*address)
+        if len(data) > size:
+            self.session._fail("datagram exceeds the scheduler receive buffer")
+        return data, address
+
+    def close(self):
+        self.session._healthy()
+        if self.closed or self.receives:
+            self.session._fail("scheduler closed with an invalid receive boundary")
+        self.closed = True
+        self.session._observe({"kind": "socket_close"})
+
+
 class _CollisionReads:
     def __init__(self, session):
         self.session = session
@@ -111,6 +152,7 @@ class _Session:
         self._effects = []
         self._sends = 0
         self._state_profile = "wire-only"
+        self._callback_actions = deque()
 
     @property
     def fault(self):
@@ -149,7 +191,17 @@ class _Session:
         return (player.match.id, player.slot)
 
     def _callback(self, kind, player):
-        self._observe({"kind": kind, "player": self._player_key(player)})
+        key = self._player_key(player)
+        self._observe({"kind": kind, "player": key})
+        while self._callback_actions and self._callback_actions[0][:2] == (kind, key):
+            _, _, operation, arguments = self._callback_actions.popleft()
+            self._observe({"kind": "callback_action", "operation": operation, "arguments": arguments,
+                           "player": key, "callback": kind})
+            try:
+                result = self._dispatch(operation, arguments)
+            except Exception as error:  # noqa: BLE001 - production catches callback exceptions
+                self._fail(f"callback action failed: {type(error).__name__}")
+            self._observe({"kind": "callback_result", "result": result})
 
     def _match(self, identifier):
         if type(identifier) is not tuple or len(identifier) != 2:
@@ -196,7 +248,66 @@ class _Session:
             return self.server.send_home(args["account"])
         if operation == "take_out":
             return self.server.take_out(self._player(args["player"]), args["reason"])
+        if operation == "run_loop":
+            return self._run_loop(args["receives"], args["callback_actions"])
         return self.server._report_leaves()
+
+    def _run_loop(self, receives, callback_actions):
+        if self.server.running:
+            self._fail("controlled scheduler requires a stopped server")
+        if type(receives) is not list or not receives:
+            self._fail("scheduler receives must be a nonempty list")
+        for received in receives:
+            if received is None:
+                continue
+            if type(received) is not tuple or len(received) != 2:
+                self._fail("invalid scheduler receive outcome")
+            data, address = received
+            if type(data) is bytes:
+                _address(address)
+                if len(data) > RECEIVE_BYTES:
+                    self._fail("datagram exceeds the scheduler receive buffer")
+            elif (data != "error" or type(address) is not tuple or len(address) != 2
+                  or type(address[0]) is not int or type(address[1]) is not str):
+                self._fail("invalid scheduler receive outcome")
+
+        if type(callback_actions) not in (tuple, list):
+            self._fail("callback actions must be an ordered sequence")
+        for action in callback_actions:
+            if type(action) is not tuple or len(action) != 4:
+                self._fail("invalid callback action")
+            kind, key, operation, arguments = action
+            if (kind not in ("joined", "left") or type(operation) is not str
+                    or operation not in CALLBACK_OPERATIONS):
+                self._fail("unsupported callback action")
+            self._player(key)
+            _fields(arguments, OPERATIONS[operation], "callback action arguments")
+            if operation == "take_out":
+                self._player(arguments["player"])
+                if type(arguments["reason"]) is not str:
+                    self._fail("invalid callback leave reason")
+            else:
+                _integer(arguments["conn"], "handoff connection", minimum=1)
+
+        original_socket = self.server.sock
+        loop_socket = _LoopSocket(self, receives)
+        self._callback_actions.extend(callback_actions)
+        self.server.sock = loop_socket
+        self.server.running = True
+        try:
+            self.server._run(on_iteration_error=self._iteration_failed)
+            self._healthy()
+            if not loop_socket.closed:
+                self._fail("scheduler did not close the controlled socket")
+            if self._callback_actions:
+                self._fail("unconsumed callback actions")
+        finally:
+            self.server.running = False
+            self.server.sock = original_socket
+            self._callback_actions.clear()
+
+    def _iteration_failed(self, error):
+        self._fail(f"scheduler iteration failed: {type(error).__name__}")
 
     def _manifest(self):
         configuration = runtime_configuration(
@@ -235,23 +346,15 @@ class _Session:
         self._active = True
         self._effects = []
         try:
-            # Callback delivery drains under the lock but invokes outside it in production.
-            # Do not add an outer lock around _report_leaves and change that contract.
-            if operation == "report_callbacks":
+            # The production loop and callback delivery acquire their own locks.
+            lock = nullcontext() if operation in ("report_callbacks", "run_loop") else self.server.lock
+            with lock:
                 before = self.server.tick, self._indices()
                 state_before = self._stored_hash()
                 self._check_boundary(before, state_before)
                 result = self._dispatch(operation, args)
                 after = self.server.tick, self._indices()
                 state_after = self._stored_hash()
-            else:
-                with self.server.lock:
-                    before = self.server.tick, self._indices()
-                    state_before = self._stored_hash()
-                    self._check_boundary(before, state_before)
-                    result = self._dispatch(operation, args)
-                    after = self.server.tick, self._indices()
-                    state_after = self._stored_hash()
             self._healthy()
             normalized = _handoffs(result) if operation in ("create_match", "join_match") else result
             row = {
@@ -281,13 +384,16 @@ class _Session:
     def report_callbacks(self):
         return self.apply("report_callbacks", {})
 
+    def run_loop(self, receives, callback_actions=()):
+        return self.apply("run_loop", {"receives": receives, "callback_actions": callback_actions})
+
 
 class RecordingServerSession(_Session):
     """Drive a fresh isolated production server and record explicit roots in memory.
 
     sendto is an optional in-memory outcome source, not a live socket. Without it,
-    all sends succeed with len(data). on_join/on_leave are observed stubs; external
-    lobby effects and callback reentrancy are outside this controlled contract.
+    all sends succeed with len(data). A scheduler root can dispatch explicit server
+    operations from its observed callbacks. Actual lobby handlers are external.
     """
 
     _recording = True
@@ -515,5 +621,5 @@ class _ReplaySession(_Session):
 
 
 def replay_server_session(document, *, resolver):
-    """Replay private controlled roots without starting GameServer._run or opening a socket."""
+    """Replay private controlled roots using only in-memory network outcomes."""
     return _ReplaySession(document, resolver).run()

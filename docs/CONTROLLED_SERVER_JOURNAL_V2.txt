@@ -2,13 +2,55 @@ Controlled server journal v2
 
 The actual server/wire contract described in CONTROLLED_SERVER_JOURNAL_V1.txt is
 retained. This version adds explicit stored-state profiles and continuous root
-boundaries; v1 private documents are rejected rather than silently upgraded.
+boundaries. The reader rejects v1 private documents.
 
 schema = ow174.controlled-server-journal.v2
 
 The expire_handoff root takes a connection ID and returns whether a pending
-seat exists. It sets the deadline to zero. The next tick handles the leave
-and callback, while an already connected client is unaffected.
+seat exists. It sets the deadline to zero, so later handshakes for that seat
+are rejected immediately. The next tick handles the leave and callback.
+This root applies to pending handoffs only.
+
+Bounded scheduler run
+
+  session.run_loop(receives, callback_actions=())
+
+The run_loop root runs the production GameServer._run synchronously with an
+in-memory socket. Supply a nonempty list of receive outcomes in order.
+
+  None                         timeout
+  (bytes, (host, port))         UDP datagram that fits the recvfrom buffer
+  ("error", (errno, message))   socket receive error
+
+The final receive still completes its scheduler iteration. Each call
+initializes its own tick deadline and ends with the production socket close.
+The journal compares socket_timeout, socket_receive and socket_close effects
+alongside environment reads, sent datagrams and callback observations. The
+original in-memory socket and stopped server state are restored at the root
+boundary. Successive run_loop roots each have a fresh scheduler deadline.
+
+Optional callback actions are an ordered list or tuple of entries of the form
+(kind, (match_id, player_slot), operation, arguments). Use kind "joined" or
+"left". The player reference identifies the callback's match and slot.
+Allowed operations are take_out and expire_handoff, with the same argument
+dictionary as their standalone roots. When the next action matches an
+observed callback, the harness calls the production method within that
+callback. Dispatch, result and nested effects are checked in order, with
+their read positions. Invalid or unconsumed input fails the journal.
+Failures inside a scheduler iteration or callback remain recorded as a journal
+fault even if production catches and logs the exception.
+
+The production callback dispatcher detaches its current batch before
+invoking handlers outside the server lock. A callback action that queues a
+new callback leaves it for the next iteration or a later report_callbacks
+root. The supplied actions exercise this boundary with controlled behavior.
+Live lobby handlers, OS socket timing and concurrent thread interleavings
+are outside this scope.
+
+The v2 envelope and the existing datagram, tick and report_callbacks roots
+are unchanged. The manifest still rejects recordings from a different
+server model. Both profiles check root boundaries with the server stopped.
+The registered-state profile also checks stored state at those boundaries.
 
 RecordingServerSession(..., verify_stored_state=False) keeps the inexpensive
 controlled-roots-and-wire-only scope. Each root's state_before/state_after and
@@ -32,8 +74,10 @@ still run once through the real GameServer path; recorded damage is not reinject
 The profile retains hashes and verifies newly computed snapshots on replay.
 
 Successful reports set stored_state_verified=True only for registered-domain-v1.
-complete_battle_replay=False and full_state_verified=False remain explicit: this
-is not live-loop/thread scheduling capture or arbitrary original-server fidelity.
+complete_battle_replay=False and full_state_verified=False remain explicit.
+The bounded scheduler verifies ordering under supplied inputs and clocks.
+Continuous live worker capture and original-server fidelity require separate
+validation.
 Wire-only reports set stored_state_verified=False. They cannot certify internal
 state equality. Scope/profile mismatches, stale manifests, unsupported storage or
 missing/extra roots/reads/effects cannot return a matching report.
