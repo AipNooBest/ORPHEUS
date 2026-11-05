@@ -95,7 +95,7 @@ class CareerMessages:
 
         Only our own player has a full profile (20807) and summary (39002). Anyone else gets a
         profile status (39001). 20807 repeats the request's own id (22206 +0x78): with another id the
-        client leaves the screen empty (ProCore research).
+        client leaves the screen empty.
         """
         if target.get("+0x0") != identity.account_lo:
             return [(PROFILES, 39001, {"+0x78": target, "+0x88": 1})]

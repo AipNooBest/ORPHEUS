@@ -260,6 +260,16 @@ class PartyTests(unittest.TestCase):
         members = self.social.party_state(self.social.party_of(self.alpha.account))["+0x78"]["+0x0"]
         self.assertEqual([member["+0xE0"] for member in members], [5, 5])
 
+    def test_leaving_an_old_match_keeps_the_chat_of_a_newer_one(self):
+        # A game that never reached its first match may already be in a second one when the first
+        # gives up on it.
+        self.social.open_match_chat((1, 2), [self.alpha.account])
+        newer = self.social.open_match_chat((3, 4), [self.alpha.account])
+        self.assertIsNone(self.social.leave_match_chat(self.alpha.account, (1, 2)))
+        self.assertEqual(self.social.match_chat_of(self.alpha.account), newer)
+        self.assertEqual(self.social.leave_match_chat(self.alpha.account, (3, 4)), newer)
+        self.assertIsNone(self.social.match_chat_of(self.alpha.account))
+
 
 if __name__ == "__main__":
     unittest.main()

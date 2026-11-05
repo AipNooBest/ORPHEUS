@@ -17,5 +17,4 @@ class Settings:
     # 0: a match starts with full teams, as the queue's mode has them. N: it starts as soon as N
     # players search the same queue (for tests with fewer players).
     test_players: int = 0
-    body_scripts: str = "off"  # opt-in: diagnostic runtime, or gated experimental owner frames
     paths: Paths = field(default_factory=Paths)

@@ -300,6 +300,6 @@ class Collection:
         """24306 {unlock, hero}: adds a bought unlock to the owned list, as retail answered a purchase.
 
         The unlock goes first: with the hero first the client charged the player and left the item
-        locked (ProCore research).
+        locked.
         """
         return (PROGRESSION_IN, 24306, {"+0x78": guid, "+0x80": self.hero_of.get(guid, 0)})

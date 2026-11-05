@@ -6,7 +6,7 @@ the game server creates for it).
 Reads DataTool's STU dumps of the heroes (type 075, `extract-stu-type <out> 075 --xml`) and the
 names in data/extracted_heroes.json.
 
-    py tools/extract_game_heroes.py D:\\OW174_stu_xml\\075
+    py tools/extract_game_heroes.py <XML dump folder>\075
 """
 
 import json
@@ -26,7 +26,9 @@ def guid(index: int, file_type: int) -> int:
 
 
 def main(argv: list[str]) -> None:
-    folder = Path(argv[1]) if len(argv) > 1 else Path(r"D:\OW174_stu_xml\075")
+    if len(argv) < 2:
+        raise SystemExit(__doc__)
+    folder = Path(argv[1])
     heroes = json.loads((DATA_DIR / "extracted_heroes.json").read_text(encoding="utf-8"))
     table = {}
     for key, hero in heroes.items():

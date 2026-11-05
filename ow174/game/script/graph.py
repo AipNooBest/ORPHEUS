@@ -22,7 +22,7 @@ The file is gzip JSON:
   (graph index and schema overrides m_1EB5A024) and its weapon component's manager and weapon scripts.
 - "missing": graph indexes referenced but not in the dump.
 
-Which states a frame carries (spec 09 section 7.1, read in the client at 0x7FF78991BE30):
+Which states a frame carries (read in the client at 0x7FF78991BE30):
 - an owner (H=1) frame has one entry per m_states entry that is neither client-only nor server-only;
 - an H=0 frame has one per m_remoteSyncNodes entry that is a state (the client casts it to the state base;
   actions fail) and neither client-only nor server-only.

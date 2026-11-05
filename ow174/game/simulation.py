@@ -22,7 +22,10 @@ FRAME_HALF = FRAME_MODULUS // 2
 FRAME_MASK = FRAME_MODULUS - 1
 RESTART_GAP = 1024
 RESTART_LOW_FRAME = 128
-COMMAND_FIELDS = set(Command.__dataclass_fields__)
+COMMAND_FIELD_ORDER = ("frame", "forward", "right", "yaw", "pitch", "buttons", "action")
+COMMAND_FIELDS = set(COMMAND_FIELD_ORDER)
+# These defaults adapt v1 to the richer live decoder; they are not part of the v1 recording schema.
+COMMAND_EXTENSION_DEFAULTS = {"extra": 0, "subframe": 0xFF, "click_yaw": None, "click_pitch": None}
 
 
 def _integer(value, name: str, minimum: int = 0, maximum: int | None = None) -> int:
@@ -49,7 +52,23 @@ def _command(value: dict) -> Command:
     for name in ("yaw", "pitch"):
         if not isinstance(value[name], int) or isinstance(value[name], bool):
             raise ValueError(f"{name} must be an integer in the decoded angle representation")
-    return Command(**value)
+    return Command(**value, **COMMAND_EXTENSION_DEFAULTS)
+
+
+def _record_command(command: Command) -> dict:
+    """Project only losslessly representable commands into the fixed seven-field v1 schema."""
+    if not isinstance(command, Command):
+        raise ValueError("Recording needs a decoded Command")
+    fields = asdict(command)
+    for name in fields.keys() - COMMAND_FIELDS:
+        if name not in COMMAND_EXTENSION_DEFAULTS:
+            raise ValueError(f"v1 does not support command field {name!r}")
+        default, value = COMMAND_EXTENSION_DEFAULTS[name], fields[name]
+        if type(value) is not type(default) or value != default:
+            raise ValueError(f"v1 cannot record nondefault command field {name!r}")
+    projected = {name: fields[name] for name in COMMAND_FIELD_ORDER}
+    _command(projected)
+    return projected
 
 
 def _digest(value) -> str:
@@ -99,7 +118,7 @@ class CommandTimeline:
         _integer(server_tick, "Server tick")
         if self._last_server_tick is not None and server_tick < self._last_server_tick:
             raise ValueError("Packet server ticks must follow recording order")
-        batch = [_command(asdict(command)) for command in commands]
+        batch = [_command(_record_command(command)) for command in commands]
         track = self.tracks.setdefault((player, epoch), _Track())
         previous = track.highwater
         fresh = 0
@@ -174,7 +193,7 @@ class CommandRecording:
     def record(self, player: str, epoch: int, server_tick: int, commands: Iterable[Command]) -> None:
         self.document["packets"].append({
             "player": player, "epoch": epoch, "server_tick": server_tick,
-            "commands": [asdict(command) for command in commands],
+            "commands": [_record_command(command) for command in commands],
         })
 
     def to_document(self) -> dict:

@@ -17,7 +17,7 @@ How each field type is written:
 Bools fill bytes across the whole message: a run of bools goes on over the edges of structs, array
 elements and fixed arrays, and only a byte-sized write (a number, string, blob or array count)
 starts a new byte. Tested in game: in 20802 the 5 flags of +0x108 and the first 4 of +0x10D form
-one run of 9 bits. ProCore's research of the client's encoder describes the same rule.
+one run of 9 bits, as the client's encoder does.
 """
 
 import json

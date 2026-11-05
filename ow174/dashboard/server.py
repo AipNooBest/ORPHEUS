@@ -103,6 +103,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return self.service.start_game(data)
         if path == "/api/matchmaking":
             return self.service.matchmaking(data)
+        if path == "/api/mode_settings":
+            return self.service.mode_settings(data)
         if path == "/api/set_map":
             return self.service.set_map(data)
         if path == "/api/end_matches":

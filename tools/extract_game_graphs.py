@@ -6,7 +6,7 @@ bodies) and keeps every graph reachable from the 32 hero bodies (their statescri
 graphs and their weapon scripts) and from the controller, hero select, HUD and mode graphs, following every
 graph reference (a GUID of type 01B anywhere in a kept graph).
 
-    py tools/extract_game_graphs.py [--xml D:\\OW174_stu_xml]
+    py tools/extract_game_graphs.py --xml <XML dump folder> --owlib <OWLib checkout>
 
 Per graph it keeps what a runtime needs and drops the editor layout (positions, comments, display names,
 colours). The file format is described in ow174/game/script/graph.py, which reads it.
@@ -47,6 +47,7 @@ ROOT_GRAPHS = {
     0x0F4A: "PvP mode",
     0x0EC2: "PvP mode",
     0x0C8E: "PvP mode body",
+    0x0258: "Biotic Field (the initial graph of 03DC.003, which 0257's canister leaves where it lands)",
 }
 LAYOUT = {"m_pos", "m_displayName", "m_comment", "m_F008EA57"}  # STUGraphItem's editor fields
 NODE_KEYS = {
@@ -402,8 +403,8 @@ def collect(xml_dir: Path, enums: EnumTables) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--xml", type=Path, default=Path(r"D:\OW174_stu_xml"), help="DataTool XML dump")
-    parser.add_argument("--owlib", type=Path, default=Path(r"D:\OWLib"), help="the OWLib that made the dump")
+    parser.add_argument("--xml", type=Path, required=True, help="DataTool XML dump")
+    parser.add_argument("--owlib", type=Path, required=True, help="the OWLib checkout that made the dump")
     args = parser.parse_args()
     enums = EnumTables(args.owlib / "TankLib" / "STU" / "Types")
     data = collect(args.xml, enums)

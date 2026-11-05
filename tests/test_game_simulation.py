@@ -94,6 +94,49 @@ class TimelineTests(unittest.TestCase):
 
 
 class ReplayTests(unittest.TestCase):
+    def test_v1_recording_keeps_exactly_the_original_seven_command_fields(self):
+        document = recording((1, 0, [1]))
+        command = document["packets"][0]["commands"][0]
+        self.assertEqual(set(command), {"frame", "forward", "right", "yaw", "pitch", "buttons", "action"})
+        timeline = CommandTimeline()
+        timeline.ingest("p1", 0, 1, [Command(**command)])
+        decoded = timeline.ordered("p1", 0)[0].command
+        self.assertEqual((decoded.extra, decoded.subframe, decoded.click_yaw, decoded.click_pitch),
+                         (0, 0xFF, None, None))
+        self.assertEqual(len(replay_document(document)["states"]), 1)
+
+    def test_recording_nondefault_view_delay_or_subframe_data_is_explicitly_unsupported(self):
+        for extension in ({"extra": 1}, {"subframe": 0}, {"click_yaw": 0}, {"click_pitch": 0}):
+            with self.subTest(extension=extension):
+                capture = CommandRecording(20000, {"p1": {"position": [0, 1, 0], "yaw": 0}})
+                with self.assertRaisesRegex(ValueError, "v1 cannot record nondefault"):
+                    capture.record("p1", 0, 1, [Command(1, **extension)])
+                self.assertEqual(capture.to_document()["packets"], [])
+                timeline = CommandTimeline()
+                with self.assertRaisesRegex(ValueError, "v1 cannot record nondefault"):
+                    timeline.ingest("p1", 0, 1, [Command(1, **extension)])
+                self.assertEqual(timeline.tracks, {})
+
+    def test_json_v1_rejects_extension_fields_even_when_their_values_are_defaults(self):
+        for extension in ({"extra": 0}, {"subframe": 0xFF}, {"click_yaw": None}, {"click_pitch": None}):
+            document = recording((1, 0, [1]))
+            document["packets"][0]["commands"][0].update(extension)
+            with (
+                self.subTest(extension=extension),
+                self.assertRaisesRegex(ValueError, "exactly these fields"),
+            ):
+                replay_document(document)
+
+    def test_basic_fixture_keeps_its_pre_import_state_and_recording_hashes(self):
+        path = Path(__file__).resolve().parents[1] / "data" / "replays" / "basic.json"
+        result = replay_document(json.loads(path.read_text(encoding="utf-8-sig")))
+        self.assertEqual(
+            result["state_hash"], "4c2d8324e24235864e14428ea83122e899269a4a8e7a77f4077d376687a6ea04"
+        )
+        self.assertEqual(
+            result["recording_hash"], "0ce43846f0fee0e18c33cd9da2f41054a3ab0045be28d288f946218449ac06ba"
+        )
+
     def test_missing_frames_report_source_span_without_fabricating_steps(self):
         result = replay_document(recording((700, 0, [100, 103])))
         states, summary = result["states"], result["summaries"][0]

@@ -12,13 +12,10 @@ htmlcov/
 build/
 dist/
 
-# Editors and agents
+# Editors
 .vs/
 .vscode/
 .idea/
-.codex/
-.claude/
-.mcp.json
 
 # Player data, created on first start
 profile.json
@@ -27,8 +24,13 @@ profiles/
 game_path.txt
 server_address.txt
 player_name.txt
+public_address.txt
 default_account.txt
+matchmaking.json
 /game/
+
+# Map collision built from the player's own game (tools/build_collision.py)
+/cache/
 
 # Logs and research output
 logs/
@@ -51,7 +53,6 @@ work/
 # Captures, dumps and disassembler databases
 data/cli_dec.bin
 data/srv_dec.bin
-data/ow_image*
 *.pcap
 *.pcapng
 *.dmp

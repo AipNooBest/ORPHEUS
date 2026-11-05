@@ -7,7 +7,7 @@ tried with one client.
 A chat channel is {"+0x0": id, "+0x10": type, "+0x14": index}. The types used here are 4 for a
 party (the id is the party id), 6 for the players of a match (the id is the match id) and 7 for
 General. Whispers (type 3) use their own messages. That 6 is the match ("All") chat and 5 the team
-chat comes from ProCore's notes and is not confirmed yet.
+chat is not confirmed yet.
 """
 
 import os
@@ -312,8 +312,13 @@ class Social:
     def match_chat_of(self, account: Account) -> dict | None:
         return self.match_channels.get(account.account_lo)
 
-    def leave_match_chat(self, account: Account) -> dict | None:
+    def leave_match_chat(self, account: Account, match_id: tuple | None = None) -> dict | None:
+        """Take the account out of its match's chat and return that channel. With a match id, only
+        when the chat is that match's: a later match's chat stays."""
         with self._lock:
+            channel = self.match_channels.get(account.account_lo)
+            if channel is None or (match_id is not None and channel["+0x0"] != id16(*match_id)):
+                return None
             self.match_chats.pop(account.account_lo, None)
             return self.match_channels.pop(account.account_lo, None)
 

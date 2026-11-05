@@ -56,6 +56,10 @@ def equip(session: Session, value: dict) -> None:
         server.notify_friends(session.account)
     target = server.items.hero_name(hero) if hero else "account"
     session.log(f"[>>>] Equipped {server.items.describe(guid)} ({target}, slot {slot})")
+    game = getattr(server, "game", None)
+    if hero and game is not None:
+        # In a match the hero select's skin button equips through here and picks nothing again.
+        game.skin_changed(session.account.account_lo, hero)
 
 
 def _is_icon(server, guid: int) -> bool:

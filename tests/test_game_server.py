@@ -12,9 +12,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ow174.game import match as match_module
 from ow174.game import messages
+from ow174.game import server as server_module
 from ow174.game.bits import BitReader, BitWriter
-from ow174.game.content import PRACTICE_RANGE
+from ow174.game.content import PRACTICE_RANGE, Spawn
 from ow174.game.link import ACK, KIND_FRAME, SYN, LinkCipher, Packet
+from ow174.game.match import Match
 from ow174.game.server import GameServer, Handoff
 
 REAPER = 0x02E0000000000002
@@ -101,8 +103,9 @@ class GameServerTests(unittest.TestCase):
         seen = game.frames_until(lambda ids, count: count >= 6)
         sent = [msg_id for ids, _ in seen for msg_id in ids]
         self.assertLess(sent.index(20302), sent.index(20301))
-        # four placeables, the player and the game mode entity in one frame; the body comes with the pick
-        self.assertEqual(seen[-1][1], 6)
+        # four placeables, the player and the game mode entity lead the frame, then the Practice Range's
+        # training bots, more than one datagram holds; the body comes with the pick
+        self.assertGreater(seen[-1][1], 6)
         self.assertEqual(self.server.snapshot()[0]["players"][0]["state"], "playing")
 
     def test_two_players_see_each_others_body(self):
@@ -136,32 +139,6 @@ class GameServerTests(unittest.TestCase):
         game.send_message(21616, pick(0xA0000100, REAPER))
         game.frames_until(lambda ids, count: self.server.snapshot()[0]["players"][0]["hero"] == "Reaper")
 
-    def test_diagnostic_body_runtime_follows_hero_lifecycles_without_sending_guesses(self):
-        self.server.body_scripts = "diagnostic"
-        (handoff,) = self.server.create_match(PRACTICE_RANGE, [(1, "Alpha", 0, 0, False)])
-        player = self.server.matches[0].players[0]
-        game = PretendGame(self.server.port, handoff)
-        self.addCleanup(game.sock.close)
-        game.send(SYN)
-        game.receive()
-        game.send(ACK)
-        game.send_message(21601, {})
-        game.frames_until(lambda ids, count: count >= 6)
-        game.send_message(21616, pick(player.entity, player.hero.guid))
-        game.frames_until(lambda ids, count: player.has_body)
-        first = player.body_script
-        self.assertIsNotNone(first)
-        self.assertFalse(first.runtime.complete)
-        self.assertEqual(first.stream.data_last, 0)
-        generation = first.runtime.generation
-        game.send_message(21616, pick(player.entity, REAPER))
-        game.frames_until(lambda ids, count: player.hero.guid == REAPER)
-        self.assertIsNot(player.body_script, first)
-        self.assertGreater(player.body_script.runtime.generation, generation)
-        status = self.server.snapshot()[0]["players"][0]["body_script"]
-        self.assertEqual(status["mode"], "diagnostic")
-        self.assertFalse(status["wire_data_sent"])
-
     def test_a_new_skin_on_the_same_hero_brings_a_new_body(self):
         skins = {REAPER: (0x0A5000000000160F, False)}
         self.server.skin_of = lambda account, hero: skins.get(hero, (0, False))
@@ -182,6 +159,14 @@ class GameServerTests(unittest.TestCase):
         game.send_message(21616, pick(0xA0000100, REAPER))
         game.frames_until(lambda ids, count: player.body != first)
         self.assertEqual(player.skin, (0x0A500000000016C3, True))
+        # Hero select's skin button in a match: the lobby equips and the game picks nothing again.
+        second = player.body
+        skins[REAPER] = (0x0A5000000000476A, False)
+        self.assertTrue(self.server.skin_changed(1, REAPER))
+        self.assertNotEqual(player.body, second)
+        self.assertEqual(player.skin, (0x0A5000000000476A, False))
+        self.assertFalse(self.server.skin_changed(1, REAPER))  # the same skin: nothing
+        self.assertFalse(self.server.skin_changed(1, 0x02E000000000006E))  # another hero's skin waits
 
     def test_heroes_are_assembled_in_a_pvp_mode(self):
         # A PvP mode (any other than the Practice Range's): the screen stays open after the pick until
@@ -205,6 +190,26 @@ class GameServerTests(unittest.TestCase):
             game.frames_until(lambda ids, count: match.assembled, seconds=2.0)
             self.assertFalse(player.select_open)
             self.assertGreater(player.mode_script.last, 0)  # the countdown went to the game mode entity
+
+    def test_a_game_that_never_connects_leaves_the_match(self):
+        with mock.patch.object(server_module, "HANDOFF_SECONDS", 0.2):
+            self.server.create_match(PRACTICE_RANGE, [(1, "Alpha", 0, 0, False)])
+        deadline = time.time() + 3
+        while not self.left and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual([player.name for player in self.left], ["Alpha"])
+        self.assertEqual(self.server.matches, [])  # its only player is gone, so the match ended
+
+    def test_a_free_for_all_puts_everyone_on_the_free_for_all_team(self):
+        # Six players on teams 0-5: team 5's own bit would be the spectator bit 0x10000000.
+        points = tuple(Spawn(None, (float(n), 1.0, 0.0), 0.0) for n in range(6))
+        arena = dataclasses.replace(PRACTICE_RANGE, spawns=points, team_sizes=(6,), free_for_all=True)
+        match = Match(arena)
+        players = [match.add_player(n, f"P{n}", 0, n, False) for n in range(6)]
+        self.assertEqual({player.team_bit for player in players}, {0x8000000})
+        self.assertEqual(len({player.spawn[0] for player in players}), 6)  # one spawn point each
+        (team,) = match.game_struct(players[0])["+0x0"]["+0x0"]["+0xC0"]
+        self.assertEqual((team["+0x60"], team["+0x61"], len(team["+0x18"])), (4, 6, 6))
 
     def test_a_ping_gets_its_pong(self):
         (handoff,) = self.server.create_match(PRACTICE_RANGE, [(1, "Alpha", 0, 0, False)])

@@ -20,6 +20,14 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
 
 ## Tools and related projects
 
+- **[LizRollin's 1.74 runtime branch](https://github.com/LizRollin/overwatch-1.74-lobby-server/tree/9f8f3bcb5eccab6fb7738bee3c2371fcf0623f29)** —
+  the expression interpreter, native statescript codecs, driver, character physics, collision,
+  combat and associated tests evaluated and integrated at this pinned revision. Its MIT notice
+  is retained. Upstream live-test claims and known defects are recorded separately from our local validation.
+- **[AipNooBest's research](https://github.com/AipNooBest/overwatch-1.74-lobby-server/tree/f8426859c3195691d379f2fb291a475dfa40139e)** —
+  additional body initialization and state-payload research used for comparison. Later HUD corrections
+  were checked before using earlier conclusions.
+
 - **[overtools / OWLib](https://github.com/overtools/OWLib)** — DataTool, TankLib, asset definitions and extraction tools used to inspect client data and prepare catalogs.
 - **[overtools / TACTLib](https://github.com/overtools/TACTLib)** — CASC/TACT reading and related tooling used by the extraction toolchain.
 - **[Plasmawatch](https://github.com/plasmawatch/login-server)** — Battle.net login-server emulation and protocol reference work.

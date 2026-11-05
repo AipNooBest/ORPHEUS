@@ -8,7 +8,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ow174.accounts.profile import Profile
 from ow174.catalog.templates import RetailTemplates
 from ow174.content.clock import from_stu_datetime, server_time, stu_datetime
-from ow174.content.ranked import COMPETITIVE_CTF, LUCIO_CUP, PC_PLATFORM, PC_POOL, TANK, Ranked
+from ow174.content.ranked import (
+    COMPETITIVE_CTF,
+    DAMAGE,
+    LUCIO_CUP,
+    PC_PLATFORM,
+    PC_POOL,
+    SUPPORT,
+    TANK,
+    Ranked,
+)
 from ow174.jam.codec import Schemas
 from ow174.jam.groups import RANKED
 
@@ -142,6 +151,20 @@ class RankedTests(unittest.TestCase):
         cards = {card["+0x18"]: card["+0x0"] for card in ratings}
         self.assertEqual(set(cards), {ROLE_QUEUE, OPEN_QUEUE, COMPETITIVE_CTF, LUCIO_CUP})
         self.assertEqual([(r["+0x0"], r["+0x10"]) for r in cards[LUCIO_CUP]], [(0, 2800)])
+
+    def test_a_match_shows_the_rank_of_the_queue_played(self):
+        # The hero select team list shows (rating, Top 500 place, tier) from component 29: on the role
+        # queue card the role's, on the open queue card the open one's, none while placements run.
+        ranked = Ranked(self.templates)
+        ranked.places = lambda profile: {"support": 42}
+        profile = Profile(ratings={"tank": 4100, "support": 3600, "open": 1999}, matches={"damage": 2})
+        self.assertEqual(ranked.rank(profile, ROLE_QUEUE, TANK), (4100, 0, 6))
+        self.assertEqual(ranked.rank(profile, ROLE_QUEUE, SUPPORT), (3600, 42, 5))
+        self.assertEqual(ranked.rank(profile, ROLE_QUEUE, DAMAGE), (0, 0, 0))  # placements
+        self.assertEqual(ranked.rank(profile, ROLE_QUEUE), (0, 0, 0))  # no role on a role queue card
+        self.assertEqual(ranked.rank(profile, OPEN_QUEUE), (1999, 0, 1))
+        self.assertIsNone(ranked.rank(profile, 0x06300000000000ED))  # Quick Play
+        self.assertIsNone(ranked.rank(profile, 0))
 
     def test_the_state_fits_the_174_schema(self):
         schemas = Schemas()

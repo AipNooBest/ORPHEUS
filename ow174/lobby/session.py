@@ -93,7 +93,7 @@ class Session:
 
     def kick(self, reason: int) -> None:
         """Drop the client with a reason: 20503 {reason, close the game} makes the login screen show
-        the reason (a 07C text) instead of "lost connection" (ProCore research). The client only
+        the reason (a 07C text) instead of "lost connection". The client only
         does that while it is still logged in, so the link closes a moment later."""
         with contextlib.suppress(OSError):
             self.send(IN_CONNECT, DISCONNECT_CLIENT, {"+0x78": reason, "+0x80": False})

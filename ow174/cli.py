@@ -4,6 +4,7 @@ Modes:
   retail           the full main menu with the lobby hero: the lobby, a local Battle.net and the
                    game with the relay DLL, which strips TLS from its Battle.net connection (default)
   tournament       a simpler menu without the hero; the game dials the lobby directly, no relay
+  host             retail, with the lobby open to players on other PCs: you host and play
   server           only the lobby server, open to players on other PCs
   join             the game with the full menu on someone else's server (--server host:port and
                    --name): a Battle.net emulator and the relay of its own send it there
@@ -32,18 +33,20 @@ from ow174.lobby.research import watch_inject_file
 from ow174.lobby.server import LobbyServer
 from ow174.lobby.settings import Settings
 from ow174.log import setup_logging
-from ow174.paths import PLAYER_NAME_FILE, SERVER_ADDRESS_FILE, Paths
+from ow174.paths import PLAYER_NAME_FILE, PUBLIC_ADDRESS_FILE, SERVER_ADDRESS_FILE, Paths
 
 log = logging.getLogger("ow174")
 
-MODES = ("retail", "tournament", "server", "join", "join-tournament")
+MODES = ("retail", "tournament", "host", "server", "join", "join-tournament")
+HOSTING = ("host", "server")
 MODE_MENU = """
 Which mode?
   1  Play in retail mode (default Overwatch mode)
   2  Play in tournament mode (used on LANs by pros)
-  3  Server only: you start the game yourself
-  4  Join a server in retail mode (default Overwatch mode)
-  5  Join a server in tournament mode (used on LANs by pros)
+  3  Host a server for others and play on it
+  4  Host a server for others without playing here
+  5  Join a server in retail mode (default Overwatch mode)
+  6  Join a server in tournament mode (used on LANs by pros)
 """
 MAX_NAME_LENGTH = 24
 EVERY_ADDRESS = "0.0.0.0"
@@ -66,7 +69,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="START.bat", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--mode", choices=MODES, help="what to start; without it you are asked")
-    parser.add_argument("--server", help="address of the server to join, such as 1.2.3.4:12357")
+    parser.add_argument("--server", help="address of the server to join, such as 1.2.3.4:3724")
     parser.add_argument("--name", help="your name on the server you join with the full menu")
     parser.add_argument(
         "--game-exe", type=Path, help="Overwatch.exe to start (default: the one picked before)"
@@ -115,10 +118,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="start a match once this many players search (default: 0 = full teams only)",
     )
     parser.add_argument(
-        "--body-scripts", choices=("off", "diagnostic", "experimental"), default=defaults.body_scripts,
-        help="body statescript research: diagnostics only, or gated experimental replication (default: off)",
-    )
-    parser.add_argument(
         "--save", type=Path, default=defaults.paths.template, help="template profile for new accounts"
     )
     parser.add_argument(
@@ -131,9 +130,32 @@ def ask_mode() -> str:
     """Ask for the mode in the console. Enter picks retail."""
     print(MODE_MENU)
     while True:
-        answer = input("Press 1 to 5, then Enter (just Enter for 1): ").strip()
-        if answer in ("", "1", "2", "3", "4", "5"):
+        answer = input(f"Press 1 to {len(MODES)}, then Enter (just Enter for 1): ").strip()
+        if answer == "" or (answer.isdigit() and 1 <= int(answer) <= len(MODES)):
             return MODES[int(answer or "1") - 1]
+
+
+def ask_public_address(saved: Path = PUBLIC_ADDRESS_FILE) -> str:
+    """Ask the host for the public address players over the internet join with; their games are sent
+    there for a match too. Enter reuses the one from last time, - is none (only players on this network
+    or a VPN)."""
+    last = saved.read_text(encoding="utf-8").strip() if saved.is_file() else ""
+    print("Players over the internet join with your public address (whatismyip.com shows it).")
+    hint = f"just Enter for {last}, - for none" if last else "just Enter if only your network plays"
+    while True:
+        answer = input(f"Your public address ({hint}): ").strip()
+        if answer == "-" or not (answer or last):
+            saved.unlink(missing_ok=True)
+            return ""
+        answer = answer or last
+        if is_host_name(answer):
+            saved.write_text(answer, encoding="utf-8")
+            return answer
+        print("Type only the address, for example 1.2.3.4, without a port.")
+
+
+def is_host_name(text: str) -> bool:
+    return bool(text) and all(char.isalnum() or char in ".-" for char in text)
 
 
 def ask_server(saved: Path = SERVER_ADDRESS_FILE) -> str:
@@ -141,11 +163,11 @@ def ask_server(saved: Path = SERVER_ADDRESS_FILE) -> str:
     last = saved.read_text(encoding="utf-8").strip() if saved.is_file() else ""
     hint = f" (just Enter for {last})" if last else ""
     while True:
-        answer = input(f"Server address, like 1.2.3.4:12357{hint}: ").strip() or last
+        answer = input(f"Server address, like 1.2.3.4:3724{hint}: ").strip() or last
         if is_server_address(answer):
             saved.write_text(answer, encoding="utf-8")
             return answer
-        print("Type the address as host:port, for example 1.2.3.4:12357.")
+        print("Type the address as host:port, for example 1.2.3.4:3724.")
 
 
 def is_server_address(text: str) -> bool:
@@ -177,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.mode is None:
         args.mode = ask_mode() if sys.stdin.isatty() else "retail"
+        if args.mode in HOSTING and not args.game_host:
+            args.game_host = ask_public_address()
     setup_logging(_paths(args).log_file)
     try:
         run(args)
@@ -211,6 +235,7 @@ def run(args: argparse.Namespace) -> None:
     if args.mode == "join-tournament":
         join_tournament(args)
         return
+    retail = args.mode in ("retail", "host")
     settings = Settings(
         host=listen_host(args),
         port=args.port,
@@ -218,16 +243,15 @@ def run(args: argparse.Namespace) -> None:
         game_port=args.game_port,
         game_host=args.game_host,
         test_players=max(0, args.test_players),
-        body_scripts=args.body_scripts,
         paths=_paths(args),
     )
     game = relay = None
     if args.mode != "server":
         game = find_game(args.game_exe)
         close_running_copy(game)
-    if args.mode == "retail" or settings.game_port > 0:
+    if retail or settings.game_port > 0:
         ensure_requirements()
-    if args.mode == "retail":
+    if retail:
         relay = ensure_relay_dll()
 
     load_or_create_profile(settings.paths.template)
@@ -240,17 +264,17 @@ def run(args: argparse.Namespace) -> None:
     threading.Thread(
         target=watch_inject_file, args=(server, settings.paths.inject_file), daemon=True, name="inject"
     ).start()
-    if args.mode == "retail":
+    if retail:
         server.games = RetailGames(game, relay, args.locale, args.timeout, bnet_port=args.bnet_port)
         _start_bnet(server, args.bnet_port)
     _log_banner(server)
 
-    if args.mode == "retail":
+    if retail:
         server.games.start()
     elif args.mode == "tournament":
         start_game(game, ["--tank_TournamentMode", f"--lobbyServer=127.0.0.1:{settings.port}"], args.locale)
     else:
-        log.info("[+] To play here too, run START.bat once more: 4, then 127.0.0.1:%d.", settings.port)
+        log.info("[+] To play here too, choose 3 next time instead of 4.")
     log.info("Keep this window open while you play; closing it stops the server.")
     server.serve_forever(listener)
 
@@ -301,9 +325,9 @@ def join_tournament(args: argparse.Namespace) -> None:
 
 
 def listen_host(args: argparse.Namespace) -> str:
-    """Where the lobby listens: --host, else every address in server mode (it is there for other
-    PCs) and only this PC in the modes that play here."""
-    return args.host or (EVERY_ADDRESS if args.mode == "server" else Settings().host)
+    """Where the lobby listens: --host, else every address when hosting (it is there for other PCs)
+    and only this PC in the modes that play alone."""
+    return args.host or (EVERY_ADDRESS if args.mode in HOSTING else Settings().host)
 
 
 def _battle_tag_on(lobby: str, address: str, name: str) -> str:
@@ -316,7 +340,7 @@ def _battle_tag_on(lobby: str, address: str, name: str) -> str:
         raise LaunchError(_unreachable(address, error)) from error
     if not tag:
         raise LaunchError(
-            f"The server {address} runs an older version. Ask the host to update it, or choose 5."
+            f"The server {address} runs an older version. Ask the host to update it, or choose 6."
         )
     return tag
 
@@ -328,7 +352,7 @@ def _unreachable(address: str, error: OSError) -> str:
 def _server_address(args: argparse.Namespace) -> str:
     address = args.server or ask_server()
     if not is_server_address(address):
-        raise LaunchError(f"{address} is not a server address. Use host:port, like 1.2.3.4:12357.")
+        raise LaunchError(f"{address} is not a server address. Use host:port, like 1.2.3.4:3724.")
     return address
 
 
@@ -387,7 +411,17 @@ def _log_banner(server: LobbyServer) -> None:
     log.info(" [*] Bind:           %s:%d", settings.host, settings.port)
     if settings.host == EVERY_ADDRESS:
         addresses = ", ".join(f"{address}:{settings.port}" for address in network_addresses())
-        log.info(" [*] Players join:   %s, or your public address with the port open", addresses)
+        log.info(" [*] Your network:   %s", addresses or "no address found")
+        if settings.game_host:
+            log.info(
+                " [*] Internet:       %s:%d (open TCP %d and UDP %d in your router and firewall)",
+                settings.game_host,
+                settings.port,
+                settings.port,
+                settings.game_port,
+            )
+        else:
+            log.info(" [*] Internet:       off (no public address, --game-host)")
     log.info(" [*] Accounts:       %s (profiles/)", ", ".join(server.accounts.all_saved()) or "none yet")
     log.info(" [*] New accounts:   copy of %s", settings.paths.template.name)
     log.info(" [*] Schemas:        %d messages in %d protocols", sum(map(len, groups.values())), len(groups))

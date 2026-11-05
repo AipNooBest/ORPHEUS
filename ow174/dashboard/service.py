@@ -17,6 +17,7 @@ from ow174.content.menu_hero import PVE_NPCS
 from ow174.content.passes import MAX_PASSES, POOLS
 from ow174.content.player import BOXES_OPENED_KEY, set_saved_value
 from ow174.content.ranked import (
+    CARD_BASE,
     CURRENT_SEASON,
     MAX_MATCHES,
     MAX_RATING,
@@ -30,10 +31,21 @@ from ow174.game import content
 from ow174.jam.groups import PARTY
 from ow174.launcher import LaunchError
 from ow174.lobby.handlers.party import MERGE_REQUEST, merge_request
+from ow174.lobby.matchmaker import QUICK_PLAY
 from ow174.paths import WEB_DIR
 from ow174.services.social import Party
 
 log = logging.getLogger("ow174.dashboard")
+
+
+def _teams_text(ruleset) -> str:
+    """A queue ruleset's teams as the dashboard shows them: "6 v 6", "1 v 5", "FFA 8"."""
+    if ruleset.free_for_all:
+        return f"FFA {ruleset.team_sizes[0]}"
+    if len(ruleset.team_sizes) == 1:  # the players' one team plays against the AI
+        return f"{ruleset.team_sizes[0]} v AI"
+    return " v ".join(str(size) for size in ruleset.team_sizes)
+
 
 PROFILE_FIELDS = (
     "player_name",
@@ -280,9 +292,37 @@ class DashboardService:
             "second_games": getattr(self.lobby, "games", None) is not None,
             "matchmaking_supported": game is not None,
             "test_players": getattr(matchmaker, "minimum_players", 0),
+            "modes": self._modes(matchmaker) if hasattr(matchmaker, "modes") else [],
             "maps": content.map_catalog(),
             "forced_map": f"0x{forced_map:X}" if forced_map else "",
         }
+
+    def _modes(self, matchmaker) -> list[dict]:
+        """The queue cards the menu offers now that the server can host (Quick Play, the season's
+        competitive cards, the Arcade's) and the cards with settings of their own, with their teams and
+        matchmaking settings."""
+        profile = self.lobby.dashboard_account().profile
+        ranked = self.lobby.content.ranked
+        season = ranked.season(profile)
+        offered = [QUICK_PLAY, season.card, season.open_card]
+        offered += [CARD_BASE | card for card in self.lobby.content.arcade.cards(profile, time.time())]
+        rows = []
+        for card in dict.fromkeys([*offered, *matchmaker.modes]):
+            rules = matchmaker.rules.get(card)
+            if not card or rules is None or not (card in matchmaker.modes or matchmaker.can_host(card)):
+                continue
+            own = matchmaker.modes.get(card)
+            rows.append(
+                {
+                    "card": f"0x{card:X}",
+                    "name": rules.name or f"0x{card:X}",
+                    "teams": " / ".join(dict.fromkeys(_teams_text(ruleset) for ruleset in rules.rulesets)),
+                    "competitive": rules.competitive,
+                    "players_to_start": own.players_to_start if own else 0,
+                    "fill_running": bool(own and own.fill_running),
+                }
+            )
+        return rows
 
     @staticmethod
     def _matches(game) -> list[dict]:
@@ -687,29 +727,54 @@ class DashboardService:
         return {"message": f"{account.name} is the default account now."}
 
     def matchmaking(self, data: dict) -> dict:
-        """How many searching players start a match: 0 = full teams only."""
+        """How many searching players start a match of a mode without a number of its own: 0 = full
+        teams only."""
         players = parse_int(data.get("test_players", 0), "Players to start", 0, 12)
-        self.lobby.matchmaker.minimum_players = players
+        matchmaker = self.lobby.matchmaker
+        with self.lock:
+            matchmaker.minimum_players = players
+            matchmaker.retry()
         if not players:
             return {"message": "Matches start with full teams."}
         return {"message": f"Matches start as soon as {players} player(s) search."}
 
+    def mode_settings(self, data: dict) -> dict:
+        """A queue card's own settings: how many searching players start its match (0 = the number
+        for every mode), and whether players who search join its matches that are on (unranked only)."""
+        matchmaker = getattr(self.lobby, "matchmaker", None)
+        if matchmaker is None:
+            raise ApiError("Matchmaking is off.", 409)
+        card = parse_guid(str(data.get("card") or ""))
+        rules = matchmaker.rules.get(card)
+        if rules is None:
+            raise ApiError("The data does not know that queue.", 400)
+        players = parse_int(data.get("players_to_start", 0), "Players to start", 0, 12)
+        fill = parse_bool(data.get("fill_running", False))
+        if fill and rules.competitive:
+            raise ApiError("Competitive matches never take players once they are on.", 400)
+        with self.lock:
+            matchmaker.set_mode(card, players, fill)
+        name = rules.name or f"0x{card:X}"
+        start = f"{players} player(s)" if players else "the number for every mode"
+        joining = "; players who search join its matches that are on" if fill else ""
+        return {"message": f"{name}: matches start with {start}{joining}."}
+
     def set_map(self, data: dict) -> dict:
-        """The map Quick Play and Arcade load, or the queue's random pick when empty/'random'. The chosen
-        map is only used when it can be hosted in the queue's modes; otherwise the queue falls back."""
+        """The map every queue loads, or each queue's own random pick ("random" or empty). A queue whose
+        modes the map is not played in keeps its own pick; the Practice Range loads in every queue."""
         matchmaker = getattr(self.lobby, "matchmaker", None)
         if matchmaker is None:
             raise ApiError("Matchmaking is off.", 409)
         value = str(data.get("map") or "").strip()
         if not value or value.lower() == "random":
             matchmaker.forced_map = None
-            return {"message": "Quick Play and Arcade use the queue's random map."}
+            return {"message": "Matches use their queue's random map."}
         guid = parse_guid(value)
         name = content.map_name(guid)
         if name is None:
             raise ApiError("The data does not know that map.", 400)
         matchmaker.forced_map = guid
-        return {"message": f"Quick Play and Arcade will load {name} (when the mode allows it)."}
+        return {"message": f"Matches load {name} when their queue's modes allow it."}
 
     def end_matches(self) -> dict:
         game = self.lobby.game

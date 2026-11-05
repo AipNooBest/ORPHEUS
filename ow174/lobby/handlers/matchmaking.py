@@ -9,7 +9,16 @@ import json
 from ow174.content import passes
 from ow174.content.queue import PASS_ROLES, PICKING, ROLE_NUMBERS, SEARCHING, wait_times
 from ow174.content.ranked import ROLES
-from ow174.jam.groups import GAME_REQUEST, GROUP_FINDER, GROUPS, MATCHMAKE, PASSES, QUEUE, QUEUE_WAITS
+from ow174.jam.groups import (
+    GAME_REQUEST,
+    GROUP_FINDER,
+    GROUPS,
+    MATCH_LOBBY_OUT,
+    MATCHMAKE,
+    PASSES,
+    QUEUE,
+    QUEUE_WAITS,
+)
 from ow174.jam.values import to_jsonable
 from ow174.lobby.router import Router
 from ow174.lobby.session import Session
@@ -26,6 +35,7 @@ DECLINE = 44105  # Decline on that banner
 PASS_ROLE = 44106  # {role numbers}: the role to spend a priority pass on, sent after 44103
 CHANGE_ROLES = 44107  # Change Role on the role screen, once the member is ready
 PRACTICE_RANGE = (2, 4)  # a create-game request with kind 2 and flags 4
+LOBBY_ANSWER = 52903  # {bool}: the client's answer to the 53000 of a popped queue (lobby/matchmaker.py)
 
 
 def _mode_guid(value: dict) -> int:
@@ -249,6 +259,13 @@ def create_game(session: Session, value: dict) -> None:
         session.server.matchmaker.practice(session)
     else:
         session.log(f"[MM] Unknown create-game request: {to_jsonable(value)}")
+
+
+@routes.on(MATCH_LOBBY_OUT, LOBBY_ANSWER)
+def lobby_answer(session: Session, value: dict) -> None:
+    """Sent by the client itself on a 53000 with match lobby type 4 (0x7FF789692FE0): true when the
+    lobby's ticket is the one of the queue entry 44202 took out. Nothing waits for it."""
+    session.log(f'[MM] "Game Found!" match lobby answer (52903): {value.get("+0x78")}')
 
 
 # The group finder. The client sends 52200-52205 (9529F0ED) and gets its answers in 52300-52302

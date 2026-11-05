@@ -206,6 +206,20 @@ class Ranked:
                     rating.update(_rating(profile, queue, places.get(queue, 0)))
         return cards
 
+    def rank(self, profile: Profile, card: int, role: int = 0) -> tuple[int, int, int] | None:
+        """The rank a match on this card shows for the player in the hero select team list: (skill
+        rating, Top 500 place, tier) in the queue the player plays, on a role queue card the role's (a
+        role GUID). None when the card is not one of the player's competitive cards. The rating is 0,
+        and the client shows no rank, during placements or without a role on a role queue card."""
+        season = self.season(profile)
+        if not card or card not in (season.card, season.open_card, *EVENT_QUEUES):
+            return None
+        queue = self.queue(profile, card, role)
+        if queue is None:
+            return 0, 0, 0
+        rating = _rating(profile, queue, self.places(profile).get(queue, 0))
+        return rating["+0x18"], rating["+0x1C"], rating["+0x22"]
+
     def party_ratings(self, profile: Profile) -> list[dict]:
         """The ratings a party member carries in 20700 (+0x68), one entry per competitive card.
 

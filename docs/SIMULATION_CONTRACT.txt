@@ -3,11 +3,19 @@ Target build: 1.74.0.0.104319
 
 Purpose and boundary
 This is an OFFLINE recording/replay contract. It does not change CommandQueue, the UDP server,
-the original client's code, or its replication protocol. It replays the existing FlatMover model:
+the original client's code, or its replication protocol. It replays the preserved FlatMover model
+in ow174/game/flat_model.py, independently of the live mover's later collision and input-fill policy:
 flat floor, existing movement constants, no map collision/gravity, no original weapon/ability logic.
 The original client's complete timing, prediction, reconciliation and restart behavior remain unknown.
 Input is decoded Command fields; ignored wire/subframe/latency fields and raw datagrams are not
 preserved. This format is a semantic command capture, not a lossless packet capture.
+The v1 command schema is permanently the original seven fields, not the current Command dataclass's
+field list. Decoding supplies the live decoder's extension defaults explicitly: extra=0,
+subframe=255, click_yaw=None, click_pitch=None. CommandRecording and CommandTimeline reject any
+nondefault value in those extensions, and reject unknown extension fields, before recording/applying
+the packet. They do not silently discard view delay or click-time aim data. JSON v1 rejects extension
+keys even when their values are defaults. A capture needing such data requires a separate schema;
+v1 does not claim to replay its lag compensation or subframe combat semantics.
 
 Two clocks
 quanta_us is a caller-selected positive integer: microseconds applied to each DISTINCT known command.

@@ -20,8 +20,7 @@ if not errorlevel 1 (
 )
 echo Local practice server. Keep this window open while playing.
 echo Dashboard: http://127.0.0.1:3725
-echo This build supports lobby, map loading, hero selection and movement.
-echo Weapons, abilities and damage are still under development.
+echo Soldier: 76 combat and training bots are experimental. See docs\STATE.md.
 ".venv\Scripts\python.exe" -u -B -m ow174 --mode retail --bnet-port 1118 --test-players 1 %*
 if errorlevel 1 goto failed
 exit /b 0

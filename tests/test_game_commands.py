@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ow174.game.bits import BitReader, BitWriter
 from ow174.game.commands import CommandQueue, read_commands
-from ow174.game.mover import FlatMover
+from ow174.game.mover import Mover
 
 
 def record(first_frame: int) -> bytes:
@@ -56,12 +56,13 @@ class CommandTests(unittest.TestCase):
         self.assertEqual([command.frame for command in queue.new(again)], [5002])
 
     def test_forward_at_yaw_0_walks_along_z(self):
-        mover = FlatMover((0.0, 1.0, 0.0))
-        for command in read_commands(BitReader(record(1)))[:1]:
-            mover.step(command, 1.0)
-        self.assertAlmostEqual(mover.position[0], 0.0)
-        self.assertAlmostEqual(mover.position[2], 5.5)
-        self.assertEqual(mover.position[1], 1.0)
+        mover = Mover((0.0, 1.0, 0.0))
+        (command,) = read_commands(BitReader(record(1)))[:1]
+        for _ in range(63):  # about a second of ticks
+            mover.step(command, 0.016)
+        self.assertEqual(mover.position[0], 0.0)
+        self.assertAlmostEqual(mover.position[2], 5.5, delta=0.1)  # a few ticks to get up to speed
+        self.assertEqual((mover.position[1], mover.velocity), (1.0, (0.0, 0.0, 5.5)))
 
 
 if __name__ == "__main__":

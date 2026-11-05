@@ -20,7 +20,7 @@ from ow174.lobby.session import Session
 
 routes = Router()
 
-# Retail's answer to 42600 (from the ProCore research): no live match.
+# Retail's answer to 42600: no live match.
 NO_OWL_MATCH = {"+0x78": True, "+0x80": []}
 
 

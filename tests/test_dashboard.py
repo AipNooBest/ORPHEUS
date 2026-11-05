@@ -19,11 +19,14 @@ from ow174.catalog.events import CHALLENGES  # noqa: E402
 from ow174.catalog.items import ItemDB  # noqa: E402
 from ow174.catalog.templates import RetailTemplates  # noqa: E402
 from ow174.content.collection import Collection  # noqa: E402
+from ow174.content.ranked import OPEN_QUEUE, ROLE_QUEUE  # noqa: E402
 from ow174.dashboard.server import start_dashboard  # noqa: E402
+from ow174.lobby.matchmaker import QUICK_PLAY, Matchmaker  # noqa: E402
 from ow174.paths import WEB_DIR  # noqa: E402
 from ow174.services.shop import ShopService  # noqa: E402
 
 WEB_PREVIEWS = WEB_DIR / "assets" / "previews"
+DEATHMATCH = 0x063000000000003B
 # The real (unlock level, frame GUID) table; frame GUIDs are not in level order.
 BORDERS = Collection(RetailTemplates(), ItemDB()).border_levels
 
@@ -43,9 +46,14 @@ class Lobby:
                 default_loadouts={1: {}},
                 border_levels=BORDERS,
                 portrait_frame=lambda profile: profile.frame_guid or BORDERS[0][1],
-            )
+            ),
+            ranked=SimpleNamespace(
+                season=lambda profile: SimpleNamespace(card=ROLE_QUEUE, open_card=OPEN_QUEUE)
+            ),
+            arcade=SimpleNamespace(cards=lambda profile, now: [DEATHMATCH & 0xFFFF]),
         )
         self.social = SimpleNamespace(sessions={})
+        self.matchmaker = Matchmaker(SimpleNamespace(game=None), 0, root / "matchmaking.json")
         self.loot = SimpleNamespace(open_all=self.open_all)
         self.pushed = []
         self.granted = []
@@ -118,6 +126,46 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual({b["id"] for b in data["catalogs"]["box_types"]}, set(BOX_TYPES))
         self.assertEqual(data["server"]["connected_clients"], 0)
         self.assertEqual(data["profile"]["player_name"], "Alpha")
+
+    def test_the_map_for_every_queue_is_set_and_cleared(self):
+        status, _ = self.request("/api/set_map", {"map": "0x80000000000066D"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.lobby.matchmaker.forced_map, 0x080000000000066D)
+        _, data = self.request("/api/state")
+        self.assertEqual(data["server"]["forced_map"], "0x80000000000066D")
+        self.assertIn({"guid": "0x80000000000066D", "name": "Ilios"}, data["server"]["maps"])
+        self.request("/api/set_map", {"map": "random"})
+        self.assertIsNone(self.lobby.matchmaker.forced_map)
+        status, _ = self.request("/api/set_map", {"map": "0x0800000000099999"})  # not a map the data knows
+        self.assertEqual(status, 400)
+
+    def test_each_mode_has_its_own_players_to_start_and_joining(self):
+        _, data = self.request("/api/state")
+        modes = {mode["card"]: mode for mode in data["server"]["modes"]}
+        self.assertEqual(list(modes)[:2], [f"0x{QUICK_PLAY:X}", f"0x{ROLE_QUEUE:X}"])  # what the menu offers
+        self.assertEqual(modes[f"0x{DEATHMATCH:X}"]["teams"], "FFA 8")
+        self.assertEqual(modes[f"0x{QUICK_PLAY:X}"]["teams"], "6 v 6")
+        self.assertTrue(modes[f"0x{ROLE_QUEUE:X}"]["competitive"])
+
+        status, _ = self.request(
+            "/api/mode_settings", {"card": f"0x{DEATHMATCH:X}", "players_to_start": "4", "fill_running": True}
+        )
+        self.assertEqual(status, 200)
+        matchmaker = self.lobby.matchmaker
+        self.assertEqual(matchmaker.players_to_start(DEATHMATCH), 4)
+        self.assertTrue(matchmaker.fills_running(DEATHMATCH))
+        self.assertEqual(matchmaker.players_to_start(QUICK_PLAY), 0)  # the others keep the number for all
+        saved = json.loads((Path(self.temp.name) / "matchmaking.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved, {f"0x{DEATHMATCH:X}": {"players_to_start": 4, "fill_running": True}})
+        _, data = self.request("/api/state")
+        mode = next(mode for mode in data["server"]["modes"] if mode["card"] == f"0x{DEATHMATCH:X}")
+        self.assertEqual((mode["players_to_start"], mode["fill_running"]), (4, True))
+
+        status, _ = self.request("/api/mode_settings", {"card": f"0x{ROLE_QUEUE:X}", "fill_running": True})
+        self.assertEqual(status, 400)  # competitive matches never take players once on
+        status, _ = self.request("/api/mode_settings", {"card": f"0x{DEATHMATCH:X}", "players_to_start": 0})
+        self.assertEqual(status, 200)
+        self.assertNotIn(DEATHMATCH, matchmaker.modes)  # back to the number for every mode
 
     def test_an_account_can_be_made_the_default(self):
         status, data = self.request("/api/default_account", {"name": "beta"})

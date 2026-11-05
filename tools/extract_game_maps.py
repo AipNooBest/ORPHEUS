@@ -8,7 +8,7 @@ Inputs (all from an Overwatch 1.74 install through DataTool, OWLib):
 
     py tools/extract_game_maps.py --stu <dump> --raw <raw> --ents <ents>
 
-Rules, from the client (IDA base 0x7FF788F10000):
+Rules, from the client (image base 0x7FF788F10000):
 - Map placeables get one flat index over the placeable types whose flag is set in the type table
   0x7FF78BD36CE0 (builder 0x7FF78AA52900): light, area, entity, ... in that order. So the first
   entity has index count(light) + count(area).

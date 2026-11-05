@@ -28,11 +28,15 @@ pad to the next byte of the payload, a u8 mask length and the mask (one bit per 
 order), then the values of the fields that are set. Scalars go as whole bytes; a u64 marked as an
 id is a byte mask and its non-zero bytes.
 
-The movement-state block (0x7FF789B6F680) is a delta against a zero state. Its field order was read
-in IDA; only the command frame, the Euler angles, the position, the velocity and the aim pitch are
-sent here. The same block, after one bit (0 = against that zero state), is a ch3 movement record,
-which is how a moving entity gets its position. A movement state is only kept when its command
-frame is newer than the newest one the entity has (the gate at 0x7FF7896DA7D3).
+The movement-state block (0x7FF789B6F680) is a delta against a reference state (mostly zeros, see
+_input_fields). Its field order was read in the client; the command frame, the flags, the aim pitch, the
+throttles and the last command that had any, the ticks in the air, the gravity scale, the frame of the
+last stand-up, the Euler angles, the position, the velocity, the spring offsets and speed and gravity's
+part of the velocity are sent here. The same block, after one bit (0 = against that reference
+state), is a ch3 movement record, which is how a moving entity gets its position: the client only
+interpolates between the records it gets, it never moves another player's body itself. A movement
+state is only kept when its command frame is newer than the newest one the entity has (the gate at
+0x7FF7896DA7D3).
 """
 
 import math
@@ -52,21 +56,28 @@ PLAYER_PATH = 0x10
 WITH_PARTICIPANT = 0x20
 SKIN_THEME = 0x40  # the skin is a skin theme, not a skin
 
-# Replicated fields of the components we send, in order (the client's type objects; checked in IDA
-# for 26, 44, 74, 75 and 123). "id" is a u64 sent as a byte mask, "entity" 4 bytes, "blob:N" N raw
-# bytes of a nested struct.
+# Replicated fields of the components we send, in order (the client's type objects; checked
+# for 26, 29, 44, 74, 75 and 123). "id" is a u64 sent as a byte mask, "dbid" a 16-byte id (low, high),
+# "entity" 4 bytes, "blob:N" N raw bytes of a nested struct.
 COMPONENT_FIELDS = {
     26: ["id"],  # MFilterBitsComponentData: filter bits (team, spectator)
+    # MPlayerComponentData (field records at 0x7FF78BFEAE50, names from the PS4 data): m_lobbyPlayerID (the
+    # key of the client's player cards, 20308), m_battleTag (the entity's name in the chat, 0x7FF789CB3F80),
+    # m_playerLevel, then s32 audio locale, group token, party state and platform, m_rankedLevel (skill
+    # rating), m_heroicRank (Top 500 place), m_rankedLevelTier (0-6), m_moderator. All flags 0: raw bytes.
+    29: ["dbid", "string", "u32", "s32", "s32", "s32", "s32", "s16", "s16", "s8", "u8"],
     44: ["entity", "entity", "entity"],  # MECPossessorData: current, view target, primary possessable
-    # STUHealthComponent: 16 health, 16 armour, 16 shield parts {u32 on, f32 now, f32 max, 4 bytes,
-    # 4 x u8}, then u32, u32, entity, u8, u8.
+    # The health component (type 0x7FF78BFE8720): 16 health, 16 armour and 16 shield pools (see pool),
+    # then u32, u32, entity, u8, u8.
     51: ["blob:20"] * 48 + ["u32", "u32", "entity", "u8", "u8"],
-    # MECGameModeParticipant: portrait frame, s16, slot, u8, u8, s8, can select a hero, u8, u8.
+    # MECGameModeParticipant: portrait frame (the client loads its asset, 0x7FF7894C9D90), s16, slot,
+    # lfg role, u8, role queue role, can select a hero, u8, u8.
     74: ["id", "s16", "s8", "u8", "u8", "s8", "u8", "u8", "u8"],
     75: ["id"] * 6,  # MECCharacterController: current hero, skin, ..., last valid hero
     # MECGameMode: u32[], the game mode GUID, ...
     114: ["u32[]", "id", "id", "u64", "u64", "u64", "u64", "s32", "f32", "f32", "u32"] + ["u8"] * 9,
     123: ["id"],  # MECCharacterBody: the body's hero
+    90: ["lease[]"],  # MECPredictor: m_leaseBlocks, owner-only (projectiles.py)
 }
 SCALAR_FORMATS = {
     "u8": "<B",
@@ -96,24 +107,41 @@ class RecordWriter(BitWriter):
             self.bits(0, missing)
 
 
+def _byte_mask(value: int) -> bytes:
+    """A u64 as a mask of its non-zero bytes followed by those bytes, the lowest first."""
+    number = int(value) & 0xFFFFFFFFFFFFFFFF
+    mask, body = 0, bytearray()
+    for k in range(8):
+        byte = (number >> (8 * k)) & 0xFF
+        if byte:
+            mask |= 1 << k
+            body.append(byte)
+    return bytes([mask]) + bytes(body)
+
+
 def _write_value(out: RecordWriter, kind: str, value) -> None:
     if kind == "id":
-        number = int(value) & 0xFFFFFFFFFFFFFFFF
-        mask, body = 0, bytearray()
-        for k in range(8):
-            byte = (number >> (8 * k)) & 0xFF
-            if byte:
-                mask |= 1 << k
-                body.append(byte)
         out.pad()
-        out.raw(bytes([mask]) + bytes(body))
+        out.raw(_byte_mask(value))
+    elif kind == "dbid":  # (low, high), each a byte mask and its bytes, not padded (0x7FF78A76B500)
+        for half in value:
+            out.raw(_byte_mask(half))
     elif kind == "entity":
         out.raw(struct.pack("<I", int(value) & 0xFFFFFFFF))
+    elif kind == "string":  # a teString: on a byte, its u32 byte count and the bytes (0x7FF78AAF0300)
+        data = str(value).encode("utf-8")
+        out.pad()
+        out.raw(struct.pack("<I", len(data)) + data)
     elif kind.startswith("blob:"):
         data = bytes.fromhex(value) if isinstance(value, str) else bytes(value)
         if len(data) != int(kind[5:]):
             raise ValueError(f"{kind} needs {kind[5:]} bytes, got {len(data)}")
         out.raw(data)
+    elif kind == "lease[]":  # LeaseBlock {u64 definition, u32 start, u32 stop, u32 first id, u8 per frame}
+        out.pad()
+        out.raw(struct.pack("<I", len(value)))
+        for block in value:
+            out.raw(struct.pack("<QIIIB", *block))
     elif kind.endswith("[]"):
         items = list(value)
         out.pad()
@@ -143,21 +171,85 @@ def _write_components(out: RecordWriter, components: dict) -> None:
                 _write_value(out, kind, value)
 
 
-def health(now: float, most: float) -> dict:
-    """Component 51 with one health part, as the HUD bar reads it."""
-    part = struct.pack("<IffII", 1, now, most, 1, 1)
-    return {51: [part]}
+# A health pool (type 0x7FF78BFE8660, 20 bytes): u32 id (0 = none), f32 max, f32 current, u32 type (0
+# health, 1 armour, 2 shields: the client reads array t for type t, 0x7FF7894D0530), then four bytes. The
+# HUD bar (0x7FF7894CCEE0) draws a pool as health, armour or shields only when byte 17 is 1 and byte 18 is
+# 0, else as over-health in another colour; 1 is the client's own default for byte 17 (0x7FF78A1FFBD0).
+# Bytes 16 and 18 are 0, as 0033's pool states leave them; byte 19 is 1 (unverified: no client reader found).
+POOLS = 16  # pools per type
+HEALTH_POOL, ARMOUR_POOL, SHIELDS_POOL = 0, 1, 2
+
+
+def pool(pool_id: int, kind: int, most: float, now: float) -> bytes:
+    return struct.pack("<IffI4B", pool_id, most, now, kind, 0, 1, 0, 1)
+
+
+def health(now: float, most: float, armour: float = 0.0, shields: float = 0.0) -> dict:
+    """Component 51 with a body's pools: health (now of most) and, when the body has them, full armour
+    and shields. The ids follow the order 0033 begins the pools in, shields, armour, health (unverified: the
+    client only tests an id for 0)."""
+    parts: list = [None] * (3 * POOLS)
+    pool_id = 1
+    for kind, top in ((SHIELDS_POOL, shields), (ARMOUR_POOL, armour)):
+        if top > 0:
+            parts[kind * POOLS] = pool(pool_id, kind, top, top)
+            pool_id += 1
+    parts[HEALTH_POOL * POOLS] = pool(pool_id, HEALTH_POOL, most, now)
+    return {51: parts}
+
+
+NO_INPUT = 0xFFFFFFFF  # input_frame of a body that never had movement input: the reference state's value
+CREATE_BASE = 0xFFFFFFFF  # the frame a create's movement state counts back from (0x7FF78969DD3C)
 
 
 class Movement:
-    """One movement state. yaw and pitch are the commands' s16 angle units."""
+    """One movement state. yaw and pitch are the commands' s16 angle units.
 
-    def __init__(self, position, yaw=0, pitch=0, velocity=(0.0, 0.0, 0.0), flags=0) -> None:
+    Another client animates a body from more than its pose (its 3P animation, 0x7FF789B1EB10): the flags
+    (crouched, in the air, dead), throttles = this frame's (right, forward) as s8, input_frame = the
+    frame of the last command that had throttles with input_throttles its throttles (None: this state's
+    own frame, right for a body that moves now; NO_INPUT: never; the record's own frame goes as None, and
+    the client then takes the throttles for input_throttles), air_ticks = ticks since the take-off and
+    gravity = the gravity scale its air animation uses. The defaults are the reference state's.
+
+    The owner's client compares the state of its own body with the one it predicted for that frame
+    (correction.py), so that one also has frame (its command frame; None: the packet frame), crouch_frame
+    (+40, the frame it last stood up in; None: never), spring (+52, +56: the two spring offsets as steps
+    of 1/32768 of their range), spring_speed (+60) and fall (the up part of +832)."""
+
+    def __init__(
+        self,
+        position,
+        yaw=0,
+        pitch=0,
+        velocity=(0.0, 0.0, 0.0),
+        flags=0,
+        throttles=(0, 0),
+        input_frame: int | None = None,
+        input_throttles=(0, 0),
+        air_ticks=0,
+        gravity=0.0,
+        frame: int | None = None,
+        crouch_frame: int | None = None,
+        spring=(0, 0),
+        spring_speed=0.0,
+        fall=0.0,
+    ) -> None:
         self.position = tuple(position)
         self.yaw = int(yaw)
         self.pitch = int(pitch)
         self.velocity = tuple(velocity)
         self.flags = int(flags)
+        self.throttles = tuple(throttles)
+        self.input_frame = input_frame
+        self.input_throttles = tuple(input_throttles)
+        self.air_ticks = int(air_ticks)
+        self.gravity = float(gravity)
+        self.frame = frame
+        self.crouch_frame = crouch_frame
+        self.spring = tuple(spring)
+        self.spring_speed = float(spring_speed)
+        self.fall = float(fall)
 
 
 def _selector(out: BitWriter, value: int, width_index: int, width: int) -> None:
@@ -170,9 +262,93 @@ def _selector(out: BitWriter, value: int, width_index: int, width: int) -> None:
     out.bits(value & ((1 << width) - 1), width)
 
 
-def write_movement(out: BitWriter, state: Movement, frame_back: int | None) -> None:
-    """The movement-state block. `frame_back` None puts the state at the packet frame (ch3); a number
-    puts it that many frames before the create path's base of 0xFFFFFFFF."""
+def _delta(out: BitWriter, value: int, widths: tuple[int, ...]) -> None:
+    """A present signed value at the smallest of the field's widths it fits, else in 32 bits after a 0
+    for every width. The client sign-extends the short forms."""
+    out.bit(1)
+    for width in widths:
+        if -(1 << (width - 1)) <= value < 1 << (width - 1):
+            out.bit(1)
+            out.bits(value & ((1 << width) - 1), width)
+            return
+        out.bit(0)
+    out.bits(value & 0xFFFFFFFF, 32)
+
+
+def _throttle(out: BitWriter, value: int) -> None:
+    """An s8 throttle (0x7FF789B71C50): 1 and its byte, or 0 for the reference state's 0."""
+    if value:
+        out.bit(1)
+        out.bits(value & 0xFF, 8)
+    else:
+        out.bit(0)
+
+
+def _input_frame(state: Movement, frame: int | None) -> int | None:
+    """+36 as the record carries it: None for the record's own frame (+8, `frame`; None if not known)."""
+    if state.input_frame is None:
+        return None
+    if frame is None:
+        raise ValueError("a state with an input frame needs the record's frame")
+    value = state.input_frame & 0xFFFFFFFF
+    return None if value == frame & 0xFFFFFFFF else value
+
+
+def _input_fields(out: BitWriter, state: Movement, frame: int | None) -> None:
+    """+16 to +40 (0x7FF789B6F80E to 0x7FF789B71E50) of a record whose command frame (+8) is `frame`.
+    Their reference values: +16 = 0, +20 = +40 = 0xFFFFFFFF, +24 = 0.0, +28 = 1.0, +32 to +35 = 0,
+    +36 = 0xFFFFFFFF."""
+    if state.air_ticks:
+        _delta(out, state.air_ticks, (4, 10))  # +16 the ticks in the air
+    else:
+        out.bit(0)
+    out.bit(0)  # +20: no timed movement event
+    gravity = round(state.gravity * POSITION_UNITS)
+    if gravity:
+        _delta(out, gravity, (8, 10, 24))  # +24 the gravity scale, at 1/1024
+    else:
+        out.bit(0)
+    out.bit(0)  # +28: the move-speed scale stays 1
+    # +36, the frame of the last command with throttles: a 0 bit makes it the record's frame (+8); else 1
+    # and 0 keep the reference's "never", 1 1 0 and 32 bits set it. The client reads +34 and +35 only when
+    # +36 is not +8 (0x7FF789B71DF6), else it copies +32 and +33: so the record's own frame always goes as
+    # the 0 bit, without +34/+35 (written, they were read as the next fields: the crashes of 2026-10-03).
+    input_frame = _input_frame(state, frame)
+    if input_frame is None:
+        out.bit(0)
+    elif input_frame == NO_INPUT:
+        out.bit(1)
+        out.bit(0)
+    else:
+        out.bit(1)
+        out.bit(1)
+        out.bit(0)
+        out.bits(input_frame, 32)
+    if state.crouch_frame is None:
+        out.bit(0)  # +40: the reference's "never"
+    else:
+        out.bit(1)  # +40, the frame it last stood up in: 1 0 and 32 bits
+        out.bit(0)
+        out.bits(state.crouch_frame & 0xFFFFFFFF, 32)
+    for throttle in state.throttles:  # +32 right, +33 forward
+        _throttle(out, throttle)
+    if input_frame is not None:
+        for throttle in state.input_throttles:  # +34, +35: the throttles of command +36
+            _throttle(out, throttle)
+
+
+def _steps(out: BitWriter, steps: int) -> None:
+    """A spring offset (+52, +56; 0x7FF789B770B0): the reference's steps (0) plus a signed delta."""
+    if steps:
+        _delta(out, steps, (8, 12, 17))
+    else:
+        out.bit(0)
+
+
+def write_movement(out: BitWriter, state: Movement, frame_back: int | None, base: int | None = None) -> None:
+    """The movement-state block. Its frame is `frame_back` frames before the base (0x7FF789B76D00: the
+    packet frame on ch3, CREATE_BASE on the create path; None: not known); None or 0 is the base itself."""
+    frame = None if base is None else (base - (frame_back or 0)) & 0xFFFFFFFF
     flags = state.flags & 0xFFFFFFFF
     if flags:
         out.bit(1)
@@ -184,12 +360,17 @@ def write_movement(out: BitWriter, state: Movement, frame_back: int | None) -> N
     else:
         out.bit(0)
     out.bit(0)  # +4: positions and velocity at 1/1024 m
-    if frame_back is None:
+    if not frame_back:
         out.bit(0)  # +8: the command frame is the base
     elif 1 <= frame_back < 16:
         out.bit(1)
         out.bit(1)
         out.bits(frame_back, 4)
+    elif 16 <= frame_back < 1024:
+        out.bit(1)
+        out.bit(0)  # not the 4-bit width: the 10-bit one
+        out.bit(1)
+        out.bits(frame_back, 10)
     else:
         out.bit(1)
         out.bits(0, 2)  # no width picked: 32 bits follow
@@ -200,7 +381,7 @@ def write_movement(out: BitWriter, state: Movement, frame_back: int | None) -> N
         _selector(out, pitch, 2, 16)  # +66 the aim pitch; widths 8, 10, 16
     else:
         out.bit(0)
-    out.bits(0, 8)  # +16, +20, +24, +28, then the two of +36/+40 and +32, +33 kept
+    _input_fields(out, state, frame)
     for angle in (state.yaw & 0xFFFF, 0, 0):  # Euler yaw, pitch, roll; widths 8, 10, 16
         if angle:
             _selector(out, angle, 2, 16)
@@ -220,7 +401,22 @@ def write_movement(out: BitWriter, state: Movement, frame_back: int | None) -> N
         out.bit(0)
     out.bits(0, 9)  # nine optional parts
     out.bit(0)  # no parent: world space
-    out.bits(0, 5)  # +52, +60, +56, +384, +832
+    _steps(out, state.spring[0])  # +52
+    speed = round(state.spring_speed * POSITION_UNITS)
+    if speed:
+        _delta(out, speed, (8, 10, 24))  # +60 the spring speed, at 1/1024
+    else:
+        out.bit(0)
+    _steps(out, state.spring[1])  # +56
+    out.bit(0)  # +384
+    if state.fall:  # +832: three optional raw floats (0x7FF789B71CE0), gravity's part of the velocity
+        out.bit(1)
+        out.bit(0)
+        out.bit(1)
+        out.f32(state.fall)
+        out.bit(0)
+    else:
+        out.bit(0)
 
 
 def create(
@@ -255,7 +451,7 @@ def create(
         for _ in range(3):
             out.f32(1.0)
     if movement is not None:
-        write_movement(out, movement, frame_back)
+        write_movement(out, movement, frame_back, CREATE_BASE)
     _write_components(out, components)
     return out
 
@@ -277,12 +473,17 @@ def update(origin: int, components: dict) -> RecordWriter:
     return out
 
 
-def movement_record(state: Movement) -> BitWriter:
+def movement_record(state: Movement, tick: int | None = None) -> BitWriter:
     """A ch3 record: 12 bits of length (counting themselves), a 0 bit, the movement state at the packet
-    frame."""
+    frame `tick`, or at the state's own frame (which must not be after the packet frame)."""
+    frame_back = None
+    if state.frame is not None and tick is not None:
+        frame_back = tick - state.frame
+        if frame_back < 0:
+            raise ValueError(f"a state of frame {state.frame} cannot go in packet frame {tick}")
     body = BitWriter()
     body.bit(0)
-    write_movement(body, state, None)
+    write_movement(body, state, frame_back, tick)
     out = BitWriter()
     out.bits(12 + body.count, 12)
     out.append(body)
@@ -300,15 +501,15 @@ class EntityUpdate:
         self.movement = movement
         self.chunk = chunk  # a statescript.chunk()
         self.chunk_last = 0  # the chunk's last frame, to know when the client has it
+        self.ch2 = None  # the projectile channel's bits after its own bit (projectiles.release), or None
         self.stream = None  # the statescript.Stream told when the chunk arrives
-        self.on_arrived = None  # optional callback after the containing datagram is acknowledged
         self.resend = True  # send it again when its datagram is lost
 
 
-def _write_entity(out: BitWriter, item: EntityUpdate) -> None:
+def _write_entity(out: BitWriter, item: EntityUpdate, tick: int | None = None) -> None:
     out.entity_id(item.entity)
     out.bit(1)  # ch0 reads nothing but takes its bit
-    if not item.op and item.movement is None and item.chunk is None:
+    if not item.op and item.movement is None and item.chunk is None and item.ch2 is None:
         out.bit(0)
         return
     out.bit(1)  # ch1 runs
@@ -318,14 +519,18 @@ def _write_entity(out: BitWriter, item: EntityUpdate) -> None:
         out.append(item.chunk)
     else:
         out.bit(0)
-    if not item.op and item.movement is None:
+    if not item.op and item.movement is None and item.ch2 is None:
         out.bit(0)
         return
-    out.bits(0b001, 3)  # ch2 runs, no event, no state
+    if item.ch2 is None:
+        out.bits(0b001, 3)  # ch2 runs, no event, no state
+    else:
+        out.bit(1)  # ch2 runs
+        out.append(item.ch2)
     out.bit(1)  # ch3 runs
     if item.movement is not None:
         out.bit(1)
-        out.append(movement_record(item.movement))
+        out.append(movement_record(item.movement, tick))
     else:
         out.bit(0)
     if not item.op:
@@ -358,5 +563,5 @@ def frame(tick: int, ack: int, reliable=(), unreliable=(), entities=()) -> bytes
         raise ValueError("at most 127 entities per frame")
     out.bits(len(entities), 7)
     for item in entities:
-        _write_entity(out, item)
+        _write_entity(out, item, tick)
     return out.getvalue()

@@ -116,7 +116,7 @@ class Content:
             (PERMISSIONS, 55500, self.player.features()),
             (PROGRESSION_IN, 24300, self.collection.progression(profile)),
             # The client merges boxes (24302) and takes each balance and the level from its own
-            # message (ProCore's live checks); a 24300 sent again is not relied on for them.
+            # message; a 24300 sent again is not relied on for them.
             self.collection.boxes_update(profile.loot_boxes),
             (PROGRESSION_IN, 24307, {"+0x78": profile.credits}),
             (PROGRESSION_IN, 24308, {"+0x78": profile.comp_points}),

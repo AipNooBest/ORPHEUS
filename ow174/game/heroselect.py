@@ -9,7 +9,7 @@ client-only nodes read). The client sends the pick as ClientOutInstance 21616 {e
 game message 1361.025, instance}, with the hero among the parameters; 1360.025 asks to open or close
 the screen. Retail OW2 traffic works the same way.
 
-More of the screen (read in the graphs and in IDA):
+More of the screen (read in the graphs and the client):
 - The skin selector shows while 288B's v25377 ("assembling heroes") is on. In retail the PvP mode
   script sets it for the assemble phase, and we do the same; in the Practice Range we set it whenever
   the screen is open, and hide the assemble title that comes with it (v8535). With it on, the client
@@ -17,10 +17,13 @@ More of the screen (read in the graphs and in IDA):
   (24500), and the body wears it (world.create).
 - The team list: 288A's state 1 starts 288D, whose client-only nodes post their entity (game message
   134F.025) to the local player's 288B unless it is an enemy. On our own entity that puts us in the list.
+  Every other player's controller entity gets 288D as its only (root) instance, in a plain frame that
+  also carries his pick (team_entry_frame); the list reads his name from his card (20308, match.py).
 """
 
 from dataclasses import dataclass
 
+from ow174.game.bits import BitWriter
 from ow174.game.content import PRACTICE_RANGE_MODE, heroes
 from ow174.game.statescript import (
     CONTROLLER,
@@ -29,11 +32,14 @@ from ow174.game.statescript import (
     HUD,
     PVP_CONTROLLER,
     TEAM_ENTRY,
+    Asset,
     Bool,
     Graph,
     Instance,
+    Value,
     owner_full_frame,
     subscript,
+    write_variable,
 )
 
 OPEN_SELECT = 2438
@@ -46,6 +52,12 @@ HIDE_ASSEMBLE = 8535
 PICK_HERO = 0x0240000000001361  # 1361.025 {hero}
 OPEN_OR_CLOSE = 0x0240000000001360  # 1360.025 {open}
 HERO_TYPE = 0x02E0  # the type bits of a 075 hero GUID
+# The entity variables of a controller that the team list reads from another player's entity: the
+# hero he plays (0C90/13C1 set it once the hero is spawned), whether he has picked, and the pick (288B
+# sets both with the pick). The list shows v940, else the pick while v2114 is on, else "still choosing".
+CURRENT_HERO = 940
+PICKED = 2114
+PICKED_HERO = 13161
 
 
 @dataclass(frozen=True)
@@ -68,17 +80,27 @@ def controller_of(mode_guid: int) -> Controller:
 
 
 def controller_frame(
-    controller: Controller, cmfd: int, select_open: bool, skins: bool = False, hide_assemble: bool = False
+    controller: Controller,
+    cmfd: int,
+    select_open: bool,
+    skins: bool = False,
+    hide_assemble: bool = False,
+    presence: dict[int, Value] | None = None,
+    hero: int | None = None,
 ):
     """The owner full frame for the player's entity: the controller (1) with hero select 288A (2) ->
     288B (3) under it, 13C1's HUD 20E4 (4), and 288A's team list entry 288D (the next index).
     `skins` turns on v25377, which shows the skin selector; `hide_assemble` hides the assemble title
-    and timer that come with it."""
+    and timer that come with it. `presence` adds presence bits of the controller (notices.py). `hero`
+    is the hero he plays (None before the first pick): v940, which retail's controller graph sets on
+    the server. The F1 hero info (288A's client-only 2931) shows v940's hero while hero select is
+    closed (2931 st3: v14152 = v31435 ? the browsed hero : v940)."""
     active = {controller.hero_select_bit: None, controller.select_bit: subscript(2)}
     host = Instance(2, HERO_SELECT_HOST, parent=(1, controller.select_state), active={0: subscript(3)})
     screen = Instance(3, HERO_SELECT, parent=(2, 0))
+    bits = {controller.allow_bit: Bool(True), **(presence or {})}
     instances = [
-        Instance(1, controller.graph, presence={controller.allow_bit: Bool(True)}, active=active),
+        Instance(1, controller.graph, presence=bits, active=active),
         host,
         screen,
     ]
@@ -92,8 +114,41 @@ def controller_frame(
         screen.presence[ASSEMBLING] = Bool(True)
     if hide_assemble:
         screen.extra[HIDE_ASSEMBLE] = Bool(True)
-    variables = {OPEN_SELECT: Bool(select_open), SELECT_SHOWN: Bool(select_open)}
+    variables: dict[int, Value] = {OPEN_SELECT: Bool(select_open), SELECT_SHOWN: Bool(select_open)}
+    if hero:
+        variables[CURRENT_HERO] = Asset(hero)
     return owner_full_frame(cmfd, instances, variables)
+
+
+def team_entry_frame(hero: int | None) -> BitWriter:
+    """A plain (H=0) full frame for another player's controller entity: 288D as its root instance 1,
+    which puts him in this client's team list unless he is an enemy, and the variables the list reads
+    from his entity. `hero` is the hero he picked and plays, None while he is still choosing. 288D has
+    no presence bits and no states, so its instance block is a single bit."""
+    variables: dict[int, Value] = {}
+    if hero:
+        variables[CURRENT_HERO] = Asset(hero)
+    variables[PICKED] = Bool(bool(hero))
+    if hero:
+        variables[PICKED_HERO] = Asset(hero)
+    out = BitWriter()
+    out.bit(0)  # lead
+    out.bit(0)  # H: not the owner's frame
+    out.w_u16(1)  # instance 1
+    out.bits(TEAM_ENTRY.index, 16)
+    out.bit(0)  # it lives on this entity
+    out.bit(0)  # flag
+    out.bit(0)  # no parent: a root instance
+    out.bit(0)  # no references
+    out.w_u16(0)  # the instance list ends
+    out.bit(1)  # entity variables follow
+    for number, value in variables.items():
+        out.w_var(number)
+        write_variable(out, value)
+    out.w_var(0)
+    out.bit(0)  # 288D's block: no extra ids
+    out.bits(0, 2)  # the frame's event lists: none
+    return out
 
 
 def picked_hero(parameters: bytes) -> int | None:

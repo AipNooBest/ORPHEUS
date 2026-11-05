@@ -4,6 +4,12 @@ The lobby sends each player of a match 20600 with this server's address, a conne
 own and two keys (lobby/matchmaker.py). The client then sends SYN datagrams with that id in the
 header until it gets SYN|ACK, and the session is open with its first ACK. From then on the server
 sends one world frame per tick; the first reliable message is 20300 (load the map).
+
+Datagrams go to their game by that connection id, as in the client: it routes every datagram by the id
+in its header and opens it with that connection's keys, whatever the address (0x7FF7893127F0). All
+links of one game share one socket (0x7FF78930F920), so a game that goes from one match to the next
+sends the old connection's FIN and the new one's SYN from the same address; the address of a client
+follows its newest datagram.
 """
 
 import ctypes
@@ -13,10 +19,11 @@ import secrets
 import socket
 import threading
 import time
+import weakref
 from ctypes import wintypes
 from dataclasses import dataclass
 
-from ow174.game import messages, world
+from ow174.game import correction, messages, movelog, world
 from ow174.game.bits import BitReader
 from ow174.game.commands import InputError, read_commands
 from ow174.game.link import (
@@ -33,7 +40,8 @@ from ow174.game.link import (
     delivery,
     peek_connection,
 )
-from ow174.game.match import Match, Player, no_skin, pong
+from ow174.game.match import Match, Player, no_skin, pong, sends
+from ow174.game.script.driver import warm_up
 from ow174.jam.codec import DecodeError
 from ow174.jam.values import to_jsonable
 
@@ -42,12 +50,32 @@ log = logging.getLogger("ow174.game")
 TICK_SECONDS = 0.016
 FIRST_TICK = 1000
 SILENCE_SECONDS = 10.0  # the client sends at least every 250 ms; after this long it is gone
+# A game that has not connected this long after its 20600 is not coming (for example it could not
+# reach the game server's address): the player leaves the match, and the lobby takes them back.
+HANDOFF_SECONDS = 60.0
 MAX_PAYLOAD = MAX_DATAGRAM - HEADER_SIZE
 PING = 21610
 MAP_LOADED = (21601, 21602)
 GAME_MESSAGE = 21616
 LEAVE_GAME = 20304
+# A game sent to the menu (20304) closes its link within ~30 ms; one that does
+# not is dropped after this long, so that its match still ends.
+LEAVE_GRACE_SECONDS = 3.0
+DROPPED_LOG_SECONDS = 5.0  # datagrams we drop: one line per address, connection and reason in this time
 SIO_UDP_CONNRESET = 0x9800000C
+
+
+def next_tick_after(due: float, now: float) -> tuple[float, int]:
+    """When the tick after the one due at `due` is due, and how many ticks fell behind `now` (they are
+    skipped, not run late). So the packet frame stays on real time, like retail's (62.5 per second, OW2
+    traffic): the client's command clock runs on real time and only ever jumps forward to the packet
+    frame (0x7FF7896DB296, 0x7FF789AC7140), so a frame number that fell behind would leave the client's
+    commands further ahead of it with every stall, past its 64 predicted states and 32 kept commands."""
+    following = due + TICK_SECONDS
+    if following >= now:
+        return following, 0
+    missed = int((now - following) // TICK_SECONDS) + 1
+    return following + missed * TICK_SECONDS, missed
 
 
 def _ignore_connection_resets(sock: socket.socket) -> None:
@@ -92,6 +120,17 @@ class Handoff:
     match_id: tuple[int, int]
 
 
+@dataclass
+class OpenMatch:
+    """A match that still has free places, as the matchmaker sees it."""
+
+    match: Match
+    waiting: bool  # still waiting for its players: hero select has not started counting down
+    free: list[int]  # free places per team (one entry for free for all)
+    roles: list[dict[int, int]]  # per team: role queue role -> players playing it
+    started: float  # time.time() of its creation
+
+
 class Client:
     """One connected game: the transport state and the queues of what to send."""
 
@@ -113,9 +152,17 @@ class Client:
         self.in_flight = {}  # datagram seq -> (reliable messages, entity updates) it carried
         self.expected_in = 0  # the client's next reliable message
         self.parked_in = {}
+        self.leaving_since: float | None = None  # when go_home sent 20304
 
     def log(self, message: str, level: int = logging.INFO) -> None:
         log.log(level, "[game %s:%d %s] %s", self.address[0], self.address[1], self.player.name, message)
+
+    def go_home(self, now: float) -> None:
+        """20304 with 0 = leave for good (0x7FF7896E6830): the game goes back to the menu and closes its
+        link. GameServer._tick drops it after LEAVE_GRACE_SECONDS if it does not."""
+        if self.leaving_since is None:
+            self.queue_reliable(LEAVE_GAME, {"+0x78": 0, "+0x79": False})
+            self.leaving_since = now
 
     # --- queues --------------------------------------------------------------------------------
 
@@ -129,7 +176,37 @@ class Client:
         self.unreliable.append(messages.encode(msg_id, value))
 
     def queue_entities(self, updates: list) -> None:
-        self.entities.extend(updates)
+        # A destroy retires all older records of this entity for this client, including
+        # reliable creates/chunks awaiting ACK. A later reuse of the id is a new generation.
+        lifecycles = getattr(self, "_entity_lifecycles", None)
+        if lifecycles is None:
+            lifecycles = self._entity_lifecycles = {}
+        generations = getattr(self, "_entity_record_generations", None)
+        if generations is None:
+            generations = self._entity_record_generations = weakref.WeakKeyDictionary()
+        for item in updates:
+            generation, alive = lifecycles.get(item.entity, (0, True))
+            if item not in generations:
+                if item.op in (world.OP_CREATE, world.OP_DESTROY):
+                    # Preserve the generation of already-sent records, even for an older
+                    # producer that did not put them through queue_entities first.
+                    pending = [*self.entities]
+                    for _reliable, records in self.in_flight.values():
+                        pending.extend(records)
+                    for old in pending:
+                        if old.entity == item.entity and old not in generations:
+                            generations[old] = generation
+                    generation += 1
+                    alive = item.op == world.OP_CREATE
+                    lifecycles[item.entity] = (generation, alive)
+                generations[item] = generation
+            if generations[item] == generation and (alive or item.op == world.OP_DESTROY):
+                self.entities.append(item)
+        self.entities = [
+            item for item in self.entities
+            if generations.get(item, 0) == lifecycles.get(item.entity, (0, True))[0]
+            and (lifecycles.get(item.entity, (0, True))[1] or item.op == world.OP_DESTROY)
+        ]
 
     # --- sending -------------------------------------------------------------------------------
 
@@ -162,10 +239,23 @@ class Client:
         self._send(Packet(self.conn, KIND_FRAME, flags=ACK, payload=payload))
 
     def _payload(self, tick: int, reliable, unreliable, entities) -> bytes:
-        return world.frame(tick, tick, reliable, unreliable, entities)
+        # The command ack: the newest command frame we have. The client stops
+        # sending the frames before it again; our tick could make it drop frames we never got. While
+        # the owner gets records of its body, it stays near them (correction.command_ack).
+        ack = correction.command_ack(self.player, tick)
+        return world.frame(tick, ack, reliable, unreliable, entities)
 
     def acked(self, ack: int, ack_bits: int) -> None:
         """Take back what the client did not get: its reliable messages and entity records go out again."""
+        lifecycles = getattr(self, "_entity_lifecycles", {})
+        generations = getattr(self, "_entity_record_generations", {})
+
+        def current(item) -> bool:
+            generation, alive = lifecycles.get(item.entity, (0, True))
+            return generations.get(item, 0) == generation and (
+                alive or item.op == world.OP_DESTROY
+            )
+
         lost_reliable, lost_records = [], []
         for seq in list(self.in_flight):
             state = delivery(seq, ack, ack_bits)
@@ -174,17 +264,15 @@ class Client:
             reliable, records = self.in_flight.pop(seq)
             if state:
                 for item in records:
-                    if item.stream is not None:
+                    if current(item) and item.stream is not None:
                         item.stream.arrived(item.chunk_last)
-                    callback = getattr(item, "on_arrived", None)
-                    if callback is not None:
-                        callback()
             else:
                 lost_reliable += reliable
-                lost_records += [item for item in records if item.resend]
+                lost_records += [item for item in records if item.resend and current(item)]
         if lost_reliable:
             self.reliable = sorted(lost_reliable + self.reliable)
             self.log(f"[!] resending {len(lost_reliable)} reliable message(s)")
+        lost_records = [item for item in lost_records if current(item)]
         if lost_records:
             self.entities = lost_records + self.entities
             self.log(f"[!] resending {len(lost_records)} entity record(s)")
@@ -206,8 +294,12 @@ class Client:
         if not self.open and packet.flags & ACK:
             self.open = True
             self.log("[+] connected")
-            self.queue_reliable(20300, self.player.match.instance_message(self.player))
-        if packet.kind == KIND_FRAME and packet.payload:
+            if self.player.gone or self.server.going_home(self.player):
+                self.go_home(now)  # taken out of the match before its game connected (GameServer.take_out)
+            else:
+                self.queue_reliable(20300, self.player.match.instance_message(self.player))
+                self.server.joined(self.player)
+        if packet.kind == KIND_FRAME and packet.payload and not self.player.gone:
             self._payload_in(packet.payload, now)
 
     def _payload_in(self, payload: bytes, now: float) -> None:
@@ -253,28 +345,30 @@ class Client:
 
 class GameServer:
     def __init__(
-        self, host: str = "127.0.0.1", port: int = 3730, on_leave=None, skin_of=no_skin,
-        *, body_scripts: str = "off",
+        self, host: str = "127.0.0.1", port: int = 3730, on_leave=None, skin_of=no_skin, on_join=None
     ) -> None:
-        if body_scripts not in ("off", "diagnostic", "experimental"):
-            raise ValueError("Unknown body script mode")
         self.host = host
         self.port = port
         self.on_leave = on_leave  # called with each player who leaves a match
+        self.on_join = on_join  # called with each player whose game connected to its match
         self.skin_of = skin_of  # (account, hero) -> the equipped (skin theme, golden weapon); no locks
-        self.body_scripts = body_scripts
         self.sock: socket.socket | None = None
         self.lock = threading.RLock()
-        self.handoffs: dict[int, tuple[Handoff, Player]] = {}  # connection id -> waiting player
-        self.clients: dict[tuple, Client] = {}  # address -> client
+        # connection id -> (the 20600 data, the waiting player, when to give up on them)
+        self.handoffs: dict[int, tuple[Handoff, Player, float]] = {}
+        self.clients: dict[int, Client] = {}  # connection id -> client
+        self._dropped: dict[tuple, list] = {}  # (address, conn, why) -> [count not logged yet, last line]
         self.matches: list[Match] = []
         self.tick = FIRST_TICK
         self._next_conn = secrets.randbelow(0x100000) + 1
         self._left_players: list[Player] = []  # told to on_leave once the lock is released
+        self._joined_players: list[Player] = []  # told to on_join once the lock is released
+        self._sent_home: weakref.WeakSet[Player] = weakref.WeakSet()  # taken out by the server (take_out)
         self.running = False
 
     def start(self) -> None:
         """Bind the port and run the server thread. Raises OSError when the port is taken."""
+        warm_up()  # the statescript data (0.35 s), so that the first hero body does not stall a tick
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         _ignore_connection_resets(self.sock)
         self.sock.bind((self.host, self.port))
@@ -288,25 +382,59 @@ class GameServer:
 
     # --- matches -------------------------------------------------------------------------------
 
-    def create_match(self, game_map, players) -> list[Handoff]:
-        """A match for these players: [(account_lo, name, hero GUID, team, tournament)]. Returns the
-        20600 data of each, in the same order."""
+    def create_match(self, game_map, players, card: int = 0) -> list[Handoff]:
+        """A match for these players: [(account_lo, name, hero GUID, team, tournament[, card])], card
+        being the player's card as the lobby shows it (content.player.record). `card` is the queue card
+        the match is for (0: none). Returns the 20600 data of each, in the same order."""
         with self.lock:
-            match = Match(
-                game_map, on_leave=self._left, skin_of=self.skin_of, body_scripts=self.body_scripts
-            )
-            handoffs = []
-            for account_lo, name, hero, team, tournament in players:
-                player = match.add_player(account_lo, name, hero, team, tournament)
-                conn = self._next_conn
-                self._next_conn = (self._next_conn % 0x0FFFFFFF) + 1
-                handoff = Handoff(conn, secrets.token_bytes(32), secrets.token_bytes(32), match.id)
-                self.handoffs[conn] = (handoff, player)
-                handoffs.append(handoff)
+            match = Match(game_map, on_leave=self._left, skin_of=self.skin_of, card=card)
+            handoffs = [self._add_player(match, entry) for entry in players]
             self.matches.append(match)
         names = ", ".join(player.describe() for player in match.players)
         log.info("[game] %s on %s (%s): %s", match.label(), game_map.name, game_map.mode_name, names)
         return handoffs
+
+    def open_matches(self, card: int) -> list[OpenMatch]:
+        """The queue card's matches that still have free places, oldest first."""
+        with self.lock:
+            rooms = []
+            for match in self.matches:
+                if not card or match.card != card or match.ended:
+                    continue
+                free = match.free_places()
+                if any(places > 0 for places in free):
+                    rooms.append(
+                        OpenMatch(match, match.waiting_for_players, free, match.roles_taken(), match.started)
+                    )
+            return rooms
+
+    def join_match(self, match: Match, players) -> list[Handoff] | None:
+        """More players for a match that is on, as create_match takes them; None once it has ended."""
+        with self.lock:
+            if match.ended or match not in self.matches:
+                return None
+            handoffs = [self._add_player(match, entry) for entry in players]
+            names = ", ".join(player.describe() for player in match.players[-len(players) :])
+        log.info("[game] %s: %s join", match.label(), names)
+        return handoffs
+
+    def lineup(self, match_id: tuple[int, int]) -> list[tuple[int, int, int, dict]]:
+        """(account_lo, team, role, card) of each player still in the match: the lobby's roster for its
+        VERSUS loading screen (lobby/lineup.py)."""
+        with self.lock:
+            for match in self.matches:
+                if match.id == match_id:
+                    return [(p.account_lo, p.team, p.role, dict(p.card)) for p in match.players if not p.gone]
+        return []
+
+    def _add_player(self, match: Match, entry) -> Handoff:
+        account_lo, name, hero, team, tournament, *card = entry
+        player = match.add_player(account_lo, name, hero, team, tournament, card[0] if card else None)
+        conn = self._next_conn
+        self._next_conn = (self._next_conn % 0x0FFFFFFF) + 1
+        handoff = Handoff(conn, secrets.token_bytes(32), secrets.token_bytes(32), match.id)
+        self.handoffs[conn] = (handoff, player, time.time() + HANDOFF_SECONDS)
+        return handoff
 
     def switch_hero(self, account_lo: int, hero) -> bool:
         with self.lock:
@@ -317,6 +445,17 @@ class GameServer:
                         return True
         return False
 
+    def skin_changed(self, account_lo: int, hero_guid: int) -> bool:
+        """The lobby equipped an item of a hero (24500): a player in a match who plays that hero gets the
+        new skin (Match.skin_changed). Hero select equips skins through the lobby, even in a match, and
+        picks nothing again."""
+        with self.lock:
+            for match in self.matches:
+                for player in match.players:
+                    if player.account_lo == account_lo and player.client is not None and not player.gone:
+                        return match.skin_changed(player, hero_guid)
+        return False
+
     def send_home(self, account_lo: int | None = None) -> int:
         """Send a player's game (every game for None) back to the menu: 20304 with 0 = leave for good
         (0x7FF7896E6830). Returns how many games were told."""
@@ -324,13 +463,60 @@ class GameServer:
         with self.lock:
             for client in list(self.clients.values()):
                 if account_lo is None or client.player.account_lo == account_lo:
-                    client.queue_reliable(LEAVE_GAME, {"+0x78": 0, "+0x79": False})
+                    self._sent_home.add(client.player)
+                    client.go_home(time.time())
                     count += 1
         return count
 
+    def player_of(self, account_lo: int) -> Player | None:
+        """The account's player in a match it has not left, whether its game connected or not."""
+        with self.lock:
+            for match in self.matches:
+                for player in match.players:
+                    if player.account_lo == account_lo and not player.gone:
+                        return player
+        return None
+
+    def elsewhere(self, account_lo: int, match_id: tuple[int, int]) -> Player | None:
+        """The account's player in a match other than this one that it has not left: for example the
+        Practice Range it plays while its queue match pops (lobby/matchmaker.py)."""
+        with self.lock:
+            for match in self.matches:
+                for player in match.players:
+                    if match.id != match_id and player.account_lo == account_lo and not player.gone:
+                        return player
+        return None
+
+    def take_out(self, player: Player, reason: str) -> str:
+        """Take a player out of its match from the server side: a connected game goes back to the menu
+        (20304) and leaves the match when its link closes; a game that has not connected leaves the
+        match now, and gets 20304 if it still connects. Returns what happened, for the log."""
+        with self.lock:
+            if player.gone:
+                return "had left already"
+            self._sent_home.add(player)
+            client = player.client
+            if client is not None and not client.closed:
+                client.go_home(time.time())
+                return "sent to the menu"
+            player.match.leave(player, reason)
+            return "left before its game connected"
+
+    def going_home(self, player: Player) -> bool:
+        """Whether the server took the player out of its match (take_out, send_home)."""
+        with self.lock:
+            return player in self._sent_home
+
+    def joined(self, player: Player) -> None:
+        self._joined_players.append(player)
+
     def in_match(self, account_lo: int) -> bool:
         with self.lock:
-            return any(player.account_lo == account_lo for match in self.matches for player in match.players)
+            return any(
+                player.account_lo == account_lo and not player.gone
+                for match in self.matches
+                for player in match.players
+            )
 
     def snapshot(self) -> list[dict]:
         with self.lock:
@@ -340,15 +526,18 @@ class GameServer:
         self._left_players.append(player)
 
     def _report_leaves(self) -> None:
-        """Tell the lobby about players who left, outside our lock: the lobby calls us under its own."""
+        """Tell the lobby about games that connected and players who left, outside our lock: the lobby
+        calls us under its own."""
         with self.lock:
+            joined, self._joined_players = self._joined_players, []
             left, self._left_players = self._left_players, []
-        for player in left:
-            if self.on_leave is not None:
-                try:
-                    self.on_leave(player)
-                except Exception:
-                    log.exception("[game] the lobby's leave handler failed")
+        for callback, players in ((self.on_join, joined), (self.on_leave, left)):
+            for player in players:
+                if callback is not None:
+                    try:
+                        callback(player)
+                    except Exception:
+                        log.exception("[game] the lobby's join or leave handler failed")
 
     # --- the loop ------------------------------------------------------------------------------
 
@@ -369,9 +558,8 @@ class GameServer:
                     if data is not None:
                         self._datagram(data, address, time.time())
                     if time.monotonic() >= next_tick:
-                        next_tick += TICK_SECONDS
-                        if next_tick < time.monotonic():  # fell behind: do not try to catch up
-                            next_tick = time.monotonic() + TICK_SECONDS
+                        next_tick, missed = next_tick_after(next_tick, time.monotonic())
+                        self.tick += missed
                         self._tick(time.time())
             except Exception:
                 log.exception("[game] tick failed")
@@ -379,44 +567,105 @@ class GameServer:
         self.sock.close()
 
     def _datagram(self, data: bytes, address, now: float) -> None:
-        client = self.clients.get(address)
+        conn = peek_connection(data)
+        if conn is None:
+            self._drop_datagram(address, None, "not a game link datagram", now)
+            return
+        client = self.clients.get(conn)
         if client is not None:
             packet = client.cipher.open(data)
             if packet is None:
+                self._drop_datagram(address, conn, "does not open with that connection's keys", now)
                 return
+            if address != client.address:
+                if not client.window.is_new(packet.seq):
+                    self._drop_datagram(address, conn, "an old datagram from another address", now)
+                    return
+                client.log(f"[+] the game moved to {address[0]}:{address[1]}")
+                client.address = address
             client.received(packet, now)
             return
-        conn = peek_connection(data)
         waiting = self.handoffs.get(conn)
         if waiting is None:
+            self._drop_datagram(address, conn, "unknown connection", now)
             return
-        handoff, player = waiting
+        handoff, player, _ = waiting
         cipher = LinkCipher(handoff.key_in, handoff.key_out)
         packet = cipher.open(data)
         if packet is None or not packet.flags & SYN:
+            self._drop_datagram(address, conn, "not a SYN with the keys of its 20600", now)
             return
         del self.handoffs[conn]
         client = Client(self, address, conn, cipher, player)
-        player.client = client
-        self.clients[address] = client
-        client.log(f"[+] SYN for {player.match.label()}")
+        if not player.gone:  # one taken out before it connected only gets its 20304
+            player.client = client
+        self.clients[conn] = client
+        client.log(f"[+] SYN for {player.match.label()}, connection {conn}{self._others_at(address, client)}")
         client.received(packet, now)
+
+    def _others_at(self, address, client=None) -> str:
+        """The other connections on this address, for the log: a game's links all share one socket."""
+        at = [
+            f"{other.conn} ({other.player.match.label()})"
+            for other in self.clients.values()
+            if other.address == address and other is not client
+        ]
+        return f"; this address also has connection {', '.join(at)}" if at else ""
+
+    def _drop_datagram(self, address, conn, why: str, now: float) -> None:
+        """Log a datagram we drop: the first at once, then one line with the count per address, connection
+        and reason every DROPPED_LOG_SECONDS (_tick writes the last count)."""
+        key = (address, conn, why)
+        seen = self._dropped.get(key)
+        if seen is not None:
+            seen[0] += 1
+            if now - seen[1] < DROPPED_LOG_SECONDS:
+                return
+        self._log_dropped(key, 1 if seen is None else seen[0], now)
+
+    def _log_dropped(self, key, count: int, now: float) -> None:
+        address, conn, why = key
+        log.info(
+            "[game %s:%d] [!] dropped %d datagram(s) of connection %s: %s%s",
+            address[0],
+            address[1],
+            count,
+            conn,
+            why,
+            self._others_at(address),
+        )
+        self._dropped[key] = [0, now]
 
     def _tick(self, now: float) -> None:
         self.tick += 1
+        for conn, (_, player, deadline) in list(self.handoffs.items()):
+            if now >= deadline:
+                del self.handoffs[conn]
+                player.match.leave(player, "did not connect")
         for match in list(self.matches):
             match.update(now, self.tick)
         for client in list(self.clients.values()):
             if now - client.heard > SILENCE_SECONDS:
                 client.log("[!] no datagrams for 10 s, dropping the game")
                 self.drop(client)
-            elif client.open:
+            elif client.leaving_since is not None and now - client.leaving_since >= LEAVE_GRACE_SECONDS:
+                client.log("[!] still here after 20304, dropping the game")
+                self.drop(client)
+            elif client.open and sends(self.tick):
                 client.send_frame(self.tick, now)
         self.matches = [match for match in self.matches if not match.ended]
+        for key, (count, last) in list(self._dropped.items()):
+            if now - last >= DROPPED_LOG_SECONDS:
+                if count:
+                    self._log_dropped(key, count, now)
+                else:
+                    del self._dropped[key]
 
     def drop(self, client: Client) -> None:
         if client.closed:
             return
         client.closed = True
-        self.clients.pop(client.address, None)
+        if self.clients.get(client.conn) is client:
+            del self.clients[client.conn]
+        movelog.close(client.player)
         client.player.match.leave(client.player)

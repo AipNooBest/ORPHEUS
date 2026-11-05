@@ -25,12 +25,13 @@ class AskModeTests(unittest.TestCase):
     def test_numbers_pick_the_modes(self):
         self.assertEqual(self.ask("1"), "retail")
         self.assertEqual(self.ask(" 2 "), "tournament")
-        self.assertEqual(self.ask("3"), "server")
-        self.assertEqual(self.ask("4"), "join")
-        self.assertEqual(self.ask("5"), "join-tournament")
+        self.assertEqual(self.ask("3"), "host")
+        self.assertEqual(self.ask("4"), "server")
+        self.assertEqual(self.ask("5"), "join")
+        self.assertEqual(self.ask("6"), "join-tournament")
 
     def test_anything_else_asks_again(self):
-        self.assertEqual(self.ask("tournament", "9", "2"), "tournament")
+        self.assertEqual(self.ask("tournament", "9", "0", "2"), "tournament")
 
     def test_a_mode_on_the_command_line_is_not_asked(self):
         self.assertEqual(cli.parse_args(["--mode", "tournament"]).mode, "tournament")
@@ -119,12 +120,26 @@ class JoinTests(unittest.TestCase):
                 cli.join(args)
         close.assert_not_called()
 
-    def test_server_only_listens_for_other_pcs(self):
+    def test_hosting_listens_for_other_pcs(self):
         self.assertEqual(cli.listen_host(cli.parse_args(["--mode", "server"])), "0.0.0.0")
+        self.assertEqual(cli.listen_host(cli.parse_args(["--mode", "host"])), "0.0.0.0")
         self.assertEqual(cli.listen_host(cli.parse_args(["--mode", "retail"])), "127.0.0.1")
         self.assertEqual(
             cli.listen_host(cli.parse_args(["--mode", "server", "--host", "10.0.0.2"])), "10.0.0.2"
         )
+
+    def test_the_public_address_is_remembered_and_dash_drops_it(self):
+        saved = self.saved.with_name("public_address.txt")
+
+        def ask(*answers):
+            with patch("builtins.input", side_effect=answers), patch("builtins.print"):
+                return cli.ask_public_address(saved)
+
+        self.assertEqual(ask(""), "")  # nothing saved yet: only the host's network plays
+        self.assertEqual(ask("1.2.3.4:3724", "1.2.3.4"), "1.2.3.4")
+        self.assertEqual(ask(""), "1.2.3.4")
+        self.assertEqual(ask("-"), "")
+        self.assertFalse(saved.exists())
 
     def test_names(self):
         for name in ("Jinxzi", "Игрок_2", "a-b"):

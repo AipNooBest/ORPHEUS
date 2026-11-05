@@ -77,10 +77,15 @@ class GameMap:
     placeables: tuple[int, ...]  # map entities the server creates; the loading screen waits for them
     spawns: tuple[Spawn, ...]
     mode_name: str = ""
+    # Players per team, from the ruleset. The hero select screen's team list shows the missing ones as
+    # empty slots.
+    team_sizes: tuple[int, ...] = (6, 6)
+    free_for_all: bool = False  # one team, everyone against everyone (its one size is the player count)
 
 
-# Practice Range (0688.002 with 0018.0C5): its four server-owned placeables, the ones ProCore read
-# in the running client and the rule in tools/extract_game_maps.py gives, and the spawn point.
+# Practice Range (0688.002 with 0018.0C5): its four server-owned placeables, the ones the running
+# client has and the rule in tools/extract_game_maps.py gives, and the spawn point. Its
+# mode has one player on the blue team and none on the red one.
 PRACTICE_RANGE = GameMap(
     name="Practice Range",
     map_guid=0x0800000000000688,
@@ -88,6 +93,7 @@ PRACTICE_RANGE = GameMap(
     placeables=(0x88, 0x22E, 0x234, 0x289),
     spawns=(Spawn(None, (54.56507, 1.0, 42.14788), -170.3434),),
     mode_name="Practice Range",
+    team_sizes=(1, 0),
 )
 
 
@@ -137,10 +143,15 @@ def _first_round_spawns(entry: dict, free_for_all: bool) -> tuple[Spawn, ...]:
 
 
 def game_map(
-    map_guid: int, mode_guid: int, mode_name: str = "", free_for_all: bool = False
+    map_guid: int,
+    mode_guid: int,
+    mode_name: str = "",
+    free_for_all: bool = False,
+    team_sizes: tuple[int, ...] = (6, 6),
 ) -> GameMap | None:
-    """The map as it is played in that mode, or None when the server can't host it: no data, a mode
-    the map doesn't support, no spawn points, or a mode whose loading needs its own script."""
+    """The map as it is played in that mode with that many players per team, or None when the server
+    can't host it: no data, a mode the map doesn't support, no spawn points, or a mode whose loading
+    needs its own script."""
     if map_guid == PRACTICE_RANGE.map_guid:
         return PRACTICE_RANGE
     entry = _map_entries().get(map_guid)
@@ -153,7 +164,10 @@ def game_map(
     spawns = _first_round_spawns(entry, free_for_all)
     if not spawns:
         return None
-    return GameMap(entry["name"], map_guid, mode_guid, tuple(placeables), spawns, mode_name)
+    sizes = tuple(team_sizes)
+    return GameMap(
+        entry["name"], map_guid, mode_guid, tuple(placeables), spawns, mode_name, sizes, free_for_all
+    )
 
 
 SPAWN_SPACING = 1.5  # metres between players who get the same spawn point

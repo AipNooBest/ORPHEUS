@@ -55,6 +55,58 @@ F. Tools and unavailable specifications
   graph.py mentions "spec 09 section 7.1"; the referenced spec is not bundled here.
   Do not describe that unavailable material as read, public or fully verified.
 
+G. Additional public 1.74 implementation located during this work
+  LizRollin/overwatch-1.74-lobby-server, wip, fixed commit:
+  9f8f3bcb5eccab6fb7738bee3c2371fcf0623f29
+  https://github.com/LizRollin/overwatch-1.74-lobby-server/tree/9f8f3bcb5eccab6fb7738bee3c2371fcf0623f29
+  This revision includes script/expr.py, runtime.py, nodes.py, driver.py, decode.py,
+  rulesets.py, codec extraction/table data and unit/model tests; it also contains collision,
+  movement, combat and projectile implementations. These are new implementation references,
+  not proof that the main local project already has those features working in the client.
+  Its WIP.md attributes working Soldier combat and training bots to the author's live tests,
+  and also lists stuck firing/ammo after kills, Sprint failures, crashes after kills, HUD
+  health-number problems, missing ultimate behavior and incomplete match rules. Those are
+  upstream claims and known issues, not new independent real-client acceptance here.
+
+  Isolated baseline performed here:
+    Export: work/upstream-liz, made by git archive of the fixed commit, with tarfile
+    filter='data'; the destination did not previously exist.
+    Interpreter: the existing main project's .venv Python, with -B.
+    Six inspected suites passed: expression 14, runtime 11, driver 24, codecs 9,
+    abilities 11 and game_statescript 6; total 75, no failures/errors/skips.
+    Test execution prohibited process launches and socket connect/bind. No blocked
+    attempts occurred; no game, server, injection or downloader was started.
+    Baseline records: work/liz-validation.json and work/liz-validation.log.
+    These results apply to the unmodified fixed-commit export before the separately
+    authorized expression robustness patch. The export may change after that baseline.
+    Original expr.py SHA-256:
+    7940ab23fe9cb8c99858a0e2335f7aacb1f029d865bc6906f711b664b956c580
+
+  A separate robustness investigation reproduced an unbounded expression jump loop with
+  expr.run([1, 0]). This case is not covered by the original 75 passing tests. An instruction
+  budget and malformed/truncated/jump-target validation are being repaired and tested in the
+  isolated copy. Do not treat the baseline pass as evidence that interpreter inputs are bounded.
+  Controlled main-project integration and live-client acceptance are still in progress.
+
+H. AipNooBest protocol/HUD notes and retracted conclusions
+  Earlier weapon/snapshot POC, fixed commit f8426859c3195691d379f2fb291a475dfa40139e:
+  https://github.com/AipNooBest/overwatch-1.74-lobby-server/blob/f8426859c3195691d379f2fb291a475dfa40139e/docs/STATESCRIPT.md
+  https://github.com/AipNooBest/overwatch-1.74-lobby-server/blob/f8426859c3195691d379f2fb291a475dfa40139e/docs/HERO-WEAPONS.md
+  Corrective HUD work, fixed commit 860bab453eaa8b49e5760b155f9a3fa68e164af3:
+  https://github.com/AipNooBest/overwatch-1.74-lobby-server/blob/860bab453eaa8b49e5760b155f9a3fa68e164af3/docs/HERO-WEAPONS.md
+  https://github.com/AipNooBest/overwatch-1.74-lobby-server/blob/860bab453eaa8b49e5760b155f9a3fa68e164af3/docs/HUD-VARIABLES.md
+  The later notes retract the earlier queue-mode-5 HUD explanation. They also explicitly
+  retract screenshot readings of ammo 30/30, health/armor numbers and ability rows: the
+  purported digits were duplicate weapon rendering. The later branch still describes a
+  partially rendered HUD. Preserve both the revision and the retraction when using these notes.
+  Their snapshot POC and static activation choices are not a general statescript executor.
+  Documentation and code comments also disagree on the body-create descriptor list; inspect
+  actual call sites and verify client acceptance rather than copying the prose alone.
+
+  The relay release source URL squeeeezy/overwatch-1.74-lobby-server returned 404 through
+  both the GitHub connector and public GitHub during this check. Its unavailable contents and
+  branches were not inspected; the reason for the 404 is unknown.
+
 Acceptance and redirection
   An unsupported node or unknown expression that blocks a scenario remains an explicit
   blocker. Do not count structural node presence or caller-declared handlers as support.

@@ -1,53 +1,96 @@
 # Project state
 
-## Works
+Local evidence updated 2026-11-05, for client **1.74.0.0.104319**. The gameplay
+integration uses LizRollin's wip revision
+`9f8f3bcb5eccab6fb7738bee3c2371fcf0623f29`, on top of the Boi baseline and the
+local startup/research work. [WIP.md](../WIP.md) retains the upstream author's
+test claims and known issues. Those claims are separate from the observations below.
 
-- Login, the main menu, the lobby hero and lobby scenes (events).
-- Loot boxes: all 11 types can be opened.
-- The shop: prices come from the catalog, and each item takes the right currency (credits, league tokens or competitive points).
-- The three Anniversary Remix scenes.
-- The dashboard: profile, events, loot boxes, shop and skins.
-- Hero challenges with a Play menu banner (Tracer, Symmetra, Hanzo's Kanezaka) and their rewards.
-- Competitive seasons, ratings and the Top 500 board in the menus.
+## Local client observations
 
-## Experimental game server
+- The real `_retail_/Overwatch.exe` logs into the local emulator without running
+  the official Battle.net launcher.
+- The Practice Range loads and the hero-selection screen appears. A hero switch
+  was observed and recorded by the server.
+- After the gameplay integration, the user reports killing training robots. The
+  corresponding log records multiple damage notifications (25001), eliminations
+  (25005), bot deaths and respawns.
+- The user reports **no enemy overhead health bar**, no expected hit effect,
+  and an elimination label without the robot's name. These remain unresolved.
+  A robot's expected effect must be checked separately from flesh blood effects.
 
-The `wip` branch includes a UDP game server. See [WIP.md](../WIP.md) for the upstream
-gameplay research status. Loading a map does not imply a complete playable match.
+The automated UI check was stopped by the user with Escape. It did not establish
+stable weapon/ammo HUD, a complete shooting/reload cycle, ten repeated hero
+switches/reentries, or multiplayer agreement. Server logs and model tests do not
+replace these client acceptance checks.
 
-On 2026-11-05, a local Windows client of build 1.74.0.0.104319 was observed to:
+## Gameplay implementation now present
 
-- Log in through the local Battle.net emulator, without the official launcher.
-- Load the Practice Range, spawn, and display hero selection.
-- Switch heroes; the server log recorded a switch to Doomfist.
+The canonical gameplay path uses `game/script/driver.py`, `runtime.py`,
+`nodes.py` and `expr.py`, with target-build graph and codec data. It runs body,
+weapon-manager and weapon instances and encodes owner/observer state frames.
+It is no longer the earlier flat-movement/lobby-only implementation.
 
-Walking, multiplayer visibility and matchmaking are described in the upstream WIP notes;
-they were not independently verified during this local UI check. The user stopped UI
-automation with Escape after the hero-selection observation.
+The imported implementation includes collision-based movement, hitscan and
+projectiles, health pools, damage/death/respawn, Practice Range bots, and partial
+hero abilities and match presentation. Each feature still needs scenario-specific
+client validation. It does not constitute a complete game server or support all
+heroes and match rules.
 
-Weapons, abilities, reliable combat HUD, damage, death/respawn, objectives and complete
-match phases are not implemented. `game/script/graph.py` loads graph data; the expression
-interpreter and graph runtime still need implementation. Current movement is a flat mover,
-without proper map collision or gravity.
+Local repairs add bounded expression execution and malformed-bytecode handling;
+freeze reliable body creates to their original hero, skin, pose and projectile
+lease; retire queued/in-flight entity records and ACK callbacks after destroy;
+and reject late input packets without resetting only one command consumer.
+Command decoding handles uint32 wrap. The native body driver explicitly rejects
+a forward wrap before changing its old-epoch timers/state; automatic live epoch
+recovery is not implemented.
+
+The Practice Range collision cache was built from this user's local CASC data:
+`0688.col`, format 5, 470397 bytes, SHA-256
+`dfdb71fbe9ad079d9d0b56fe12bd7c992a76c6ec942084d86f6388827f36a169`.
+This proves cache extraction and loading inputs, not complete map collision fidelity.
+
+## Research and regression boundary
+
+`script/research_runtime.py`, `script/body.py`, `script/replication.py`,
+`game/simulation.py`, `game/flat_model.py` and `game/range_model.py` preserve
+the earlier strict research, replay and geometry models. The live body driver
+does not run through those prototypes. Their reports measure their stated
+models; they are not a list of failures of the imported native gameplay runtime.
+
+The v1 replay schema deliberately keeps its original seven input fields. Native
+command extensions with non-default values require a newer recording contract;
+the v1 adapter rejects them instead of silently losing information. See
+[SIMULATION_CONTRACT.txt](SIMULATION_CONTRACT.txt).
+
+## Remaining acceptance and implementation work
+
+- Validate Soldier: 76 firing/reload and stable HUD for at least 60 seconds, then
+  repeated hero switches and leaving/reentering the Practice Range.
+- Resolve robot overhead bars, hit presentation and elimination-name lookup using
+  target-build evidence. The bot body cannot accept player-only component 123.
+- Recheck upstream defects: stuck firing/ammo after kills, Sprint eventually
+  failing, crashes after kills, skin-dependent Biotic Field and stale HUD health.
+  The new regression repairs are not proof that these live symptoms are cured.
+- Establish two-client combat and loss/reordering acceptance, then complete mode
+  phases, objectives, doors, health packs, match results and additional heroes.
+- Verify real command-epoch transitions and owner-frame recovery. Do not infer a
+  restart merely from a low frame in a late datagram.
 
 ## Local startup
 
-- Use `START_LOCAL.cmd` for this machine's single-player research setup. It uses the
-  isolated `.venv`, `--test-players 1`, and `--bnet-port 1118`.
-- The original port 1119 is occupied on this machine. `--bnet-port` changes only the
-  local client/stall port; the relay still connects to RPC port 21119.
-- An installation folder or `Overwatch Launcher.exe` passed to `--game-exe` is resolved
-  to the real `_retail_/Overwatch.exe`. The official launcher is never executed.
-- The original game files and official launcher are retained.
+`START_LOCAL.cmd` uses `.venv`, `--test-players 1` and `--bnet-port 1118` on this
+machine. Port 1119 is occupied by another application; the relay RPC port remains
+21119. Passing an install folder or `Overwatch Launcher.exe` resolves to the
+actual game executable. The original client files and launcher are retained.
 
-## Next combat milestone
+## Lobby and data
 
-Start with Soldier: 76 in the Practice Range. Establish body statescript instances,
-state/variable layouts and owner input acknowledgements, then verify that the weapon
-and ammo HUD remain stable through client prediction rollback. Only then add firing,
-ammo/reload, target hit detection and replicated damage. Input decoding or server-only
-damage calculations alone are not combat acceptance criteria.
+The existing lobby includes menus/scenes, loot boxes, catalog purchases, profile
+and cosmetic management, events/challenges, competitive menu data and the local
+dashboard. See the upstream README for its scope.
 
-## Data
-
-`data/` holds message layouts and catalogs taken from a 1.68 reference capture and the 1.74 client. Player names in it are anonymized. The raw captures are not included. `ow174/bnet/descriptors.pb` is Battle.net protocol data the server needs; it is not a program.
+`data/` contains target-build schemas/catalogs/graphs and some 1.68 reference
+traffic decoded with 1.74 schemas. Raw captures are not bundled. Cross-version
+references, unavailable specifications and evidence limits are recorded in
+[RESEARCH_EVIDENCE.txt](RESEARCH_EVIDENCE.txt).

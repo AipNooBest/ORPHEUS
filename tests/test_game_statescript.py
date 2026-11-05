@@ -17,8 +17,8 @@ def bitstring(bits: BitWriter) -> str:
 
 
 class StatescriptTests(unittest.TestCase):
-    def test_procores_live_game_mode_frame(self):
-        # 13C0 on the game mode entity, as ProCore sent it live: owner frame, CmFD 10000000, 20 state bits.
+    def test_a_live_game_mode_frame(self):
+        # 13C0 on the game mode entity, as it was sent live: owner frame, CmFD 10000000, 20 state bits.
         frame = owner_full_frame(10000000, [Instance(1, Graph(0x13C0, 20, 3))], {})
         self.assertEqual(
             bitstring(frame),

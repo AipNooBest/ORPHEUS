@@ -11,12 +11,13 @@ from ow174.catalog.templates import RetailTemplates
 from ow174.content import Content, Identity
 from ow174.content.leaderboard import Player
 from ow174.jam.codec import Schemas
-from ow174.jam.groups import FRIENDS, GROUPS, LOBBY
+from ow174.jam.groups import CHAT_IN, FRIENDS, GROUPS, LOBBY, MATCH_LOBBY
 from ow174.jam.handshake import server_handshake
 from ow174.jam.values import id16
 from ow174.launcher.retail import RetailGames
+from ow174.lobby import lineup
 from ow174.lobby.battle_tag_query import answer_query
-from ow174.lobby.handlers import build_router
+from ow174.lobby.handlers import build_router, leaving
 from ow174.lobby.matchmaker import Matchmaker
 from ow174.lobby.research import ClientRecorder
 from ow174.lobby.session import FRIEND_CARDS, Session
@@ -44,7 +45,8 @@ class LobbyServer:
         self.loot = LootBoxEngine(self.content.collection, self.items)
         self.shop = ShopService(self.content.collection, self.items)
         self.game = None  # the game server (ow174.game.server), once start_game_server() ran
-        self.matchmaker = Matchmaker(self, settings.test_players)
+        self.match_lobbies: dict[int, tuple] = {}  # account_lo -> match id of its client's match lobby
+        self.matchmaker = Matchmaker(self, settings.test_players, paths.matchmaking)
         self.accounts = Accounts(paths.profiles, paths.template)
         self.content.ranked.places = self._top500_places
         self.social = Social(self.accounts, self.content)
@@ -222,8 +224,11 @@ class LobbyServer:
         from ow174.game.server import GameServer
 
         game = GameServer(
-            self.settings.host, self.settings.game_port, on_leave=self.game_left, skin_of=self.skin_of,
-            body_scripts=self.settings.body_scripts,
+            self.settings.host,
+            self.settings.game_port,
+            on_leave=self.game_left,
+            skin_of=self.skin_of,
+            on_join=self.game_joined,
         )
         game.start()
         self.game = game
@@ -239,14 +244,35 @@ class LobbyServer:
         weapon = self.items.unlocks.get(loadout.get("+0x50") or 0)
         return (skin.skin_theme if skin else 0), bool(weapon and weapon.name == GOLDEN_WEAPON)
 
-    def game_left(self, player) -> None:
-        """A player's game left its match: back in the menu, it gets its party state again."""
-        session = self.session_of(player.account_lo)
-        if session is None:
-            return
+    def game_joined(self, player) -> None:
+        """A player's game connected to its match: its client gets the match lobby (handlers/leaving.py)."""
         with self.state_lock:
-            self.social.leave_match_chat(session.account)
-            self.notify_party(self.social.party_of(session.account))
+            leaving.game_joined(self, player)
+
+    def game_left(self, player) -> None:
+        """A player's game left its match, or never reached it: back in the menu, it leaves the match
+        chat (else its "Match" channel stays in the menu), joins General again and gets its party state
+        again. Its place in the match may go to a party that waits."""
+        session = self.session_of(player.account_lo)
+        with self.state_lock:
+            leaving.game_left(self, session, player)  # and the match lobby
+        if session is not None:
+            with self.state_lock:
+                channel = self.social.leave_match_chat(session.account, player.match.id)
+                if channel is not None:
+                    session.send(CHAT_IN, 20404, {"+0x78": channel})
+                    session.send(CHAT_IN, 20402, {"+0x78": self.social.general})
+                if player.match.ranked:  # its VERSUS roster goes (lobby/lineup.py)
+                    session.send(MATCH_LOBBY, 53002, lineup.NO_ROSTER)
+                self.notify_party(self.social.party_of(session.account))
+        if player.match.card:  # not on the game server's thread, which runs the ticks
+            threading.Thread(target=self.retry_matchmaking, args=(player.match.card,), daemon=True).start()
+
+    def retry_matchmaking(self, card: int | None = None) -> None:
+        """Place the parties that wait again, in the message handlers' lock order: state, matchmaker,
+        game server."""
+        with self.state_lock:
+            self.matchmaker.retry(card)
 
     # --- connections ---------------------------------------------------------------------------
 

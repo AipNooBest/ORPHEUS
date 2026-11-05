@@ -1,6 +1,6 @@
 """The game link's UDP transport, server side.
 
-Read in the client (checked in IDA, addresses in our dump):
+Read in the client:
 - A datagram is a 34-byte header, then the payload encrypted with AES-256-GCM (builder
   0x7FF7893096D0, the seal call at 0x7FF7893099E4):
       +0  tag[12]       the first 12 bytes of the GCM tag
@@ -108,11 +108,15 @@ class ReceiveWindow:
         self.expected = 0
         self.bits = 0
 
+    def is_new(self, seq: int) -> bool:
+        """Whether accept() would take this packet, without taking it."""
+        return (seq - self.expected) & 0xFFFFFFFF < 0x80000000
+
     def accept(self, seq: int) -> bool:
         """False for a packet older than the expected one: the client drops those too."""
-        gap = (seq - self.expected) & 0xFFFFFFFF
-        if gap >= 0x80000000:
+        if not self.is_new(seq):
             return False
+        gap = (seq - self.expected) & 0xFFFFFFFF
         shift = gap + 1
         self.bits = ((self.bits << shift) | 1) & 0xFFFFFFFFFFFFFFFF if shift < ACK_WINDOW else 1
         self.expected = (seq + 1) & 0xFFFFFFFF

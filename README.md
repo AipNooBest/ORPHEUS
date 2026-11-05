@@ -15,15 +15,23 @@ To switch modes, close the game and the black window, then start `START.bat` aga
 
 - **Play in retail mode**: the default Overwatch menu, with a hero in the lobby.
 - **Play in tournament mode**: the mode used on LANs by pros, with a simpler menu.
-- **Server only**: only the server, for players on other PCs (see below).
-- **Join a server in retail mode**: play on someone else's server with the default Overwatch menu. Type its address, like `1.2.3.4:12357`, and your name. The next time, Enter reuses them.
+- **Host a server for others and play on it**: your server, open to players on other PCs, and your game on it (see below).
+- **Host a server for others without playing here**: the same, without starting the game.
+- **Join a server in retail mode**: play on someone else's server with the default Overwatch menu. Type its address, like `1.2.3.4:3724`, and your name. The next time, Enter reuses them.
 - **Join a server in tournament mode**: the same with the mode used on LANs by pros.
 
 ## Host a server for others
 
-Choose **Server only**. It shows the addresses players on your network can use. For players over the internet, open port 3724 in your firewall and router and give them your public address, for example `1.2.3.4:3724`. They choose one of the **Join a server** modes in `START.bat`. Another port: `START.bat --mode server --port 12357`.
+1. In your router and firewall, open TCP port 3724 (the lobby) and UDP port 3730 (matches).
+2. Start `START.bat` and choose 3 (to play too) or 4.
+3. Type your public address when it asks (whatismyip.com shows it). The next time, Enter reuses it. Just Enter, the first time, if only players on your network play.
+4. Give players your address with the port, for example `1.2.3.4:3724`. They choose one of the **Join a server** modes.
 
-To play on it yourself too, start `START.bat` once more and choose **Join a server in retail mode** with `127.0.0.1:3724`. The dashboard stays reachable only on your own computer.
+The server reads each map's collision from your own copy of the game, and builds a map's collision the first time a match is played there (or all maps at once with `py tools/build_collision.py`).
+
+A match starts when its teams are full. To start it with fewer players, set "Players to start" in the dashboard. The dashboard stays reachable only on your own computer.
+
+From a console: `START.bat --mode host --game-host 1.2.3.4`, another lobby port with `--port 12357`.
 
 Anyone can log in with any name, so a player can take another player's name.
 
