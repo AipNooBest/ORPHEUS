@@ -60,6 +60,7 @@ SILENCE_SECONDS = 10.0  # the client sends at least every 250 ms; after this lon
 # reach the game server's address): the player leaves the match, and the lobby takes them back.
 HANDOFF_SECONDS = 60.0
 MAX_PAYLOAD = MAX_DATAGRAM - HEADER_SIZE
+MAX_ENTITY_RECORDS = 127
 MAX_PENDING_COMBAT_NOTICES = 256  # per body create, retain the newest notices during prolonged loss
 BOT_DESTROY_GRACE_TICKS = round(SILENCE_SECONDS / TICK_SECONDS)  # bound waits by the transport silence budget
 PLAYER_BODY_REUSE_SECONDS = 30.0  # the client retains destroyed entity IDs
@@ -752,6 +753,7 @@ class Client:
 
     def send_frame(self, tick: int, now: float, *, reliable_only: bool = False) -> None:
         queued = []
+        own = None
         if reliable_only:
             unreliable, entities = [], []
         else:
@@ -759,7 +761,10 @@ class Client:
             self._flush_bot_nameplates()
             unreliable = self.unreliable[: messages.MAX_PER_KIND]
             queued = self._ready_entity_records()
-            entities = (queued + self.player.match.remote_movements(self.player))[:127]
+            movements = self.player.match.remote_movements(self.player)
+            if movements and movements[-1].correction is not None:
+                own = movements[-1]
+            entities = (queued + movements)[:MAX_ENTITY_RECORDS]
         reliable = self.reliable[: messages.MAX_PER_KIND]
         try:
             payload = self._payload(tick, reliable, unreliable, entities)
@@ -786,6 +791,23 @@ class Client:
                         payload = candidate
                         break
                     entities = entities[: len(entities) // 2]
+            if own is not None and own not in entities and len(queued) <= len(entities):
+                # Leave the reliable and queued entity prefix in place. Only
+                # best-effort remote movement can give up space for the correction.
+                prefix = len(queued)
+                keep = min(len(entities), MAX_ENTITY_RECORDS - 1)
+                while keep >= prefix:
+                    records = [*entities[:keep], own]
+                    try:
+                        candidate = self._payload(tick, reliable, unreliable, records)
+                    except (ValueError, OverflowError, struct.error):
+                        break  # the already validated packet is still sendable
+                    if len(candidate) <= MAX_PAYLOAD:
+                        entities, payload = records, candidate
+                        break
+                    if keep == prefix:
+                        break
+                    keep = prefix + (keep - prefix) // 2
         except (ValueError, OverflowError, struct.error) as error:
             self._frame_rejected(f"frame encoding failed: {type(error).__name__}")
             return

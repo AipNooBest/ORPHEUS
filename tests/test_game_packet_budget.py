@@ -363,6 +363,47 @@ class PacketBudgetTests(unittest.TestCase):
             self.assertEqual(player.mover.corrected, 107)
             sent.assert_called_once_with(player, tick, 107, 109)
 
+    def test_owner_correction_yields_only_best_effort_movement_when_budgeted(self):
+        from test_game_repeated_lifecycles import wire_frame
+
+        for limit in ("none", "bytes", "records"):
+            with self.subTest(limit=limit):
+                server, client, player, peer = connection()
+                prepare_corrections(player)
+                tick = player.match.tick = 107
+                other = player.match.add_player(2, "Offline peer", SOLDIER, 0, False)
+                other.has_body = True
+                player.seen[other.body] = True
+                remote, own = player.match.remote_movements(player)
+                self.assertEqual((remote.entity, own.entity), (other.body, player.body))
+                queued = []
+                if limit == "bytes":
+                    card = card_message(player)
+                    card["+0x80"] = {**card["+0x80"], "+0x40": "A" * 1113}
+                    client.queue_reliable(20308, card)
+                    for movement in (remote, own):
+                        size = len(client._payload(tick, client.reliable, [], [movement]))
+                        self.assertLessEqual(size, MAX_PAYLOAD)
+                    size = len(client._payload(tick, client.reliable, [], [remote, own]))
+                    self.assertGreater(size, MAX_PAYLOAD)
+                elif limit == "records":
+                    queued = [EntityUpdate(0x80000001 + index, OP_DESTROY) for index in range(126)]
+                    client.queue_entities(queued)
+                    self.assertLessEqual(len(client._payload(tick, [], [], [*queued, remote])), MAX_PAYLOAD)
+                expected = [remote, own] if limit == "none" else [*queued, own]
+                expected_payload = client._payload(tick, client.reliable, [], expected)
+
+                client.send_frame(tick, 10.0)
+
+                packet, _, reliable, _, command_ack, count = decoded(self, peer, server.sock.sent[-1][0])
+                _, records = wire_frame(packet)
+                self.assertEqual([item.entity for item, _ in records], [item.entity for item in expected])
+                self.assertEqual(packet.payload, expected_payload)
+                self.assertEqual([(ordinal, msg_id) for ordinal, msg_id, _ in reliable],
+                                 [(0, 20308)] if limit == "bytes" else [])
+                self.assertEqual((command_ack, count, player.mover.corrected), (109, len(expected), 107))
+                self.assertEqual(client.in_flight[packet.seq][1], queued)
+
     def test_budget_delayed_first_correction_keeps_commands_for_the_later_replay(self):
         server, client, player, peer = connection()
         prepare_corrections(player)
