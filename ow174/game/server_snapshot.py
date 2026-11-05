@@ -75,7 +75,7 @@ FIELDS = {
     Client: _names("server address conn cipher player window seq open closed heard next_reliable reliable "
                    "unreliable entities in_flight _bot_notices _bot_health _bot_notice_tail "
                    "_bot_destroy_wait _bot_scripts expected_in parked_in leaving_since"),
-    _BotScriptDelivery: _names("stream death"),
+    _BotScriptDelivery: _names("stream death_frames"),
     Match: _names("environment id game_map card skin_of tick controller assemble_ends assembled players "
                   "started on_leave ended bots _pending_bot_scripts bots_shown notices combat "
                   "collision_provider collision_state collision_world _collision_failed"),
@@ -107,7 +107,7 @@ FIELDS = {
         "retired first_owner_frame server_only ult_seconds ultimates reports report_count"
     ),
     driver.BodyWorld: _names("hero mode body throttles"),
-    BotScript: _names("component frame server_only initial"),
+    BotScript: _names("component frame server_only initial death_frame _produced"),
     runtime.World: _names("hero mode"),
     LinkCipher: _names("key_in key_out salt_in salt_out"),
     ReceiveWindow: _names("expected bits"),

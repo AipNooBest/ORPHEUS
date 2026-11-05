@@ -6,10 +6,11 @@ from ow174.game.script import graph, runtime
 from ow174.game.script.driver import OWNER_HEALTH, BodyStream, ReplicatedBody, Snapshot, create_initial_graphs
 
 DIED = 0x024000000000003E  # 003E.025, the body's authoritative death message
+_Payload = tuple[BitWriter, Snapshot, set]
 
 
 class BotScript(ReplicatedBody):
-    """Run an NPC body's graph at creation and death. Movement and AI stay with the bot."""
+    """Run an NPC body's graph at creation and through its death events. Movement and AI stay with the bot."""
 
     def __init__(self, body: int, hero: int, entity: int, frame: int, mode: int, health: float) -> None:
         record = graph.entity_body(body)
@@ -26,9 +27,11 @@ class BotScript(ReplicatedBody):
         self.server_only = self.initial_exclusions()
         snapshot = observers.snapshot(self)
         self.initial = observers.full_frame(self, snapshot), snapshot
+        self.death_frame: int | None = None
+        self._produced = snapshot
 
-    def die(self, frame: int, params: dict, sender: int) -> tuple[BitWriter, Snapshot, set] | None:
-        """Deliver 003E.025 at this server frame and encode its terminal change from the initial frame."""
+    def die(self, frame: int, params: dict, sender: int) -> _Payload | None:
+        """Deliver 003E.025 and encode the change that happens immediately."""
         component = self.component
         if component.owner_dead:
             return None
@@ -43,10 +46,32 @@ class BotScript(ReplicatedBody):
         if not runtime.send_message(component, DIED, params, sender):
             return None
         component.run_now()
+        self.death_frame = frame
+        return self._delta()
 
+    def advance_death(self, frame: int, lifetime_ticks: int) -> list[_Payload]:
+        """Run due graph events within this death's lifetime and retain each frame's change in order."""
+        if self.death_frame is None:
+            return []
+        limit = min(frame, self.death_frame + lifetime_ticks)
+        component = self.component
+        payloads = []
+        while (due := component.next_event_time()) is not None:
+            due_frame = due // component.frame_ms
+            if due_frame > limit:
+                break
+            self.frame = due_frame
+            component.run_frame(due_frame)
+            payload = self._delta()
+            if payload is not None:
+                payloads.append(payload)
+        return payloads
+
+    def _delta(self) -> _Payload | None:
         snapshot = observers.snapshot(self)
-        base = BodyStream(component.entity)
-        base.base = self.initial[1]
+        base = BodyStream(self.component.entity)
+        base.base = self._produced
         delta, keys = observers.delta(self, base, snapshot)
         if delta is not None:
+            self._produced = snapshot
             return delta, snapshot, keys

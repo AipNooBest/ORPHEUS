@@ -37,8 +37,38 @@ class SyntheticScript:
 
     def die(self, frame, params, sender):
         self.deaths.append((frame, params, sender))
-        data, snap = self.frame(len(self.deaths), full=False, tick=frame)
+        return self.delta(len(self.deaths), frame)
+
+    def delta(self, count, frame):
+        data, snap = self.frame(count, full=False, tick=frame)
         return data, snap, {("state", *PULSE_KEY)}
+
+    def advance_death(self, frame, lifetime_ticks):
+        return ()
+
+
+class TimedScript(SyntheticScript):
+    """Schedule known pulse deltas so the test measures production Combat and Client ordering."""
+
+    def __init__(self, graph, offsets, *, immediate=True):
+        super().__init__(graph)
+        self.offsets, self.immediate = offsets, immediate
+        self.advances, self.emitted = [], []
+
+    def die(self, frame, params, sender):
+        payload = super().die(frame, params, sender)
+        return payload if self.immediate else None
+
+    def advance_death(self, frame, lifetime_ticks):
+        self.advances.append((frame, lifetime_ticks))
+        death = self.deaths[0][0]
+        result = []
+        for offset in self.offsets[len(self.emitted):]:
+            if offset > lifetime_ticks or death + offset > frame:
+                break
+            self.emitted.append(death + offset)
+            result.append(self.delta(len(self.emitted) + int(self.immediate), self.emitted[-1]))
+        return result
 
 
 class WirePeer:
@@ -177,6 +207,18 @@ class BotStatescriptTests(unittest.TestCase):
         with patch.object(bots, "respawned", return_value=replacement):
             self.match.combat._respawn_bot(self.bot)
         return replacement.entity
+
+    def acknowledge_baseline(self, peer, entity):
+        _, _, create = self.send(peer)
+        self.assertIn(entity, self.entities(create, world.OP_CREATE))
+        peer.ack()
+        _, _, full = self.send(peer)
+        self.assert_pulse(self.only_chunk(full, entity), first=0, last=1, count=0)
+        peer.ack()
+
+    def advance_combat(self, now, tick):
+        self.tick = self.match.tick = tick
+        self.match.combat.update(now, tick, frames=False)
 
     def test_initial_bot_scripts_are_prepared_one_per_update_before_world_spawn(self):
         batch = [bots.respawned(self.bot, self.bot.entity + offset, 0) for offset in range(3)]
@@ -333,3 +375,109 @@ class BotStatescriptTests(unittest.TestCase):
         _, _, final = self.send(peer)
         self.assertEqual(self.chunks(final, old), [])
         self.assertEqual(peer.pulses, [])
+
+    def test_skipped_death_ticks_deliver_reliable_deltas_before_retirement(self):
+        old = self.bot.entity
+        shooter, watcher = self.shooting_peer, self.watching_peer
+        lifetime = int(combat.BOT_RESPAWN / combat.TICK)
+        script = self.bot.body_script = TimedScript(self.graph, (10, 14, lifetime + 1))
+        for peer in (shooter, watcher):
+            self.acknowledge_baseline(peer, old)
+        self.advance_combat(10.0, self.tick)
+        self.kill_bot()
+        death_tick = self.tick
+
+        _, _, lost_immediate = self.send(shooter, receive=False)
+        immediate = self.only_chunk(lost_immediate, old)
+        self.assert_pulse(immediate, first=2, last=2, count=1)
+        _, _, witnessed = self.send(watcher)
+        self.assert_pulse(self.only_chunk(witnessed, old), first=2, last=2, count=1)
+        watcher.ack()
+        late = self.add_observer(3)
+        self.show_bots(late)
+        self.acknowledge_baseline(late, old)
+
+        # A single late tick reaches the respawn deadline. Both due deltas must
+        # be queued before the old lifetime is retired, and the one past the cap omitted.
+        expiry_tick = death_tick + lifetime + 5
+        replacement = self.replacement(self.match.combat.next_bot)
+        fresh = replacement.entity
+        with patch.object(bots, "respawned", return_value=replacement):
+            self.advance_combat(10.0 + combat.BOT_RESPAWN, expiry_tick)
+        self.assertEqual(script.advances, [(expiry_tick, lifetime)])
+        self.assertEqual(script.emitted, [death_tick + 10, death_tick + 14])
+        self.assertEqual(self.match.bots, [replacement])
+
+        # The watcher acknowledged the immediate pulse, so it is already free
+        # to receive the first timed delta while the shooter's original was lost.
+        _, _, first_watched = self.send(watcher)
+        self.assertIn(fresh, self.entities(first_watched, world.OP_CREATE))
+        self.assertNotIn(old, self.entities(first_watched, world.OP_DESTROY))
+        self.assert_pulse(self.only_chunk(first_watched, old), first=3, last=3, count=2)
+        watcher.ack()
+        _, _, second_watched = self.send(watcher)
+        self.assert_pulse(self.only_chunk(second_watched, old), first=4, last=4, count=3)
+        watcher.ack()
+        _, _, finished_watcher = self.send(watcher)
+        self.assertIn(old, self.entities(finished_watcher, world.OP_DESTROY))
+
+        _, _, shooter_gap = self.send(shooter)
+        self.assertIn(fresh, self.entities(shooter_gap, world.OP_CREATE))
+        self.assertNotIn(old, self.entities(shooter_gap, world.OP_DESTROY))
+        self.assertEqual(self.chunks(shooter_gap, old), [])
+        shooter.ack()
+        _, _, retried_immediate = self.send(shooter)
+        self.assert_same_chunk(immediate, self.only_chunk(retried_immediate, old))
+        shooter.ack()
+
+        _, _, lost_timed = self.send(shooter, receive=False)
+        first_timed = self.only_chunk(lost_timed, old)
+        self.assert_pulse(first_timed, first=3, last=3, count=2)
+        _, _, timed_gap = self.send(shooter)
+        self.assertEqual(self.chunks(timed_gap, old), [])
+        self.assertNotIn(old, self.entities(timed_gap, world.OP_DESTROY))
+        shooter.ack()
+        _, _, retried_timed = self.send(shooter)
+        self.assert_same_chunk(first_timed, self.only_chunk(retried_timed, old))
+        _, _, before_ack = self.send(shooter)
+        self.assertEqual(self.chunks(before_ack, old), [])
+        self.assertNotIn(old, self.entities(before_ack, world.OP_DESTROY))
+        shooter.ack()
+
+        shooter.client.queue_bot_death_update(old, script.delta(4, self.tick))
+        _, _, last_timed = self.send(shooter)
+        self.assert_pulse(self.only_chunk(last_timed, old), first=4, last=4, count=3)
+        shooter.ack()
+        _, _, finished_shooter = self.send(shooter)
+        self.assertIn(old, self.entities(finished_shooter, world.OP_DESTROY))
+        self.assertEqual(self.chunks(finished_shooter, old), [])
+        for peer in (shooter, watcher):
+            self.assertEqual(peer.pulses, [(old, 2, 1), (old, 3, 2), (old, 4, 3)])
+
+        _, _, late_view = self.send(late)
+        self.assertIn(old, self.entities(late_view, world.OP_DESTROY))
+        self.assertIn(fresh, self.entities(late_view, world.OP_CREATE))
+        self.assertEqual(self.chunks(late_view, old), [])
+        self.assertEqual(late.pulses, [])
+
+    def test_delayed_first_delta_reaches_only_viewers_registered_at_death(self):
+        old, shooter = self.bot.entity, self.shooting_peer
+        script = self.bot.body_script = TimedScript(self.graph, (15,), immediate=False)
+        self.acknowledge_baseline(shooter, old)
+        self.advance_combat(10.0, self.tick)
+        self.kill_bot()
+        death_tick = self.tick
+        _, _, after_death = self.send(shooter)
+        self.assertEqual(self.chunks(after_death, old), [])
+        shooter.ack()
+
+        late = self.add_observer(3)
+        self.show_bots(late)
+        self.acknowledge_baseline(late, old)
+        self.advance_combat(10.0 + 15 * combat.TICK, death_tick + 15)
+        self.assertEqual(script.emitted, [death_tick + 15])
+        _, _, original_view = self.send(shooter)
+        self.assert_pulse(self.only_chunk(original_view, old), first=2, last=2, count=1)
+        _, _, late_view = self.send(late)
+        self.assertEqual(self.chunks(late_view, old), [])
+        self.assertEqual(late.pulses, [])

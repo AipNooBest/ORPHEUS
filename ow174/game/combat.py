@@ -496,6 +496,8 @@ class Combat:
         if frames:
             self.observers.update()
         for when, who in list(self.respawns):
+            if isinstance(who, bots.Bot) and who in self.match.bots:
+                self._advance_bot_death(who, tick)
             if now >= when:
                 self.respawns.remove((when, who))
                 self._respawn(who)
@@ -801,12 +803,27 @@ class Combat:
             params = self._death_parameters(killer, critical, loadout)
             event = script.die(self.match.tick, params, killer.body)
         except Exception:
+            bot.body_script = None
             log.exception("[game] %s: %s's body script failed on %X", self.match.label(), bot.name, DIED)
             return
-        if event is not None:
+        for viewer in self.match.players:
+            if viewer.client is not None:
+                viewer.client.queue_bot_death(bot.entity, event)
+
+    def _advance_bot_death(self, bot: bots.Bot, tick: int) -> None:
+        script = bot.body_script
+        if script is None:
+            return
+        try:
+            events = script.advance_death(tick, int(BOT_RESPAWN / TICK))
+        except Exception:
+            bot.body_script = None
+            log.exception("[game] %s: %s's death script timer failed", self.match.label(), bot.name)
+            return
+        for event in events:
             for viewer in self.match.players:
                 if viewer.client is not None:
-                    viewer.client.queue_bot_death(bot.entity, event)
+                    viewer.client.queue_bot_death_update(bot.entity, event)
 
     def _died(self, killer, victim, critical: bool, loadout) -> None:
         """A player died: the notices, his body script's "died" (the kill feed line), and the respawn."""

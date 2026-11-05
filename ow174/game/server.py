@@ -146,7 +146,7 @@ _BotDeathPayload = tuple[BitWriter, Snapshot, set]
 @dataclass
 class _BotScriptDelivery:
     stream: BodyStream
-    death: _BotDeathPayload | None = None  # waits here for the full frame ACK
+    death_frames: deque[_BotDeathPayload] | None = None  # None until this viewer is registered for death
 
 
 class Client:
@@ -238,27 +238,32 @@ class Client:
         if self.bot_create_acked(entity):
             self.queue_entities([update])
 
-    def queue_bot_death(self, entity: int, payload: _BotDeathPayload) -> None:
-        """Deliver this lifetime's death once its initial statescript frame has arrived."""
+    def queue_bot_death(self, entity: int, payload: _BotDeathPayload | None) -> None:
+        """Register this lifetime's death, even when the first statescript changes are delayed."""
         script = self._bot_scripts.get(entity)
-        if (
-            script is None
-            or entity in self._bot_destroy_wait
-            or script.death is not None
-            or script.stream.last > 1
-        ):
+        if script is None or entity in self._bot_destroy_wait or script.death_frames is not None:
             return
-        script.death = payload
+        script.death_frames = deque() if payload is None else deque([payload])
+        self._flush_bot_death(script)
+
+    def queue_bot_death_update(self, entity: int, payload: _BotDeathPayload) -> None:
+        """Queue a continuation for a viewer already registered for this death."""
+        script = self._bot_scripts.get(entity)
+        if script is None or entity in self._bot_destroy_wait or script.death_frames is None:
+            return
+        script.death_frames.append(payload)
         self._flush_bot_death(script)
 
     def _flush_bot_death(self, script: _BotScriptDelivery) -> None:
         stream = script.stream
-        if stream.base is None or script.death is None:
+        frames = script.death_frames
+        if stream.base is None or stream.pending or not frames:
             return
-        frame, snapshot, keys = script.death
+        # The producer encoded each delta from the preceding snapshot. Wait for
+        # that frame's ACK before sending the next in order.
+        frame, snapshot, keys = frames.popleft()
         update = stream.delta(frame, snapshot, keys, 0)
         update.resend = True  # this one-off event has no newer snapshot to carry it again
-        script.death = None
         self.queue_entities([update])
 
     def _ack_bot_create(self, entity: int) -> None:
@@ -287,8 +292,11 @@ class Client:
         script = self._bot_scripts.get(entity)
         if script is None:
             return False
-        stream = script.stream
-        return bool(stream.pending or script.death is not None or (stream.last > 1 and health_pending))
+        return bool(
+            script.stream.pending
+            or script.death_frames
+            or (script.death_frames is not None and health_pending)
+        )
 
     def _hold_bot_destroy(self, item: world.EntityUpdate) -> bool:
         entity = item.entity
