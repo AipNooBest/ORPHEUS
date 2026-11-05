@@ -63,7 +63,7 @@ class FakeClient:
     def queue_mode_frame(self, frame: BitWriter) -> None:
         self.queue_entities([self.player.mode_script.full_frame(frame)])
 
-    def queue_bot_health(self, entity: int, components: dict) -> None:
+    def queue_body_health(self, entity: int, components: dict) -> None:
         self.queue_entities([
             world.EntityUpdate(entity, world.OP_UPDATE, lambda origin: world.update(origin, components))
         ])

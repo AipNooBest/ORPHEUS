@@ -59,7 +59,7 @@ from ow174.game.script import expr, graph, nodes, runtime
 from ow174.game.script.bot import DIED, BotScript
 from ow174.game.script.driver import Snapshot
 from ow174.game.statescript import InstanceWire, StateWire, remote_full_frame
-from ow174.game.world import ARMOUR_POOL, HEALTH_POOL, OP_DESTROY, OP_UPDATE, POOLS, SHIELDS_POOL
+from ow174.game.world import ARMOUR_POOL, HEALTH_POOL, OP_DESTROY, POOLS, SHIELDS_POOL
 
 log = logging.getLogger("ow174.game")
 
@@ -932,35 +932,17 @@ class Combat:
     # --- what the clients get ----------------------------------------------------------------------
 
     def _send_health(self) -> None:
-        """Send player deltas and superseding bot pool snapshots through component 51."""
-        match = self.match
-        bot_entities = {bot.entity for bot in match.bots}
+        """Send the latest complete pool snapshot for each body that changed."""
         for entity, vitals in list(self.vitals.items()):
             if not vitals.changed:
                 continue
-            is_bot = entity in bot_entities
-            # A replacement bot snapshot must cover every current pool, even if only one changed.
-            components = vitals.component(vitals.ids if is_bot else sorted(vitals.changed))
+            # A replacement covers prior unacknowledged changes in any pool.
+            components = vitals.component(vitals.ids)
             vitals.changed.clear()
-            for viewer in match.players:
+            for viewer in self.match.players:
                 client = viewer.client
-                if client is None or not viewer.spawned:
-                    continue
-                if is_bot:
-                    client.queue_bot_health(entity, components)
-                elif self._has(viewer, entity):
-                    client.queue_entities(
-                        [
-                            world.EntityUpdate(
-                                entity, OP_UPDATE, lambda origin, c=components: world.update(origin, c)
-                            )
-                        ]
-                    )
-
-    @staticmethod
-    def _has(viewer, entity: int) -> bool:
-        """Whether this viewer has the player body from an earlier frame."""
-        return (viewer.has_body and viewer.body == entity) or bool(viewer.seen.get(entity))
+                if client is not None and viewer.spawned:
+                    client.queue_body_health(entity, components)
 
 
 def match_record_delay() -> int:

@@ -177,7 +177,7 @@ class Client:
         self.in_flight = {}  # datagram seq -> (reliable messages, entity updates) it carried
         # Current combat body creates. None means the peer acknowledged this create.
         self._combat_notices: dict[int, deque[tuple[int, bytes]] | None] = {}
-        self._bot_health: dict[int, world.EntityUpdate] = {}  # latest snapshot awaiting delivery per bot
+        self._body_health: dict[int, world.EntityUpdate] = {}  # latest snapshot awaiting delivery per body
         self._combat_notice_tail: dict[int, int] = {}  # last promoted reliable ordinal per body
         self._bot_scripts: dict[int, _BotScriptDelivery] = {}
         self._body_destroy_wait: dict[int, tuple[world.EntityUpdate, int]] = {}
@@ -309,16 +309,16 @@ class Client:
             if script.death_frames is not None:
                 self._flush_bot_frames(script)
 
-    def queue_bot_health(self, entity: int, components: dict) -> None:
-        """Keep the latest complete pool snapshot for this connection's current bot."""
+    def queue_body_health(self, entity: int, components: dict) -> None:
+        """Keep the latest complete pool snapshot for a current body, including before create ACK."""
         if entity not in self._combat_notices or entity in self._body_destroy_wait:
             return
-        previous = self._bot_health.get(entity)
+        previous = self._body_health.get(entity)
         if previous is not None:
             # Each viewer owns its record. Supersession must not disable another client's resend.
             self.cancel_entity_record(previous)
         update = world.EntityUpdate(entity, world.OP_UPDATE, lambda origin: world.update(origin, components))
-        self._bot_health[entity] = update
+        self._body_health[entity] = update
         if self.bot_create_acked(entity):
             self.queue_entities([update])
 
@@ -502,7 +502,7 @@ class Client:
         pending = self._combat_notices.get(entity)
         if pending is not None:
             self._combat_notices[entity] = None
-            health = self._bot_health.get(entity)
+            health = self._body_health.get(entity)
             if health is not None:
                 self.queue_entities([health])
             script = self._bot_scripts.get(entity)
@@ -532,7 +532,7 @@ class Client:
         if any(body == entity for body, _, _ in self._display_notices):
             return True
         tail = self._combat_notice_tail.get(entity)
-        health_pending = entity in self._bot_health
+        health_pending = entity in self._body_health and entity not in self._player_body_reuse_after
         if health_pending and self.bot_create_acked(entity):
             return True  # bystanders also need the old body's terminal health
         if tail is not None and oldest <= tail:
@@ -579,7 +579,7 @@ class Client:
         controller = entity & ~0xFF
         if self._confirmed_possessions.get(controller) == entity:
             del self._confirmed_possessions[controller]
-        self._bot_health.pop(entity, None)
+        self._body_health.pop(entity, None)
         if entity not in self._player_body_reuse_after:
             self._combat_notice_tail.pop(entity, None)
         self._bot_scripts.pop(entity, None)
@@ -872,8 +872,8 @@ class Client:
                         # ACKs can arrive before the server catches up on missed simulation ticks.
                         now = self.server.environment.monotonic(callsite="client.body_destroy_ack")
                         self._player_body_reuse_after[item.entity] = now + PLAYER_BODY_REUSE_SECONDS
-                    elif self._bot_health.get(item.entity) is item:
-                        del self._bot_health[item.entity]
+                    elif self._body_health.get(item.entity) is item:
+                        del self._body_health[item.entity]
                     else:
                         pending = self._pending_possessions.get(item.entity)
                         if pending is not None and pending[1] is item:
@@ -1441,7 +1441,7 @@ class GameServer:
             return
         client.closed = True
         client._combat_notices.clear()
-        client._bot_health.clear()
+        client._body_health.clear()
         client._combat_notice_tail.clear()
         client._bot_scripts.clear()
         client._body_destroy_wait.clear()

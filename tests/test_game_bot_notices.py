@@ -677,7 +677,7 @@ class BotNoticeTests(unittest.TestCase):
         self.send(104, deliver=False)
         self.client.queue_entities([world.EntityUpdate(self.entity, world.OP_CREATE, build)])
         self.match.combat._tell_hit(self.player, self.target, 30, 0, 105)
-        self.client.queue_bot_health(self.entity, world.health(170, 200))
+        self.client.queue_body_health(self.entity, world.health(170, 200))
         self.ack()  # only the old create
         self.assertFalse(self.client.bot_create_acked(self.entity))
         reliable, records = self.send(107)
@@ -709,7 +709,7 @@ class BotNoticeTests(unittest.TestCase):
         self.ack()
         self.assertFalse(self.client.bot_create_acked(fresh))
         self.assertFalse(self.client._combat_notices)
-        self.assertFalse(self.client._bot_health)
+        self.assertFalse(self.client._body_health)
         self.assertFalse(self.client.reliable)
 
     def respawn_target(self, tick):
@@ -821,7 +821,7 @@ class BotNoticeTests(unittest.TestCase):
         self.assert_kill_notices(reliable)
         self.assertEqual(self.health, [])
         self.ack()
-        self.assertIn(self.entity, self.client._bot_health)
+        self.assertIn(self.entity, self.client._body_health)
 
         self.respawn_target(289)
         reliable, records = self.send(289)
@@ -873,7 +873,7 @@ class BotNoticeTests(unittest.TestCase):
         self.server.drop(self.client)
         self.assertFalse(self.client._body_destroy_wait)
         self.assertFalse(self.client._combat_notice_tail)
-        self.assertFalse(self.client._bot_health)
+        self.assertFalse(self.client._body_health)
 
     def test_long_wait_keeps_only_bounded_latest_notices(self):
         with patch("ow174.game.server.MAX_PENDING_COMBAT_NOTICES", 2):
@@ -911,6 +911,48 @@ class BotNoticeTests(unittest.TestCase):
         self.assertEqual(self.health, [(world.OP_CREATE, 200)])
         self.ack()
         self.send(104)
+        self.assertEqual(self.health, [(world.OP_UPDATE, 180)])
+
+    def test_owner_health_retry_cannot_restore_a_superseded_pool(self):
+        self.connect()
+        self.match.tick = 100
+        self.player.spawned = self.player.has_body = True
+        self.target = next(target for target in self.match.combat._targets() if target.owner is self.player)
+        self.entity = self.target.entity
+        self.client.queue_entities(self.match.own_body_updates(self.player))
+        self.window = ReceiveWindow()
+        self.seq = 0
+        self.send(100)
+        self.assertEqual(self.health, [(world.OP_CREATE, 200)])
+        self.ack()
+
+        attacker = bots.make(PRACTICE_RANGE.map_guid)[0]
+        fight = self.match.combat
+        fight._damage(attacker, self.target, 20, False, None, 103)
+        fight._send_health()
+        self.send(103, deliver=False)
+        self.assertEqual(self.health, [(world.OP_UPDATE, 180)])
+        fight._damage(attacker, self.target, 10, False, None, 106)
+        fight._send_health()
+        self.send(106)
+        self.assertEqual(self.health, [(world.OP_UPDATE, 170)])
+        self.ack()
+        self.send(109)
+        self.assertEqual(self.health, [])
+        self.assertEqual(fight.vitals_of(self.target).total, 170)
+
+    def test_remote_player_health_changed_after_create_queued_waits_for_ack(self):
+        self.prepare_player_target()
+        self.damage_bot(20, 100)  # Create has a frozen 200 pool and has not gone out yet.
+        self.send(100, deliver=False)
+        self.assertEqual(self.health, [(world.OP_CREATE, 200)])
+        self.send(103)
+        self.assertEqual(self.health, [])
+        self.ack()
+        self.send(106)
+        self.assertEqual(self.health, [(world.OP_CREATE, 200)])
+        self.ack()
+        self.send(109)
         self.assertEqual(self.health, [(world.OP_UPDATE, 180)])
 
     def test_superseded_health_is_not_resent_but_latest_still_retries(self):
