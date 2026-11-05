@@ -1300,7 +1300,7 @@ def message_params(instance: Instance, node) -> dict:
 
 
 def send(instance: Instance, node, caller) -> None:
-    """Send a game message: to this entity's own instances, or through the world to another entity."""
+    """Send a game message to each target, through the world for other entities."""
     cfg = node.fields.get("m_gameMessage")
     message = expr.guid_of(cfg.get("m_gameMessage")) if isinstance(cfg, dict) else 0
     if not message:
@@ -1309,11 +1309,17 @@ def send(instance: Instance, node, caller) -> None:
     component: Component = instance.component
     targets = node.fields.get("m_targets", node.fields.get("m_target"))
     target = instance.evaluate(targets) if targets is not None else expr.Entity(component.entity)
-    entity = expr.to_entity(target)
-    if entity == component.entity:
-        send_message(component, message, params, component.entity)
-    elif entity:
-        component.world.send_message(entity, message, params, component.entity)
+    if isinstance(target, tuple):
+        entities = (
+            item.id for item in target if isinstance(item, expr.Entity) and expr.valid_entity(item.id)
+        )
+    else:
+        entities = (expr.to_entity(target),)
+    for entity in entities:
+        if entity == component.entity:
+            send_message(component, message, params, component.entity)
+        elif entity:
+            component.world.send_message(entity, message, params, component.entity)
 
 
 @handler("STU_187D5125")
