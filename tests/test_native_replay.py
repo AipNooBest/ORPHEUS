@@ -176,6 +176,17 @@ class NativeReplayTests(unittest.TestCase):
         self.assertEqual(result["validated_commands"], 1)
         self.assertEqual(result["diagnostics"][0]["kind"], "before_state_mismatch")
 
+    def test_unrecorded_event_sequence_advance_is_not_hidden_by_an_empty_queue(self):
+        script = body()
+        document = {"header": header(script), "events": [command_event(script, Command(1001), 0)]}
+        next(script.component.seq)
+        document["events"].append(command_event(script, Command(1002), 1))
+        document["events"].append(ending(script, 2))
+        result = replay_document(document)
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual(result["validated_commands"], 1)
+        self.assertEqual(result["diagnostics"][0]["kind"], "before_state_mismatch")
+
     def test_native_driver_gap_fill_is_never_silently_used(self):
         document = trace([Command(1001), Command(1004)])  # source native driver did run 1002/1003
         result = replay_document(document)

@@ -1,5 +1,8 @@
 Controlled server journal v1 — root and wire baseline, not full battle replay
 
+Historical v1 contract. Current code uses v2; see CONTROLLED_SERVER_JOURNAL_V2.txt
+for mandatory profile/state fields, continuous boundaries and explicit model setup.
+
 Scope
 
 server_journal.py explicitly constructs a fresh GameServer and drives its actual

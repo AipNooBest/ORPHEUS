@@ -22,9 +22,10 @@ from ow174.game.replay_manifest import assert_compatible, capture_manifest, runt
 from ow174.game.server import GameServer, Handoff
 from ow174.paths import DATA_DIR, ROOT
 
-SCHEMA = "ow174.controlled-server-journal.v1"
+SCHEMA = "ow174.controlled-server-journal.v2"
 BUILD = "1.74.0.0.104319"
 SCOPE = "controlled-roots-and-wire-only"
+STORED_SCOPE = "controlled-roots-wire-and-registered-state"
 OPERATIONS = {
     "create_match": {"game_map", "players", "card"},
     "join_match": {"match_id", "players"},
@@ -108,6 +109,7 @@ class _Session:
         self._matches = {}
         self._effects = []
         self._sends = 0
+        self._state_profile = "wire-only"
 
     @property
     def fault(self):
@@ -194,8 +196,27 @@ class _Session:
         return self.server._report_leaves()
 
     def _manifest(self):
-        configuration = runtime_configuration(quanta_us=RETAIL_QUANTA, run_options={"scope": SCOPE})
+        configuration = runtime_configuration(
+            quanta_us=RETAIL_QUANTA,
+            run_options={"scope": self._scope(), "state_profile": self._state_profile},
+        )
         return capture_manifest(root=ROOT, data_dir=DATA_DIR, configuration=configuration)
+
+    def _scope(self):
+        return SCOPE if self._state_profile == "wire-only" else STORED_SCOPE
+
+    def _stored_hash(self):
+        if self._state_profile == "wire-only":
+            return None
+        from ow174.game.server_snapshot import export_server_state, snapshot_digest
+
+        return snapshot_digest(export_server_state(
+            self.server, archives=self._matches.values(), collision_provider=self._collision_reads,
+            assets=self._state_assets,
+        ))
+
+    def _check_boundary(self, before, state_before):
+        raise NotImplementedError
 
     def _root(self, operation, arguments):
         self._healthy()
@@ -215,19 +236,26 @@ class _Session:
             # Do not add an outer lock around _report_leaves and change that contract.
             if operation == "report_callbacks":
                 before = self.server.tick, self._indices()
+                state_before = self._stored_hash()
+                self._check_boundary(before, state_before)
                 result = self._dispatch(operation, args)
                 after = self.server.tick, self._indices()
+                state_after = self._stored_hash()
             else:
                 with self.server.lock:
                     before = self.server.tick, self._indices()
+                    state_before = self._stored_hash()
+                    self._check_boundary(before, state_before)
                     result = self._dispatch(operation, args)
                     after = self.server.tick, self._indices()
+                    state_after = self._stored_hash()
             self._healthy()
             normalized = _handoffs(result) if operation in ("create_match", "join_match") else result
             row = {
                 "operation": operation, "arguments": replay_values.encode(args),
                 "before": replay_values.encode(before), "after": replay_values.encode(after),
                 "result": replay_values.encode(normalized), "effects": replay_values.clone(self._effects),
+                "state_before": state_before, "state_after": state_after,
             }
             return row, result
         except BaseException:
@@ -262,21 +290,39 @@ class RecordingServerSession(_Session):
     _recording = True
 
     def __init__(self, *, environment: ExecutionEnvironment, collision_provider: CollisionProvider,
-                 registry=None, skin_of=no_skin, sendto=None):
+                 registry=None, skin_of=no_skin, sendto=None, verify_stored_state=False):
         super().__init__()
+        if type(verify_stored_state) is not bool:
+            raise TypeError("verify_stored_state must be an explicit boolean")
+        self._state_profile = "registered-domain-v1" if verify_stored_state else "wire-only"
+        if verify_stored_state:
+            # Explicit model preparation, before server construction/capture. The
+            # exporter itself only peeks; it must not initialize a cache while observing.
+            from ow174.game.mover import _movers
+
+            _movers()
         self.environment = RecordingEnvironment(environment)
         self.registry = WorldRegistry() if registry is None else registry
+        self._state_assets = WorldRegistry()
         self.collision = RecordingCollisionProvider(collision_provider, self.registry)
         self._skin_source, self._send_source = skin_of, sendto
         self._roots = []
         self._initial_manifest = self._manifest()
         self._initialize_server()
         self._initial = replay_values.encode((self.server.tick, self._indices()))
+        self._initial_state = self._stored_hash()
 
     def _observe(self, effect):
         if not self._active:
             self._fail("external effect outside a controlled root")
         self._effects.append(replay_values.encode((self._indices(), effect)))
+
+    def _check_boundary(self, before, state_before):
+        previous = self._roots[-1] if self._roots else None
+        expected_boundary = self._initial if previous is None else previous["after"]
+        expected_state = self._initial_state if previous is None else previous["state_after"]
+        if replay_values.encode(before) != expected_boundary or state_before != expected_state:
+            self._fail("unrecorded change between controlled roots")
 
     def _skin(self, account, hero):
         result = self._skin_source(account, hero)
@@ -321,9 +367,15 @@ class RecordingServerSession(_Session):
             self._fail("cannot end an active root")
         try:
             assert_compatible(self._initial_manifest, self._manifest())
+            expected_state = self._roots[-1]["state_after"] if self._roots else self._initial_state
+            expected_boundary = self._roots[-1]["after"] if self._roots else self._initial
+            boundary = replay_values.encode((self.server.tick, self._indices()))
+            if self._stored_hash() != expected_state or boundary != expected_boundary:
+                self._fail("unrecorded stored domain change before recording end")
             result = {
-                "schema": SCHEMA, "build": BUILD, "scope": SCOPE,
+                "schema": SCHEMA, "build": BUILD, "scope": self._scope(),
                 "manifest": self._initial_manifest, "initial": self._initial,
+                "state_profile": self._state_profile, "initial_state": self._initial_state,
                 "environment": self.environment.finish(), "collision": self.collision.finish(),
                 "roots": self._roots, "end": {"seq": len(self._roots), "status": "complete"},
             }
@@ -342,9 +394,20 @@ class _ReplaySession(_Session):
         super().__init__()
         document = replay_values.clone(document)
         _fields(document, {"schema", "build", "scope", "manifest", "initial", "environment",
-                           "collision", "roots", "end"}, "journal")
-        if (document["schema"], document["build"], document["scope"]) != (SCHEMA, BUILD, SCOPE):
+                           "collision", "roots", "end", "state_profile", "initial_state"}, "journal")
+        if document["schema"] != SCHEMA or document["build"] != BUILD:
             self._fail("unsupported controlled journal version or scope")
+        profile = document["state_profile"]
+        if type(profile) is not str or profile not in ("wire-only", "registered-domain-v1"):
+            self._fail("unsupported stored-state profile")
+        self._state_profile = profile
+        if document["scope"] != self._scope():
+            self._fail("journal scope differs from its state profile")
+        if profile == "registered-domain-v1":
+            from ow174.game.mover import _movers
+
+            _movers()
+        self._state_assets = WorldRegistry()
         if type(document["roots"]) is not list:
             self._fail("journal roots must be a list")
         _fields(document["end"], {"seq", "status"}, "journal end")
@@ -357,9 +420,18 @@ class _ReplaySession(_Session):
         self._initialize_server()
         if replay_values.encode((self.server.tick, self._indices())) != document["initial"]:
             self._fail("initial server boundary differs")
+        if self._stored_hash() != document["initial_state"]:
+            self._fail("initial stored state differs")
         self.document = document
         self._expected_effects = []
         self._effect_index = 0
+        self._expected_boundary = None
+
+    def _check_boundary(self, before, state_before):
+        expected = self._expected_boundary
+        if (expected is None or replay_values.encode(before) != expected["before"]
+                or state_before != expected["state_before"]):
+            self._fail("stored state or boundary differs before root dispatch")
 
     def _next(self, kind):
         if not self._active or self._effect_index == len(self._expected_effects):
@@ -409,13 +481,15 @@ class _ReplaySession(_Session):
 
     def run(self):
         for seq, expected in enumerate(self.document["roots"]):
-            _fields(expected, {"seq", "operation", "arguments", "before", "after", "result", "effects"},
+            _fields(expected, {"seq", "operation", "arguments", "before", "after", "result", "effects",
+                               "state_before", "state_after"},
                     "root")
             if type(expected["seq"]) is not int or expected["seq"] != seq:
                 self._fail("root sequence differs")
             if type(expected["effects"]) is not list:
                 self._fail("root effects must be a list")
             self._expected_effects, self._effect_index = expected["effects"], 0
+            self._expected_boundary = expected
             row, _ = self._root(expected["operation"], replay_values.decode(expected["arguments"]))
             row["seq"] = seq
             if self._effect_index != len(self._expected_effects):
@@ -427,9 +501,10 @@ class _ReplaySession(_Session):
         self.collision.assert_complete()
         self._finished = True
         return {
-            "schema": SCHEMA, "scope": SCOPE, "status": "matched_controlled_roots_and_wire",
+            "schema": SCHEMA, "scope": self._scope(), "status": "matched_controlled_roots_and_wire",
             "roots": len(self.document["roots"]), "send_attempts": self._sends,
             "complete_battle_replay": False, "full_state_verified": False,
+            "stored_state_verified": self._state_profile == "registered-domain-v1",
             "evidence_hash": hashlib.sha256(json.dumps(
                 replay_values.encode(self.document), ensure_ascii=True, separators=(",", ":")
             ).encode("utf-8")).hexdigest(),

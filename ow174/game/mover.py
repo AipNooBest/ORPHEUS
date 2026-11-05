@@ -54,6 +54,7 @@ field for field as the client compares it with the server's (0x7FF789B73E00, see
 import json
 import math
 import struct
+import threading
 from collections import deque
 from dataclasses import dataclass, fields, replace
 from functools import cache
@@ -248,16 +249,39 @@ class MoverData:
     character_collision: int = 1
 
 
-@cache
+_mover_table: dict[int, MoverData] | None = None
+_mover_table_lock = threading.Lock()
+
+
 def _movers() -> dict[int, MoverData]:
-    if not MOVERS_PATH.is_file():
-        return {}
-    names = {field.name for field in fields(MoverData)}
-    table = json.loads(MOVERS_PATH.read_text(encoding="utf-8"))
-    return {
-        int(body, 16): MoverData(**{key: value for key, value in entry.items() if key in names})
-        for body, entry in table.items()
-    }
+    global _mover_table
+    with _mover_table_lock:
+        if _mover_table is None:
+            if not MOVERS_PATH.is_file():
+                _mover_table = {}
+            else:
+                names = {field.name for field in fields(MoverData)}
+                table = json.loads(MOVERS_PATH.read_text(encoding="utf-8"))
+                _mover_table = {
+                    int(body, 16): MoverData(**{key: value for key, value in entry.items() if key in names})
+                    for body, entry in table.items()
+                }
+        return _mover_table
+
+
+def loaded_mover_table() -> dict[int, MoverData] | None:
+    """Observe cold/loaded canonical data identity without reading or initializing the table."""
+    with _mover_table_lock:
+        return _mover_table
+
+
+def _clear_movers() -> None:
+    global _mover_table
+    with _mover_table_lock:
+        _mover_table = None
+
+
+_movers.cache_clear = _clear_movers  # retain the previous private cache reset interface
 
 
 def mover_data(body: int | None) -> MoverData:

@@ -59,7 +59,7 @@ rejected. The live match handler retires that body's script; other players keep
 running. This prevents half-completed simulations from looking successful. It
 does not add automatic recovery or prove the cause of the reported live issues.
 
-The latest full Python regression ran 994 tests, all passing. The formerly skipped
+The latest full Python regression ran 1070 tests, all passing. The formerly skipped
 King's Row physics case now runs with the locally built cache. A separate 62.448-second offline
 Soldier sequence applied/decoded 3903 owner chunks, observed ammo spending and
 seven refills, and ended with no active volley after release. This is a native
@@ -88,8 +88,9 @@ any mismatch. It has no default recording or file output; returned tapes can
 contain private handoff keys. Fifteen wrapper tests pass. These are boundaries for
 full battle replay, not a complete recorder or deterministic Match replay.
 
-Body observation hashes now include lazy state-allocation order because button
-resync, teardown and volley reporting traverse it. The isolated 975-command body
+Body observation hashes now include lazy state-allocation order and the next
+event sequence without consuming it. Button resync, teardown and volley reporting
+traverse stored state order; equal-time events use sequence order. The isolated 975-command body
 example still matches. The real Match's projectile-lease discovery also allocates
 states after body creation; a body-only trace without that external operation now
 correctly reports an incomplete boundary instead of hiding the difference. Full
@@ -104,6 +105,17 @@ training bot and observed its replacement after respawn; all86 controlled roots
 and13 send attempts matched replay, with the largest datagram1189 bytes. No
 game or network socket was started. This verifies controlled roots and wire;
 complete_battle_replay and full_state_verified remain False.
+
+The v2 journal adds an opt-in registered stored-state profile. It independently
+compares hashes before and after each root, including VM event/timer order and
+mutable identity, mover/contact/GJK state, combat and lifecycle state, stream
+baselines, transport queues and callbacks. An unrecorded change between roots or
+before the end fails the recording. A two-player encrypted protocol scenario
+replays damage, death, respawn and hero selection with the registered state check.
+The default wire-only profile remains available. The profile is not a live-loop
+recorder or a snapshot of the whole process. See
+[CONTROLLED_SERVER_JOURNAL_V2.txt](CONTROLLED_SERVER_JOURNAL_V2.txt) and
+[SERVER_STORED_STATE_V1.txt](SERVER_STORED_STATE_V1.txt).
 
 The new scenario exposed oversized native datagrams at spawn: the old budget
 loop stopped at one entity although messages plus that entity exceeded1264 bytes.

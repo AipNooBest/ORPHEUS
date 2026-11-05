@@ -1,0 +1,63 @@
+Controlled server stored-state graph v1
+
+export_server_state(server, archives=(), collision_provider=..., assets=...)
+exports registered stored state without running builders, VM evaluation, physics,
+frame snapshots, random draws or event-sequence allocation. snapshot_digest hashes
+the detached graph. Snapshots contain private encryption keys and account data;
+the journal retains hashes, not public raw snapshots. This is not a restorer.
+
+The server must be stopped and controlled explicitly. External environment, socket,
+skin lookup, collision provider, join/leave callbacks and domain lock are named
+boundaries. Journal read tapes and ordered effects verify their observations.
+Real _run scheduling, lobby callback reentrancy, other threads, Python stacks and
+arbitrary external writes are outside this scope. complete_battle_replay and
+full_state_verified remain False; stored_state_verified names this exact profile.
+
+The strong domain roots include the server and the session's existing archived
+matches, which remain usable for later join/take_out rejection. Exact class/field
+schemas cover Match/Player, bots, vitals/history/rockets/respawns, projectiles/fields,
+voice work, notices, stats, controller/body/observer streams, snapshots, transport
+windows/queues/in-flight records, reliable generations, payload writers and their
+callbacks. Unknown classes/fields are rejected. Dictionaries/lists/deques preserve
+order and mutable identity; deque maxlen is included. Attribute dictionaries also
+have graph identity. Immutable plain tuple values preserve their member order.
+
+Entity builders are not called. Their pinned relative source identity, recursively
+complete Python CodeType metadata (including constants, nested code and names),
+defaults and closure contents are stored. co_code alone was insufficient: changing
+component constant114 to75 leaves bytecode unchanged but changes the record built.
+Function globals are the pinned model/configuration, not a general Python heap
+snapshot. Runtime code/module monkey-patching outside registered roots is unsupported.
+
+Each Component owns its complete VM artifact. External State/Instance references
+include the global Component node identity, so equal entity numbers do not merge
+different lifecycles. VM storage sidecars bridge mutable identities already reachable
+in the generic domain graph. Unsupported private mutable sharing across Component
+artifacts fails explicitly; declared static graph model sharing is permitted only
+with the VM exporter's definition/topology checks. Component world/RNG/EventSequence
+identities also bridge into the global graph.
+
+Each Mover owns a full physics artifact. Its actual World/data/values also bridge
+globally: equal geometry or equal MoverData values do not imply equal identity.
+Mover.use tests those identities and may reset CharacterBody when they differ.
+Unsupported mutable physics sharing across different Mover artifacts is rejected.
+Static World content uses the collision asset fingerprint and explicit registration.
+
+The canonical mover table is now an explicit lazy store with a read-only peek.
+Only normal _movers initialization loads it; loaded_mover_table() never initializes
+or reads a file. The previous private cache_clear reset remains available. Stored
+journal setup explicitly prepares this static table before constructing its server,
+and the global snapshot root records the actual canonical objects. This captures
+the distinction between canonical data and a field-equal clone without warming a
+cache as a side effect of export. Existing mover mechanics use the same values.
+
+Weak generation/home lookup tables retain only keys strongly reachable from the
+closed domain roots. Expired or externally held weak-only entries cannot affect
+future registered queue/ACK operations and are excluded; membership order is sorted
+by stable graph node. This avoids making arbitrary GC residue look like gameplay.
+
+Static assets, source/configuration and model tables must remain stable during the
+capture. Query-cache occupancy is excluded only where the collision fingerprint
+validates its derived contents. Snapshot construction is expensive and opt-in;
+it is not enabled in the production tick by default. Observation does not claim
+that the underlying movement/weapon/hero rules match the original server.

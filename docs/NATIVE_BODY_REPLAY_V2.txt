@@ -70,8 +70,9 @@ float representation (finite values only); sets and object keys are canonicalize
 debug projection additionally uses hexadecimal float values. Transport stream/reports and pending shots
 are excluded; shots have
 their own summary. This is a key execution-state fingerprint, not a restorable process checkpoint.
-The raw itertools event counter is excluded; queued event sequence/FIFO is recorded. No deprecated
-pickle/copy introspection of itertools is used. Attribute rows are canonicalized by raw state index,
+The explicit EventSequence.next_value is recorded without consuming an event; queued FIFO is also
+recorded. No pickle/copy or deprecated itertools introspection is used. Attribute rows are canonicalized
+by raw state index,
 but each instance also preserves state_order, including never-activated allocated states. Logical-button
 resync, teardown and volley reporting currently traverse that lazy-allocation order, so equal active
 attributes alone do not prove equal future behavior. Recording reads this order without allocating

@@ -1,0 +1,39 @@
+Controlled server journal v2
+
+The actual server/wire contract described in CONTROLLED_SERVER_JOURNAL_V1.txt is
+retained. This version adds explicit stored-state profiles and continuous root
+boundaries; v1 private documents are rejected rather than silently upgraded.
+
+schema = ow174.controlled-server-journal.v2
+
+RecordingServerSession(..., verify_stored_state=False) keeps the inexpensive
+controlled-roots-and-wire-only scope. Each root's state_before/state_after and
+header initial_state are None. Root tick/read-cursor boundaries are still checked.
+
+RecordingServerSession(..., verify_stored_state=True) uses state_profile =
+registered-domain-v1 and scope = controlled-roots-wire-and-registered-state.
+It explicitly prepares canonical static mover data before server construction,
+then captures an initial stored-domain hash and a before/after hash at each root.
+SERVER_STORED_STATE_V1.txt specifies the registered domain and exclusions.
+
+Header fields additionally require state_profile and initial_state. Root rows
+add state_before/state_after. Configuration manifests bind the selected profile.
+The next root must begin at the previous root's exact after boundary and state;
+an unrecorded intermediate mutation permanently fails recording before dispatch.
+finish also checks the final boundary/state. Replay checks the expected before
+boundary/state before executing a root, then compares its actual after values.
+
+Snapshot construction is strictly observational. Inputs/ACK/combat/stream changes
+still run once through the real GameServer path; recorded damage is not reinjected.
+The profile retains hashes and verifies newly computed snapshots on replay.
+
+Successful reports set stored_state_verified=True only for registered-domain-v1.
+complete_battle_replay=False and full_state_verified=False remain explicit: this
+is not live-loop/thread scheduling capture or arbitrary original-server fidelity.
+Wire-only reports set stored_state_verified=False. They cannot certify internal
+state equality. Scope/profile mismatches, stale manifests, unsupported storage or
+missing/extra roots/reads/effects cannot return a matching report.
+
+Full snapshots, raw roots and read tapes can contain handoff keys. No default file
+writer or raw logging is added. Public evidence should contain only counts, hashes,
+declared scope and validation results, never private recording payloads.

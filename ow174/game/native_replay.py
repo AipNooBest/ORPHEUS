@@ -124,6 +124,7 @@ def _snapshot(script: BodyScript, encode) -> dict:
             "frame": component.frame, "now": component.now, "held": list(component.held),
             "button": component.button, "owner_dead": component.owner_dead,
             "next_id": component.next_id,
+            "next_seq": component.seq.next_value,
             "vars": _variables(component.vars, encode), "disabled": encode(component.disabled),
             "destroyed": encode(component.destroyed),
             "fault": str(component.fault) if component.fault else None,
