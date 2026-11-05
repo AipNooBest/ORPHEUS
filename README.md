@@ -1,8 +1,32 @@
 # ORPHEUS
 
-ORPHEUS reconstructs server behavior for Overwatch 1.74.0.0.104319. The current delivery target is a complete Soldier: 76 session in the Practice Range. The project is a work in progress.
+ORPHEUS is a server restoration project for Overwatch 1 retail build **1.74.0.0.104319**. The goal is to reproduce the server behavior of that build across its heroes, maps, modes, and online features, including the state and events that drive the original client's presentation. Development is ongoing.
 
-The local server can load the Practice Range and simulate movement, some weapon and ability behavior, damage, bot deaths, respawns, and hero changes. Automated tests cover these server and protocol paths. Client acceptance is pending for animation and HUD presentation, hit feedback, bot names and kill feed, audio, out-of-bounds death, and several ability behaviors. The [implementation and verification record](docs/STATE.md) separates these results.
+## Restoration checklist
+
+Check an item when its stated scope has repeatable evidence and any required original-client acceptance has passed. Checked subitems record completed work within an open milestone.
+
+- [ ] **Research and replay.** Rebuild the required data from documented sources, resolve protocol and graph semantics, and reproduce complete sessions from recorded inputs and events.
+  - [x] Pin the target build and document upstream sources and data provenance.
+  - [x] Replay controlled encrypted server sessions and compare wire output and registered server state.
+- [ ] **Login, profiles and social features.** Complete authentication, account and profile state, progression, cosmetics, parties and other social features supported by the target build.
+- [ ] **Lobby and match lifecycle.** Verify queues, team assignment, game setup, hero selection, match handoff, joining, leaving, reconnecting and returning to the lobby.
+- [ ] **Network synchronization.** Verify authoritative movement, prediction and correction, input timing, and state consistency for players and observers under delay, loss, reordering and repeated connections.
+- [ ] **Heroes and abilities.** Cover every hero's weapons, reloads, aiming, movement abilities, passives, cooldowns, resources, ultimates, transformations and deployables, with shared mechanics tested across the roster.
+- [ ] **Combat and health.** Reproduce hit detection, projectiles, explosions, damage, healing, armor, shields, barriers, status effects, eliminations, assists and respawns.
+- [ ] **Maps and world interactions.** Verify collision, movement surfaces, spawn rooms, doors, health packs, destructible objects and environmental deaths for the applicable maps and modes.
+  - [x] Extract and integrity-check local collision caches for all 95 catalog maps and handle missing caches explicitly.
+- [ ] **Modes and match rules.** Verify objectives, scoring, timers, overtime, round transitions, victory conditions and results across the build's supported modes.
+- [ ] **Bots and scripted scenarios.** Verify training and tutorial behavior, including target identity, routes, combat, spawning, death, respawn and scenario resets.
+- [ ] **Models, skins and animation.** Verify first- and third-person model changes, skins, weapon handling, scopes and aim-down-sights, ability animations, and spawn, death and respawn sequences.
+- [ ] **HUD, menus and visual feedback.** Verify health and ammo displays, overhead bars, reticles, hit markers, material-specific impact effects, elimination names, kill feed, on-fire meter, scoreboards and match screens.
+- [ ] **Audio and dialogue.** Verify asset selection and playback triggers for weapon, hit, critical-hit and death sounds, multikill and match announcements, ambient audio and music, and contextual, randomized and Easter egg dialogue. Check listeners, timing and supported languages.
+- [ ] **Stability and delivery.** Verify tick and packet budgets, long-running matches, recovery, reproducible deployment, and final acceptance with the original client.
+  - [x] Verify server-only startup of the audited public source checkout using separate runtime data.
+
+## Current validation
+
+The first end-to-end validation group is Soldier: 76 in the Practice Range. Offline checks cover movement, firing and reloading, bot damage and respawn, hero switches, and leaving and rejoining. Original-client acceptance for this group is pending. Test results and remaining gaps are recorded in the [implementation and verification record](docs/STATE.md) and the [changelog](CHANGELOG.md).
 
 ## Architecture
 
@@ -50,7 +74,7 @@ The full regression suite uses the prepared local research data, including addit
 .\.venv\Scripts\python.exe -B -m unittest discover -s tests
 ```
 
-The first validation group covers Soldier: 76 and the Practice Range through model, animation, movement, weapon and HUD, abilities, damage, death, respawn, UI, and audio. Common mechanisms are tested against other applicable data before the next hero or map is added to acceptance.
+Develop and verify shared mechanics across the heroes, maps and modes that use them. For each acceptance group, check gameplay together with its models, animation, HUD and audio.
 
 See the [development workflow](AGENTS.md), [changelog](CHANGELOG.md), and [replay contract](docs/CONTROLLED_SERVER_JOURNAL_V2.txt). Raw diagnostic captures may include authentication or session data and belong in local storage.
 
