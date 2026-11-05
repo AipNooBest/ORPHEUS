@@ -262,9 +262,9 @@ class DeathTests(unittest.TestCase):
         fight = self.run.match.combat
         target = next(target for target in fight._targets() if target.owner is self.b)
         loadout = 0x09E000000000008D  # Soldier's rifle
+        last_command = script.frame
         fight._damage(self.a, target, 200.0, True, loadout, self.run.frame)
-        self.run.step({})
-        self.run.step({})
+        self.assertEqual(script.frame, last_command)
 
         delta, _ = observers.delta(script, stream, observers.snapshot(script))
         wire = chunk(delta, script.frame, 0)

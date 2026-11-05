@@ -839,9 +839,12 @@ class Combat:
         script = victim.body_script
         if script is not None:
             try:
-                runtime.send_message(
-                    script.component, DIED, self._death_parameters(killer, critical, loadout), killer.body
-                )
+                component = script.component
+                params = self._death_parameters(killer, critical, loadout)
+                if runtime.send_message(component, DIED, params, killer.body):
+                    # The server owns the death event. Run it before the observer snapshot even
+                    # if the victim sends no further commands.
+                    component.run_now()
             except Exception:
                 log.exception("[game] %s: %s's body script failed on %X", label, victim.name, DIED)
         self.respawns.append((self.now + respawn_seconds(self.match), victim))
