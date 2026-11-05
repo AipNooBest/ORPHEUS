@@ -385,7 +385,7 @@ class Target:
 
 @dataclass
 class Rocket:
-    """A projectile in flight (Helix Rockets)."""
+    """A projectile in flight."""
 
     shooter: object
     team: int
@@ -397,6 +397,7 @@ class Rocket:
     blast: HitDef | None
     shot: object = None  # its projectiles.Shot: told when it ends
     flown: float = 0.0  # seconds in the air
+    last_tick: int | None = None  # last world tick, or None before player input is simulated
 
 
 class Combat:
@@ -622,7 +623,8 @@ class Combat:
             cfg = node.field(name)
             return default if cfg is None else _number(state.evaluate(cfg, watch=False), default)
 
-        if isinstance(shooter, bots.Bot):
+        npc = isinstance(shooter, bots.Bot)
+        if npc:
             x, y, z = shooter.position
             # Use the server body pose until the animated muzzle transform is available.
             origin, direction = (x, y + EYE, z), aim(round(shooter.yaw), 0)
@@ -648,7 +650,10 @@ class Combat:
             )
             if damaging or shot is not None:
                 self.rockets.append(
-                    Rocket(shooter, shooter.team, origin, direction, speed, lifetime, direct, blast, shot)
+                    Rocket(
+                        shooter, shooter.team, origin, direction, speed, lifetime, direct, blast, shot,
+                        last_tick=self.tick if npc else None,
+                    )
                 )
             return
         if direct is None or direct.amount <= 0.0:
@@ -680,8 +685,13 @@ class Combat:
         )
 
     def _fly(self, rocket: Rocket) -> None:
-        """One tick of a projectile: it hits the first enemy body or wall on its way and explodes there."""
-        duration = min(TICK, rocket.left)
+        """Sweep elapsed world time against the current bodies and static collision."""
+        # Player input can arrive immediately before the scheduler accounts for a gap.
+        elapsed = 1 if rocket.last_tick is None else self.tick - rocket.last_tick
+        if elapsed <= 0:
+            return
+        rocket.last_tick = self.tick
+        duration = min(elapsed * TICK, rocket.left)
         if duration <= 0.0:
             self._landed(rocket)
             return

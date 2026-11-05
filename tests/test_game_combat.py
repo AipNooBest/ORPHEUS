@@ -204,6 +204,57 @@ class DamageTests(unittest.TestCase):
         self.assertEqual(vitals.heal(1000.0), 47.5 + 50.0 + 25.0)
 
 
+class ProjectileTimingTests(unittest.TestCase):
+    def match_with_projectile(self, lifetime=1.0):
+        run = Run(KANEZAKA_DM, ("Shooter", "Target"))
+        run.step({})
+        shooter, target = run.players
+        x, y, z = shooter.mover.position
+        target.mover.position = [x, y, z + 5.0]
+        fight = run.match.combat
+        victim = next(body for body in fight._targets() if body.owner is target)
+        rocket = combat.Rocket(
+            shooter, shooter.team, fight._eye(shooter), (0.0, 0.0, 1.0), 35.0,
+            lifetime, HitDef(19.0), None,
+        )
+        fight.rockets.append(rocket)
+        return run, rocket, fight.vitals_of(victim)
+
+    def test_skipped_world_ticks_match_the_contiguous_static_hit(self):
+        results = []
+        for advances in (range(1, 14), (13,)):
+            run, rocket, vitals = self.match_with_projectile()
+            rocket.last_tick = run.frame
+            for advance in advances:
+                frame = run.frame + advance
+                run.match.update(frame * combat.TICK, frame)
+            self.assertEqual(vitals.total, 181.0)
+            self.assertFalse(run.match.combat.rockets)
+            results.append(rocket.flown)
+        self.assertAlmostEqual(*results)
+
+    def test_skipped_world_ticks_do_not_extend_flight_past_its_bound(self):
+        run, rocket, vitals = self.match_with_projectile(lifetime=0.05)
+        rocket.last_tick = run.frame
+        frame = run.frame + 13
+        run.match.update(frame * combat.TICK, frame)
+        self.assertEqual(vitals.total, 200.0)
+        self.assertEqual(rocket.flown, 0.05)
+        self.assertFalse(run.match.combat.rockets)
+
+    def test_player_admission_moves_once_and_repeated_world_tick_moves_zero(self):
+        run, rocket, vitals = self.match_with_projectile()
+        frame = run.frame + 13
+        run.match.update(frame * combat.TICK, frame)
+        self.assertEqual(rocket.flown, combat.TICK)
+        run.match.update(frame * combat.TICK, frame)
+        self.assertEqual(rocket.flown, combat.TICK)
+        frame += 3
+        run.match.update(frame * combat.TICK, frame)
+        self.assertEqual(rocket.flown, 4 * combat.TICK)
+        self.assertEqual(vitals.total, 200.0)
+
+
 class BotTests(unittest.TestCase):
     def test_bot_damage_and_death_use_the_attacker_entity(self):
         run = Run()
