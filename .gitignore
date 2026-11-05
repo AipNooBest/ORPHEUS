@@ -46,9 +46,12 @@ work/
 
 # Relay build output (the release DLL is downloaded by START.bat)
 *.dll
+*.exe
 *.obj
 *.lib
 *.exp
+*.pdb
+*.pyd
 
 # Captures, dumps and disassembler databases
 data/cli_dec.bin
@@ -56,6 +59,8 @@ data/srv_dec.bin
 *.pcap
 *.pcapng
 *.dmp
+*.mdmp
+*.dump
 *.id0
 *.id1
 *.i64
@@ -70,5 +75,18 @@ data/srv_dec.bin
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.keystore
+.netrc
+credentials.json
+secrets.json
+/secrets/
+/local-data/
+/game-client/
+/captures/
+/data/resource_keys_174.json
 Thumbs.db
 desktop.ini
