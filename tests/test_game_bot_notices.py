@@ -62,7 +62,7 @@ class BotNoticeTests(unittest.TestCase):
         self.window = ReceiveWindow()
         self.seq = 0
 
-    def prepare_player_target(self, *, mode_ready=True):
+    def prepare_player_target(self, *, mode_ready=True, queue_create=True):
         self.connect()
         self.match.tick = 100
         self.player.spawned = self.player.has_body = True
@@ -74,7 +74,8 @@ class BotNoticeTests(unittest.TestCase):
         self.victim.spawned = self.victim.has_body = victim_client.open = True
         self.target = next(target for target in self.match.combat._targets() if target.owner is self.victim)
         self.entity = self.target.entity
-        self.client.queue_entities([self.match.remote_body_create(self.player, self.victim)])
+        if queue_create:
+            self.client.queue_entities([self.match.remote_body_create(self.player, self.victim)])
         # These tests isolate body and mode delivery from the name association gate.
         self.client._confirmed_possessions[self.victim.entity] = self.victim.body
         if mode_ready:
@@ -954,6 +955,30 @@ class BotNoticeTests(unittest.TestCase):
         self.ack()
         self.send(109)
         self.assertEqual(self.health, [(world.OP_UPDATE, 180)])
+
+    def test_late_observer_create_freezes_current_player_health(self):
+        self.prepare_player_target(queue_create=False)
+        fight = self.match.combat
+        attacker = bots.make(PRACTICE_RANGE.map_guid)[0]
+        fight._damage(attacker, self.target, 20, False, None, 100)
+        fight._send_health()
+        vitals = fight.vitals_of(self.target)
+        self.assertEqual(vitals.total, 180)
+        self.assertFalse(vitals.changed)
+
+        self.match.ensure_remote_body(self.player, self.victim)
+        self.send(103, deliver=False)
+        self.assertEqual(self.health, [(world.OP_CREATE, 180)])
+        fight._damage(attacker, self.target, 10, False, None, 104)
+        fight._send_health()
+        self.send(106)
+        self.assertEqual(self.health, [])
+        self.ack()
+        self.send(109)
+        self.assertEqual(self.health, [(world.OP_CREATE, 180)])
+        self.ack()
+        self.send(112)
+        self.assertEqual(self.health, [(world.OP_UPDATE, 170)])
 
     def test_superseded_health_is_not_resent_but_latest_still_retries(self):
         self.prepare(single=True)

@@ -81,7 +81,7 @@ class FrozenCreateTests(unittest.TestCase):
             self.assertIs(player.body_script, new_script)
             return lease
 
-        match.combat = SimpleNamespace(projectiles=SimpleNamespace(lease=leased))
+        match.combat = SimpleNamespace(vitals={}, projectiles=SimpleNamespace(lease=leased))
         with patch.object(match, "start_body_script", side_effect=start):
             create = match.own_body_updates(owner)[0]
         self.assertIs(create.stream, callback)
@@ -98,7 +98,7 @@ class FrozenCreateTests(unittest.TestCase):
         match, owner = Match.__new__(Match), self.owner()
         viewer = SimpleNamespace(slot=2, seen={})
         observers = Observers(SimpleNamespace())
-        match.combat = SimpleNamespace(observers=observers)
+        match.combat = SimpleNamespace(vitals={}, observers=observers)
         create = match.remote_body_create(viewer, owner)
         with patch("ow174.game.match.world.create", side_effect=self.capture):
             original = create.build(0)

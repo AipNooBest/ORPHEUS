@@ -601,10 +601,13 @@ class Match:
         return self._body_builder(owner, state, own)(origin)
 
     def _body_builder(self, owner: Player, state: Movement | None, own: bool = False):
-        """A player's body with its hero's health pools (component 51), team bit and hero; on the owner's
-        client also its projectile lease (component 90, projectiles.py), frozen for reliable delivery."""
-        health, armour, shields = pools.body_pools(owner.hero.guid)
-        components = world.health(health, health, armour, shields)
+        """Freeze a player's current health pools, team and hero, with the projectile lease for its owner."""
+        vitals = self.combat.vitals.get(owner.body)
+        if vitals is None:
+            health, armour, shields = pools.body_pools(owner.hero.guid)
+            components = world.health(health, health, armour, shields)
+        else:
+            components = vitals.component(vitals.ids)
         components[26] = [owner.team_bit]
         components[123] = [owner.hero.guid]
         if own:
