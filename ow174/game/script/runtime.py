@@ -25,6 +25,7 @@ Node classes (nodes.py) subclass State and register their action handlers here.
 
 import bisect
 import logging
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -48,7 +49,7 @@ ABORT_PLUG = "m_F198FD3A"
 SUBGRAPH_STATES = "m_FF3DAF1E"
 
 STATE_CLASSES: dict[str, type["State"]] = {}  # node class -> runtime state class (nodes.py fills it)
-HANDLERS: dict[str, object] = {}  # node class -> handler(instance, node, caller) -> accepted
+HANDLERS: dict[str, object] = {}  # action/condition handlers can defer with NotImplemented
 ENTRY_CLASSES = {"STUStatescriptEntry", "STU_571CC72E"}  # run at Init (EntryClientOnlySharedVars agrees too)
 MESSAGE_ENTRIES = {"STUStatescriptEntryGameMessage"}
 
@@ -253,10 +254,33 @@ def would_stack_to_top(var: Var, priority: tuple[float, bool], exclude: "State |
     return True
 
 
+@dataclass(frozen=True)
+class RaycastRequest:
+    """Resolved world-space inputs with the authored filter kept opaque."""
+
+    origin: expr.Vec3
+    direction: expr.Vec3
+    length: float
+    ignored_entities: tuple[int, ...]
+    filter_config: dict | None
+
+
+@dataclass(frozen=True)
+class RaycastResult:
+    """All outputs of a completed cast, including the provider's values on a miss."""
+
+    hit: bool
+    entity: Entity | None
+    point: expr.Vec3 | None
+    normal: expr.Vec3 | None
+
+
 class World:
     """What the runtime asks outside its entity: the owner's hero and mode (for ruleset defaults), other
     entities, config vars the server cannot compute, and game messages to other entities. The base
     answers like an empty world."""
+
+    raycast: Callable[[RaycastRequest], RaycastResult | None] | None = None
 
     def __init__(self, hero: int = 0, mode: int = 0) -> None:
         self.hero = hero
@@ -772,12 +796,14 @@ class Instance:
 
     def _run_node(self, node: Node, caller: "State | None") -> bool:
         function = HANDLERS.get(node.cls)
-        if function is None:
-            if node.cls not in ENTRY_CLASSES and node.cls not in MESSAGE_ENTRIES:
-                expr.warn_once(node.cls, "node class %s has no model: it only follows m_outPlug", node.cls)
-            self.follow(node, "m_outPlug", None)
-            return True
-        return function(self, node, caller)
+        if function is not None:
+            accepted = function(self, node, caller)
+            if accepted is not NotImplemented:
+                return accepted
+        if node.cls not in ENTRY_CLASSES and node.cls not in MESSAGE_ENTRIES:
+            expr.warn_once(node.cls, "node class %s has no model: it only follows m_outPlug", node.cls)
+        self.follow(node, "m_outPlug", None)
+        return True
 
     # --- game messages -----------------------------------------------------------------------------
 

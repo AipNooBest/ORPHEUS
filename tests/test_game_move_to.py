@@ -90,6 +90,7 @@ class FixedTargetMoveToTests(unittest.TestCase):
 
     def test_genji_authored_miss_uses_the_world_body_position(self):
         hero_guid, graph_id, state_index, _, speed = AUTHORED_STATES[0]
+        origin = Vec3(0.0, 2.2, 0.0)
         direction = Vec3(0.0, 0.0, 1.0)
         hit_point = Vec3(0.0, 1.0, 3.0)
         for point, expected in ((None, Vec3(0.0, 1.0, 15.0)), (hit_point, hit_point)):
@@ -99,19 +100,23 @@ class FixedTargetMoveToTests(unittest.TestCase):
                 native = world_class.native
 
                 def resolve_direction(world, cfg, reader, *, source=instance, original=native):
-                    if reader is source and cfg.get("$") == "STU_2200A66D":
-                        return direction
+                    if reader is source:
+                        if cfg.get("$") == "STU_21A13145":
+                            return origin
+                        if cfg.get("$") == "STU_2200A66D":
+                            return direction
                     return original(world, cfg, reader)
 
-                def complete_ray(caller, node, _state, *, point=point):
-                    caller.write((INSTANCE, 788), point is not None)
-                    caller.write((INSTANCE, 431), point)
-                    caller.follow(node, "m_outPlug", None)
-                    return True
+                def complete_ray(world, request, *, point=point):
+                    self.assertEqual(
+                        (request.origin, request.direction, request.length), (origin, direction, 15.0),
+                    )
+                    self.assertEqual(request.ignored_entities, (world.body,))
+                    return runtime.RaycastResult(point is not None, None, point, None)
 
                 with (
                     patch.object(world_class, "native", resolve_direction),
-                    patch.dict(runtime.HANDLERS, {"STU_08D6BA6E": complete_ray}),
+                    patch.object(world_class, "raycast", complete_ray),
                 ):
                     player.match.tick = START + 1
                     player.take_commands([Command(START + 1, buttons=0x08)])

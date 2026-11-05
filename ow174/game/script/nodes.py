@@ -10,11 +10,13 @@ DataFlowMapping, Effect, ...) do on a server.
 """
 
 import math
+from types import NotImplementedType
 
 from ow174.game.script import expr
 from ow174.game.script.expr import (
     EPSILON,
     Asset,
+    Entity,
     Handle,
     Vec3,
     equal,
@@ -31,6 +33,8 @@ from ow174.game.script.runtime import (
     ABORT,
     Component,
     Instance,
+    RaycastRequest,
+    RaycastResult,
     State,
     Var,
     handler,
@@ -1239,6 +1243,90 @@ class ActiveQuery(State):
 
 
 # --- actions and conditions ------------------------------------------------------------------------
+
+
+_RAYCAST_OUTPUTS = ("m_out_HitSomething", "m_out_HitEntity", "m_out_HitPointWS", "m_out_HitNormal")
+
+
+def _finite_number(value) -> bool:
+    try:
+        return type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _finite_vector(value) -> bool:
+    return isinstance(value, Vec3) and all(_finite_number(axis) for axis in value)
+
+
+def _ray_entity(value) -> bool:
+    return isinstance(value, Entity) and type(value.id) is int and 0 <= value.id <= 0xFFFFFFFF
+
+
+def _raycast_request(instance: Instance, node) -> RaycastRequest | None:
+    kind = node.field("m_type")
+    unsupported = ("m_castRadius", "m_3B0AD973", "m_2158DFDE")
+    if type(kind) is not int or kind != 0 or any(node.field(field) is not None for field in unsupported):
+        return None
+    option = node.field("m_8CBE558B")
+    if option is not None and (
+        not isinstance(option, dict) or option.get("$") != "STUConfigVarBool" or option.get("m_value") != 0
+    ):
+        return None
+    filter_config = node.field("m_castFilter")
+    if filter_config is not None and (
+        not isinstance(filter_config, dict) or filter_config.get("$") != "STUConfigVarFilter"
+    ):
+        return None
+    origin = instance.evaluate(node.field("m_startPosWS"))
+    direction = instance.evaluate(node.field("m_dirWS"))
+    length = instance.evaluate(node.field("m_castLength"))
+    if not _finite_vector(origin) or not _finite_vector(direction) or not any(direction):
+        return None
+    if not _finite_number(length) or length <= 0:
+        return None
+    ignores = node.field("m_ignoreEntities")
+    if ignores is not None and not isinstance(ignores, list):
+        return None
+    entities = [instance.evaluate(config) for config in ignores or ()]
+    if any(not _ray_entity(entity) for entity in entities):
+        return None
+    return RaycastRequest(
+        origin, direction, float(length), tuple(entity.id for entity in entities), filter_config
+    )
+
+
+@handler("STU_08D6BA6E")
+def raycast_action(instance: Instance, node, caller) -> bool | NotImplementedType:
+    """Run the authored type-0 cast when a provider can complete it."""
+    provider = instance.component.world.raycast
+    if provider is None:
+        return NotImplemented
+    targets = []
+    for field in _RAYCAST_OUTPUTS:
+        config = node.field(field)
+        try:
+            target = lvalue(config)
+        except (IndexError, TypeError, ValueError):
+            return NotImplemented
+        if config is not None and (target is None or target in targets):
+            return NotImplemented
+        targets.append(target)
+    request = _raycast_request(instance, node)
+    if request is None:
+        return NotImplemented
+    result = provider(request)
+    if not isinstance(result, RaycastResult) or type(result.hit) is not bool:
+        return NotImplemented
+    if result.entity is not None and not _ray_entity(result.entity):
+        return NotImplemented
+    if any(value is not None and not _finite_vector(value) for value in (result.point, result.normal)):
+        return NotImplemented
+    for target, value in zip(targets, (result.hit, result.entity, result.point, result.normal), strict=True):
+        if target is not None:
+            instance.write(target, value)
+    instance.follow(node, "m_outPlug", None)
+    return True
 
 
 @handler("STUStatescriptActionSetVar")
