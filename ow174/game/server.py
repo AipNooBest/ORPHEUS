@@ -1390,10 +1390,13 @@ class GameServer:
         if self._clock_ticks_left is not None or candidate > MAX_SIMULATION_TICK:
             self._drain_clock(now)
             return
+        # Emit the current state once when a normal send boundary was crossed,
+        # even when the scheduler skipped the boundary tick itself.
+        frames = candidate // SEND_EVERY > self.tick // SEND_EVERY
         self.tick = candidate
         self._expire_handoffs(now)
         for match in list(self.matches):
-            match.update(now, self.tick)
+            match.update(now, self.tick, frames=frames)
         for client in list(self.clients.values()):
             if now - client.heard > SILENCE_SECONDS:
                 client.log("[!] no datagrams for 10 s, dropping the game")
@@ -1401,7 +1404,7 @@ class GameServer:
             elif client.leaving_since is not None and now - client.leaving_since >= LEAVE_GRACE_SECONDS:
                 client.log("[!] still here after 20304, dropping the game")
                 self.drop(client)
-            elif client.open and sends(self.tick):
+            elif client.open and frames:
                 client.send_frame(self.tick, now)
         self.matches = [match for match in self.matches if not match.ended]
         for key, (count, last) in list(self._dropped.items()):

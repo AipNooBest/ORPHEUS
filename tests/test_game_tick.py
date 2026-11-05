@@ -4,10 +4,12 @@ behind are skipped, not run late, as retail's frame counts 62.5 per second."""
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ow174.game.server import TICK_SECONDS, next_tick_after
+from ow174.game.server import TICK_SECONDS, GameServer, next_tick_after
 
 
 class TickTests(unittest.TestCase):
@@ -32,6 +34,25 @@ class TickTests(unittest.TestCase):
                 due, missed = next_tick_after(due, now)
                 frames += missed + 1
         self.assertLessEqual(abs(frames - now / TICK_SECONDS), 2)
+
+    def test_world_sends_once_on_crossed_boundary_after_skipped_ticks(self):
+        server = GameServer()
+        server.tick = 1001
+        client = SimpleNamespace(heard=100.0, leaving_since=None, open=True, send_frame=Mock())
+        match = SimpleNamespace(ended=False, update=Mock())
+        server.clients[1] = client
+        server.matches.append(match)
+
+        # Miss the send phase repeatedly, then cross two boundaries in one step.
+        # A late frame can be followed by the next regular send in 1 or 2 ticks.
+        for missed in (0, 3, 2, 2, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0):
+            tick = server.tick + missed + 1
+            server._tick(100.0 + (tick - 1001) * TICK_SECONDS, missed=missed)
+
+        sent = [call.args[0] for call in client.send_frame.call_args_list]
+        self.assertEqual(sent, [1002, 1006, 1009, 1012, 1014, 1022, 1023, 1026, 1029])
+        prepared = [call.args[1] for call in match.update.call_args_list if call.kwargs["frames"]]
+        self.assertEqual(prepared, sent)
 
 
 if __name__ == "__main__":

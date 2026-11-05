@@ -843,9 +843,11 @@ class Match:
 
     # --- lifetime ------------------------------------------------------------------------------
 
-    def update(self, now: float, tick: int) -> None:
+    def update(self, now: float, tick: int, *, frames: bool | None = None) -> None:
         """Run the spawn steps of players who loaded, keep their statescript acked, walk the training
         bots, and show new players and bodies to the others."""
+        if frames is None:
+            frames = sends(tick)
         self.tick = tick
         ready = self._refresh_collision()
         if self.collision_state.status == "unavailable":
@@ -858,7 +860,7 @@ class Match:
             for bot in self.bots:
                 bot.step(tick, RETAIL_QUANTA / 1e6, self.collision_world)
         if ready:
-            self.combat.update(now, tick, frames=sends(tick))
+            self.combat.update(now, tick, frames=frames)
         if self.assemble_ends is not None and not self.assembled and now >= self.assemble_ends:
             self._end_assemble(now)
         for player in self.players:
@@ -869,7 +871,7 @@ class Match:
                 self._spawn_steps(player, client, now)
             if player.script.data_last and now >= player.script.next_ack:
                 self._owner_ack(player, player.script, now)
-            if player.body_script is not None and player.spawned and sends(tick):
+            if player.body_script is not None and player.spawned and frames:
                 self._body_frames(player, client)
             if self.assembling() and player.steps_done >= 4 and now >= player.next_countdown:
                 self._send_countdown(player, now)
