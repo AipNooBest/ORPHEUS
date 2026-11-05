@@ -740,10 +740,16 @@ class Match:
     @staticmethod
     def sent_updates(viewer: Player, updates) -> None:
         """Commit only records selected for a successfully sent datagram, never budget candidates."""
+        script = viewer.body_script
         for update in updates:
             if update.op == OP_CREATE and update.entity in viewer.seen:
                 viewer.seen[update.entity] = True
             correction.sent(viewer, update)
+            if (
+                script is not None and not script.retired and update.entity == viewer.body
+                and update.stream is script.stream and update.chunk is not None and not update.resend
+            ):
+                script.report_sent(update.chunk_last)
 
     def destroy_for_others(self, player: Player, body: int) -> None:
         for other in self.players:

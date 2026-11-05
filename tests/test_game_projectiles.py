@@ -257,6 +257,51 @@ class OwnerProjectileDeliveryTests(unittest.TestCase):
         self.ack()
         self.advance()
 
+    def test_owner_volley_report_waits_for_a_successfully_sent_chunk(self):
+        from test_game_repeated_lifecycles import wire_frame
+
+        script = self.player.body_script
+        before = script.report_count
+        self.advance()
+        self.advance()
+        owner, = [item for item in self.client.entities if item.stream is script.stream]
+        self.client.queue_reliable(
+            20302, {"+0x78": {"+0x0": self.player.entity}, "+0x7C": False, "+0x80": 0},
+        )
+        budget = len(self.client._payload(self.tick, self.client.reliable, [], []))
+        with patch("ow174.game.server.MAX_PAYLOAD", budget):
+            self.assertEqual(self.send(), [])
+        self.ack()
+        self.assertIn(owner, self.client.entities)
+        self.assertEqual(script.report_count, before)
+
+        self.server.sock.fail_next = True
+        with self.assertLogs("ow174.game", level="WARNING"):
+            self.client.send_frame(self.tick, self.tick * combat.TICK)
+        self.assertIn(owner, self.client.entities)
+        self.assertEqual(script.report_count, before)
+        self.player.take_commands([Command(self.tick + 1)])
+        self.advance()
+        self.assertEqual(self.shot.reports, [])
+
+        self.assertEqual(self.send(), [])
+        packet, _, _, _, _, _ = decoded(self, self.cipher, self.server.sock.sent[-1][0])
+        _, records = wire_frame(packet)
+        chunk, = [item.chunk for item, _ in records if item.entity == self.player.body and item.chunk]
+        known = {number: value[0] for number, value in script.stream.base.instances.items()}
+        frame = read_chunk(chunk.getvalue(), chunk.count, known)
+        self.assertTrue(frame.owner)
+        self.assertLess(frame.cmfd, script.frame)
+        self.assertIn(self.shot.state, frame.instances[self.shot.instance].states)
+        number, cmfd, last, keys = script.reports[-1]
+        self.assertEqual((number, cmfd, last), (before + 1, frame.cmfd, frame.last))
+        self.assertIn(("state", self.shot.instance, self.shot.state), keys)
+        self.assertFalse(self.shot.created)
+        self.ack()
+        self.advance()
+        self.assertEqual(self.shot.reports, [(cmfd, last)])
+        self.assertEqual(self.send(), [(OP_CREATE, False)])
+
     def test_late_volley_ack_still_creates_before_releasing_the_owner_rocket(self):
         self.late_volley_ack()
         self.assertEqual(self.send(), [(OP_CREATE, False)])

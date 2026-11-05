@@ -551,11 +551,17 @@ class BodyScript(ReplicatedBody):
         frame, keys, snap = self.delta(
             stream.base, stream.touched(), self.frame, correction, kill_feed=kill_feed,
         )
-        update = stream.delta(frame, snap, keys, self.frame)
+        return [stream.delta(frame, snap, keys, self.frame)]
+
+    def report_sent(self, last: int) -> None:
+        """Record the owner delta actually transmitted for projectile confirmation."""
+        pending = self.stream.pending.get(last)
+        if pending is None:
+            return
+        snapshot, keys = pending
         self.report_count += 1
-        self.reports.append((self.report_count, self.frame, stream.last, keys))
+        self.reports.append((self.report_count, snapshot.k, last, keys))
         del self.reports[:-MAX_REPORTS]
-        return [update]
 
 
 def create_initial_graphs(component: runtime.Component, record: dict) -> list[runtime.Instance]:
