@@ -59,8 +59,8 @@ rejected. The live match handler retires that body's script; other players keep
 running. This prevents half-completed simulations from looking successful. It
 does not add automatic recovery or prove the cause of the reported live issues.
 
-The latest full Python regression ran 852 tests: 851 passed and one was skipped
-for an unavailable King's Row collision cache. A separate 62.448-second offline
+The latest full Python regression ran 874 tests, all passing. The formerly skipped
+King's Row physics case now runs with the locally built cache. A separate 62.448-second offline
 Soldier sequence applied/decoded 3903 owner chunks, observed ammo spending and
 seven refills, and ended with no active volley after release. This is a native
 driver/local decoder model check, not real-client HUD or combat acceptance.
@@ -90,6 +90,14 @@ diagnostics. Movement log v2 also preserves windows before old/duplicate filteri
 These diagnostics are opt-in. A 975-command offline-generated body trace matched
 its replay; it is not a full Match/combat/network capture. See
 [NATIVE_BODY_REPLAY_V2.txt](NATIVE_BODY_REPLAY_V2.txt).
+
+The repeated lifecycle protocol model covers ten Soldier/Reaper/Soldier round
+trips and ten leave/rejoins. Real encrypted loopback UDP packets pass through the
+production router and ACK handling, with an independent world-record reader
+feeding the body decoder model. The cases exercise create/full ACK gates,
+ordinary retransmission, retired records, observer references, fresh ammo/weapon
+state, and old connection packets after reentry. This is backend protocol-model
+acceptance; the user's real-client lifecycle/HUD checks remain separate.
 
 ## Remaining acceptance and implementation work
 
