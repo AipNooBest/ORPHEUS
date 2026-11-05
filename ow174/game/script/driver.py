@@ -20,6 +20,7 @@ chunks sent after it carried (the client may have applied them), so a lost datag
 """
 
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from ow174.game import pools
@@ -181,7 +182,7 @@ class BodyScript:
         self.create_arrived = False  # the client has the body (see `created`)
         self.retired = False
         self.first_owner_frame: int | None = None
-        self.server_only: set[int] = set()
+        self.server_only: set[int] = set()  # existing entity-scope exclusions
         self.ult_seconds = ult_seconds
         self.ultimates: list = []  # the Ability states that start on #342e (not charged while they run)
         self.reports: list = []  # (number, CmFD, chunk last, keys) of the owner frames sent (projectiles.py)
@@ -225,8 +226,7 @@ class BodyScript:
             instance.init()
         component.run_frame(frame)
         for instance in component.instances.values():
-            for value in instance.graph.fields.get("m_9CEC6985") or []:
-                self.server_only.add(expr.guid_of(value) & 0xFFFF)
+            self.server_only.update(_server_only_vars(instance.graph))
             for node in instance.graph.states:
                 if node is None or node.cls != "STUStatescriptStateAbility":
                     continue
@@ -303,6 +303,16 @@ class BodyScript:
     def graphs(self) -> dict[int, object]:
         return {instance.id: instance.graph for instance in self.component.instances.values()}
 
+    def replicated_vars(self, instance: runtime.Instance | None = None) -> Iterator[tuple[int, runtime.Var]]:
+        """Variables eligible for both wire snapshots. Instance variable IDs are local to their graph."""
+        if instance is None:
+            variables = self.component.vars
+            excluded = self.server_only | NOT_SENT
+        else:
+            variables = instance.vars
+            excluded = _server_only_vars(instance.graph)
+        return ((var_id, var) for var_id, var in variables.items() if var_id not in excluded)
+
     def snapshot(self) -> Snapshot:
         """The body as the client should have it after the last frame run."""
         self.component.ensure_valid()
@@ -310,7 +320,7 @@ class BodyScript:
         for instance in self.component.instances.values():
             parent = (instance.parent.id, instance.parent_state) if instance.parent is not None else None
             snap.instances[instance.id] = (instance.graph.index, parent)
-            for var_id, var in instance.vars.items():
+            for var_id, var in self.replicated_vars(instance):
                 self._add_var(snap, instance.id, var_id, var)
             for index, state in instance.states.items():
                 self._add_state(snap, instance.id, index, state)
@@ -319,13 +329,11 @@ class BodyScript:
                 for event in instance.timers()
                 if sendable(event.state.node.cls, True)
             )
-        for var_id, var in self.component.vars.items():
+        for var_id, var in self.replicated_vars():
             self._add_var(snap, 0, var_id, var)
         return snap
 
     def _add_var(self, snap: Snapshot, owner: int, var_id: int, var: runtime.Var) -> None:
-        if var_id in self.server_only or (owner == 0 and var_id in NOT_SENT):
-            return
         bindings = tuple(
             Binding(link.state.instance.id, link.state.index, link.slot, link.priority, link.above)
             for link in var.links
@@ -492,6 +500,10 @@ class BodyScript:
         self.reports.append((self.report_count, self.frame, stream.last, keys))
         del self.reports[:-MAX_REPORTS]
         return [update]
+
+
+def _server_only_vars(definition: graph.Graph) -> set[int]:
+    return {expr.guid_of(value) & 0xFFFF for value in definition.fields.get("m_9CEC6985") or ()}
 
 
 def _reads(cfg, var: int) -> bool:

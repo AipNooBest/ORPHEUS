@@ -22,7 +22,7 @@ import logging
 
 from ow174.game.script import expr, graph
 from ow174.game.script.codecs import stec_classes
-from ow174.game.script.driver import NOT_SENT, BodyStream, Snapshot
+from ow174.game.script.driver import BodyStream, Snapshot
 from ow174.game.statescript import (
     InstanceWire,
     StateWire,
@@ -42,8 +42,8 @@ def snapshot(script) -> Snapshot:
     for instance in component.instances.values():
         parent = (instance.parent.id, instance.parent_state) if instance.parent is not None else None
         snap.instances[instance.id] = (instance.graph.index, parent)
-        for var_id, var in instance.vars.items():
-            _add_var(snap, script, instance.id, var_id, var)
+        for var_id, var in script.replicated_vars(instance):
+            _add_var(snap, instance.id, var_id, var)
         for node in instance.graph.remote_states():
             state = instance.states.get(node.state)
             if state is None or presenter(node):
@@ -56,9 +56,8 @@ def snapshot(script) -> Snapshot:
                 continue
             payload = state.payload() if family(cls) != "none" else {}
             snap.states[(instance.id, node.state)] = (cls, state.active, tuple(sorted(payload.items())))
-    for var_id, var in component.vars.items():
-        if var_id not in NOT_SENT:
-            _add_var(snap, script, 0, var_id, var)
+    for var_id, var in script.replicated_vars():
+        _add_var(snap, 0, var_id, var)
     return snap
 
 
@@ -68,9 +67,7 @@ def presenter(node) -> bool:
     return node.cls == "STUStatescriptStateUXPresenter" or "m_45216F79" in node.fields
 
 
-def _add_var(snap: Snapshot, script, owner: int, var_id: int, var) -> None:
-    if var_id in script.server_only:
-        return
+def _add_var(snap: Snapshot, owner: int, var_id: int, var) -> None:
     value = var.value()
     if value is not None:
         snap.vars[(owner, var_id)] = (value, ())

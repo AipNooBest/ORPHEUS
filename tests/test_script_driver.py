@@ -16,7 +16,7 @@ from ow174.game.script import decode, runtime
 from ow174.game.script import driver as driver_module
 from ow174.game.script import graph as graphs
 from ow174.game.script.driver import POLLED_SWITCHES, SETTLE_FRAMES, TRUSTED_NATIVES, BodyScript
-from ow174.game.script.expr import Asset, Entity, Handle, Vec3
+from ow174.game.script.expr import INSTANCE, Asset, Entity, Handle, Vec3
 from ow174.game.statescript import (
     Binding,
     EventWire,
@@ -321,6 +321,37 @@ class ClientModelTests(unittest.TestCase):
 
 
 class BodyTests(unittest.TestCase):
+    def test_reaper_owner_frame_uses_the_instances_own_replication_exclusions(self):
+        reaper = 0x02E0000000000002
+        body = BodyScript(reaper, 0xA0000101, START)
+        client = ClientModel(reaper)
+        [tree] = body.spawn_frames()
+        client.apply(tree)
+        body.stream.arrived(tree.chunk_last)
+        body.command(START + 1, 0)
+        [first] = body.frames()
+        client.apply(first)
+        body.stream.arrived(first.chunk_last)
+        body.command(START + 1 + SETTLE_FRAMES, 0)
+
+        feed = next(item for item in body.component.instances.values() if item.graph.index == 0x01CF)
+        subscript = feed.parent.state(10)  # 004B st10 creates 0B8B, where #392 is server-only
+        subscript.end(False)
+        subscript.begin()
+        local = subscript.child
+        attacker = Entity(0xA0000201)
+        feed.write((INSTANCE, 392), attacker)
+        local.write((INSTANCE, 392), attacker)
+        body.component.set(392, attacker)  # keep the existing entity-level exclusion
+
+        [update] = body.frames()
+        frame = client.apply(update)
+        self.assertTrue(frame.owner and frame.correction)
+        self.assertEqual(frame.instances[feed.id].vars[392], (attacker, ()))
+        self.assertEqual(frame.instances[local.id].parent, (feed.parent.id, 10))
+        self.assertNotIn(392, frame.instances[local.id].vars)
+        self.assertNotIn(392, frame.entity_vars)
+
     def test_spawn_frames(self):
         body = soldier()
         [tree] = body.spawn_frames()

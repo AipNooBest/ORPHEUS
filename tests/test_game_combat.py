@@ -7,15 +7,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ow174.game import bots, combat, world
+from ow174.game import bots, combat, observers, world
 from ow174.game.bits import BitReader, BitWriter
 from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.combat import Combat, HitDef, Target, Vitals
 from ow174.game.commands import FIRE, Command, read_commands
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
 from ow174.game.match import Match
-from ow174.game.script import graph, runtime
+from ow174.game.script import expr, graph, runtime
 from ow174.game.script.decode import read_chunk
+from ow174.game.script.driver import BodyStream
+from ow174.game.statescript import chunk
 from ow174.game.world import ARMOUR_POOL, HEALTH_POOL, SHIELDS_POOL
 
 KANEZAKA_DM = PRACTICE_RANGE.__class__(**{**PRACTICE_RANGE.__dict__, "mode_guid": 0x023000000000001E,
@@ -248,6 +250,33 @@ class DeathTests(unittest.TestCase):
         feed = self.b.body_script.component.instances[13].state(108)
         self.assertTrue(feed.payload()["count"] >= 1)
 
+    def test_remote_kill_feed_pulse_carries_the_hero_death_attribution(self):
+        for _ in range(40):  # let the graph settle before testing attribution
+            self.run.step({})
+        script = self.b.body_script
+        stream = BodyStream(self.b.body)
+        stream.base = observers.snapshot(script)
+        known = {index: value[0] for index, value in stream.base.instances.items()}
+        feed_id = next(index for index, value in known.items() if value == 0x01CF)
+
+        fight = self.run.match.combat
+        target = next(target for target in fight._targets() if target.owner is self.b)
+        loadout = 0x09E000000000008D  # Soldier's rifle
+        fight._damage(self.a, target, 200.0, True, loadout, self.run.frame)
+        self.run.step({})
+        self.run.step({})
+
+        delta, _ = observers.delta(script, stream, observers.snapshot(script))
+        wire = chunk(delta, script.frame, 0)
+        frame = read_chunk(wire.getvalue(), wire.count, known)
+        self.assertFalse(frame.owner)
+        feed = frame.instances[feed_id]
+        self.assertEqual(feed.states[108], (True, {"fresh": True, "count": 1}))
+        self.assertEqual(feed.vars[392], (expr.Entity(self.a.body), ()))  # 0765.025 attacker
+        self.assertEqual(feed.vars[1821], (True, ()))  # 0765.025 critical
+        self.assertEqual(feed.vars[9300], (expr.Asset(loadout), ()))
+        self.assertEqual(feed.vars[9296], ((), ()))
+
     def test_the_dead_cannot_shoot(self):
         """Reading (a) of the live report: a dead player's presses are dropped (the client's edge handler,
         0x7FF78AAAC570), so his volley never starts and no shot of his counts."""
@@ -353,14 +382,10 @@ class ModeFrameTests(unittest.TestCase):
 
 
 def _chunk(frame: BitWriter) -> bytes:
-    from ow174.game.statescript import chunk
-
     return chunk(frame, 0, 1).getvalue()
 
 
 def _chunk_bits(frame: BitWriter) -> int:
-    from ow174.game.statescript import chunk
-
     return chunk(frame, 0, 1).count
 
 
