@@ -1,6 +1,7 @@
 """Real encrypted Client frames stay within the budget and commit only actual sends; no UDP socket."""
 
 import dataclasses
+import struct
 import sys
 import unittest
 from pathlib import Path
@@ -15,7 +16,7 @@ from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.commands import FIRE, Command
 from ow174.game.content import PRACTICE_RANGE, SOLDIER
 from ow174.game.link import ACK, KIND_CONTROL, KIND_FRAME, MAX_DATAGRAM, LinkCipher, Packet, ReceiveWindow
-from ow174.game.match import Match, card_message
+from ow174.game.match import SEND_EVERY, Match, card_message
 from ow174.game.script import decode
 from ow174.game.script.driver import SETTLE_FRAMES
 from ow174.game.server import MAX_PAYLOAD, Client, GameServer
@@ -239,6 +240,73 @@ class PacketBudgetTests(unittest.TestCase):
         self.assertEqual(model.vars[(11, 53)], 27)
         self.assertEqual(stream.base_last, current.last)
         self.assertEqual(tuple(stream.pending), ())
+
+    def test_replacing_queued_owner_death_keeps_terminal_health_first(self):
+        from test_game_repeated_lifecycles import wire_frame
+        from test_server_journal import ServerJournalTests
+
+        def terminal_order(backlog):
+            fixture = ServerJournalTests()
+            session, sent = fixture.make()
+            (peer,), (player,) = fixture.connected(session, sent, two=False)
+            match, client, script = player.match, player.client, player.body_script
+            now = 101.0
+
+            def send(*, defer_entities=False):
+                nonlocal now
+                before = len(sent)
+                budget = MAX_PAYLOAD
+                if defer_entities:
+                    client.queue_reliable(
+                        20302, {"+0x78": {"+0x0": player.entity}, "+0x7C": False, "+0x80": 0},
+                    )
+                    tick = match.tick + SEND_EVERY - match.tick % SEND_EVERY
+                    budget = len(client._payload(tick, client.reliable, [], []))
+                with mock.patch.object(server_module, "MAX_PAYLOAD", budget):
+                    for _ in range(SEND_EVERY):
+                        now += 0.016
+                        session.tick(now)
+                        if len(sent) > before:
+                            break
+                self.assertEqual(len(sent), before + 1)
+                packet = decoded(self, peer.cipher, sent[-1][0])[0]
+                peer.drain()
+                peer.send(now=now)
+                return wire_frame(packet)[1]
+
+            for count in (1, 24):
+                peer.commands(script.frame + 1, count, 0, now=now)
+                send()
+            self.assertGreater(player.mode_script.delivered, 0)
+            if backlog:
+                peer.commands(script.frame + 1, 1, 0, now=now)
+                self.assertEqual(send(defer_entities=True), [])
+                deferred, = [item for item in client.entities if item.stream is script.stream]
+                self.assertEqual(deferred.entity, player.body)
+
+            target = next(target for target in match.combat._targets() if target.owner is player)
+            match.combat._damage(player, target, 200.0, False, None, match.tick)
+            peer.commands(script.frame + 1, 1, 0, now=now)
+            known = {index: entry[0] for index, entry in script.stream.base.instances.items()}
+            feed = next(index for index, graph_index in known.items() if graph_index == 0x01CF)
+            terminal = []
+            for item, fields in send():
+                if item.entity != player.body:
+                    continue
+                if 51 in fields:
+                    health = [struct.unpack_from("<f", value, 8)[0] for value in fields[51].values()]
+                    terminal.append(("health", health))
+                if item.chunk is not None:
+                    frame = decode.read_chunk(item.chunk.getvalue(), item.chunk.count, known)
+                    self.assertTrue(frame.owner)
+                    self.assertEqual(frame.cmfd, script.frame)
+                    terminal.append(("death", frame.instances[feed].states[108]))
+            return terminal
+
+        for backlog in (False, True):
+            with self.subTest(backlog=backlog):
+                pulse = (True, {"fresh": True, "count": 1})
+                self.assertEqual(terminal_order(backlog), [("health", [0.0]), ("death", pulse)])
 
     def test_legal_messages_defer_create_then_ack_original_record_once(self):
         server, client, player, peer = connection()

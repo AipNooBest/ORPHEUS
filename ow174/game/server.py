@@ -568,7 +568,14 @@ class Client:
                     if item.chunk_last > queued.chunk_last:
                         # The replacement already includes the cumulative keys. The
                         # queued record never went to the wire or registered a report.
-                        self.entities[index] = item
+                        # Keep the replacement behind updates already queued for this body.
+                        last = max(
+                            (later for later in range(index + 1, len(self.entities))
+                             if self.entities[later].entity == item.entity),
+                            default=index,
+                        )
+                        self.entities.pop(index)
+                        self.entities.insert(last, item)
                         item.stream.pending.pop(queued.chunk_last, None)
                     return
         self.entities.append(item)
