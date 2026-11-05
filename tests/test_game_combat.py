@@ -302,6 +302,33 @@ class DeathTests(unittest.TestCase):
         self.assertFalse(self.run.match.combat.is_dead(self.b))
         self.assertFalse(self.b.body_script.component.owner_dead)
 
+    def test_replacement_body_waits_for_its_own_respawn_deadline(self):
+        fight = self.run.match.combat
+        delay = combat.respawn_seconds(self.run.match)
+        fight.update(100.0, 1000, frames=False)
+
+        def kill_current_body():
+            target = next(target for target in fight._targets() if target.owner is self.b)
+            fight._damage(self.a, target, 200.0, False, None, fight.tick)
+            self.assertTrue(fight.is_dead(self.b))
+
+        kill_current_body()
+        old = self.b.body
+        self.run.match.switch_hero(self.b, self.b.hero)
+        current = self.b.body
+        self.assertNotEqual(current, old)
+        self.assertNotIn(old, fight.vitals)
+
+        fight.update(101.0, 1062, frames=False)
+        kill_current_body()
+        fight.update(100.0 + delay, 1188, frames=False)
+        self.assertEqual(self.b.body, current)
+        self.assertTrue(fight.is_dead(self.b))
+
+        fight.update(101.0 + delay, 1250, frames=False)
+        self.assertNotEqual(self.b.body, current)
+        self.assertFalse(fight.is_dead(self.b))
+
 
 class ModeFrameTests(unittest.TestCase):
     def test_the_mode_entity_lists_its_ui_graph(self):

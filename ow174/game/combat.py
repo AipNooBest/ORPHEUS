@@ -417,6 +417,12 @@ class Combat:
         vitals = self.vitals.get(player.body) if player.has_body else None
         return vitals is not None and vitals.dead
 
+    def retire_player_body(self, player) -> None:
+        """Discard the old body's health, history and respawn when its lifetime ends."""
+        self.vitals.pop(player.body, None)
+        self.history.pop(player.body, None)
+        self.respawns[:] = [(when, who) for when, who in self.respawns if who is not player]
+
     def spawned(self, player) -> None:
         """The player's client has the world: the game mode entity gets its UI graph (mode_frame). While
         heroes are assembled the countdown's frames carry it."""
@@ -802,9 +808,7 @@ class Combat:
         player = who
         if player.gone or not player.has_body or not self.is_dead(player):
             return
-        old = player.body
         self.match.switch_hero(player, player.hero)  # a new body at the spawn point, the old one goes
-        self.vitals.pop(old, None)
         self.voice.spawned(player, self.now)
         log.info("[game] %s: %s respawned", self.match.label(), player.name)
 

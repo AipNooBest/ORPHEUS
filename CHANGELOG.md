@@ -21,3 +21,9 @@ This log records tested changes and their acceptance status. Entries are grouped
 
 - The baseline at `5ce3414` passed 1086 Python tests. Ruff and Git diff checks passed.
 - The manual test of the earlier `aeb2d57` copy still had gaps in animation and HUD, target feedback, names, kill feed, audio, void death, and hero skills. Complete Soldier: 76 and Practice Range client acceptance remains pending.
+
+#### Fixed
+
+- Retired a player's old health, hit history and respawn timer when the body is replaced or the player leaves. A second body now waits for its own death timer, even if an earlier body was replaced before its timer expired.
+- Passed 55 targeted Python tests covering the two-death regression, body recovery, repeated switches and reentry, encrypted server replay, and bot notices. Ruff and Git diff checks passed. Client acceptance for the change is pending.
+- Initial GitHub push remains pending due to the tracked material in reachable history. The local commits and the original upstream remote are available for continued development.

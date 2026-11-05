@@ -989,6 +989,7 @@ class Match:
         old = player.body if player.has_body else None
         old_hero = player.hero.guid if old is not None else None
         if old is not None:
+            self.combat.retire_player_body(player)
             player.new_body()
         player.hero = hero
         player.skin = self.skin_of(player.account_lo, hero.guid)
@@ -1020,6 +1021,7 @@ class Match:
         player.spawned = False
         self.stop_body_script(player)
         if player.has_body:
+            self.combat.retire_player_body(player)
             self.destroy_for_others(player, player.body)
         log.info("[game] %s: %s %s", self.label(), player.name, reason)
         if self.on_leave is not None:
