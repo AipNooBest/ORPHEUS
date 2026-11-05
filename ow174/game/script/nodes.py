@@ -285,6 +285,19 @@ class LogicalButton(State):
         return {"counter": self.counter}
 
 
+@state_class("STU_91EF24A9")
+class AIBehavior(State):
+    """A behavior candidate. The world decides when its selected subgraph runs."""
+
+    def on_enter(self) -> None:
+        if self.instance.component.world.selects_ai_behavior(self.instance):
+            self.instance.follow(self.node, "m_6F92F4BD", self)
+
+    def on_end(self, finished: bool) -> None:
+        if self.instance.component.world.selects_ai_behavior(self.instance):
+            self.instance.exit_subgraph(self.node, "m_6F92F4BD")
+
+
 @state_class("STU_D7F9E1C3")
 class AIFireWeapon(State):
     """Hold the authored fire-control button for the self-targeted 0B92 action."""

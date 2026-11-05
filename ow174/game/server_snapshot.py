@@ -107,8 +107,8 @@ FIELDS = {
         "retired first_owner_frame server_only ult_seconds ultimates reports report_count"
     ),
     driver.BodyWorld: _names("hero mode body throttles match"),
-    BotScript: _names("component frame server_only initial death_frame _produced"),
-    BotWorld: _names("hero mode weapon_buttons"),
+    BotScript: _names("component frame server_only initial death_frame _produced behavior"),
+    BotWorld: _names("hero mode weapon_buttons owner_position"),
     runtime.World: _names("hero mode"),
     LinkCipher: _names("key_in key_out salt_in salt_out"),
     ReceiveWindow: _names("expected bits"),

@@ -15,6 +15,7 @@ import unittest
 
 import test_game_server as server_tests
 import test_game_to_game as transition_tests
+from test_game_projectiles import read_shot
 from test_game_world import read_movement
 from test_script_driver import ClientModel, server_on
 
@@ -124,7 +125,18 @@ def wire_frame(packet):
         if not reader.bit():  # ch2: a chunk can end the entity here
             records.append((update, {}))
             continue
-        assert reader.bits(2) == 0  # no projectile event or state in this scenario
+        if reader.bit():
+            first = True
+            while reader.bit():
+                if first:
+                    reader.var_b()
+                    first = False
+                elif not reader.bit():
+                    reader.bits(4)
+                else:
+                    reader.bits(32 if reader.bit() else 8)
+                read_shot(reader)
+        assert not reader.bit()  # these scenarios use no projectile release state
         assert reader.bit() == 1  # ch3
         if reader.bit():
             start = reader.pos

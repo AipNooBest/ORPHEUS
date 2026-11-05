@@ -41,7 +41,7 @@ from ow174.game.collision import (
     default_collision_provider,
 )
 from ow174.game.commands import Command, CommandQueue
-from ow174.game.content import SOLDIER, GameMap, Hero, heroes, spawn_point
+from ow174.game.content import PRACTICE_RANGE, SOLDIER, GameMap, Hero, heroes, spawn_point
 from ow174.game.environment import ExecutionEnvironment, SystemEnvironment
 from ow174.game.mover import CROUCHED, GRAVITY_SCALE, Mover, mover_data, statescript_mods
 from ow174.game.projectiles import MAX_LEASE_FRAME
@@ -500,8 +500,11 @@ class Match:
         if graph.entity_body(bot.body) is None:
             return
         try:
+            firing = (bot.firing and self.game_map.map_guid == PRACTICE_RANGE.map_guid
+                      and self.game_map.mode_guid == PRACTICE_RANGE.mode_guid)
             bot.body_script = BotScript(
-                bot.body, bot.hero, bot.entity, self.tick, self.game_map.mode_guid, bot.health
+                bot.body, bot.hero, bot.entity, self.tick, self.game_map.mode_guid, bot.health,
+                firing_position=bot.position if firing else None,
             )
         except Exception:
             log.exception("[game] %s: could not initialize %s's statescript", self.label(), bot.name)

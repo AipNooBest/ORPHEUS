@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from test_game_combat import Run
-from test_game_graph_analysis import make_graph, node
+from test_game_graph_analysis import make_graph, node, output
 from test_game_packet_budget import connection, decoded
 from test_game_projectiles import ABILITY_2
 from test_game_repeated_lifecycles import wire_frame
@@ -14,7 +14,7 @@ from ow174.game.body_vm_snapshot import export_component_vm
 from ow174.game.content import SOLDIER
 from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
 from ow174.game.script import decode, graph, runtime
-from ow174.game.script.bot import BotScript, BotWorld
+from ow174.game.script.bot import DIED, FIRING_GRAPH, RESET, BotScript, BotWorld
 from ow174.game.script.driver import OWNER_HEALTH, Snapshot
 from ow174.game.server import BOT_DESTROY_GRACE_TICKS, Client
 
@@ -57,6 +57,71 @@ class AIFireWeaponTests(unittest.TestCase):
                 self.assertEqual(component.held, [])
                 self.assertFalse(listener.down)
                 self.assertIsNone(action.button_id)
+
+    def test_bot_death_retires_private_behavior_before_running_pending_fire(self):
+        volley = "STUStatescriptStateWeaponVolley"
+
+        def message(position, guid, target):
+            return node(position, "STUStatescriptEntryGameMessage", fields={
+                "m_gameMessage": {"$": "STUConfigVarGameMessage", "m_gameMessage": f"0x{guid:016X}"},
+                "m_outPlug": output([target, "m_inPlug"]),
+            })
+
+        def mark(position):
+            return node(position, "STUStatescriptActionSetVar", fields={
+                "m_out_Var": {"$": "STUConfigVarDynamic", "m_identifier": LIVE_VAR},
+                "m_value": {"$": "STUConfigVarBool", "m_value": 1},
+            })
+
+        weapon = make_graph(GRAPH, [
+            node(0, "STUStatescriptEntry", fields={"m_outPlug": output([1, "m_beginPlug"])}),
+            node(1, "STUStatescriptStateLogicalButton", state=0, fields={
+                "m_logicalButton": {"$": "STUConfigVarInt", "m_value": 20},
+                "m_onGoingDownPlug": output([2, "m_beginPlug"]),
+            }),
+            node(2, volley, state=1, remote=0),
+            message(3, RESET, 5), message(4, DIED, 5), mark(5),
+        ], states=[1, 2], remote=[2], entries=[0, 3, 4])
+        weapon.fields["m_680A2CB2"] = [0]
+        behavior = make_graph(FIRING_GRAPH, [message(0, RESET, 1), mark(1)], entries=[0])
+        definitions = {GRAPH: weapon, FIRING_GRAPH: behavior}
+        body = {"graphs": [{"graph": GRAPH}], "ai_weapon_buttons": {"0": 20}}
+        with (
+            patch.object(graph, "entity_body", return_value=body),
+            patch.object(graph, "graph", side_effect=definitions.get),
+            patch.object(decode, "graph_of", side_effect=definitions.get),
+        ):
+            args = (0x0400000000001403, SOLDIER, bots.BOT_ENTITY, 100, 0, 200)
+            control = BotScript(*args)
+            control.component.edges([(20, True)])
+            control.advance_live(101)
+            [(shot, _, _)] = control.component.shots
+            self.assertEqual((shot.node.cls, shot.index), (volley, 1))
+
+            script = BotScript(*args, firing_position=(0.0, 0.0, 3.0))
+            ai = script.behavior
+            self.assertIsNotNone(ai)
+            self.assertIs(ai.vars[LIVE_VAR].value(), True)
+            self.assertNotIn(LIVE_VAR, script.component.instances[1].vars)
+            full, snapshot = script.initial
+            chunk = statescript.chunk(full, 0, 1)
+            decoded = decode.read_chunk(chunk.getvalue(), chunk.count)
+            self.assertEqual({number: item.graph for number, item in decoded.instances.items()}, {1: GRAPH})
+            self.assertNotIn((ai.id, LIVE_VAR), snapshot.vars)
+
+            script.component.edges([(20, True)])
+            death, final, _ = script.die(101, {}, 0xA0000101)
+            self.assertTrue(script.component.owner_dead)
+            self.assertIsNone(script.behavior)
+            self.assertTrue(ai.stopped)
+            self.assertEqual(tuple(script.component.instances), (1,))
+            self.assertFalse(script.component.held)
+            self.assertFalse(script.component.shots)
+            self.assertNotIn((1, 1), final.states)
+            chunk = statescript.chunk(death, 2, 0)
+            decoded = decode.read_chunk(chunk.getvalue(), chunk.count, {1: GRAPH})
+            self.assertEqual(tuple(decoded.instances), (1,))
+            self.assertEqual(decoded.instances[1].vars, {LIVE_VAR: (True, ())})
 
 
 class SyntheticScript:

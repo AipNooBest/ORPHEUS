@@ -20,7 +20,7 @@ chunks sent after it carried (the client may have applied them), so a lost datag
 """
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -179,8 +179,11 @@ class ReplicatedBody:
             for var_id in _server_only_vars(instance.graph)
         }
 
+    def replicated_instances(self) -> Iterable[runtime.Instance]:
+        return self.component.instances.values()
+
     def graphs(self) -> dict[int, object]:
-        return {instance.id: instance.graph for instance in self.component.instances.values()}
+        return {instance.id: instance.graph for instance in self.replicated_instances()}
 
     def _report_shots(self) -> None:
         """Collect shots due in active volleys. Volleys that ended reported their own shots."""

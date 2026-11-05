@@ -596,7 +596,7 @@ class Combat:
             if not bot.firing or bot.dead or not isinstance(script, BotScript):
                 continue
             try:
-                snapshot = script.advance_live(tick)
+                snapshot = script.advance_live(tick, bot.position)
                 if snapshot is not None:
                     for viewer in self.match.players:
                         if viewer.spawned and viewer.client is not None:

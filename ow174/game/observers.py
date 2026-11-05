@@ -38,8 +38,7 @@ def snapshot(script) -> Snapshot:
     """The body as other clients should have it: every instance, every value (no bindings) and the remote
     states that are on (or StEC states that ran)."""
     snap = Snapshot(script.frame)
-    component = script.component
-    for instance in component.instances.values():
+    for instance in script.replicated_instances():
         parent = (instance.parent.id, instance.parent_state) if instance.parent is not None else None
         snap.instances[instance.id] = (instance.graph.index, parent)
         for var_id, var in script.replicated_vars(instance):

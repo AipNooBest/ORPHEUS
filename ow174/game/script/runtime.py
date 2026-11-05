@@ -280,6 +280,9 @@ class World:
     def ai_weapon_button(self, slot: int) -> int | None:
         return None
 
+    def selects_ai_behavior(self, instance: "Instance") -> bool:
+        return False
+
     def native(self, cfg: dict, instance: "Instance"):
         if cfg.get("$") == "STU_A3DEF368" and self.mode and mode_variables(self.mode) is not None:
             return Entity(GAME_MODE_ENTITY)
@@ -1029,13 +1032,17 @@ def message_entries(instance: Instance, message: int) -> list[Node]:
 
 def send_message(component: Component, message: int, params: dict, sender: int) -> int:
     """Deliver a game message to every instance of the component (at now). Returns how many nodes get it."""
-    count = 0
-    for instance in list(component.instances.values()):
-        for node in message_entries(instance, message):
-            delivery = (message, dict(params), sender)
-            instance.post(Event(component.now, 0, MESSAGE, node=node, message=delivery))
-            count += 1
-    return count
+    return sum(send_instance_message(instance, message, params, sender)
+               for instance in list(component.instances.values()))
+
+
+def send_instance_message(instance: Instance, message: int, params: dict, sender: int) -> int:
+    """Queue a message at the component clock for only this graph instance."""
+    entries = message_entries(instance, message)
+    for node in entries:
+        delivery = (message, dict(params), sender)
+        instance.post(Event(instance.component.now, 0, MESSAGE, node=node, message=delivery))
+    return len(entries)
 
 
 INSTANCE_SCOPE, ENTITY_SCOPE = INSTANCE, ENTITY
