@@ -277,6 +277,9 @@ class World:
     def position(self, entity: int):
         return expr.Vec3(0.0, 0.0, 0.0)
 
+    def ai_weapon_button(self, slot: int) -> int | None:
+        return None
+
     def native(self, cfg: dict, instance: "Instance"):
         if cfg.get("$") == "STU_A3DEF368" and self.mode and mode_variables(self.mode) is not None:
             return Entity(GAME_MODE_ENTITY)

@@ -218,6 +218,103 @@ class SpawnerRootTests(unittest.TestCase):
         self.assertFalse(output.exists())
 
 
+class AIWeaponButtonTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        (self.root / "003").mkdir()
+        (self.root / "Types.cs").write_text("""
+    public class STUAIWeaponFireControlInfo : STUInstance
+    {
+        public STULogicalButton m_4F5E7D4C;
+    }
+    public enum STULogicalButton : int
+    {
+        [STUField(0xD128396E)] xD128396E = 0x14,
+        [STUField(0xB42D90B7)] xB42D90B7 = 0x1D,
+        [STUField(0xADC2B02C)] xADC2B02C = -1,
+    }
+        """, encoding="utf-8")
+        self.enums = EnumTables(self.root)
+        self.body = self.root / "003/000000001403.003.xml"
+        self.associated = self.root / "003/000000001404.003.xml"
+        self.write_body()
+
+    def write_body(self, association='<dragon:ref dragon:name="m_8B9A461F" GUID="000000001404.003" />'):
+        self.body.write_text(f"""
+          <STUEntityDefinition xmlns:dragon="https://yretenai.com/dragonml/v1">
+            {association}
+          </STUEntityDefinition>
+        """, encoding="utf-8")
+
+    def write_controls(self, rows):
+        self.associated.write_text(f"""
+          <STUEntityDefinition xmlns:dragon="https://yretenai.com/dragonml/v1">
+            <dragon:map dragon:name="m_componentMap">
+              <STU_993B1B10 dragon:key="2570787600">
+                <STU_993B1B10 dragon:name="dragon:value">
+                  <dragon:array dragon:name="m_CD486A71">
+                    {rows}
+                  </dragon:array>
+                </STU_993B1B10>
+              </STU_993B1B10>
+            </dragon:map>
+          </STUEntityDefinition>
+        """, encoding="utf-8")
+
+    def body_record(self):
+        return extractor.body_record(self.body, self.enums, None, "entity 1403", include_ai_weapons=True)[0]
+
+    def test_only_opted_in_additional_bodies_get_associated_weapon_buttons(self):
+        self.write_controls("""
+          <STUAIWeaponFireControlInfo m_ED6D601D="3" m_A60150E2="0" m_4F5E7D4C="xD128396E" />
+          <STUAIWeaponFireControlInfo m_ED6D601D="0" m_A60150E2="2" m_4F5E7D4C="xB42D90B7" />
+        """)
+        hero = "0x02E000000000016B"
+        body = "0x0400000000001403"
+        heroes = self.root / "heroes.json"
+        heroes.write_text(json.dumps({hero: {"body": body, "name": "control"}}), encoding="utf-8")
+        spawners = self.root / "spawners.json"
+        spawners.write_text('{"maps": {}}', encoding="utf-8")
+        with patch.object(extractor, "HEROES", heroes), patch.object(extractor, "ROOT_GRAPHS", {}):
+            baseline = extractor.collect(self.root, self.enums, (0x1403,))
+            opted_in = extractor.collect(self.root, self.enums, (0x1403,), ai_spawners=spawners)
+        self.assertNotIn("ai_weapon_buttons", baseline["entities"][body])
+        self.assertEqual(opted_in["entities"][body]["ai_weapon_buttons"], {"0": 20, "2": 29})
+        self.assertEqual(opted_in["bodies"], baseline["bodies"])
+        self.assertNotIn("ai_weapon_buttons", opted_in["bodies"][body])
+
+    def test_unassociated_or_empty_controls_do_not_supply_defaults(self):
+        self.write_body("")
+        self.assertNotIn("ai_weapon_buttons", self.body_record())
+        self.write_body()
+        self.write_controls("")
+        self.assertNotIn("ai_weapon_buttons", self.body_record())
+
+    def test_ambiguous_slots_and_malformed_fields_are_rejected(self):
+        primary = '<STUAIWeaponFireControlInfo m_A60150E2="0" m_4F5E7D4C="xD128396E" />'
+        alternate = '<STUAIWeaponFireControlInfo m_A60150E2="0" m_4F5E7D4C="xB42D90B7" />'
+        cases = (
+            (primary + alternate, "duplicate AI weapon slot 0"),
+            (primary.replace('m_A60150E2="0"', 'm_ED6D601D="0"'), "invalid AI weapon slot"),
+            (primary.replace('m_A60150E2="0"', 'm_A60150E2="-1"'), "invalid AI weapon slot"),
+            (primary.replace("xD128396E", "x00000000"), "invalid AI weapon logical button"),
+            (primary.replace("xD128396E", "xADC2B02C"), "invalid AI weapon logical button"),
+            ("<STUWeaponComponent />", "invalid AI weapon control row type"),
+        )
+        for rows, message in cases:
+            with self.subTest(message=message, rows=rows):
+                self.write_controls(rows)
+                with self.assertRaisesRegex(ValueError, message):
+                    self.body_record()
+
+    def test_non_entity_association_is_rejected(self):
+        self.write_body('<dragon:ref dragon:name="m_8B9A461F" GUID="000000001404.01B" />')
+        with self.assertRaisesRegex(ValueError, r"m_8B9A461F must reference a \.003"):
+            self.body_record()
+
+
 class NumericScalarTests(unittest.TestCase):
     def test_locales_and_exponents_produce_numeric_values(self):
         cases = {

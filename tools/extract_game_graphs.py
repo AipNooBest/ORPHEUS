@@ -11,7 +11,8 @@ graph reference (a GUID of type 01B anywhere in a kept graph).
 Additional entity definitions can be added to a separate bundle with repeated --entity options.
 Use --mode-xml <0C5 directory> with --output outside the repository to also export the mode entity's
 initial variables from the mode definitions.
-Use --ai-spawners <ai_spawners_174.json> with an external --output to include the graphs placed on maps.
+Use --ai-spawners <ai_spawners_174.json> with an external --output to include the graphs placed on maps
+and the AI weapon buttons on additional entity definitions.
 
 Per graph it keeps what a runtime needs and drops the editor layout (positions, comments, display names,
 colours). The file format is described in ow174/game/script/graph.py, which reads it.
@@ -389,7 +390,9 @@ def graph_ref(xml: StuXml, element: ET.Element, name: str) -> int | None:
     return guid_index(ref.get("GUID")) if ref is not None else None
 
 
-def body_record(path: Path, enums: EnumTables, hero: str | None, name: str) -> tuple[dict, set[int]]:
+def body_record(
+    path: Path, enums: EnumTables, hero: str | None, name: str, *, include_ai_weapons: bool = False,
+) -> tuple[dict, set[int]]:
     """A body definition (003): its statescript component's initial graphs in order, with their schema
     overrides, and its weapon component's scripts."""
     xml = StuXml(path, enums)
@@ -407,8 +410,73 @@ def body_record(path: Path, enums: EnumTables, hero: str | None, name: str) -> t
             for weapon in weapon_list if weapon_list is not None else []:
                 weapons.append(graph_ref(xml, xml.resolve(weapon), "m_script"))
     record = {"hero": hero, "name": name, "graphs": graphs, "manager": manager, "weapons": weapons}
+    if include_ai_weapons and (buttons := _ai_weapon_buttons(path, xml)):
+        record["ai_weapon_buttons"] = buttons
     used = {entry["graph"] for entry in graphs} | {manager, *weapons}
     return record, {graph for graph in used if graph is not None}
+
+
+def _ai_weapon_buttons(path: Path, xml: StuXml) -> dict[str, int]:
+    """The logical button for each slot in the body's associated AI definition."""
+    association = "m_8B9A461F"
+    try:
+        ref = xml.field(xml.root, association)
+    except KeyError as exc:
+        raise ValueError(f"{path.name}: unresolved {association} reference") from exc
+    guid = ref.get("GUID", "") if ref is not None and tag(ref) == "ref" else ""
+    if xml.root.get(association) not in (None, "{null}") or (
+        ref is not None and (not re.fullmatch(r"[0-9A-Fa-f]{1,12}\.003", guid) or not guid_index(guid))
+    ):
+        raise ValueError(f"{path.name}: {association} must reference a .003 entity definition")
+    if ref is None:
+        return {}
+    path = path.with_name(f"{guid_index(guid):012X}.003.xml")
+    try:
+        return _ai_weapon_slots(StuXml(path, xml.enums))
+    except (ValueError, KeyError, ET.ParseError) as exc:
+        raise ValueError(f"{path.name}: {exc}") from exc
+
+
+def _ai_weapon_slots(xml: StuXml) -> dict[str, int]:
+    if tag(xml.root) != "STUEntityDefinition":
+        raise ValueError("expected a STUEntityDefinition root for AI weapon controls")
+    component_map = xml.field(xml.root, "m_componentMap")
+    if component_map is None:
+        return {}
+    if tag(component_map) != "map":
+        raise ValueError("invalid AI entity component map")
+    component_class = "STU_993B1B10"
+    components = [entry for entry in component_map if tag(entry) == component_class]
+    if not components:
+        return {}
+    if len(components) != 1:
+        raise ValueError("duplicate AI weapon control components")
+    component = xml.field(components[0], "dragon:value")
+    if component is None or tag(component) != component_class:
+        raise ValueError("invalid AI weapon control component")
+    field = "m_CD486A71"
+    rows = xml.field(component, field)
+    if component.get(field) not in (None, "{null}") or (rows is not None and tag(rows) != "array"):
+        raise ValueError(f"invalid AI weapon control {field} array")
+
+    buttons = {}
+    for item in rows if rows is not None else ():
+        row = xml.resolve(item)
+        if tag(row) != "STUAIWeaponFireControlInfo":
+            raise ValueError(f"invalid AI weapon control row type {tag(row)}")
+        slot = scalar(row.get("m_A60150E2"))
+        if type(slot) is not int or not 0 <= slot <= 0xFFFFFFFF:
+            raise ValueError("invalid AI weapon slot m_A60150E2")
+        if str(slot) in buttons:
+            raise ValueError(f"duplicate AI weapon slot {slot}")
+        button_field = "m_4F5E7D4C"
+        enum = xml.enums.field_enum(tag(row), button_field)
+        button = xml.enums.number(enum, scalar(row.get(button_field)), f"{tag(row)}.{button_field}")
+        if (enum != "STULogicalButton" or type(button) is not int or button < 0
+                or button not in xml.enums.enums[enum].values()):
+            raise ValueError(f"invalid AI weapon logical button for slot {slot}")
+        buttons[str(slot)] = button
+    return buttons
 
 
 def _mode_identifier(xml: StuXml, element: ET.Element, field: str) -> str:
@@ -524,7 +592,7 @@ def collect(
     for index in sorted(set(entity_indexes)):
         path = xml_dir / "003" / f"{index:012X}.003.xml"
         name = f"entity {index:04X}"
-        record, used = body_record(path, enums, None, name)
+        record, used = body_record(path, enums, None, name, include_ai_weapons=ai_spawners is not None)
         entities[f"0x{0x0400000000000000 | index:016X}"] = record
         queue.extend((graph, name) for graph in sorted(used))
     queue += list(ROOT_GRAPHS.items())
@@ -572,7 +640,8 @@ def main() -> None:
     parser.add_argument("--entity", action="append", type=entity_index, default=[],
                         help="additional 003 asset index such as 1403, repeatable")
     parser.add_argument("--mode-xml", type=Path, help="directory of .0C5 XML files to export mode variables")
-    parser.add_argument("--ai-spawners", type=Path, help="local map spawner table to include as graph roots")
+    parser.add_argument("--ai-spawners", type=Path,
+                        help="include local map spawner graph roots and AI weapon controls")
     parser.add_argument("--output", type=Path, help="destination bundle")
     args = parser.parse_args()
     output = args.output or OUT

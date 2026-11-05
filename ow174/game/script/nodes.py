@@ -285,6 +285,33 @@ class LogicalButton(State):
         return {"counter": self.counter}
 
 
+@state_class("STU_D7F9E1C3")
+class AIFireWeapon(State):
+    """Hold the authored fire-control button for the self-targeted 0B92 action."""
+
+    def __init__(self, *args) -> None:
+        super().__init__(*args)
+        self.button_id: int | None = None
+
+    def on_enter(self) -> None:
+        component = self.instance.component
+        if component.owner_dead or _field(self, "m_234135C3") is not None:
+            return
+        target = self.evaluate(_field(self, "m_14EDDDA7"), watch=False)
+        enabled = self.evaluate(_field(self, "m_20BCEE62"), watch=False)
+        slot = self.evaluate(_field(self, "m_A60150E2"), watch=False)
+        if target != expr.Entity(component.entity) or enabled is not True or type(slot) is not int:
+            return
+        self.button_id = component.world.ai_weapon_button(slot)
+        if self.button_id is not None:
+            component.edges([(self.button_id, True)])
+
+    def on_end(self, finished: bool) -> None:
+        if self.button_id is not None:
+            self.instance.component.edges([(self.button_id, False)])
+            self.button_id = None
+
+
 @state_class("STU_E4A30BCF")
 class DisableLogicalButton(State):
     """While active, the entity's LogicalButtons for this button are blocked (OnBegin 0x7FF78AA82530)."""

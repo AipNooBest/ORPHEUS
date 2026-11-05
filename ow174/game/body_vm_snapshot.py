@@ -11,6 +11,7 @@ import random
 
 from ow174.game import replay_values
 from ow174.game.script import expr, graph, nodes, runtime
+from ow174.game.script.bot import BotWorld
 from ow174.game.script.driver import BodyScript, BodyWorld
 
 SCHEMA = "ow174.body-vm-storage.v1"
@@ -47,6 +48,7 @@ _STATE_LAYOUTS = {
     nodes.BooleanSwitch: (("current", "pending"), ()),
     nodes.Stack: (("top", "under", "value", "var"), ()),
     nodes.LogicalButton: (("down", "pressed_at", "early_counter"), ()),
+    nodes.AIFireWeapon: (("button_id",), ()),
     nodes.DisableLogicalButton: ((), ("button_id",)),
     nodes.Wait: ((), ("ms",)), nodes.WaitForServerFrames: ((), ()),
     nodes.WaitFrames: (("target",), ()),
@@ -340,10 +342,14 @@ class _Export:
             return {"ref": self._graph(obj)}
         if kind is graph.Node:
             return {"ref": self._node(obj)}
-        if kind in (runtime.World, BodyWorld):
+        if kind in (runtime.World, BodyWorld, BotWorld):
             if obj is not self.component.world:
                 raise BodyVMSnapshotError("foreign VM world reference")
-            fields = {"hero", "mode"} | ({"body", "throttles", "match"} if kind is BodyWorld else set())
+            fields = {"hero", "mode"}
+            if kind is BodyWorld:
+                fields.update(("body", "throttles", "match"))
+            if kind is BotWorld:
+                fields.add("weapon_buttons")
             # The match and its pending deliveries belong to the enclosing server snapshot.
             return {"class": _name(kind), "fields_identity": self.identity(vars(obj)),
                     "fields": self.fields(obj, fields, exclude={"match"})}

@@ -39,7 +39,7 @@ from ow174.game.link import LinkCipher, ReceiveWindow
 from ow174.game.match import Match, Player, ShownController
 from ow174.game.mover import Mover, MoverData, loaded_mover_table
 from ow174.game.script import driver, expr, runtime
-from ow174.game.script.bot import BotScript
+from ow174.game.script.bot import BotScript, BotWorld
 from ow174.game.server import Client, GameServer, Handoff, _BotScriptDelivery
 from ow174.paths import ROOT
 
@@ -108,6 +108,7 @@ FIELDS = {
     ),
     driver.BodyWorld: _names("hero mode body throttles match"),
     BotScript: _names("component frame server_only initial death_frame _produced"),
+    BotWorld: _names("hero mode weapon_buttons"),
     runtime.World: _names("hero mode"),
     LinkCipher: _names("key_in key_out salt_in salt_out"),
     ReceiveWindow: _names("expected bits"),

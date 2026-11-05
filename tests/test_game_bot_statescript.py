@@ -10,10 +10,11 @@ from test_game_projectiles import ABILITY_2
 from test_game_repeated_lifecycles import wire_frame
 
 from ow174.game import bodytrace, bots, combat, movelog, projectiles, statescript, world
+from ow174.game.body_vm_snapshot import export_component_vm
 from ow174.game.content import SOLDIER
 from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
-from ow174.game.script import decode, graph
-from ow174.game.script.bot import BotScript
+from ow174.game.script import decode, graph, runtime
+from ow174.game.script.bot import BotScript, BotWorld
 from ow174.game.script.driver import OWNER_HEALTH, Snapshot
 from ow174.game.server import BOT_DESTROY_GRACE_TICKS, Client
 
@@ -21,6 +22,41 @@ GRAPH = 0xF0FE
 PULSER = "STU_B9898052"
 PULSE_KEY = (1, 0)
 LIVE_VAR = 32
+
+
+class AIFireWeaponTests(unittest.TestCase):
+    def test_action_presses_and_releases_the_authored_slot_on_the_vm_clock(self):
+        def integer(value):
+            return {"$": "STUConfigVarInt", "m_value": value}
+
+        control = make_graph(1, [node(0, "STU_D7F9E1C3", state=0, fields={
+            "m_14EDDDA7": {"$": "STU_B5A0CAF0"},
+            "m_20BCEE62": {"$": "STUConfigVarBool", "m_value": 1},
+            "m_A60150E2": integer(3),
+        })], states=[0])
+        weapon = make_graph(2, [node(0, "STUStatescriptStateLogicalButton", state=0, fields={
+            "m_logicalButton": integer(42),
+        })], states=[0])
+        weapon.fields["m_680A2CB2"] = [0]
+        for buttons, end in (({"3": 42}, runtime.FINISH), ({"3": 42}, runtime.ABORT), ({}, runtime.ABORT)):
+            with self.subTest(buttons=buttons, end=end):
+                component = runtime.Component(bots.BOT_ENTITY, world=BotWorld(SOLDIER, 0, buttons))
+                listener = component.create(weapon).state(0)
+                action = component.create(control).state(0)
+                listener.request(runtime.BEGIN)
+                component.run_frame(10)
+                action.request(runtime.BEGIN, 7)
+                component.run_frame(11)
+                self.assertEqual(component.held, [42] if buttons else [])
+                self.assertEqual(listener.pressed_at, 182 if buttons else None)
+                self.assertEqual(listener.down, bool(buttons))
+                self.assertTrue(export_component_vm(component))
+
+                action.request(end, 3)
+                component.run_frame(12)
+                self.assertEqual(component.held, [])
+                self.assertFalse(listener.down)
+                self.assertIsNone(action.button_id)
 
 
 class SyntheticScript:

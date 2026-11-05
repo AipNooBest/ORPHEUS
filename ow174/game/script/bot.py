@@ -9,6 +9,17 @@ DIED = 0x024000000000003E  # 003E.025, the body's authoritative death message
 _Payload = tuple[BitWriter, Snapshot, set]
 
 
+class BotWorld(runtime.World):
+    """Use the NPC body's associated fire-control slots as logical input bindings."""
+
+    def __init__(self, hero: int, mode: int, weapon_buttons: dict[str, int]) -> None:
+        super().__init__(hero, mode)
+        self.weapon_buttons = weapon_buttons
+
+    def ai_weapon_button(self, slot: int) -> int | None:
+        return self.weapon_buttons.get(str(slot))
+
+
 class BotScript(ReplicatedBody):
     """Run the NPC body's graphs on the server clock. Movement and AI stay with the bot."""
 
@@ -17,7 +28,9 @@ class BotScript(ReplicatedBody):
         if record is None:
             raise ValueError(f"no statescript data for entity body {body:016X}")
         self.frame = frame
-        component = self.component = runtime.Component(entity, world=runtime.World(hero, mode))
+        buttons = record.get("ai_weapon_buttons")
+        world = BotWorld(hero, mode, buttons) if buttons else runtime.World(hero, mode)
+        component = self.component = runtime.Component(entity, world=world)
         component.frame = frame
         component.now = frame * component.frame_ms
         self.set_health(health, health)

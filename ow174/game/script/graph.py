@@ -20,6 +20,8 @@ The file is gzip JSON:
   when the target node is one DataTool could not read.
 - "bodies": per hero body (the 003 GUID): its statescript component's initial graphs in definition order
   (graph index and schema overrides m_1EB5A024) and its weapon component's manager and weapon scripts.
+- "entities" (optional): additional body records with the same graph fields. An "ai_weapon_buttons" map
+  can link decimal fire-control slots to logical buttons from the associated AI definition.
 - "mode_variables" (optional): per 0C5 mode GUID, its explicit mode entity values by 01C identifier index.
 - "missing": graph indexes referenced but not in the dump.
 
