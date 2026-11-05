@@ -560,6 +560,34 @@ class BodyTests(unittest.TestCase):
         self.assertEqual(client.on(), server_on(body) - UNSENDABLE)
         self.assertNotIn((11, 10), client.on())  # the volley began and ended in the lost frame's time
 
+    def test_new_volley_carries_starting_ammo_when_the_stop_was_not_acknowledged(self):
+        body, client = spawned()
+        body.command(START + 1, 0)
+        first, = body.frames()
+        client.apply(first)
+        body.stream.arrived(first.chunk_last)
+        body.command(START + 31, FIRE)
+        first_volley, = body.frames()
+        client.apply(first_volley)
+        body.stream.arrived(first_volley.chunk_last)
+
+        body.command(START + 32, 0)
+        lost_stop, = body.frames()
+        body.command(START + 42, FIRE)
+        second_volley, = body.frames()
+        frame = client.apply(second_volley)
+        rifle = frame.instances[11]
+        self.assertEqual(frame.first, lost_stop.chunk_last)
+        self.assertEqual(rifle.states[10][1]["counter"], 2)
+        self.assertEqual(rifle.vars[53], (29, ()))
+        body.stream.arrived(second_volley.chunk_last)
+
+        body.command(START + 43, FIRE)
+        continuing, = body.frames()
+        frame = client.apply(continuing)
+        self.assertNotIn(10, frame.instances[11].states)
+        self.assertEqual(frame.instances[11].vars[53], (28, ()))
+
     def test_the_full_frame_waits_for_the_create(self):
         body = soldier()
         create = body.created(EntityUpdate(0xA0000101, OP_CREATE))

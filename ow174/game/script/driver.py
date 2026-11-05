@@ -450,7 +450,11 @@ class BodyScript(ReplicatedBody):
                 state = StateWire(now[0], now[1], dict(now[2]))
             keys.add(("state", *key))
             wire(owner).states[index] = state
-            if state.active and state.cls == VOLLEY and (was is None or not was[1]):
+            # The last acknowledged frame can still show a previous activation as on.
+            if (
+                state.active and state.cls == VOLLEY
+                and (was is None or not was[1] or dict(was[2])["counter"] != state.payload["counter"])
+            ):
                 self._volley_start(snap, owner, index, wire, entity_vars, keys)
         for item in snap.instances:
             wire(item).events = [EventWire(*event) for event in snap.events.get(item, ())]
