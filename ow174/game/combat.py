@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from ow174.game import bots, observers, pools, projectiles, stats, voicelines, world
 from ow174.game.bits import BitWriter
 from ow174.game.collision import AX, AY, AZ, BX, BY, BZ, CELL, CX, CY, CZ, MASK, MOVER, NUMBER
+from ow174.game.commands import Command
 from ow174.game.mover import mover_data
 from ow174.game.script import expr, graph, runtime
 from ow174.game.script.bot import DIED, BotScript
@@ -439,8 +440,8 @@ class Combat:
             player.client.queue_entities([player.mode_script.full_frame(mode_frame({}))])
         self.voice.spawned(player, self.now)
 
-    def command(self, player, command) -> None:
-        """One command frame the player's body script ran: its shots hit."""
+    def command(self, player, command: Command | None) -> None:
+        """Consume the body's reports. Only a frame with a pose can affect targets."""
         if self.match.collision_world is None:
             return
         script = player.body_script
@@ -449,11 +450,12 @@ class Combat:
         shots, script.component.shots[:] = list(script.component.shots), []
         if self.is_dead(player):
             return
-        for state, number, time in shots:
-            try:
-                self._shoot(player, command, state, number, time)
-            except Exception:
-                log.exception("[game] %s: %s's shot failed", self.match.label(), player.name)
+        if command is not None:
+            for state, number, time in shots:
+                try:
+                    self._shoot(player, command, state, number, time)
+                except Exception:
+                    log.exception("[game] %s: %s's shot failed", self.match.label(), player.name)
         try:
             self._melee(player, command, script)
         except Exception:
@@ -474,7 +476,7 @@ class Combat:
             key = (script.entity, instance.id, index)
             seen = self.melee_seen.get(key, 0)
             self.melee_seen[key] = state.counter
-            if state.counter == seen or not state.active:
+            if state.counter == seen or not state.active or command is None:
                 continue
             modify = state.node.field("m_modifyHealth") or {}
             amount = _number(state.evaluate(modify.get("m_amount"), watch=False), 0.0) if modify else 0.0
@@ -674,9 +676,7 @@ class Combat:
         if direct is None or direct.amount <= 0.0:
             return
         reach = field("m_FEC435C6", RANGE) or RANGE
-        # Within the mover's reconstruction window, this command supplies the pose and
-        # fallback aim for the current simulation frame. Script-only catch-up outside
-        # that window still uses the available command. Notices use the volley clock.
+        # The input supplies this simulation frame's aim and view time. Notices use the volley clock.
         view_tick = self.tick
         if command is not None:
             view_tick = command.frame - command.view_delay(shooter.quanta) * 1e6 / shooter.quanta

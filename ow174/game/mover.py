@@ -590,6 +590,13 @@ class Mover:
 
     # ---- the tick
 
+    def first_step_frame(self, frame: int) -> int:
+        """First frame that will get a movement pose, including bounded gap recovery."""
+        last = self.last_command
+        if last is not None and 1 < frame - last.frame <= 2 * REPEAT:
+            return last.frame + 1
+        return frame
+
     def step(
         self, command: Command, seconds: float, tick: int = 0,
         *, after_missing: Callable[[Command], None] | None = None,
@@ -599,8 +606,8 @@ class Mover:
         missing one without throttles and buttons). A body script can follow each missing movement step
         to keep its modifiers aligned with the fallback input."""
         last = self.last_command
-        if last is not None and 1 < command.frame - last.frame <= 2 * REPEAT:
-            for frame in range(last.frame + 1, command.frame):
+        if last is not None:
+            for frame in range(self.first_step_frame(command.frame), command.frame):
                 if frame - last.frame > REPEAT:
                     last = Command(last.frame, yaw=last.yaw, pitch=last.pitch)
                 missing = replace(

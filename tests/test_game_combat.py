@@ -253,6 +253,36 @@ class DamageTests(unittest.TestCase):
         self.assertTrue(all(0 < offset < 30 for offset in control[2]))
         self.assertEqual(fight_after_gap(True), control)
 
+    def test_long_input_gap_does_not_apply_old_rifle_rounds_at_the_endpoint(self):
+        for distance in (65, 300):
+            for buttons in (0, FIRE):
+                with self.subTest(distance=distance, buttons=buttons):
+                    run = Run(KANEZAKA_DM, ("Shooter", "Target"))
+                    run.match.bots.clear()
+                    run.match._pending_bot_scripts.clear()
+                    shooter, victim = run.players
+                    x, y, z = shooter.mover.position
+                    victim.mover.position = [x, y, z + 6.0]
+                    fight = run.match.combat
+                    target = next(target for target in fight._targets() if target.owner is victim)
+                    vitals = fight.vitals_of(target)
+                    rifle = next(instance for instance in shooter.body_script.component.instances.values()
+                                 if instance.graph.index == 0x0254)
+                    press = Command(run.frame + 1, yaw=-32768, buttons=FIRE)
+                    shooter.take_commands([press])
+                    self.assertEqual(vitals.total, 200.0)
+                    self.assertEqual(rifle.vars[53].value(), 29)
+
+                    yaw, pitch = aim(fight._eye(shooter), (x, y + 1.0, z + 6.0))
+                    endpoint = Command(press.frame + distance, yaw=yaw, pitch=pitch, buttons=buttons)
+                    expected = [(endpoint.frame, 20)] if buttons else []
+                    for window in ([endpoint], [press, endpoint]):
+                        shooter.take_commands(window)
+                        hits = shooter.client.messages(combat.HIT)
+                        self.assertEqual([(hit["+0x84"], hit["+0x78"]["+0x4"]) for hit in hits], expected)
+                        self.assertEqual(vitals.total, 180.0 if buttons else 200.0)
+                        self.assertEqual(rifle.vars[53].value(), 28 if buttons else 29)
+
 
 class ProjectileTimingTests(unittest.TestCase):
     def match_with_projectile(self, lifetime=1.0):

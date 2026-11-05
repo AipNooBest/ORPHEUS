@@ -290,6 +290,8 @@ class Player:
         for command in fresh:
             if self.has_body:
                 dead = self.match.combat.is_dead(self)
+                first_pose = command.frame if dead else self.mover.first_step_frame(command.frame)
+                self._advance_body_gap(first_pose)
                 if not dead:  # a dead body lies where it fell
                     self.mover.step(
                         command, seconds, self.match.tick,
@@ -300,11 +302,21 @@ class Player:
             movelog.snapshots(self)
         return boundary
 
-    def _advance_body_frame(self, command: Command) -> None:
-        """Resolve body input and combat at the pose produced by this movement step."""
+    def _advance_body_gap(self, first_pose: int) -> None:
+        """Release old input and advance timers across frames without a movement pose."""
+        script = self.body_script
+        if script is None or script.frame + 1 >= first_pose:
+            return
+        first_missing = script.frame + 1
+        self._advance_body_frame(Command(first_missing), posed=False)
+        if first_missing < first_pose - 1:
+            self._advance_body_frame(Command(first_pose - 1), posed=False)
+
+    def _advance_body_frame(self, command: Command, *, posed: bool = True) -> None:
+        """Resolve body input and consume combat reports from this simulation step."""
         if self.body_script is not None:
             self.match.body_command(self, command)
-            self.match.combat.command(self, command)
+            self.match.combat.command(self, command if posed else None)
         # Modifier changes take effect on the next movement frame.
         script = self.body_script
         self.mover.track_mods(statescript_mods(script.component) if script else {}, command.frame)
