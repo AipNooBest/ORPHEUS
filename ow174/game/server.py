@@ -57,6 +57,7 @@ SILENCE_SECONDS = 10.0  # the client sends at least every 250 ms; after this lon
 HANDOFF_SECONDS = 60.0
 MAX_PAYLOAD = MAX_DATAGRAM - HEADER_SIZE
 MAX_PENDING_BOT_NOTICES = 256  # per bot create, retain the newest notices during prolonged loss
+BOT_DESTROY_GRACE_TICKS = round(SILENCE_SECONDS / TICK_SECONDS)  # bound waits by the transport silence budget
 PING = 21610
 MAP_LOADED = (21601, 21602)
 GAME_MESSAGE = 21616
@@ -156,6 +157,8 @@ class Client:
         # The current bot creates only. None means the peer acknowledged this create.
         self._bot_notices: dict[int, deque[tuple[int, bytes]] | None] = {}
         self._bot_health: dict[int, world.EntityUpdate] = {}  # latest snapshot awaiting delivery per bot
+        self._bot_notice_tail: dict[int, int] = {}  # last promoted reliable ordinal per bot
+        self._bot_destroy_wait: dict[int, tuple[world.EntityUpdate, int, int]] = {}
         self.expected_in = 0  # the client's next reliable message
         self.parked_in = {}
         self.leaving_since: float | None = None  # when go_home sent 20304
@@ -175,11 +178,13 @@ class Client:
     def queue_reliable(self, msg_id: int, value: dict) -> None:
         self._queue_encoded_reliable(msg_id, messages.encode(msg_id, value))
 
-    def _queue_encoded_reliable(self, msg_id: int, payload: bytes) -> None:
-        self.reliable.append((self.next_reliable, payload))
+    def _queue_encoded_reliable(self, msg_id: int, payload: bytes) -> int:
+        ordinal = self.next_reliable
+        self.reliable.append((ordinal, payload))
         self.next_reliable += 1
         if msg_id not in (20306,):
-            self.log(f"[>>>] {msg_id} (reliable #{self.next_reliable - 1})")
+            self.log(f"[>>>] {msg_id} (reliable #{ordinal})")
+        return ordinal
 
     def bot_create_acked(self, entity: int) -> bool:
         """Whether this connection acknowledged the current create for a bot."""
@@ -189,11 +194,12 @@ class Client:
         """Keep references to a bot out of the reliable stream until its create is acknowledged."""
         if entity not in self._bot_notices:
             return
+        payload = messages.encode(msg_id, value)
         pending = self._bot_notices[entity]
         if pending is None:
-            self.queue_reliable(msg_id, value)
+            self._bot_notice_tail[entity] = self._queue_encoded_reliable(msg_id, payload)
         else:
-            pending.append((msg_id, messages.encode(msg_id, value)))
+            pending.append((msg_id, payload))
 
     def queue_bot_health(self, entity: int, components: dict) -> None:
         """Keep the latest complete pool snapshot for this connection's current bot."""
@@ -217,7 +223,38 @@ class Client:
             if health is not None:
                 self.queue_entities([health])
             for msg_id, payload in pending:
-                self._queue_encoded_reliable(msg_id, payload)
+                self._bot_notice_tail[entity] = self._queue_encoded_reliable(msg_id, payload)
+
+    def _oldest_pending_reliable(self) -> int:
+        queued = self.reliable[0][0] if self.reliable else self.next_reliable
+        in_flight = (batch[0][0] for batch, _ in self.in_flight.values() if batch)
+        return min(queued, min(in_flight, default=queued))
+
+    def _hold_bot_destroy(self, item: world.EntityUpdate) -> bool:
+        entity = item.entity
+        if entity in self._bot_destroy_wait:
+            return True
+        tail = self._bot_notice_tail.pop(entity, None)
+        if tail is None or (entity not in self._bot_health and self._oldest_pending_reliable() > tail):
+            return False
+        # The client can receive the notice but park it behind an earlier reliable gap.
+        # Its terminal health update can also be sent in a later packet.
+        self._bot_notices.pop(entity, None)
+        expiry = self.player.match.tick + BOT_DESTROY_GRACE_TICKS
+        self._bot_destroy_wait[entity] = (item, tail, expiry)
+        return True
+
+    def _release_bot_destroys(self, tick: int) -> None:
+        if not self._bot_destroy_wait:
+            return
+        oldest = self._oldest_pending_reliable()
+        ready = []
+        for entity, (item, tail, expiry) in list(self._bot_destroy_wait.items()):
+            if tick >= expiry or (oldest > tail and entity not in self._bot_health):
+                del self._bot_destroy_wait[entity]
+                ready.append(item)
+        if ready:
+            self.queue_entities(ready)
 
     def queue_unreliable(self, msg_id: int, value: dict) -> None:
         self.unreliable.append(messages.encode(msg_id, value))
@@ -234,6 +271,11 @@ class Client:
         for item in updates:
             generation, alive = lifecycles.get(item.entity, (0, True))
             if item not in generations:
+                if item.op == world.OP_DESTROY and self._hold_bot_destroy(item):
+                    continue
+                if item.op == world.OP_CREATE:
+                    self._bot_notice_tail.pop(item.entity, None)
+                    self._bot_destroy_wait.pop(item.entity, None)
                 if item.op in (world.OP_CREATE, world.OP_DESTROY):
                     # Preserve the generation of already-sent records, even for an older
                     # producer that did not put them through queue_entities first.
@@ -278,6 +320,7 @@ class Client:
         return True
 
     def send_frame(self, tick: int, now: float) -> None:
+        self._release_bot_destroys(tick)
         reliable = self.reliable[: messages.MAX_PER_KIND]
         unreliable = self.unreliable[: messages.MAX_PER_KIND]
         entities = (self.entities + self.player.match.remote_movements(self.player))[:127]
@@ -807,6 +850,8 @@ class GameServer:
         client.closed = True
         client._bot_notices.clear()
         client._bot_health.clear()
+        client._bot_notice_tail.clear()
+        client._bot_destroy_wait.clear()
         if self.clients.get(client.conn) is client:
             del self.clients[client.conn]
         movelog.close(client.player)

@@ -71,8 +71,8 @@ FIELDS = {
                        "handoffs clients _dropped matches tick _next_conn _left_players _joined_players "
                        "_sent_home running"),
     Client: _names("server address conn cipher player window seq open closed heard next_reliable reliable "
-                   "unreliable entities in_flight _bot_notices _bot_health expected_in parked_in "
-                   "leaving_since"),
+                   "unreliable entities in_flight _bot_notices _bot_health _bot_notice_tail "
+                   "_bot_destroy_wait expected_in parked_in leaving_since"),
     Match: _names("environment id game_map card skin_of tick controller assemble_ends assembled players "
                   "started on_leave ended bots bots_shown notices combat collision_provider collision_state "
                   "collision_world _collision_failed"),

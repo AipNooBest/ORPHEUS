@@ -10,7 +10,7 @@ from test_game_repeated_lifecycles import wire_frame
 from ow174.game import bodytrace, bots, combat, movelog, world
 from ow174.game.content import PRACTICE_RANGE, SOLDIER
 from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
-from ow174.game.server import Client
+from ow174.game.server import SILENCE_SECONDS, TICK_SECONDS, Client
 
 
 class BotNoticeTests(unittest.TestCase):
@@ -24,6 +24,7 @@ class BotNoticeTests(unittest.TestCase):
         self.server, self.client, self.player, self.peer = connection()
         self.match = self.player.match
         self.match.bots = bots.make(PRACTICE_RANGE.map_guid)
+        self.match.combat.next_bot = bots.BOT_ENTITY + len(self.match.bots)
         self.match.tick = 100
         self.player.spawned = self.player.has_body = True
         enemies = [target for target in self.match.combat._targets() if target.team != self.player.team]
@@ -165,6 +166,133 @@ class BotNoticeTests(unittest.TestCase):
         self.assertFalse(self.client._bot_notices)
         self.assertFalse(self.client._bot_health)
         self.assertFalse(self.client.reliable)
+
+    def respawn_target(self, tick):
+        self.match.tick = tick
+        self.match.combat._respawn_bot(self.target.owner)
+
+    def test_lost_kill_notices_delay_only_the_old_destroy(self):
+        self.prepare(single=True)
+        self.send(100)
+        self.ack()
+        observer = self.match.add_player(2, "Beta", SOLDIER, 0, False)
+        observer.client = Client(
+            self.server, ("memory.test", 40002), 2, LinkCipher(b"v" * 32, b"w" * 32), observer,
+        )
+        observer.spawned = True
+        self.match.bots_shown[observer.slot] = self.match.tick
+        observer.client.queue_entities([self.match._bot_create_update(self.target.owner)])
+        observer.client.send_frame(100, 10.0)
+        observer.client.acked(1, 1)
+        self.kill_bot()
+        lost, _ = self.send(101, deliver=False)
+        self.assert_kill_notices(lost)
+        self.assertEqual(self.health, [(world.OP_UPDATE, 0)])
+
+        fresh = self.match.combat.next_bot
+        self.respawn_target(289)
+        self.assertEqual([(item.entity, item.op) for item in observer.client.entities], [
+            (self.entity, world.OP_DESTROY), (fresh, world.OP_CREATE),
+        ])
+        self.client.queue_entities([world.EntityUpdate(self.entity, world.OP_DESTROY)])
+        reliable, records = self.send(289)
+        self.assertEqual(self.notices(reliable), [])
+        self.assertNotIn((self.entity, world.OP_DESTROY), records)
+        self.assertIn((fresh, world.OP_CREATE), records)
+        self.ack()  # the death message and terminal health datagram was lost
+        reliable, records = self.send(292)
+        self.assert_kill_notices(reliable)
+        self.assertEqual(self.health, [(world.OP_UPDATE, 0)])
+        self.assertNotIn((self.entity, world.OP_DESTROY), records)
+        self.ack()
+        self.assertEqual(self.send(295)[1].count((self.entity, world.OP_DESTROY)), 1)
+
+    def test_acknowledged_kill_notices_wait_for_earlier_reliable_gap(self):
+        self.prepare(single=True)
+        self.send(100)
+        self.ack()
+        large_messages(self.client, self.player, 1)
+        self.send(101, deliver=False)  # reliable sequence 0
+        self.kill_bot()
+        parked, _ = self.send(104)
+        self.assert_kill_notices(parked)
+        self.assertEqual([seq for seq, _, _ in parked], [1, 2])
+        self.ack()  # the peer got both notices but parks them behind sequence 0
+        self.send(107, deliver=False)
+
+        self.respawn_target(289)
+        self.assertNotIn((self.entity, world.OP_DESTROY), self.send(289)[1])
+        self.ack()
+        reliable, records = self.send(292)
+        self.assertEqual([(seq, identifier) for seq, identifier, _ in reliable], [(0, 20308)])
+        self.assertNotIn((self.entity, world.OP_DESTROY), records)
+        self.ack()
+        self.assertIn((self.entity, world.OP_DESTROY), self.send(295)[1])
+
+    def test_acknowledged_kill_notices_wait_for_budget_delayed_terminal_health(self):
+        self.prepare(single=True)
+        self.send(100)
+        self.ack()
+        self.kill_bot()
+        notices_only = self.client._payload(101, self.client.reliable, (), ())
+        with patch("ow174.game.server.MAX_PAYLOAD", len(notices_only)):
+            reliable, _ = self.send(101)
+        self.assert_kill_notices(reliable)
+        self.assertEqual(self.health, [])
+        self.ack()
+        self.assertIn(self.entity, self.client._bot_health)
+
+        self.respawn_target(289)
+        reliable, records = self.send(289)
+        self.assertEqual(self.notices(reliable), [])
+        self.assertNotIn((self.entity, world.OP_DESTROY), records)
+        self.assertEqual(self.health, [(world.OP_UPDATE, 0)])
+        self.assertNotIn((self.entity, world.OP_DESTROY), self.send(292)[1])
+        self.ack()
+        self.assertIn((self.entity, world.OP_DESTROY), self.send(295)[1])
+
+    def test_retirement_expires_without_ack_progress(self):
+        self.prepare(single=True)
+        self.send(100)
+        self.ack()
+        self.kill_bot()
+        self.send(101, deliver=False)
+        self.respawn_target(289)
+        expiry = 289 + round(SILENCE_SECONDS / TICK_SECONDS)
+        self.assertNotIn((self.entity, world.OP_DESTROY), self.send(expiry - 1)[1])
+        self.assertIn((self.entity, world.OP_DESTROY), self.send(expiry)[1])
+        self.ack()
+        reliable, _ = self.send(expiry + 1)
+        self.assert_kill_notices(reliable)  # retirement cannot break the reliable sequence
+
+    def test_reused_entity_id_cancels_held_destroy_and_stale_health(self):
+        self.prepare(single=True)
+        build = self.client.entities[0].build
+        self.send(100)
+        self.ack()
+        self.kill_bot()
+        self.send(101, deliver=False)
+        self.client.queue_entities([world.EntityUpdate(self.entity, world.OP_DESTROY)])
+        self.assertIn(self.entity, self.client._bot_destroy_wait)
+        self.client.queue_entities([world.EntityUpdate(self.entity, world.OP_CREATE, build)])
+        self.assertNotIn(self.entity, self.client._bot_destroy_wait)
+        self.assertIn((self.entity, world.OP_CREATE), self.send(104)[1])
+        self.assertEqual(self.health, [(world.OP_CREATE, 200)])
+        self.ack()
+        self.assertNotIn((self.entity, world.OP_DESTROY), self.send(107)[1])
+        self.assertEqual(self.health, [])
+
+    def test_client_drop_releases_held_destroy_and_notice_ordinals(self):
+        self.prepare(single=True)
+        self.send(100)
+        self.ack()
+        self.kill_bot()
+        self.respawn_target(289)
+        self.assertIn(self.entity, self.client._bot_destroy_wait)
+        self.server.drop(self.client)
+        self.assertFalse(self.client._bot_destroy_wait)
+        self.assertFalse(self.client._bot_notice_tail)
+        self.assertFalse(self.client._bot_health)
 
     def test_long_wait_keeps_only_bounded_latest_notices(self):
         with patch("ow174.game.server.MAX_PENDING_BOT_NOTICES", 2):
