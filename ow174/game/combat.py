@@ -427,6 +427,8 @@ class Combat:
 
     def command(self, player, command) -> None:
         """One command frame the player's body script ran: its shots hit."""
+        if self.match.collision_world is None:
+            return
         script = player.body_script
         if script is None:
             return
@@ -477,6 +479,8 @@ class Combat:
     def update(self, now: float, tick: int, frames: bool = True) -> None:
         """Each tick: keep where the bodies are, fly the rockets, respawn, send health that changed. The
         other players' body frames only on the ticks that send (`frames`)."""
+        if self.match.collision_world is None:
+            return
         self.now, self.tick = now, tick
         for target in self._targets():
             history = self.history.setdefault(target.entity, deque(maxlen=HISTORY))
@@ -697,10 +701,12 @@ class Combat:
                 script.set_health(vitals.total, sum(vitals.most.values()))
 
     def _collision(self):
-        from ow174.game.collision import world_when_ready
+        from ow174.game.collision import CollisionError
 
-        game_map = self.match.game_map
-        return world_when_ready(game_map.map_guid, game_map.name, game_map.mode_guid)
+        world = self.match.collision_world
+        if world is None:
+            raise CollisionError("match collision is not ready")
+        return world
 
     # --- damage and death --------------------------------------------------------------------------
 

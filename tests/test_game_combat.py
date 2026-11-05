@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ow174.game import bots, combat
 from ow174.game.bits import BitReader, BitWriter
+from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.combat import Combat, HitDef, Target, Vitals
 from ow174.game.commands import FIRE, Command, read_commands
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
@@ -56,7 +57,9 @@ class Run:
     """A match ticked frame by frame, the players' commands taken as the server takes them."""
 
     def __init__(self, game_map=PRACTICE_RANGE, names=("A",)) -> None:
-        self.match = Match(game_map)
+        self.match = Match(game_map, collision_provider=StaticCollisionProvider(flat_world(
+            game_map.spawns[0].position[1]
+        )))
         self.players = []
         for number, name in enumerate(names):
             player = self.match.add_player(number + 1, name, SOLDIER, number, False)
@@ -135,7 +138,7 @@ class GeometryTests(unittest.TestCase):
         )
 
     def test_the_target_as_the_shooter_saw_it(self):
-        match = Match(PRACTICE_RANGE)
+        match = Match(PRACTICE_RANGE, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         fight = Combat(match)
         target = Target(5, 1, (10.0, 0.0, 0.0), 1.8, 0.4, 1.55, None)
         fight.history[5] = __import__("collections").deque([(100, (0.0, 0.0, 0.0), 1.8, 1.55),

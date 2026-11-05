@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ow174.game import world
 from ow174.game.bits import BitReader, BitWriter
+from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.commands import CROUCH, JUMP, Command
 from ow174.game.content import PRACTICE_RANGE, SOLDIER
 from ow174.game.match import Match
@@ -342,7 +343,7 @@ class RemoteMovementTests(unittest.TestCase):
     """What another player's client gets about a body from frame to frame."""
 
     def setUp(self):
-        self.match = Match(PRACTICE_RANGE)
+        self.match = Match(PRACTICE_RANGE, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         self.runner = self.match.add_player(1, "Alpha", SOLDIER, 0, False)
         self.viewer = self.match.add_player(2, "Beta", SOLDIER, 1, False)
         self.runner.has_body = True

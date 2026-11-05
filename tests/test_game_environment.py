@@ -14,6 +14,7 @@ from ow174.game import environment as environment_module
 from ow174.game import match as match_module
 from ow174.game import messages
 from ow174.game.bits import BitReader, BitWriter
+from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.content import PRACTICE_RANGE
 from ow174.game.environment import SystemEnvironment
 from ow174.game.link import ACK, SYN, LinkCipher, Packet
@@ -134,7 +135,8 @@ def initial_reads():
 class GameEnvironmentTests(unittest.TestCase):
     def setUp(self):
         # These tests cover external clocks/entropy, without starting async asset loading.
-        collision = mock.patch.object(match_module, "world_when_ready", return_value=None)
+        collision = mock.patch.object(match_module, "default_collision_provider",
+                                      return_value=StaticCollisionProvider(flat_world(1.0)))
         collision.start()
         self.addCleanup(collision.stop)
 

@@ -39,7 +39,9 @@ import threading
 import time
 from array import array
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from ow174.game import contacts, props
 from ow174.game.casc import CascError, Storage, game_root
@@ -636,38 +638,107 @@ def build(map_guid: int, storage: Storage, name: str = "") -> Path:
 
 
 KEEP_WORLDS = 4  # maps kept loaded after their matches; a running match keeps its own
-# (map GUID, the mode's placeable identifiers) -> World or None (none to be had), recently used last
+# (map GUID, the mode's placeable identifiers) -> terminal request handle, recently used last
 _worlds: OrderedDict = OrderedDict()
 _pending: set[tuple] = set()
+_requests: dict = {}  # pending handles; a provider retains its own handle after LRU eviction
 _loading = threading.Lock()
 _building = threading.Lock()  # one cache build at a time
 
 
-def _load(map_guid: int, name: str, build_missing: bool, identifiers: frozenset[int]) -> World | None:
+@dataclass(frozen=True)
+class LoadState:
+    """An atomic resource read: pending and unavailable cannot stand in for an empty map."""
+
+    status: str
+    world: World | None = None
+    error: str = ""
+
+    def __post_init__(self) -> None:
+        if self.status not in ("pending", "ready", "unavailable"):
+            raise ValueError(f"unknown collision state: {self.status}")
+        if (self.status == "ready") != (self.world is not None):
+            raise ValueError("only ready collision states must have a World")
+        if self.status == "ready" and not isinstance(self.world, World):
+            raise ValueError("ready collision states need a World")
+        if self.status == "unavailable" and not self.error:
+            raise ValueError("unavailable collision states need an error")
+
+
+class CollisionProvider(Protocol):
+    def poll(self, map_guid: int, name: str = "", mode: int | None = None) -> LoadState: ...
+
+
+@dataclass
+class _LoadHandle:
+    state: LoadState
+
+
+class StaticCollisionProvider:
+    """An explicitly supplied world, for artificial scenes and isolated protocol tests."""
+
+    def __init__(self, world: World) -> None:
+        self.state = LoadState("ready", world)
+
+    def poll(self, map_guid: int, name: str = "", mode: int | None = None) -> LoadState:
+        return self.state
+
+
+class AsyncCollisionProvider:
+    def __init__(self) -> None:
+        self._handles: dict[tuple, _LoadHandle] = {}
+
+    def poll(self, map_guid: int, name: str = "", mode: int | None = None) -> LoadState:
+        key = (map_guid, props.mode_identifiers(mode))
+        handle = self._handles.get(key)
+        if handle is None:
+            handle = self._handles[key] = _request_world(map_guid, name, mode)
+        with _loading:
+            return handle.state
+
+
+def default_collision_provider() -> CollisionProvider:
+    return AsyncCollisionProvider()
+
+
+def _read_cache(map_guid: int, name: str, build_missing: bool, identifiers: frozenset[int]) -> World:
     path = cache_path(map_guid)
+    if build_missing and map_guid in collision_keys():
+        with _building:
+            if cache_version(path) != VERSION and (root := installed_game()) is not None:
+                started = time.monotonic()
+                build(map_guid, Storage(root), name)
+                log.info("[game] built the collision of %s in %.1f s", name or hex(map_guid),
+                         time.monotonic() - started)  # fmt: skip
+    if path.is_file():
+        return World.load(path, identifiers)
+    raise CollisionError(f"no collision cache for {name or hex(map_guid)}")
+
+
+def _load(map_guid: int, name: str, build_missing: bool, identifiers: frozenset[int]) -> World | None:
     try:
-        if build_missing and map_guid in collision_keys():
-            with _building:
-                if cache_version(path) != VERSION and (root := installed_game()) is not None:
-                    started = time.monotonic()
-                    build(map_guid, Storage(root), name)
-                    log.info("[game] built the collision of %s in %.1f s", name or hex(map_guid),
-                             time.monotonic() - started)  # fmt: skip
-        if path.is_file():
-            return World.load(path, identifiers)
-        log.warning("[game] no collision for %s: bodies walk on a flat floor", name or hex(map_guid))
+        return _read_cache(map_guid, name, build_missing, identifiers)
     except (OSError, CascError, CollisionError, lzma.LZMAError, ValueError) as error:
         log.warning("[game] no collision for %s: %s", name or hex(map_guid), error)
     return None
 
 
-def _keep(key: tuple, world: World | None) -> None:
+def _keep(key: tuple, world: World | None, error: str = "") -> LoadState:
+    state = LoadState("ready", world) if world is not None else LoadState(
+        "unavailable", error=error or f"collision unavailable for map {key[0]:#x}"
+    )
     with _loading:
-        _worlds[key] = world
+        handle = _requests.pop(key, None)
+        if handle is None:
+            handle = _LoadHandle(state)
+        else:
+            handle.state = state
+        _worlds[key] = handle
         _worlds.move_to_end(key)
         while len(_worlds) > KEEP_WORLDS:
             _worlds.popitem(last=False)
         _pending.discard(key)
+    return state
 
 
 def world_for(
@@ -681,15 +752,13 @@ def world_for(
     with _loading:
         if key in _worlds:
             _worlds.move_to_end(key)
-            return _worlds[key]
+            return _worlds[key].state.world
     world = _load(map_guid, name, build_missing, identifiers)
     _keep(key, world)
     return world
 
 
-def world_when_ready(map_guid: int, name: str = "", mode: int | None = None) -> World | None:
-    """The map's collision for a game mode if it is loaded; else it starts loading it in the background
-    and returns None for now, so a match never waits for it."""
+def _request_world(map_guid: int, name: str, mode: int | None) -> _LoadHandle:
     identifiers = props.mode_identifiers(mode)
     key = (map_guid, identifiers)
     with _loading:
@@ -697,9 +766,36 @@ def world_when_ready(map_guid: int, name: str = "", mode: int | None = None) -> 
             _worlds.move_to_end(key)
             return _worlds[key]
         if key in _pending:
-            return None
+            return _requests[key]
+        handle = _LoadHandle(LoadState("pending"))
+        _requests[key] = handle
         _pending.add(key)
-    threading.Thread(
-        target=lambda: _keep(key, _load(map_guid, name, True, identifiers)), name="collision", daemon=True
-    ).start()
-    return None
+
+    def load() -> None:
+        try:
+            world = _read_cache(map_guid, name, True, identifiers)
+        except Exception as error:  # noqa: BLE001 - all worker failures must publish a terminal state
+            # A failed worker must publish a terminal state instead of leaving the map pending forever.
+            detail = f"{type(error).__name__}: {error}"
+            log.warning("[game] no collision for %s: %s", name or hex(map_guid), detail)
+            _keep(key, None, detail)
+        else:
+            _keep(key, world)
+
+    try:
+        threading.Thread(target=load, name="collision", daemon=True).start()
+    except RuntimeError as error:
+        _keep(key, None, f"could not start collision loader: {error}")
+    return handle
+
+
+def load_state(map_guid: int, name: str = "", mode: int | None = None) -> LoadState:
+    """Request a map in the background and return its current state without waiting for I/O."""
+    handle = _request_world(map_guid, name, mode)
+    with _loading:
+        return handle.state
+
+
+def world_when_ready(map_guid: int, name: str = "", mode: int | None = None) -> World | None:
+    """Legacy optional-world query. Live matches use the structured provider and pin their World."""
+    return load_state(map_guid, name, mode).world

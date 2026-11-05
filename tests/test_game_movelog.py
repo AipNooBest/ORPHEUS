@@ -13,6 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ow174.game import correction, movelog
+from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.commands import Command
 from ow174.game.content import PRACTICE_RANGE, SOLDIER
 from ow174.game.match import Match
@@ -25,7 +26,8 @@ class LogTests(unittest.TestCase):
 
     def setUp(self):
         logging.getLogger("ow174.script").setLevel(logging.ERROR)
-        flat = mock.patch("ow174.game.match.world_when_ready", return_value=None)  # a flat floor
+        flat = mock.patch("ow174.game.match.default_collision_provider",
+                          return_value=StaticCollisionProvider(flat_world(1.0)))
         flat.start()
         self.addCleanup(flat.stop)
         self.folder = Path(tempfile.mkdtemp())
@@ -148,7 +150,8 @@ class AckTests(unittest.TestCase):
 
     def setUp(self):
         logging.getLogger("ow174.script").setLevel(logging.ERROR)
-        flat = mock.patch("ow174.game.match.world_when_ready", return_value=None)
+        flat = mock.patch("ow174.game.match.default_collision_provider",
+                          return_value=StaticCollisionProvider(flat_world(1.0)))
         flat.start()
         self.addCleanup(flat.stop)
         self.match = Match(PRACTICE_RANGE)

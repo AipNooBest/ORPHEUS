@@ -15,6 +15,7 @@ from test_game_world import read_movement
 
 from ow174.game import correction, world
 from ow174.game.bits import BitReader
+from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.commands import CROUCH, JUMP, Command
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
 from ow174.game.match import Match
@@ -99,7 +100,8 @@ class CadenceTests(unittest.TestCase):
 
     def setUp(self):
         logging.getLogger("ow174.script").setLevel(logging.ERROR)
-        flat = mock.patch("ow174.game.match.world_when_ready", return_value=None)  # a flat floor
+        flat = mock.patch("ow174.game.match.default_collision_provider",
+                          return_value=StaticCollisionProvider(flat_world(1.0)))
         flat.start()
         self.addCleanup(flat.stop)
         self.match = Match(PRACTICE_RANGE)

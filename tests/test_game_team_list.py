@@ -14,6 +14,7 @@ from test_game_server import REAPER, PretendGame, pick
 
 from ow174.game import heroselect, messages, world
 from ow174.game.bits import BitReader, BitWriter
+from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
 from ow174.game.link import ACK, KIND_FRAME, SYN
 from ow174.game.match import CARD_AGAIN_TICKS, CARD_RANK, CARD_ROLE, PLAYER_CARD, RANKED, UNRANKED, Match
@@ -236,7 +237,7 @@ class TeamListFrameTests(unittest.TestCase):
 
     def test_the_game_struct_gives_each_team_its_size(self):
         for game_map, sizes in ((PVP, [6, 6]), (PRACTICE_RANGE, [1, 0])):
-            match = Match(game_map)
+            match = Match(game_map, collision_provider=StaticCollisionProvider(flat_world(1.0)))
             viewer = match.add_player(1, "Alpha", 0, 0, False)
             teams = match.game_struct(viewer)["+0x0"]["+0x0"]["+0xC0"]
             self.assertEqual([team["+0x60"] for team in teams], [0, 1])
@@ -258,7 +259,7 @@ class Recorder:
 
 class ShowPlayersTests(unittest.TestCase):
     def test_new_players_come_a_few_per_tick_and_their_frames_a_tick_later(self):
-        match = Match(PVP)
+        match = Match(PVP, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         players = [match.add_player(number, f"P{number}", 0, number % 2, False) for number in range(1, 6)]
         for player in players:
             player.client, player.spawned = Recorder(), True
@@ -281,7 +282,7 @@ class ShowPlayersTests(unittest.TestCase):
     def test_each_card_goes_once_more_later_within_the_cards_per_tick(self):
         # A second card makes the client fill the team list again (event 0x47), once the portrait
         # frames the creates named have loaded. They share the new players' limit per tick.
-        match = Match(PVP)
+        match = Match(PVP, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         players = [match.add_player(number, f"P{number}", 0, number % 2, False) for number in range(1, 6)]
         for player in players:
             player.client, player.spawned = Recorder(), True
@@ -309,6 +310,10 @@ class ShowPlayersTests(unittest.TestCase):
 
 class TeamListServerTests(unittest.TestCase):
     def setUp(self):
+        collision = mock.patch("ow174.game.match.default_collision_provider",
+                               return_value=StaticCollisionProvider(flat_world(1.0)))
+        collision.start()
+        self.addCleanup(collision.stop)
         self.server = GameServer("127.0.0.1", 0)
         self.server.start()
         self.addCleanup(self.server.stop)

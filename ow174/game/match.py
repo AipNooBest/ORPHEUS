@@ -30,7 +30,15 @@ import math
 from copy import deepcopy
 
 from ow174.game import bodytrace, bots, combat, correction, heroselect, movelog, notices, pools, stats, world
-from ow174.game.collision import MOVER, TEAM0, TEAM1, world_when_ready
+from ow174.game.collision import (
+    MOVER,
+    TEAM0,
+    TEAM1,
+    CollisionProvider,
+    LoadState,
+    World,
+    default_collision_provider,
+)
 from ow174.game.commands import Command, CommandQueue
 from ow174.game.content import SOLDIER, GameMap, Hero, heroes, spawn_point
 from ow174.game.environment import ExecutionEnvironment, SystemEnvironment
@@ -261,9 +269,10 @@ class Player:
 
     def take_commands(self, commands: list[Command]) -> None:
         """Move the server's copy of the body. Without a body the client moves nothing either."""
+        collision = self.match.collision_world
+        if collision is None:
+            return
         seconds = self.quanta / 1e6
-        game_map = self.match.game_map
-        collision = world_when_ready(game_map.map_guid, game_map.name, game_map.mode_guid)
         self.mover.use(mover_data(self.hero.body), collision)
         fresh = self.commands.new(commands)
         if movelog.ENABLED:
@@ -289,11 +298,11 @@ class Player:
         self.mover = self.new_mover()
 
     def new_mover(self) -> Mover:
-        """The body's mover at the spawn point, on the map's collision (a flat floor while that loads),
-        with the hero's values. It collides as its client's does: with what stops its own team's physics
+        """The body's mover at the spawn point, with the hero's values and the match's pinned collision.
+        It cannot run before collision is ready. It uses what stops its own team's physics
         proxy (some props stop one team only, as on Blizzard World), both in a free-for-all."""
         game_map = self.match.game_map
-        world = world_when_ready(game_map.map_guid, game_map.name, game_map.mode_guid)
+        world = self.match.collision_world
         category = MOVER
         if not game_map.free_for_all and self.team in (0, 1):
             category = (TEAM0, TEAM1)[self.team]
@@ -324,6 +333,7 @@ class Match:
         card: int = 0,
         *,
         environment: ExecutionEnvironment | None = None,
+        collision_provider: CollisionProvider | None = None,
     ) -> None:
         self.environment = SystemEnvironment() if environment is None else environment
         self.id = (
@@ -347,6 +357,39 @@ class Match:
         self.bots_shown: dict[int, int] = {}  # player slot -> the tick the bots' creates went to its queue
         self.notices = notices.Notices(self)  # joined / left / hero switch lines in the clients' chat
         self.combat = combat.Combat(self)  # hits, health, deaths, respawns (combat.py)
+        self.collision_provider = (
+            default_collision_provider() if collision_provider is None else collision_provider
+        )
+        self.collision_state = LoadState("pending")
+        self.collision_world: World | None = None
+        self._collision_failed = False
+        self._refresh_collision()
+
+    def _refresh_collision(self) -> bool:
+        """Observe asynchronous completion at a match boundary, then keep the World for this match."""
+        if self.collision_state.status == "pending":
+            game_map = self.game_map
+            self.collision_state = self.collision_provider.poll(
+                game_map.map_guid, game_map.name, game_map.mode_guid
+            )
+            if self.collision_state.status == "ready":
+                self.collision_world = self.collision_state.world
+                for player in self.players:
+                    player.mover.use(world=self.collision_world)
+        return self.collision_world is not None
+
+    def _collision_failure(self, now: float) -> None:
+        if self._collision_failed:
+            return
+        self._collision_failed = True
+        reason = f"collision unavailable: {self.collision_state.error}"
+        log.error("[game] %s: %s", self.label(), reason)
+        for player in self.players:
+            if not player.gone:
+                if player.client is not None:
+                    player.client.go_home(now)
+                self.leave(player, reason)
+        self.ended = True
 
     def add_player(
         self,
@@ -701,12 +744,15 @@ class Match:
         """Run the spawn steps of players who loaded, keep their statescript acked, walk the training
         bots, and show new players and bodies to the others."""
         self.tick = tick
-        if self.bots:
-            game_map = self.game_map
-            collision = world_when_ready(game_map.map_guid, game_map.name, game_map.mode_guid)
+        ready = self._refresh_collision()
+        if self.collision_state.status == "unavailable":
+            self._collision_failure(now)
+            return
+        if ready and self.bots:
             for bot in self.bots:
-                bot.step(tick, RETAIL_QUANTA / 1e6, collision)
-        self.combat.update(now, tick, frames=sends(tick))
+                bot.step(tick, RETAIL_QUANTA / 1e6, self.collision_world)
+        if ready:
+            self.combat.update(now, tick, frames=sends(tick))
         if self.assemble_ends is not None and not self.assembled and now >= self.assemble_ends:
             self._end_assemble(now)
         for player in self.players:
@@ -742,7 +788,7 @@ class Match:
         if player.steps_done == 1 and waited >= SEND_GAME:
             client.queue_reliable(20301, {"+0x78": self.game_struct(player)})
             player.steps_done = 2
-        if player.steps_done == 2 and waited >= SEND_WORLD:
+        if player.steps_done == 2 and waited >= SEND_WORLD and self.collision_world is not None:
             client.queue_entities(self.spawn_updates(player))
             player.steps_done = 3
             player.spawned = True
@@ -991,6 +1037,7 @@ class Match:
             "id": self.label(),
             "map": self.game_map.name,
             "started": self.started,
+            "collision": {"state": self.collision_state.status, "error": self.collision_state.error},
             "players": [
                 {
                     "name": player.name,

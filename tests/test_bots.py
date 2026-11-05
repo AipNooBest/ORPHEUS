@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from test_game_world import read_record
 
 from ow174.game import bots, world
+from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.content import PRACTICE_RANGE, SOLDIER
 from ow174.game.match import BOT_RECORD_DELAY, Match, _rotation
 from ow174.game.world import NO_INPUT, OP_CREATE
@@ -345,7 +346,7 @@ class FloorTests(unittest.TestCase):
 
 class MatchTests(unittest.TestCase):
     def setUp(self):
-        self.match = Match(PRACTICE_RANGE)
+        self.match = Match(PRACTICE_RANGE, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         self.player = self.match.add_player(1, "Alpha", SOLDIER, 0, False)
         self.ids = {bot.entity for bot in self.match.bots}
 

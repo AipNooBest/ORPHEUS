@@ -14,6 +14,7 @@ from ow174.game import match as match_module
 from ow174.game import messages
 from ow174.game import server as server_module
 from ow174.game.bits import BitReader, BitWriter
+from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.content import PRACTICE_RANGE, Spawn
 from ow174.game.link import ACK, KIND_FRAME, SYN, LinkCipher, Packet
 from ow174.game.match import Match
@@ -85,6 +86,10 @@ class PretendGame:
 
 class GameServerTests(unittest.TestCase):
     def setUp(self):
+        collision = mock.patch.object(match_module, "default_collision_provider",
+                                      return_value=StaticCollisionProvider(flat_world(1.0)))
+        collision.start()
+        self.addCleanup(collision.stop)
         self.left = []
         self.server = GameServer("127.0.0.1", 0, on_leave=self.left.append)
         self.server.start()

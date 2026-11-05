@@ -14,6 +14,7 @@ from test_game_team_list import read_create
 
 from ow174.game import heroselect, stats, world
 from ow174.game.bits import BitReader
+from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
 from ow174.game.match import Match
 from ow174.game.script import expr
@@ -147,7 +148,7 @@ class StatsComponentTests(unittest.TestCase):
 
 class BoardInMatchTests(unittest.TestCase):
     def setUp(self):
-        self.match = Match(PVP)
+        self.match = Match(PVP, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         self.alpha = self.match.add_player(1, "Alpha", 0, 0, False)
         self.beta = self.match.add_player(2, "Beta", 0, 0, False)
         self.gamma = self.match.add_player(3, "Gamma", 0, 1, False)
@@ -193,7 +194,7 @@ class BoardInMatchTests(unittest.TestCase):
 
 class PossessionTests(unittest.TestCase):
     def setUp(self):
-        self.match = Match(PVP)
+        self.match = Match(PVP, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         self.alpha = self.match.add_player(1, "Alpha", 0, 0, False)
         self.gamma = self.match.add_player(3, "Gamma", 0, 1, False)
         for player in (self.alpha, self.gamma):
@@ -250,7 +251,7 @@ class HeroInfoTests(unittest.TestCase):
         self.assertNotIn(heroselect.CURRENT_HERO, read_chunk(made.getvalue(), made.count).entity_vars)
 
     def test_the_match_sends_the_hero_after_a_pick_that_kept_the_screen(self):
-        match = Match(PVP)
+        match = Match(PVP, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         alpha = match.add_player(1, "Alpha", 0, 0, False)
         into_world(match, alpha, 100)
         match.assemble_ends = 1000.0  # assembling: the pick leaves the screen open, no controller frame

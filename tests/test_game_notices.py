@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ow174.game import heroselect, messages, notices, world
 from ow174.game.bits import BitReader, BitWriter
+from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
 from ow174.game.match import Match, ShownController
 from ow174.game.notices import PLAYER_CARD, Switch, card_message, joined_message, left_message
@@ -133,7 +134,7 @@ class JoinedAndLeftTests(unittest.TestCase):
         self.assertEqual(through_the_link(PLAYER_CARD, joined_message(tag))["+0x80"]["+0x40"], "Beta#1002")
 
     def test_a_player_who_comes_later_joins_the_game(self):
-        match = Match(SWITCH_MAP)
+        match = Match(SWITCH_MAP, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         alpha = match.add_player(1, "Alpha", 0, 0, False, card(1, "Alpha#1001"))
         beta = match.add_player(2, "Beta", 0, 1, False, card(2, "Beta#1002"))
         into_world(match, alpha, 100)
@@ -146,7 +147,7 @@ class JoinedAndLeftTests(unittest.TestCase):
         self.assertNotIn((PLAYER_CARD, joined_message(alpha.card)), beta.client.reliable)
 
     def test_players_who_come_in_the_same_tick_join_quietly(self):
-        match = Match(SWITCH_MAP)
+        match = Match(SWITCH_MAP, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         alpha = match.add_player(1, "Alpha", 0, 0, False)
         beta = match.add_player(2, "Beta", 0, 1, False)
         into_world(match, alpha, 100)
@@ -154,7 +155,7 @@ class JoinedAndLeftTests(unittest.TestCase):
         self.assertEqual(match.notices.card(alpha, beta), card_message(beta.card))
 
     def test_a_player_who_leaves_left_the_game_for_those_who_saw_him(self):
-        match = Match(SWITCH_MAP)
+        match = Match(SWITCH_MAP, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         alpha = match.add_player(1, "Alpha", 0, 0, False)
         beta = match.add_player(2, "Beta", 0, 1, False)
         gamma = match.add_player(3, "Gamma", 0, 1, False)
@@ -166,7 +167,7 @@ class JoinedAndLeftTests(unittest.TestCase):
         self.assertEqual(gamma.client.reliable, [])  # his client never had Beta
 
     def test_a_game_that_never_came_gets_no_line(self):
-        match = Match(SWITCH_MAP)
+        match = Match(SWITCH_MAP, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         alpha = match.add_player(1, "Alpha", 0, 0, False)
         beta = match.add_player(2, "Beta", 0, 1, False)
         into_world(match, alpha, 100)
@@ -191,7 +192,7 @@ class BattleTagTests(unittest.TestCase):
         self.assertEqual(out.count, 2 + 3 + 32 + 16)  # 3 bits pad to the payload's byte (3 + 2 + 3 = 8)
 
     def test_the_player_entity_carries_the_battletag(self):
-        match = Match(SWITCH_MAP)
+        match = Match(SWITCH_MAP, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         alpha = match.add_player(1, "Alpha", 0, 0, False, card(1, "Alpha#1001"))
         nameless = match.add_player(2, "Beta", 0, 0, False)
         self.assertEqual(match._player_info(alpha)[1], "Alpha#1001")
@@ -245,7 +246,7 @@ class SwitchGraphTests(unittest.TestCase):
 
 class SwitchTests(unittest.TestCase):
     def setUp(self):
-        self.match = Match(SWITCH_MAP)
+        self.match = Match(SWITCH_MAP, collision_provider=StaticCollisionProvider(flat_world(1.0)))
         self.alpha = self.match.add_player(1, "Alpha", 0, 0, False)
         self.beta = self.match.add_player(2, "Beta", 0, 0, False)
         self.gamma = self.match.add_player(3, "Gamma", 0, 1, False)
@@ -361,7 +362,7 @@ class SwitchTests(unittest.TestCase):
 
     def test_no_switch_line_without_0c90s_notice(self):
         for game_map in (PRACTICE_RANGE, FREE_FOR_ALL):
-            match = Match(game_map)
+            match = Match(game_map, collision_provider=StaticCollisionProvider(flat_world(1.0)))
             alpha = match.add_player(1, "Alpha", 0, 0, False)
             beta = match.add_player(2, "Beta", 0, 0, False)
             for player in (alpha, beta):
