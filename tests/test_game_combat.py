@@ -29,6 +29,8 @@ KANEZAKA_DM = PRACTICE_RANGE.__class__(**{**PRACTICE_RANGE.__dict__, "mode_guid"
 
 
 class FakeClient:
+    controller_ready = True
+
     def __init__(self, player=None) -> None:
         self.player = player
         self.reliable: list = []

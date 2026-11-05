@@ -26,7 +26,7 @@ from ow174.game.world import OP_CREATE, OP_DESTROY, EntityUpdate, Movement
 
 def client() -> Client:
     server = SimpleNamespace(environment=SystemEnvironment())
-    player = SimpleNamespace(name="Test", match=SimpleNamespace(bots=[], players=[]))
+    player = SimpleNamespace(name="Test", entity=0xA0000100, match=SimpleNamespace(bots=[], players=[]))
     return Client(server, ("127.0.0.1", 1), 1, None, player)
 
 
@@ -113,6 +113,21 @@ class FrozenCreateTests(unittest.TestCase):
 
 
 class ReliableLifecycleTests(unittest.TestCase):
+    def test_old_controller_create_ack_does_not_unlock_its_replacement(self):
+        connection = client()
+        controller = connection.player.entity
+        old, current = record(controller, OP_CREATE), record(controller, OP_CREATE)
+        connection.queue_entities([old])
+        sent(connection, 0, [old])
+        connection.queue_entities([current])
+        connection.acked(1, 1)
+        self.assertFalse(connection.controller_ready)
+        sent(connection, 1, [current])
+        connection.acked(2, 1)
+        self.assertTrue(connection.controller_ready)
+        connection.queue_entities([record(controller, OP_DESTROY)])
+        self.assertFalse(connection.controller_ready)
+
     def test_record_objects_shared_by_clients_keep_independent_delivery_generations(self):
         first, second = client(), client()
         first.queue_entities([record(42, OP_CREATE)])

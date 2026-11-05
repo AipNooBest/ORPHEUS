@@ -20,13 +20,13 @@ from test_game_projectiles import read_shot
 from test_game_world import read_movement
 from test_script_driver import ClientModel, server_on
 
-from ow174.game import messages, world
+from ow174.game import heroselect, messages, world
 from ow174.game.bits import BitReader, BitWriter
 from ow174.game.collision import StaticCollisionProvider, flat_world
 from ow174.game.content import PRACTICE_RANGE, SOLDIER
 from ow174.game.link import ACK, FIN, KIND_FRAME, SYN, Packet, ReceiveWindow, peek_connection
-from ow174.game.match import SEND_EVERY, SEND_WORLD
-from ow174.game.script import decode
+from ow174.game.match import SEND_CONTROLLER, SEND_EVERY, SEND_WORLD
+from ow174.game.script import decode, expr
 from ow174.game.server import PING, GameServer
 from ow174.game.world import OP_CREATE, OP_DESTROY, EntityUpdate
 
@@ -383,6 +383,103 @@ class RepeatedLifecycleTests(unittest.TestCase):
         self.run.until(lambda: player.steps_done == 4 and player.entity in link.fields)
         self.assertIn(world.GAME_MODE_ENTITY, link.fields)
 
+    @staticmethod
+    def own_controller_chunks(link, player):
+        return [
+            (seq, item.chunk)
+            for seq, item in link.records
+            if item.entity == player.entity and item.chunk is not None
+        ]
+
+    def assert_open_controller_full(self, chunk, hero=None):
+        frame = decode.read_chunk(chunk.getvalue(), chunk.count)
+        self.assertTrue(frame.full and frame.owner)
+        self.assertEqual((frame.first, frame.last), (0, 1))
+        self.assertEqual([instance.graph for instance in frame.instances.values()],
+                         [0x13C1, 0x288A, 0x288B, 0x20E4, 0x288D])
+        self.assertEqual(frame.entity_vars[heroselect.OPEN_SELECT], (True, ()))
+        self.assertEqual(frame.entity_vars[heroselect.SELECT_SHOWN], (True, ()))
+        if hero is not None:
+            self.assertEqual(frame.entity_vars[heroselect.CURRENT_HERO], (expr.Asset(hero), ()))
+
+    def hold_own_controller_create_ack(self):
+        link, player = self.start_loading()
+        # With ownership ACK delayed, the world and controller time thresholds are both already due.
+        self.run.until(lambda: self.run.now - player.loaded_at > SEND_CONTROLLER + SEND_EVERY * 0.016,
+                       ack_except=(link,))
+        self.assertIn(20302, link.messages)
+        self.run.send(link)
+        apply = link.apply
+        dropped, unrelated, early_chunks, early_boards = [], [], [], []
+
+        def lose_controller_create(packet):
+            if packet.kind == KIND_FRAME:
+                _, records = wire_frame(packet)
+                own = [(item, fields) for item, fields in records if item.entity == player.entity]
+                early_chunks.extend(packet.seq for item, _ in own if item.chunk is not None)
+                early_boards.extend(
+                    packet.seq for item, fields in own if item.op != OP_CREATE and 64 in fields
+                )
+                if any(item.op == OP_CREATE for item, _ in own):
+                    dropped.append(packet.seq)
+                    return
+                if dropped and any(item.op == OP_CREATE for item, _ in records):
+                    unrelated.append(packet.seq)
+            apply(packet)
+
+        with patch.object(link, "apply", side_effect=lose_controller_create):
+            self.run.until(lambda: unrelated)
+        self.assertIn(unrelated[0], {packet.seq for packet in link.got})
+        self.assertNotIn(unrelated[0], player.client.in_flight)  # this world datagram was positively ACKed
+        self.assertEqual(early_chunks, [])
+        self.assertEqual(early_boards, [])
+
+        def own_create():
+            return any(item.entity == player.entity and item.op == OP_CREATE for _, item in link.records)
+
+        self.assertFalse(own_create())
+        unrelated_ack = link.window.expected, link.window.bits
+        self.run.until(own_create, ack_except=(link,))
+        return link, player, unrelated_ack
+
+    def test_controller_full_waits_for_its_own_create_ack_after_other_world_packets(self):
+        link, player, _ = self.hold_own_controller_create_ack()
+        self.run.step(SEND_EVERY, ack_except=(link,))
+        self.assertEqual(self.own_controller_chunks(link, player), [])
+        self.run.send(link)
+        self.run.until(lambda: self.own_controller_chunks(link, player))
+        (_, full), = self.own_controller_chunks(link, player)
+        self.assert_open_controller_full(full)
+        self.assertEqual(player.script.delivered, 1)
+
+    def test_early_hero_pick_keeps_latest_controller_and_possession_behind_own_create_ack(self):
+        link, player, unrelated_ack = self.hold_own_controller_create_ack()
+        last_before_pick = link.got[-1].seq
+        self.run.message(link, 21616, server_tests.pick(player.entity, SOLDIER), ack=unrelated_ack)
+        self.assertTrue(player.has_body)
+        self.assertFalse(player.select_open)
+        reopen = server_tests.pick(player.entity, SOLDIER)
+        reopen.update({"+0x80": b"\x01\x01" + bytes(8), "+0xA8": heroselect.OPEN_OR_CLOSE})
+        self.run.message(link, 21616, reopen, ack=unrelated_ack)
+        self.assertTrue(player.select_open)
+
+        self.run.step(2 * SEND_EVERY, ack_except=(link,))
+        for packet in link.got:
+            if packet.kind != KIND_FRAME or packet.seq <= last_before_pick:
+                continue
+            _, records = wire_frame(packet)
+            for item, fields in records:
+                if item.entity == player.entity and item.op != OP_CREATE:
+                    self.assertIsNone(item.chunk)
+                    self.assertFalse(fields.keys() & {44, 64, 75})
+
+        self.run.send(link)
+        self.run.until(lambda: self.own_controller_chunks(link, player) and 44 in link.fields[player.entity])
+        (_, full), = self.own_controller_chunks(link, player)
+        self.assert_open_controller_full(full, hero=SOLDIER)
+        self.assertEqual(link.fields[player.entity][44], {0: player.body, 1: player.body, 2: player.body})
+        self.assertEqual(link.fields[player.entity][75][0], SOLDIER)
+
     def test_healthy_ownership_keeps_world_timing_and_soldier_input(self):
         link, player = self.start_loading()
         self.run.until(lambda: player.entity in link.fields)
@@ -391,7 +488,17 @@ class RepeatedLifecycleTests(unittest.TestCase):
         elapsed = self.run.now - player.loaded_at
         self.assertGreaterEqual(elapsed, SEND_WORLD)
         self.assertLess(elapsed, SEND_WORLD + SEND_EVERY * 0.016)
-        self.run.until(lambda: player.steps_done == 4)
+        create_seq, = (
+            seq for seq, item in link.records if item.entity == player.entity and item.op == OP_CREATE
+        )
+        self.run.until(lambda: self.own_controller_chunks(link, player))
+        (controller_seq, full), = self.own_controller_chunks(link, player)
+        self.assertGreater(controller_seq, create_seq)
+        self.assert_open_controller_full(full)
+        elapsed = self.run.now - player.loaded_at
+        self.assertGreaterEqual(elapsed, SEND_CONTROLLER)
+        # Initial world entities can occupy the first eligible packet.
+        self.assertLess(elapsed, SEND_CONTROLLER + 2 * SEND_EVERY * 0.016)
 
         self.run.message(link, 21616, server_tests.pick(player.entity, SOLDIER))
         script = player.body_script

@@ -143,6 +143,8 @@ class Notices:
             if player.client is None:
                 del self.waiting[player.slot]
                 continue
+            if not player.client.controller_ready:
+                continue
             script = player.script
             if script.delivered < script.data_last or now < self.sent_at.get(player.slot, 0.0) + NOTICE_GAP:
                 continue

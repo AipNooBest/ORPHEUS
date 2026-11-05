@@ -183,6 +183,7 @@ class Client:
         self._player_body_reuse_after: dict[int, float | None] = {}  # None until destroy ACK
         self._pending_possessions: dict[int, tuple[int, world.EntityUpdate]] = {}
         self._confirmed_possessions: dict[int, int] = {}  # remote controller -> body named by its ACKed write
+        self._own_controller_acked = False
         self._mode_create_acked = False
         self._pending_mode_frame: BitWriter | None = None
         self._display_notices: deque[tuple[int | None, int, bytes]] = deque(maxlen=MAX_PENDING_COMBAT_NOTICES)
@@ -225,6 +226,11 @@ class Client:
         """The client can apply 20302 once the entire reliable prefix has arrived."""
         ordinal = self._ownership_ordinal
         return ordinal is not None and self._oldest_pending_reliable() > ordinal
+
+    @property
+    def controller_ready(self) -> bool:
+        """Whether this connection can receive updates for its own controller."""
+        return self._own_controller_acked and self.leaving_since is None
 
     def _queue_encoded_reliable(self, msg_id: int, payload: bytes) -> int:
         ordinal = self.next_reliable
@@ -486,7 +492,12 @@ class Client:
         self.queue_entities([update])
         return True
 
-    def _ack_body_create(self, entity: int) -> None:
+    def _ack_entity_create(self, entity: int) -> None:
+        if entity == self.player.entity and not self._own_controller_acked:
+            self._own_controller_acked = True
+            possession = self._pending_possessions.get(entity)
+            if possession is not None and self.controller_ready:
+                self.queue_entities([possession[1]])
         pending = self._combat_notices.get(entity)
         if pending is not None:
             self._combat_notices[entity] = None
@@ -601,7 +612,8 @@ class Client:
             del self._confirmed_possessions[update.entity]
             self._discard_display_notices(old)
         self._pending_possessions[update.entity] = (body, update)
-        self.queue_entities([update])
+        if update.entity != self.player.entity or self.controller_ready:
+            self.queue_entities([update])
 
     def queue_entities(self, updates: list) -> None:
         # A destroy retires all older records of this entity for this client, including
@@ -632,6 +644,8 @@ class Client:
                     generation += 1
                     alive = item.op == world.OP_CREATE
                     lifecycles[item.entity] = (generation, alive)
+                    if item.entity == self.player.entity:
+                        self._own_controller_acked = False
                     self._pending_possessions.pop(item.entity, None)
                     old = self._confirmed_possessions.pop(item.entity, None)
                     if old is not None:
@@ -796,7 +810,7 @@ class Client:
                                 self.queue_mode_frame(self._pending_mode_frame)
                                 self._pending_mode_frame = None
                         else:
-                            self._ack_body_create(item.entity)
+                            self._ack_entity_create(item.entity)
                     elif item.op == world.OP_DESTROY and item.entity in self._player_body_reuse_after:
                         # ACKs can arrive before the server catches up on missed simulation ticks.
                         now = self.server.environment.monotonic(callsite="client.body_destroy_ack")

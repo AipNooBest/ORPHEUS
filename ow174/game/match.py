@@ -8,9 +8,10 @@ How a player gets into the world:
   one frame creates the map's server-owned placeables (the loading screen only
   ends once they all exist), the player entity (000E.003, flags 0x3C) and the game mode entity
   (16B2.003).
-- Then the player's entity gets its controller's statescript (heroselect.py): the HUD and the hero
-  select screen. That frame puts the entity's statescript in owner mode, so small owner frames keep
-  telling the client which of its commands the server has (CmFD), else it replays old key presses.
+- Once its create is acknowledged, the player's entity gets its controller's statescript (heroselect.py)
+  for the HUD and the hero select screen. That frame puts the entity's statescript in owner mode,
+  so small owner frames keep telling the client which of its commands the server has (CmFD), else it
+  replays old key presses.
 - The hero's body comes with the pick, as in retail (OW2 traffic): the body with its movement state
   and an update of the player entity whose component 44 possesses it. A switch replaces the body
   under a new id in the same frame (the client ignores a destroyed id for 30 s).
@@ -684,7 +685,7 @@ class Match:
 
     def _send_board(self, player: Player, now: float) -> None:
         """The board numbers again when they changed, at most every STATS_EVERY seconds."""
-        if now < player.next_stats:
+        if not player.client.controller_ready or now < player.next_stats:
             return
         values = self._board(player)
         if values == player.stats_sent:
@@ -911,6 +912,8 @@ class Match:
             player.steps_done = 4
             self.send_controller(player)
             self.combat.spawned(player)
+        elif player.steps_done == 4 and not player.script.data_last:
+            self.send_controller(player)  # the initial frame may be waiting for the create ACK
 
     # --- assembling heroes ---------------------------------------------------------------------
 
@@ -948,7 +951,7 @@ class Match:
         """A full frame of the controller's statescript, with hero select open or closed. The skin
         selector shows in the PvP modes while heroes are assembled, in the Practice Range whenever
         the screen is open."""
-        if player.client is None:
+        if player.client is None or not player.client.controller_ready:
             return
         cmfd = player.script.next_cmfd(self._newest_frame(player))
         practice = self.controller is heroselect.PRACTICE

@@ -59,6 +59,8 @@ def card(number: int, tag: str) -> dict:
 
 
 class FakeClient:
+    controller_ready = True
+
     def __init__(self, player) -> None:
         self.player = player
         self.reliable: list[tuple[int, dict]] = []
@@ -288,6 +290,28 @@ class SwitchTests(unittest.TestCase):
             (values,) = controller_vars(player)
             self.assertEqual({var: values[var] for var in (OLD, NEW, WHO)}, expected)
         self.assertEqual(controller_vars(self.gamma), [])  # an enemy
+
+    def test_switch_notice_waits_for_the_local_controller_and_its_initial_frame(self):
+        alpha = self.alpha
+        alpha.client.controller_ready = False
+        self.switch(self.beta, REAPER, 10.0)
+        self.switch(self.beta, SOLDIER, 11.0)
+        self.assertEqual(controller_vars(alpha), [])
+        self.assertEqual(len(self.match.notices.waiting[alpha.slot]), 1)
+        self.assertNotIn(alpha.slot, self.match.notices.sent_at)
+
+        alpha.client.controller_ready = True
+        self.match.send_controller(alpha)
+        self.match.notices.update(12.0)
+        plain, = controller_vars(alpha)
+        self.assertNotIn(NEW, plain)
+        self.assertEqual(len(self.match.notices.waiting[alpha.slot]), 1)
+
+        alpha.script.arrived(alpha.script.data_last)
+        self.match.notices.update(13.0)
+        _, notice = controller_vars(alpha)
+        self.assertEqual((notice[OLD], notice[NEW]), (expr.Asset(REAPER), expr.Asset(SOLDIER)))
+        self.assertFalse(self.match.notices.waiting[alpha.slot])
 
     def test_later_controller_frames_leave_it_out(self):
         # Sent again, the client's clearing of a full frame would make the Watch post the line again.
