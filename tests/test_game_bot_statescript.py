@@ -24,6 +24,7 @@ PULSER = "STU_B9898052"
 PULSE_KEY = (1, 0)
 LIVE_VAR = 32
 FEED_GRAPH, FEED_STATE, FEED_KILLER = 0x0C18, 8, 392
+NAMEPLATE, DEATH_VOICE, BOT_WEAPON = 0x0D24, 0x0C17, 0x0BA3
 
 
 class AIFireWeaponTests(unittest.TestCase):
@@ -254,6 +255,34 @@ class TimedScript(SyntheticScript):
         return result
 
 
+class NameplateScript(TimedScript):
+    """Target-build H=0 graph/state identities in a small portable transport fixture."""
+
+    def __init__(self, definitions, killer):
+        self.definitions, self.killer = definitions, killer
+        super().__init__(definitions[1], (6,))
+
+    def graphs(self):
+        return self.definitions
+
+    def snapshot(self, count, tick=0, live=None):
+        snapshot = Snapshot(tick, instances={
+            1: (FEED_GRAPH, None), 2: (DEATH_VOICE, None), 3: (BOT_WEAPON, None), 4: (NAMEPLATE, (1, 3)),
+        })
+        snapshot.vars[(4, 14680)] = (False, ())
+        snapshot.states[(4, 76)] = ("STU_9D7BF987", True, ())
+        snapshot.states[(3, 13)] = (
+            "STUStatescriptStateWeaponVolley", True, (("counter", int(live or 1)),),
+        )
+        if count:
+            snapshot.vars[(1, FEED_KILLER)] = (expr.Entity(self.killer), ())
+            snapshot.vars[(1, 1821)] = (True, ())
+            snapshot.states[(1, FEED_STATE)] = (PULSER, True, (("count", 1), ("fresh", True)))
+        if count > 1:
+            snapshot.states[(2, 16)] = (PULSER, True, (("count", 1), ("fresh", True)))
+        return snapshot
+
+
 class WirePeer:
     def __init__(self, client, cipher):
         self.client, self.cipher = client, cipher
@@ -476,6 +505,203 @@ class BotStatescriptTests(unittest.TestCase):
         self.match.combat._damage(self.shooter, target, 200, False, None, self.tick)
         self.match.combat._send_health()
         self.assertEqual(self.bot.body_script.death_frame, self.tick)
+
+    def install_nameplate_bots(self):
+        def remote_graph(index, state, kind, variables=()):
+            return make_graph(index, [node(0, kind, state=state, remote=0)],
+                              states=[None] * state + [0], remote=[0], variables=variables)
+
+        definitions = {
+            1: make_graph(FEED_GRAPH, [
+                node(0, "STU_37D754C8", state=3), node(1, PULSER, state=FEED_STATE, remote=0),
+            ], states=[None] * 3 + [0] + [None] * 4 + [1], remote=[1],
+                variables=((FEED_KILLER, 0, 1), (1821, 0, 1))),
+            2: remote_graph(DEATH_VOICE, 16, PULSER),
+            3: remote_graph(BOT_WEAPON, 13, "STUStatescriptStateWeaponVolley"),
+            4: remote_graph(NAMEPLATE, 76, "STU_9D7BF987", ((14680, 0, 1),)),
+        }
+        by_index = {definition.index: definition for definition in definitions.values()}
+        native_graph = decode.graph_of
+        graphs = patch.object(decode, "graph_of", lambda index: by_index.get(index) or native_graph(index))
+        graphs.start()
+        self.addCleanup(graphs.stop)
+        self.bot.spawner["hero"] = "0x02E000000000016B"
+        self.bot.hero = int(self.bot.spawner["hero"], 16)
+        living = bots.respawned(self.bot, self.bot.entity + 1, self.tick)
+        self.match.combat.next_bot = living.entity + 1
+        self.match.bots.append(living)
+        for bot in self.match.bots:
+            bot.body_script = NameplateScript(definitions, self.shooter.body)
+
+        for peer in (self.watching_peer, self.shooting_peer):
+            client = peer.client
+            client._mode_create_acked = False
+            client.player.mode_script.delivered = 0
+            client.queue_entities([
+                world.EntityUpdate(world.GAME_MODE_ENTITY, world.OP_CREATE, self.match._game_mode_create),
+            ])
+            self.show_bots(peer)
+            _, _, creates = self.send(peer)
+            self.assertEqual(set(self.entities(creates, world.OP_CREATE)),
+                             {self.bot.entity, living.entity, world.GAME_MODE_ENTITY})
+            peer.ack()
+            _, _, records = self.send(peer)
+            for bot in self.match.bots:
+                frame = self.bot_frame(peer, records, bot.entity)
+                self.assertTrue(frame.full)
+                self.assertFalse(frame.owner)
+                self.assertEqual(frame.instances[3].states[13][1]["counter"], 1)
+                self.assertNotIn(NAMEPLATE, {item.graph for item in frame.instances.values()})
+            peer.ack()
+        return living
+
+    def bot_frame(self, peer, records, entity):
+        chunk = self.only_chunk(records, entity)
+        return decode.read_chunk(chunk.getvalue(), chunk.count, peer.models[entity].graphs)
+
+    def assert_nameplate_child(self, frame):
+        child, = (item for item in frame.instances.values() if item.graph == NAMEPLATE and item.descriptor)
+        self.assertEqual(child.parent, (1, 3))
+        self.assertEqual(child.vars[14680], (False, ()))
+        self.assertEqual(child.states[76], (True, {}))
+
+    def test_nameplate_waits_for_each_mode_ack_without_delaying_damage_or_death_frames(self):
+        living = self.install_nameplate_bots()
+        victim = self.bot.entity
+        self.show_shooter_identity()
+        watcher, shooter = self.watching_peer, self.shooting_peer
+        for peer in (watcher, shooter):
+            peer.client.queue_mode_frame(combat.mode_frame({}))
+        _, _, ready = self.send(watcher)
+        mode = self.only_chunk(ready, world.GAME_MODE_ENTITY)
+        self.assertEqual(decode.read_chunk(mode.getvalue(), mode.count).instances[1].graph, combat.MODE_UI)
+        self.assertEqual(self.chunks(ready, victim) + self.chunks(ready, living.entity), [])
+        watcher.ack()
+        _, _, dropped = self.send(shooter, receive=False)
+        lost_mode = self.only_chunk(dropped, world.GAME_MODE_ENTITY)
+        self.assertEqual(self.chunks(dropped, victim) + self.chunks(dropped, living.entity), [])
+
+        self.advance_combat(10.0, self.tick)
+        target = next(target for target in self.match.combat._targets() if target.owner is self.bot)
+        death_tick = self.tick
+        self.match.combat._damage(self.shooter, target, 200, True, None, death_tick)
+        self.match.combat._send_health()
+        for peer in (watcher, shooter):
+            _, reliable, death = self.send(peer)
+            self.assert_terminal_health(death)
+            frame = self.bot_frame(peer, death, victim)
+            self.assertEqual(frame.last, 2, "nameplate must not consume the first post-baseline death slot")
+            self.assertEqual(frame.instances[1].vars[FEED_KILLER], (expr.Entity(self.shooter.body), ()))
+            self.assertEqual(frame.instances[1].vars[1821], (True, ()))
+            if peer is watcher:
+                self.assert_nameplate_child(frame)
+                self.assert_nameplate_child(self.bot_frame(peer, death, living.entity))
+                self.assertEqual(watcher.feed_pulses, [(victim, 2, 1)])
+            else:
+                self.assertNotIn(NAMEPLATE, peer.models[victim].graphs.values())
+                self.assertEqual(self.chunks(death, living.entity), [])
+                self.assertEqual(shooter.feed_pulses, [])
+                hit, = (value for _, number, value in reliable if number == combat.HIT)
+                self.assertEqual(hit["+0x78"], {
+                    "+0x0": {"+0x0": self.bot.entity}, "+0x4": 200, "+0x8": combat.CRITICAL | combat.KILLING,
+                })
+                self.assertEqual(hit["+0x84"], death_tick)
+                self.assertNotIn(combat.KILL_NOTICE, [number for _, number, _ in reliable])
+            peer.ack()
+
+        self.advance_combat(10.0 + 6 * combat.TICK, death_tick + 6)
+        _, _, voiced = self.send(shooter)
+        self.assert_same_chunk(lost_mode, self.only_chunk(voiced, world.GAME_MODE_ENTITY))
+        frame = self.bot_frame(shooter, voiced, victim)
+        self.assertEqual(frame.instances[2].states[16], (True, {"fresh": True, "count": 1}))
+        self.assertNotIn(NAMEPLATE, shooter.models[victim].graphs.values())
+        self.assertEqual(self.chunks(voiced, living.entity), [])
+        shooter.ack()
+        _, reliable, named = self.send(shooter)
+        self.assert_nameplate_child(self.bot_frame(shooter, named, living.entity))
+        self.assertNotIn(NAMEPLATE, shooter.models[victim].graphs.values())
+        self.assertEqual(shooter.feed_pulses, [(victim, 4, 1)])
+        self.assertIn(combat.KILL_NOTICE, [number for _, number, _ in reliable])
+        shooter.ack()
+        _, _, settled = self.send(shooter)
+        self.assertEqual(self.chunks(settled, victim), [])
+        self.assertEqual(self.chunks(settled, living.entity), [])
+
+        self.tick = self.match.tick = death_tick + 32  # past the pulse's 500 ms freshness window
+        aged = self.bot.body_script.delta(2, self.tick)
+        aged.states[(2, 16)] = (PULSER, True, (("count", 1), ("fresh", False)))
+        shooter.client.queue_bot_death_update(victim, aged)
+        _, _, terminal = self.send(shooter)
+        frame = self.bot_frame(shooter, terminal, victim)
+        self.assertEqual(frame.instances[2].states[16], (True, {"fresh": False, "count": 1}))
+        self.assertNotIn(NAMEPLATE, shooter.models[victim].graphs.values())
+        self.assertEqual(shooter.feed_pulses, [(victim, 4, 1)])
+
+    def test_lost_nameplate_only_chunk_does_not_block_the_next_terminal_snapshot(self):
+        self.install_nameplate_bots()
+        shooter, victim = self.shooting_peer, self.bot.entity
+        shooter.client.queue_mode_frame(combat.mode_frame({}))
+        _, _, mode = self.send(shooter)
+        self.only_chunk(mode, world.GAME_MODE_ENTITY)
+        shooter.ack()
+        old_packet, _, old_records = self.send(shooter, receive=False)
+        child_only = self.bot_frame(shooter, old_records, victim)
+        self.assertEqual((child_only.first, child_only.last), (2, 2))
+        self.assert_nameplate_child(child_only)
+        self.assertNotIn(NAMEPLATE, shooter.models[victim].graphs.values())
+
+        self.advance_combat(10.0, self.tick)
+        target = next(target for target in self.match.combat._targets() if target.owner is self.bot)
+        self.match.combat._damage(self.shooter, target, 200, True, None, self.tick)
+        self.match.combat._send_health()
+        _, _, terminal = self.send(shooter)
+        self.assert_terminal_health(terminal)
+        self.assertEqual(
+            [
+                (51 in fields, record.chunk is not None)
+                for record, fields in terminal
+                if record.entity == victim and (51 in fields or record.chunk is not None)
+            ],
+            [(True, False), (False, True)],
+        )
+        frame = self.bot_frame(shooter, terminal, victim)
+        self.assertEqual((frame.first, frame.last), (2, 3))
+        self.assert_nameplate_child(frame)
+        self.assertEqual(frame.instances[1].vars[FEED_KILLER], (expr.Entity(self.shooter.body), ()))
+        self.assertEqual(frame.instances[1].vars[1821], (True, ()))
+        self.assertEqual(shooter.feed_pulses, [(victim, 3, 1)])
+        shooter.ack()
+
+        shooter.receive(old_packet, old_records)
+        shooter.ack()
+        _, _, settled = self.send(shooter)
+        self.assertEqual(self.chunks(settled, victim), [])
+        self.assertEqual(shooter.models[victim].applied, 3)
+        self.assertEqual(shooter.models[victim].records[4], (NAMEPLATE, (1, 3)))
+        self.assertEqual(shooter.feed_pulses, [(victim, 3, 1)])
+
+    def test_unacked_nameplate_alone_does_not_hold_bot_destroy(self):
+        self.install_nameplate_bots()
+        shooter, old = self.shooting_peer, self.bot.entity
+        shooter.client.queue_mode_frame(combat.mode_frame({}))
+        _, _, mode = self.send(shooter)
+        self.only_chunk(mode, world.GAME_MODE_ENTITY)
+        shooter.ack()
+        _, _, pending = self.send(shooter)
+        self.assert_nameplate_child(self.bot_frame(shooter, pending, old))
+
+        fresh = self.respawn()
+        _, _, retired = self.send(shooter)
+        self.assertIn(old, self.entities(retired, world.OP_DESTROY))
+        self.assertIn(fresh, self.entities(retired, world.OP_CREATE))
+        self.assertEqual(self.chunks(retired, old), [])
+        shooter.ack()  # positively ACK the old presenter only after the destroy arrived
+
+        _, _, settled = self.send(shooter)
+        self.assertEqual(self.chunks(settled, old), [])
+        self.assertNotIn(old, shooter.models)
+        self.assertIsNone(shooter.client.bot_stream(old))
+        self.assert_pulse(self.only_chunk(settled, fresh), first=0, last=1, count=0)
 
     def assert_terminal_health(self, records):
         values = [

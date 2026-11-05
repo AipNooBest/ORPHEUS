@@ -9,9 +9,20 @@ from ow174.game.script.driver import OWNER_HEALTH, ReplicatedBody, Snapshot, cre
 DIED = 0x024000000000003E  # 003E.025, the body's authoritative death message
 RESET = 0x0240000000000013  # 0013.025, the placement's eligibility reset
 FIRING_GRAPH = FIRING & 0xFFFF
+PRACTICE_NAMEPLATE = 0x0D24
 PRACTICE_NAMEPLATE_PARENT = 0x0C18
 PRACTICE_BOT_HEROES = frozenset(range(0x02E000000000016B, 0x02E000000000016F))
 PRACTICE_NAMEPLATE_FILTER = {"$": "STUConfigVarFilter", "m_84065FD1": 0x3FFFFFFF, "m_4EA686DB": 0x100}
+
+
+def practice_nameplate(snapshot: Snapshot) -> int | None:
+    for instance, (graph_id, parent) in snapshot.instances.items():
+        if (
+            graph_id == PRACTICE_NAMEPLATE and parent is not None and parent[1] == 3
+            and snapshot.instances.get(parent[0], (None, None))[0] == PRACTICE_NAMEPLATE_PARENT
+        ):
+            return instance
+    return None
 
 
 class BotWorld(runtime.World):

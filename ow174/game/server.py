@@ -27,6 +27,7 @@ from dataclasses import dataclass, field, replace
 from ow174.game import combat, correction, messages, movelog, observers, world
 from ow174.game.bits import BitReader, BitWriter
 from ow174.game.commands import InputError, read_commands
+from ow174.game.content import PRACTICE_RANGE_MODE
 from ow174.game.environment import ExecutionEnvironment, SystemEnvironment
 from ow174.game.link import (
     ACK,
@@ -44,6 +45,7 @@ from ow174.game.link import (
 )
 from ow174.game.match import SEND_EVERY, Match, Player, no_skin, pong, sends
 from ow174.game.projectiles import MAX_LEASE_FRAME, _ObservedProjectile
+from ow174.game.script.bot import practice_nameplate
 from ow174.game.script.driver import BodyStream, Snapshot, warm_up
 from ow174.jam.codec import DecodeError
 from ow174.jam.values import to_jsonable
@@ -149,6 +151,7 @@ class _BotScriptDelivery:
     volleys: deque[_ObservedProjectile] = field(default_factory=deque)
     death_frames: deque[Snapshot] | None = None  # None until this viewer is registered for death
     death_snapshot: Snapshot | None = None  # latest terminal state for a deferred feed pulse
+    nameplate_update: world.EntityUpdate | None = None  # standalone presenter chunk awaiting ACK
 
 
 class Client:
@@ -327,7 +330,7 @@ class Client:
         script = self._bot_scripts.get(entity)
         if script is None or entity in self._body_destroy_wait or script.death_frames is not None:
             return
-        script.death_frames = deque() if payload is None else deque([payload])
+        script.death_frames = deque() if payload is None else deque([self._project_bot_snapshot(payload)])
         self._flush_bot_frames(script)
 
     def queue_bot_death_update(self, entity: int, payload: Snapshot) -> None:
@@ -335,12 +338,18 @@ class Client:
         script = self._bot_scripts.get(entity)
         if script is None or entity in self._body_destroy_wait or script.death_frames is None:
             return
-        script.death_frames.append(payload)
+        # A later timer keeps the presenter's projection from the original death.
+        known = script.death_frames[-1] if script.death_frames else script.death_snapshot
+        if known is None:
+            stream = script.stream
+            known = stream.base or stream.pending[stream.full_update.chunk_last][0]
+        script.death_frames.append(self._project_bot_snapshot(payload, known=known))
         self._flush_bot_frames(script)
 
-    def _flush_bot_frames(self, script: _BotScriptDelivery) -> None:
+    def _flush_bot_frames(self, script: _BotScriptDelivery, *, replace_nameplate: bool = False) -> None:
         stream = script.stream
-        if stream.base is None or stream.pending:
+        nameplate = script.nameplate_update
+        if stream.base is None or (stream.pending and (nameplate is None or not replace_nameplate)):
             return
         if script.volleys:
             delivery = script.volleys[0]
@@ -348,7 +357,8 @@ class Client:
                 return  # projectile cleanup cancels its launch before advancing the stream
             if delivery.matching_volley(stream.base) is not None:
                 return  # keep this activation installed until its ch2 launch is acknowledged
-            latest = script.live or stream.base
+            base = stream.base if nameplate is None else stream.pending[nameplate.chunk_last][0]
+            latest = script.live or base
             if delivery.record.instance not in latest.instances:
                 return  # the old activation expires without recreating a removed instance
             states = dict(latest.states)
@@ -375,27 +385,95 @@ class Client:
                 if self._queue_bot_death_snapshot(script, snapshot):
                     return
         elif script.death_snapshot is not None:
-            self._queue_bot_death_snapshot(script, script.death_snapshot)
+            # Rechecking feed eligibility must not install a new presenter on a corpse.
+            self._queue_bot_death_snapshot(script, script.death_snapshot, known=stream.base)
 
-    def _queue_bot_death_snapshot(self, script: _BotScriptDelivery, snapshot: Snapshot) -> bool:
+    def _queue_bot_death_snapshot(
+        self, script: _BotScriptDelivery, snapshot: Snapshot, *, known: Snapshot | None = None,
+    ) -> bool:
         stream = script.stream
         allowed = self.player.match.combat.kill_feed_allowed(self.player, stream.entity)
         snapshot = stream.kill_feed_snapshot(snapshot, allowed=allowed)
-        return self._queue_bot_snapshot(script, snapshot)
+        return self._queue_bot_snapshot(script, snapshot, known=known)
 
-    def _queue_bot_snapshot(self, script: _BotScriptDelivery, snapshot: Snapshot) -> bool:
+    def _project_bot_snapshot(self, snapshot: Snapshot, *, known: Snapshot | None = None) -> Snapshot:
+        if self.player.match.game_map.mode_guid != PRACTICE_RANGE_MODE:
+            return snapshot
+        mode_ready = self.player.mode_script.delivered
+        if mode_ready and known is None:
+            return snapshot
+        child = practice_nameplate(snapshot)
+        if child is None or (mode_ready and known is not None
+                             and known.instances.get(child) == snapshot.instances[child]):
+            return snapshot
+        # The client-only 0D24 presenter reads #14206 from the mode's 0CB6 graph.
+        return replace(
+            snapshot,
+            instances={item: value for item, value in snapshot.instances.items() if item != child},
+            vars={key: value for key, value in snapshot.vars.items() if key[0] != child},
+            states={key: value for key, value in snapshot.states.items() if key[0] != child},
+            events={item: value for item, value in snapshot.events.items() if item != child},
+        )
+
+    def _flush_bot_nameplates(self) -> None:
+        if (not self._bot_scripts or self.leaving_since is not None or not self.player.mode_script.delivered
+                or self.player.match.game_map.mode_guid != PRACTICE_RANGE_MODE):
+            return
+        for script in self._bot_scripts.values():
+            stream = script.stream
+            if script.nameplate_update is not None:
+                # Match logic has queued this frame's health and combat updates.
+                self._flush_bot_frames(script, replace_nameplate=True)
+                continue
+            base = stream.base
+            if (base is None or stream.pending or script.live is not None or script.volleys
+                    or script.death_frames is not None or stream.entity in self._body_destroy_wait):
+                continue
+            latest = script.source.initial[1]
+            child = practice_nameplate(latest)
+            if child is None or child in base.instances:
+                continue
+            descriptor = latest.instances[child]
+            parent = descriptor[1][0]
+            if base.instances.get(parent) != latest.instances[parent]:
+                continue
+            # The acknowledged viewer snapshot owns everything outside the presenter.
+            snapshot = replace(
+                base,
+                instances=base.instances | {child: descriptor},
+                vars=base.vars | {key: value for key, value in latest.vars.items() if key[0] == child},
+                states=base.states | {key: value for key, value in latest.states.items() if key[0] == child},
+                events=base.events | {item: value for item, value in latest.events.items() if item == child},
+            )
+            self._queue_bot_snapshot(script, snapshot, nameplate_only=True)
+
+    def _queue_bot_snapshot(
+        self, script: _BotScriptDelivery, snapshot: Snapshot, *,
+        known: Snapshot | None = None, nameplate_only: bool = False,
+    ) -> bool:
         stream = script.stream
+        snapshot = self._project_bot_snapshot(snapshot, known=known)
+        old_nameplate = script.nameplate_update
+        if old_nameplate is not None:
+            previous, _ = stream.pending[old_nameplate.chunk_last]
+            if (snapshot.instances == previous.instances and snapshot.vars == previous.vars
+                    and snapshot.states == previous.states):
+                return False  # only the already-queued presenter would be repeated
         frame, keys = observers.delta(script.source, stream, snapshot)
         if frame is None:
             return False
-        self._queue_bot_frame(stream, frame, snapshot, keys)
-        return True
-
-    def _queue_bot_frame(self, stream, frame, snapshot, keys) -> None:
-        # The next frame depends on this baseline even when this datagram is lost.
+        # Authoritative updates normally wait for the preceding baseline. A
+        # presenter alone can be replaced by a cumulative update from the same base.
         update = stream.delta(frame, snapshot, keys, 0)
         update.resend = True
+        if old_nameplate is not None:
+            child = practice_nameplate(snapshot)
+            nameplate_only = child is not None and all(key[1] == child for key in keys)
+            self.cancel_entity_record(old_nameplate)
+            stream.pending.pop(old_nameplate.chunk_last, None)
+        script.nameplate_update = update if nameplate_only else None
         self.queue_entities([update])
+        return True
 
     def _ack_body_create(self, entity: int) -> None:
         pending = self._combat_notices.get(entity)
@@ -440,7 +518,7 @@ class Client:
         if script is None:
             return False
         return bool(
-            script.stream.pending
+            (script.stream.pending and script.nameplate_update is None)
             or script.live is not None
             or script.death_frames
             or (script.death_frames is not None and health_pending)
@@ -592,7 +670,9 @@ class Client:
         script = getattr(bot, "body_script", None)
         if script is not None:
             stream = BodyStream(entity)
-            stream.full(*script.initial)
+            frame, initial = script.initial
+            snapshot = self._project_bot_snapshot(initial)
+            stream.full(frame if snapshot is initial else observers.full_frame(script, snapshot), snapshot)
             self._bot_scripts[entity] = _BotScriptDelivery(stream, script)
 
     # --- sending -------------------------------------------------------------------------------
@@ -617,6 +697,7 @@ class Client:
             unreliable, entities = [], []
         else:
             self._release_body_destroys(tick)
+            self._flush_bot_nameplates()
             unreliable = self.unreliable[: messages.MAX_PER_KIND]
             entities = (self.entities + self.player.match.remote_movements(self.player))[:127]
         reliable = self.reliable[: messages.MAX_PER_KIND]
@@ -729,6 +810,8 @@ class Client:
                             self._flush_combat_ui()
                         script = self._bot_scripts.get(item.entity)
                         if script is not None and item.stream is script.stream:
+                            if item is script.nameplate_update:
+                                script.nameplate_update = None
                             self._flush_bot_frames(script)
             else:
                 lost_reliable += reliable
@@ -743,7 +826,7 @@ class Client:
         if lost_reliable:
             self.reliable = sorted(lost_reliable + self.reliable)
             self.log(f"[!] resending {len(lost_reliable)} reliable message(s)")
-        lost_records = [item for item in lost_records if current(item)]
+        lost_records = [item for item in lost_records if item.resend and current(item)]
         if lost_records:
             self.entities = lost_records + self.entities
             self.log(f"[!] resending {len(lost_records)} entity record(s)")

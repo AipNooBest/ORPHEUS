@@ -77,7 +77,7 @@ FIELDS = {
                    "_body_destroy_wait _player_body_reuse_after _bot_scripts expected_in parked_in "
                    "leaving_since _mode_create_acked _pending_mode_frame _display_notices "
                    "_pending_possessions _confirmed_possessions"),
-    _BotScriptDelivery: _names("stream source live volleys death_frames death_snapshot"),
+    _BotScriptDelivery: _names("stream source live volleys death_frames death_snapshot nameplate_update"),
     Match: _names("environment id game_map card skin_of tick controller assemble_ends assembled players "
                   "_body_messages started on_leave ended bots _pending_bot_scripts bots_shown notices combat "
                   "collision_provider collision_state collision_world _collision_failed"),
