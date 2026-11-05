@@ -387,10 +387,14 @@ class Combat:
         )
 
     def retire_player_body(self, player) -> None:
-        """Discard the old body's health, history, melee counters and respawn when its lifetime ends."""
+        """Discard body-local combat state when the player's current body retires."""
         self.vitals.pop(player.body, None)
         self.history.pop(player.body, None)
         self.melee_seen.pop(player.body, None)
+        # The owner's leased projectiles and their observer copies retire with the old body.
+        self.rockets[:] = [
+            rocket for rocket in self.rockets if rocket.shooter is not player or rocket.shot is None
+        ]
         self.respawns[:] = [(when, who) for when, who in self.respawns if who is not player]
 
     def spawned(self, player) -> None:

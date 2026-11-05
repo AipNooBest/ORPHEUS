@@ -172,6 +172,38 @@ class HelixTests(unittest.TestCase):
 
 
 class ProjectileRangeTests(unittest.TestCase):
+    def test_replacing_the_shooter_retires_the_projectiles_damage(self):
+        for replace_body, expected_health in ((False, 80.0), (True, 200.0)):
+            with self.subTest(replace_body=replace_body):
+                run = Run(KANEZAKA_DM, ("Shooter", "Target"))
+                shooter, victim = run.players
+                match = run.match
+                fight = match.combat
+                match.bots.clear()
+                y = match.game_map.spawns[0].position[1]
+                shooter.mover.position = (0.0, y, 0.0)
+                victim.mover.position = (0.0, y, 4.0)
+                target = next(target for target in fight._targets() if target.owner is victim)
+                vitals = fight.vitals_of(target)
+
+                frame = shooter.body_script.frame + 1
+                shooter.body_script.command(frame, SECONDARY)
+                fight.command(shooter, Command(frame, buttons=SECONDARY))
+                fight.update(20.0, frame, frames=False)
+                self.assertEqual(vitals.total, 200.0)
+                self.assertEqual(len(fight.rockets), 1)
+                if replace_body:
+                    old = shooter.body
+                    self.assertTrue(match.switch_hero(shooter, shooter.hero))
+                    self.assertNotEqual(shooter.body, old)
+                    fight.update(20.0 + combat.TICK, frame + 1, frames=False)
+                    self.assertFalse(fight.projectiles.shots)
+
+                for step in range(2, 11):
+                    fight.update(20.0 + step * combat.TICK, frame + step, frames=False)
+                self.assertFalse(fight.rockets)
+                self.assertEqual(vitals.total, expected_health)
+
     def test_helix_sweeps_to_its_range_boundary(self):
         for z, hit in ((100.05, True), (100.7, False)):
             with self.subTest(target_feet_z=z):
