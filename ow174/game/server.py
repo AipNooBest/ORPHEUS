@@ -492,7 +492,12 @@ class Client:
             else:
                 self.queue_reliable(20300, self.player.match.instance_message(self.player))
                 self.server.joined(self.player)
-        if packet.kind == KIND_FRAME and packet.payload and not self.player.gone:
+        if (
+            packet.kind == KIND_FRAME
+            and packet.payload
+            and not self.player.gone
+            and self.leaving_since is None
+        ):
             self._payload_in(packet.payload, now)
 
     def _payload_in(self, payload: bytes, now: float) -> None:
@@ -512,7 +517,10 @@ class Client:
             self.log(f"[<<<] undecodable input: {error}", logging.DEBUG)
             return
         if commands and self.player.spawned:
-            self.player.take_commands(commands)
+            boundary = self.player.take_commands(commands)
+            if boundary is not None:
+                self.log(f"[!] command clock boundary at {boundary:08X}; leaving", logging.WARNING)
+                self.server.take_out(self.player, "command clock boundary", now=now)
 
     def _reliable_in(self, seq: int, msg_id: int, value: dict, now: float) -> None:
         if seq < self.expected_in:
@@ -725,7 +733,7 @@ class GameServer:
                         return player
         return None
 
-    def take_out(self, player: Player, reason: str) -> str:
+    def take_out(self, player: Player, reason: str, *, now: float | None = None) -> str:
         """Take a player out of its match from the server side: a connected game goes back to the menu
         (20304) and leaves the match when its link closes; a game that has not connected leaves the
         match now, and gets 20304 if it still connects. Returns what happened, for the log."""
@@ -735,7 +743,9 @@ class GameServer:
             self._sent_home.add(player)
             client = player.client
             if client is not None and not client.closed:
-                client.go_home(self.environment.wall_time(callsite="server.take_out"))
+                if now is None:
+                    now = self.environment.wall_time(callsite="server.take_out")
+                client.go_home(now)
                 return "sent to the menu"
             player.match.leave(player, reason)
             return "left before its game connected"

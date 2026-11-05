@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 
 from ow174.game import world
 from ow174.game.bits import BitWriter
+from ow174.game.commands import FRAME_MASK
 from ow174.game.script import graph as graphs_data
 from ow174.game.statescript import InstanceWire, StateWire, Stream, remote_full_frame
 from ow174.game.world import OP_CREATE, OP_DESTROY, WITH_SCALE, WITH_TRANSFORM, EntityUpdate
@@ -104,6 +105,9 @@ KEEP_ROTATION = 0x01000000  # movement state +0 bit 24: the block's own rotation
 PREDICTED = 1  # a volley's sync after LET_GAME_DECIDE: SHOTS_AND_PROJECTILES, the lease's kind
 LEASE_FIRST = 0x00100000  # the first lease id; the server's own ids stay below
 LEASE_SPAN = 1 << 22  # frames (= ids) of one window: 18.6 hours
+LEASE_WINDOWS = 2
+# Every window's exclusive stop must fit in a u32, including the last future window.
+MAX_LEASE_FRAME = FRAME_MASK - LEASE_WINDOWS * LEASE_SPAN
 DEFINITIONS_PER_BODY = 4  # leased definitions per slot (Soldier: 072C, 1C86, 072D)
 REPORT_WINDOW = 64  # frames after the shot in which an owner frame may report it
 CONFIRM_TICKS = 3  # at least this after the report (0.05 s)
@@ -243,7 +247,8 @@ class Projectiles:
         blocks = []
         for guid in definitions(script)[:DEFINITIONS_PER_BODY]:
             base = self._base(player, guid)
-            for window in (start, start + LEASE_SPAN):
+            for index in range(LEASE_WINDOWS):
+                window = start + index * LEASE_SPAN
                 blocks.append((guid, window, window + LEASE_SPAN, base, 1))
         return blocks or None
 

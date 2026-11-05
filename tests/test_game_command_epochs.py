@@ -69,6 +69,13 @@ class QueueEpochTests(unittest.TestCase):
         commands = read_commands(BitReader(command_tests.record(FRAME_MASK)))
         self.assertEqual([item.frame for item in commands], [FRAME_MASK, 0])
 
+    def test_bounded_prefix_reports_zero_on_rollover_without_admitting_the_suffix(self):
+        queue = CommandQueue()
+        queue.reset(last_frame=FRAME_MASK - 1)
+        admitted, boundary = queue.before_limit([Command(FRAME_MASK), Command(0), Command(1)], FRAME_MASK)
+        self.assertEqual([item.frame for item in admitted], [FRAME_MASK])
+        self.assertEqual((boundary, queue.last_frame, queue.wraps), (0, FRAME_MASK, 0))
+
 
 class DriverEpochTests(unittest.TestCase):
     @staticmethod

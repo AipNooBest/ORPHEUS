@@ -175,17 +175,33 @@ class CommandQueue:
         self.wraps = 0
 
     def new(self, commands: list[Command]) -> list[Command]:
+        fresh, _ = self._consume(commands)
+        return fresh
+
+    def before_limit(
+        self, commands: list[Command], limit: int, *, anchor: int | None = None
+    ) -> tuple[list[Command], int | None]:
+        """Admit the fresh prefix that fits the current body epoch, and report its first boundary."""
+        return self._consume(commands, limit, anchor)
+
+    def _consume(
+        self, commands: list[Command], limit: int | None = None, anchor: int | None = None
+    ) -> tuple[list[Command], int | None]:
         # Validate the whole window first so malformed input cannot partly advance the queue.
         if any(type(item.frame) is not int or not 0 <= item.frame <= FRAME_MASK for item in commands):
             raise InputError("command frame must be uint32")
         fresh = []
+        previous = self.last_frame if self.last_frame is not None else anchor
         for command in commands:
-            if self.last_frame is not None:
-                distance = frame_distance(command.frame, self.last_frame)
+            if previous is not None:
+                distance = frame_distance(command.frame, previous)
                 if distance == 0 or distance >= FRAME_HALF:
                     continue
-                if command.frame < self.last_frame:
-                    self.wraps += 1
+            wrapped = previous is not None and command.frame < previous
+            if limit is not None and (wrapped or command.frame > limit):
+                return fresh, command.frame
+            if wrapped:
+                self.wraps += 1
             fresh.append(command)
-            self.last_frame = command.frame
-        return fresh
+            previous = self.last_frame = command.frame
+        return fresh, None

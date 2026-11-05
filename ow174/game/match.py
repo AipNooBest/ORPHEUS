@@ -44,6 +44,7 @@ from ow174.game.commands import Command, CommandQueue
 from ow174.game.content import SOLDIER, GameMap, Hero, heroes, spawn_point
 from ow174.game.environment import ExecutionEnvironment, SystemEnvironment
 from ow174.game.mover import CROUCHED, GRAVITY_SCALE, Mover, mover_data, statescript_mods
+from ow174.game.projectiles import MAX_LEASE_FRAME
 from ow174.game.script import graph
 from ow174.game.script.bot import BotScript
 from ow174.game.script.driver import BodyScript, CommandEpochError
@@ -272,14 +273,18 @@ class Player:
         flags = CROUCHED if mover.crouched else 0
         return Movement(mover.position, mover.yaw, mover.pitch, mover.velocity, flags)
 
-    def take_commands(self, commands: list[Command]) -> None:
-        """Move the server's copy of the body. Without a body the client moves nothing either."""
+    def take_commands(self, commands: list[Command]) -> int | None:
+        """Simulate the encodable command prefix and report the first frame needing a new link."""
         collision = self.match.collision_world
         if collision is None:
-            return
+            return None
         seconds = self.quanta / 1e6
-        self.mover.use(mover_data(self.hero.body), collision)
-        fresh = self.commands.new(commands)
+        script = self.body_script
+        fresh, boundary = self.commands.before_limit(
+            commands, MAX_LEASE_FRAME, anchor=script.frame if script is not None else None
+        )
+        if fresh:
+            self.mover.use(mover_data(self.hero.body), collision)
         if movelog.ENABLED:
             movelog.commands(self, fresh, received=commands)
         for command in fresh:
@@ -295,6 +300,7 @@ class Player:
                 self.mover.track_mods(statescript_mods(script.component) if script else {}, command.frame)
         if movelog.ENABLED:
             movelog.snapshots(self)
+        return boundary
 
     def new_body(self) -> None:
         """The next body id, at the spawn point, where the new body is created. Ids cycle through the
