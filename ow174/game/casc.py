@@ -8,6 +8,8 @@ Only what the server needs to pull a map's collision out of the player's own cop
       file in BLTE form: 'BLTE', u32 header size, then blocks that are stored ('N') or zlib ('Z').
 The content key is the MD5 of the file, which checks what was read. Files are found by their encoding
 key, not by name: the key tables (data/collision_keys_174.json) are build 1.74.0.0.104319's.
+An asset stored inside a bundle has its own content key and size, with the containing bundle's keys,
+size and the asset's offset in a nested `bundle` record. Both contents are checked before use.
 """
 
 import hashlib
@@ -112,4 +114,50 @@ class Storage:
         content = blte(record[30:])
         if ckey is not None and hashlib.md5(content).digest() != ckey:
             raise CascError(f"{ekey.hex()} does not match its content key")
+        return content
+
+    def read_record(self, record: dict) -> bytes:
+        """Read a key-table asset, either a file or a checked slice of its containing bundle.
+
+        A direct record names `ekey`, `ckey` and optionally `size`. A bundled asset instead names its
+        own `ckey` and `size`, and `bundle` holds the container's `ekey`, `ckey`, `size` and `offset`.
+        The bundle's encoding key never stands in for an encoding key of the asset itself.
+        """
+        if not isinstance(record, dict):
+            raise CascError("invalid storage record")
+        bundled = "bundle" in record
+        if bundled and "ekey" in record:
+            raise CascError("bundled storage record cannot have an outer encoding key")
+        source = record["bundle"] if bundled else record
+        if not isinstance(source, dict):
+            raise CascError("invalid storage record")
+        try:
+            ekey = bytes.fromhex(source["ekey"])
+            source_ckey = bytes.fromhex(source["ckey"])
+            ckey = bytes.fromhex(record["ckey"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise CascError("invalid storage record keys") from error
+        if any(len(key) != 16 for key in (ekey, source_ckey, ckey)):
+            raise CascError("storage record keys must be 16 bytes")
+
+        def size(value, label: str) -> int:
+            if type(value) is not int or value < 0:
+                raise CascError(f"invalid {label}: expected a non-negative integer")
+            return value
+
+        expected = size(source.get("size"), "bundle size") if bundled else None
+        if not bundled and "size" in record:
+            expected = size(record["size"], "file size")
+        if bundled:
+            offset = size(source.get("offset"), "bundle offset")
+            length = size(record.get("size"), "slice size")
+        content = self.read(ekey, source_ckey)
+        if expected is not None and len(content) != expected:
+            raise CascError(f"storage record size {expected}, read {len(content)} bytes")
+        if bundled:
+            if offset > len(content) or length > len(content) - offset:
+                raise CascError("asset slice runs past its bundle")
+            content = content[offset : offset + length]
+            if hashlib.md5(content).digest() != ckey:
+                raise CascError("bundle slice does not match its content key")
         return content

@@ -582,7 +582,7 @@ def flat_world(height: float, half_size: float = 5000.0) -> World:
 
 
 def collision_keys() -> dict[int, dict]:
-    """Map GUID -> {"ekey", "ckey", "size"} of its collision chunk in build 104319's storage."""
+    """Map GUID -> direct or bundled key record of its collision chunk in build 104319's storage."""
     if not KEYS_PATH.is_file():
         return {}
     table = json.loads(KEYS_PATH.read_text(encoding="utf-8"))
@@ -609,12 +609,10 @@ def build(map_guid: int, storage: Storage, name: str = "") -> Path:
     keys = collision_keys().get(map_guid)
     if keys is None:
         raise CollisionError(f"no collision chunk known for map {map_guid:#x}")
-    data = storage.read(bytes.fromhex(keys["ekey"]), bytes.fromhex(keys["ckey"]))
+    data = storage.read_record(keys)
     meshes, hulls = parse_chunk(data)
     try:
-        models, placed = props.map_shapes(
-            map_guid, lambda item: storage.read(bytes.fromhex(item["ekey"]), bytes.fromhex(item["ckey"]))
-        )
+        models, placed = props.map_shapes(map_guid, storage.read_record)
     except (props.PropError, struct.error, IndexError, KeyError) as error:
         raise CollisionError(f"the props of map {map_guid:#x}: {error}") from error
     identifiers = sorted({identifier for _, identifier, *_ in placed if identifier})
