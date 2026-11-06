@@ -123,7 +123,7 @@ FIELD_ENTITY = 0x04000000000003DC  # 03DC.003, the Biotic Field (0257 st1's m_pr
 FIELD_GRAPH = 0x0258  # its initial graph
 FIELD_FIRST, FIELD_SPAN = 0xA0080000, 0x00040000  # the field entities' ids
 SEEN_FIRST, SEEN_SPAN = 0xA00C0000, 0x00040000  # the server projectiles the other clients see
-FIELD_DELAY = 12  # ticks after the canister's create (0.2 s; it lands in 1-2 frames)
+FIELD_DELAY = 12  # approximate deployment delay in world ticks after admitting the cast projectile
 FIELD_SECONDS = 5.0  # 0258: #567 = 5, st1 Wait #567 - 0.5 then st4 Wait 0.5, then DestroyEntity (DATA)
 FIELD_TICKS = math.ceil(FIELD_SECONDS * 1000 / FRAME_MS)
 FADE_SECONDS = 4.5  # 0258 st1 ends: st5 (its DataFlowMapping) goes off
@@ -220,8 +220,9 @@ class Shot:
     created: dict[int, _ProjectileArrival] = field(default_factory=dict)  # owner creates and their ACKs
     created_tick: int | None = None
     release_at: int | None = None  # the tick of the release and destroy
-    field_ids: list = field(default_factory=list)  # (viewer slot, field entity id)
+    field_ids: dict[tuple[int, int | None], int] = field(default_factory=dict)  # (viewer slot, parent) -> id
     observers: list = field(default_factory=list)  # per-viewer launches of this projectile
+    field_due: int | None = None
     field_tick: int | None = None
     faded: bool = False
     arrivals: list = field(default_factory=list)  # the field entities whose create arrived
@@ -389,8 +390,7 @@ class Projectiles:
             ):
                 shot.reports.append(report)
         shot.seen_reports = script.report_count
-        if shot.spawn is not None:
-            self._confirm(shot, tick)
+        if shot.spawn == FIELD_ENTITY:
             self._field(shot, tick, first_tick)
             return
         due = shot.release_at
@@ -450,7 +450,7 @@ class Projectiles:
             self.shots.remove(shot)
         for delivery in shot.observers:
             delivery.finish(tick, explode)
-        for slot, entity in shot.field_ids:
+        for (slot, _), entity in shot.field_ids.items():
             viewer = next((player for player in self.match.players if player.slot == slot), None)
             if viewer is not None and viewer.client is not None:
                 viewer.client.queue_entities([EntityUpdate(entity, OP_DESTROY)])
@@ -468,45 +468,53 @@ class Projectiles:
     # --- the Biotic Field -----------------------------------------------------------------------------
 
     def _field(self, shot: Shot, tick: int, first_tick: int) -> None:
-        if shot.created_tick is None:
+        if shot.field_due is None:
+            shot.field_due = tick + FIELD_DELAY
+        start = shot.field_due
+        expires = start + FIELD_TICKS
+        if tick < expires:
+            self._confirm(shot, tick)
+        if tick < start:
             return
         if shot.field_tick is None:
-            if tick >= shot.created_tick + FIELD_DELAY:
-                shot.field_tick = tick
-                self._open_field(shot)
-            return
-        expires = shot.field_tick + FIELD_TICKS
+            shot.field_tick = start
+            log.info("[game] %s: %s's Biotic Field opened", self.match.label(), shot.player.name)
         # The opening tick has no heal, and the field ends before the expiry tick.
         # As with skipped NPC frames, only the most recent body poses are available.
-        steps = min(tick, expires - 1) - max(first_tick - 1, shot.field_tick)
+        steps = min(tick, expires - 1) - max(first_tick - 1, start)
         if steps > 0:
             amount = HEAL_PER_SECOND * FRAME_MS / 1000 * steps
             self.combat.heal_area(shot.player, field_centre(shot), HEAL_RADIUS, amount)
         if tick >= expires:
             self._end(shot, tick, explode=False)
             return
-        seconds = (tick - shot.field_tick) * FRAME_MS / 1000
+        seconds = (tick - start) * FRAME_MS / 1000
         if not shot.faded and seconds >= FADE_SECONDS:
             shot.faded = True
             for arrival in shot.arrivals:
                 arrival.send()
+        self._deliver_field(shot)
 
-    def _open_field(self, shot: Shot) -> None:
-        """The field entity on every client: on the owner's parented to each canister id (its client puts it
-        on its own canister), on the others at the shooter's feet (unverified: the canister falls there)."""
+    def _deliver_field(self, shot: Shot) -> None:
+        """Create each field once. Owner copies wait for their canister parent to arrive."""
         theme, _ = shot.player.skin
         for viewer in self.match.players:
             if viewer.client is None or not viewer.spawned:
                 continue
-            parents = shot.created if viewer is shot.player else [None]
+            parents = (
+                (parent for parent, arrival in shot.created.items() if arrival.received)
+                if viewer is shot.player else (None,)
+            )
             for parent in parents:
+                key = viewer.slot, parent
+                if key in shot.field_ids:
+                    continue
                 entity = FIELD_FIRST + self.next_field % FIELD_SPAN
                 self.next_field += 1
-                shot.field_ids.append((viewer.slot, entity))
+                shot.field_ids[key] = entity
                 create = EntityUpdate(entity, OP_CREATE, field_create(parent, shot.where, theme))
                 create.stream = FieldArrived(shot, viewer, Stream(entity))
                 viewer.client.queue_entities([create])
-        log.info("[game] %s: %s's Biotic Field opened", self.match.label(), shot.player.name)
 
 
 def field_centre(shot: Shot) -> tuple:

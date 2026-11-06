@@ -5,6 +5,7 @@ the other clients get, and the Biotic Field's entity, frame and heal; the other 
 import struct
 import sys
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,7 +20,7 @@ from test_game_world import read_movement
 from ow174.game import bodytrace, bots, combat, movelog, observers, projectiles, world
 from ow174.game.bits import BitReader
 from ow174.game.commands import FIRE, Command
-from ow174.game.content import PRACTICE_RANGE, SOLDIER, heroes
+from ow174.game.content import PRACTICE_RANGE, SOLDIER, find_hero, heroes
 from ow174.game.link import ACK, KIND_CONTROL, LinkCipher, Packet, ReceiveWindow
 from ow174.game.match import sends
 from ow174.game.script.decode import ClientBody, read_chunk
@@ -28,7 +29,7 @@ from ow174.game.server import Client, GameServer
 from ow174.game.world import HEALTH_POOL, OP_CREATE, OP_DESTROY
 
 HELIX, HELIX_VISOR, CANISTER = 0x040000000000072C, 0x0400000000001C86, 0x040000000000072D
-SECONDARY, ABILITY_2 = 0x02, 0x10
+SECONDARY, ABILITY_1, ABILITY_2, ULTIMATE = 0x02, 0x08, 0x10, 0x20
 
 
 def bits_of(writer) -> BitReader:
@@ -959,6 +960,160 @@ class ObserverProjectileDeliveryTests(unittest.TestCase):
 
 
 class BioticFieldTests(unittest.TestCase):
+    def test_other_deployables_do_not_spawn_a_biotic_field(self):
+        cases = (("Torbjörn", ABILITY_1, 0x28B7), ("Zarya", ULTIMATE, 0x03E2))
+        for name, button, spawn in cases:
+            with self.subTest(hero=name):
+                run = Run(KANEZAKA_DM)
+                player, = run.players
+                self.assertTrue(run.match.switch_hero(player, find_hero(name)))
+                for _ in range(30):
+                    run.step({})
+                fight = run.match.combat
+                target = next(target for target in fight._targets() if target.owner is player)
+                vitals = fight.vitals_of(target)
+                vitals.damage(vitals.total - 100.0)
+                health = vitals.now[HEALTH_POOL]
+                if button == ULTIMATE:
+                    player.body_script.set_ult_charge(10000)
+
+                run.step({player: (0, 0, button)})
+                for _ in range(45):
+                    run.step({})
+                shot, = fight.projectiles.shots
+                self.assertEqual(shot.spawn & 0xFFFF, spawn)
+                self.assertTrue(shot.created)
+                self.assertEqual(vitals.now[HEALTH_POOL], health)
+                self.assertFalse(shot.field_ids)
+
+    def test_healing_and_expiry_are_independent_of_owner_acknowledgements(self):
+        from test_server_journal import ServerJournalTests
+
+        delayed_ack = 58
+        horizon = projectiles.FIELD_TICKS + 80
+
+        def cast(resume):
+            fixture = ServerJournalTests()
+            session, sent = fixture.make()
+            links, players = fixture.connected(session, sent)
+            owner_link, _ = links
+            owner, observer = players
+            fight = owner.match.combat
+            target = next(target for target in fight._targets() if target.owner is owner)
+            vitals = fight.vitals_of(target)
+            vitals.damage(199.0)
+            now = 101.0
+            shot = expired = None
+            health = []
+            parents = {}
+            creates = {owner.slot: {}, observer.slot: {}}
+            field_create = projectiles.field_create
+
+            def remember_parent(parent, *args, **kwargs):
+                build = field_create(parent, *args, **kwargs)
+                parents[build] = parent
+                return build
+
+            with patch.object(projectiles, "field_create", side_effect=remember_parent):
+                for offset in range(horizon):
+                    now += combat.TICK
+                    suppress_ack = 23 <= offset < resume
+                    drain = patch.object(owner_link, "drain", lambda: None) if suppress_ack else nullcontext()
+                    with drain:
+                        buttons = ABILITY_2 if offset == 0 else 0
+                        owner_link.commands(owner.body_script.frame + 1, 1, buttons, now=now)
+                        cursor = len(sent)
+                        session.tick(now)
+                        if fight.projectiles.shots:
+                            [shot] = fight.projectiles.shots
+                            self.assertEqual(shot.definition, CANISTER)
+                        elif shot is not None and expired is None:
+                            expired = owner.match.tick
+                        health.append(vitals.total)
+                        for link, viewer in zip(links, players, strict=True):
+                            for data, address in sent[cursor:]:
+                                if address != link.address:
+                                    continue
+                                packet = link.cipher.open(data)
+                                _, records = viewer.client.in_flight[packet.seq]
+                                for item in records:
+                                    if item.op != OP_CREATE or item.build not in parents:
+                                        continue
+                                    parent = parents[item.build]
+                                    if viewer is owner:
+                                        self.assertIsNotNone(parent)
+                                        self.assertTrue(shot.created[parent].received)
+                                    else:
+                                        self.assertIsNone(parent)
+                                    creates[viewer.slot].setdefault(item.entity, offset)
+                            link.send(now=now)
+
+            self.assertIsNotNone(shot)
+            timing = (shot.frame, shot.field_tick, expired)
+            return timing, health, creates[owner.slot], creates[observer.slot]
+
+        normal, healthy, owner_creates, observer_creates = cast(resume=0)
+        self.assertIsNotNone(normal[1])
+        self.assertIsNotNone(normal[2])
+        self.assertEqual(normal[2] - normal[1], projectiles.FIELD_TICKS)
+        self.assertGreater(healthy[delayed_ack - 1], healthy[0])
+        self.assertAlmostEqual(healthy[-1], 1 + (projectiles.FIELD_TICKS - 1)
+                               * projectiles.HEAL_PER_SECOND * combat.TICK)
+        self.assertTrue(owner_creates)
+        self.assertEqual(len(observer_creates), 1)
+        for resume in (delayed_ack, horizon - 4):
+            with self.subTest(ack_resume=resume):
+                timing, health, owner_fields, observer_fields = cast(resume)
+                self.assertEqual(timing, normal)
+                self.assertEqual(health, healthy)
+                self.assertEqual(tuple(observer_fields.values()), tuple(observer_creates.values()))
+                if resume == delayed_ack:
+                    self.assertTrue(owner_fields)
+                    self.assertGreaterEqual(min(owner_fields.values()), resume)
+                else:
+                    self.assertEqual(owner_fields, {})
+
+    def test_gap_across_field_opening_keeps_only_retained_healing(self):
+        def launch():
+            run = Run(KANEZAKA_DM)
+            player, = run.players
+            fight = run.match.combat
+            target = next(target for target in fight._targets() if target.owner is player)
+            vitals = fight.vitals_of(target)
+            vitals.damage(199.0)
+            run.step({player: (0, 0, ABILITY_2)})
+            for _ in range(80):
+                if fight.projectiles.shots:
+                    break
+                run.step({})
+            field, = fight.projectiles.shots
+            run.step({})  # admit the canister on the world clock before the gap
+            self.assertIsNone(field.field_tick)
+            return run, field, vitals
+
+        normal, field, vitals = launch()
+        for _ in range(80):
+            if field.field_tick is not None:
+                break
+            normal.step({})
+        start = normal.frame
+        self.assertEqual(field.field_tick, start)
+        self.assertEqual(vitals.total, 1.0)  # no healing on the opening tick
+        health = [vitals.total]
+        for _ in range(combat.COMBAT_CATCH_UP + 5):
+            normal.step({})
+            health.append(vitals.total)
+
+        for elapsed in (5, combat.COMBAT_CATCH_UP + 5):
+            with self.subTest(elapsed=elapsed):
+                skipped, field, vitals = launch()
+                self.assertLess(skipped.frame, start)
+                endpoint = start + elapsed
+                skipped.match.update(endpoint * combat.TICK, endpoint)
+                self.assertEqual(field.field_tick, start)
+                retained = min(elapsed, combat.COMBAT_CATCH_UP)
+                self.assertAlmostEqual(vitals.total, 1.0 + health[elapsed] - health[elapsed - retained])
+
     def test_active_field_heals_elapsed_ticks_once_and_stops_at_expiry(self):
         run = Run(KANEZAKA_DM)
         player, = run.players
