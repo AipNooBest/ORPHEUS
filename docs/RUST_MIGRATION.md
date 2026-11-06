@@ -1,6 +1,6 @@
 # Rust migration
 
-The migration target is a Rust implementation of ORPHEUS for retail build 1.74.0.0.104319. The Python server is the reference while its behavior is ported. Its current gameplay limitations remain tracked in the [restoration roadmap](ROADMAP.md).
+The migration target is a Rust implementation of ORPHEUS for retail build 1.74.0.0.104319. New functionality and fixes go into Rust. The frozen Python server is a behavioral reference during the transition. Gameplay fidelity remains tracked in the [restoration roadmap](ROADMAP.md).
 
 | Stage | Scope | Exit criteria |
 | --- | --- | --- |
@@ -9,7 +9,7 @@ The migration target is a Rust implementation of ORPHEUS for retail build 1.74.0
 | Match simulation | Tick scheduling, collision, movement, statescript, combat, bots, heroes, maps and modes | Match the registered state and packet order from encrypted Practice Range and two-peer replays. Check sustained-fire tick time and snapshot gaps with the same inputs. |
 | Server tools and dashboard | Data preparation and extraction tools, replay and diagnostics, administration API and browser UI | Reproduce output formats and acceptance checks with Rust tooling and the Rust dashboard backend. Migrate browser behavior to Rust compiled to WebAssembly. |
 | Windows deployment | Launcher, retail relay and server-only distribution | Build the Windows tools and relay, and boot the audited checkout from the separate runtime. Verify supported connection paths with the original client. |
-| Cutover | Change the normal entry points and remove superseded implementations | Pass the prior behavioral suite, confirm original-client acceptance, and complete a server-only smoke test of the audited public checkout. |
+| Cutover | Switch the normal entry points to Rust and retire the Python server | Demonstrate broader verified coverage in Rust, verify the supported replacement workflows with the original client, and complete a server-only smoke test of the audited public checkout. |
 
 The experimental native server joins the local Battle.net listener, encrypted lobby and UDP match worker. Its login subset includes presence, progression, the hero collection, the dated Arcade roster, priority passes, career mode rules, celebration content and party and ranked messages. A headless test uses an existing profile over the encrypted lobby socket, requests a solo Practice Range seat and uses the returned keys to authenticate UDP and receive the map load. Further tests with the base graph bundle cover ownership, baseline retries, controller and mode delivery, bot movement, hero selection and replacement under packet loss, and ordinary command acknowledgement.
 
@@ -29,7 +29,7 @@ The stock Soldier preflight reports its first unsupported operation at startup. 
 
 The base graph bundle can include authored mode values without adding bot graphs. Supply the target build's `.0C5` XML directory as `--mode-xml` to [the graph extractor](../tools/extract_game_graphs.py), write its output outside the repository, then pass that output to `prepare_server_runtime --game-graphs` when assembling the external bundle. Mode values and graph data stay local.
 
-The Python server serves the regular entry points during the migration. The native server currently serves the solo base Practice Range on loopback. Other matchmaking modes, social actions, the dashboard and original-client acceptance are pending.
+The frozen Python server serves the regular entry points until cutover. The native server currently serves the solo base Practice Range on loopback. Other matchmaking modes, social actions, the dashboard and original-client acceptance are pending.
 
 ```powershell
 $env:ORPHEUS_RUNTIME_DIR = 'C:\path\to\authorized-base-runtime'

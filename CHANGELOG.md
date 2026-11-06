@@ -865,3 +865,7 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Prepared the detours outside the live tick loop and retained the bot's contact state in Python stored-state replay. Recorded allied pass-through and opposing-body blocking in the roadmap. Actor-to-actor movement collision remains open.
 - Verified both elevated patrols over the real 104319 map, including the enemy bot's return leg. In an isolated optimized Rust run of 1,900 patrol updates, the patrol step took 47 µs at p95 and 143 µs at maximum. This measurement covers patrol updates only. Client acceptance is pending.
 - Passed 288 public Rust tests, 58 base-runtime checks, 54 enriched-runtime checks and 148 focused Python tests. The Python run skipped one King's Row check because the base pack lacks that map's cache. Cargo formatting, Clippy, Ruff, relative documentation links and Git diff checks passed. The optimized Rust server started and stopped on isolated ports.
+
+#### Rust development policy
+
+- Moved new implementation and fixes to Rust. Froze the Python server as the transition entry point and behavioral reference. The cutover criteria now require broader verified Rust coverage, original-client checks for the replacement workflows, and a server-only deployment smoke test.
