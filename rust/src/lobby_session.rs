@@ -36,6 +36,7 @@ pub struct LobbySession<'a> {
     transport: LobbyTransport,
     schemas: &'a Schemas,
     local: bool,
+    authenticated: bool,
 }
 
 pub enum LoginRequest {
@@ -90,6 +91,7 @@ impl<'a> LobbySession<'a> {
             transport,
             schemas,
             local,
+            authenticated: false,
         }))
     }
 
@@ -100,43 +102,67 @@ impl<'a> LobbySession<'a> {
         accounts: &Accounts,
         local_default: impl FnOnce() -> io::Result<Arc<Account>>,
     ) -> io::Result<LoginRequest> {
-        let header = self
-            .schemas
-            .header(OUT_CONNECT, 1, LOGIN_MESSAGE)
+        self.schemas
+            .fields(OUT_CONNECT, LOGIN_MESSAGE)
             .map_err(invalid)?;
-        let login_offset = header[header.len() - 1];
+        let Some((_, _, fields)) =
+            self.receive_matching(|crc, id| (crc, id) == (OUT_CONNECT, LOGIN_MESSAGE))?
+        else {
+            return Ok(LoginRequest::Disconnected);
+        };
+        let (account, tournament) = match lobby_login::identify(&fields, self.local)? {
+            Login::Named { name, tournament } => (accounts.get(&name)?, tournament),
+            Login::LocalDefault => (local_default()?, false),
+            Login::IncompatibleRemote => {
+                return Ok(LoginRequest::Rejected {
+                    reason: INCOMPATIBLE_CLIENT,
+                });
+            }
+        };
+        let identity = Identity::create(account.account_lo, self.transport.sequence)?;
+        self.authenticated = true;
+        Ok(LoginRequest::Prepared(PreparedLogin {
+            account,
+            identity,
+            tournament,
+        }))
+    }
+
+    /// Receive the next valid client message after accepting the session login.
+    /// Client messages use the single-byte group offset.
+    pub fn receive_message(&mut self) -> io::Result<Option<LobbyMessage>> {
+        if !self.authenticated {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "lobby session has not accepted a login",
+            ));
+        }
+        self.receive_matching(|_, _| true)
+    }
+
+    fn receive_matching(
+        &mut self,
+        accept: impl Fn(u32, u32) -> bool,
+    ) -> io::Result<Option<LobbyMessage>> {
         while let Some(event) = self.transport.receive()? {
-            let Event::Message {
-                crc: OUT_CONNECT,
-                offset,
-                body,
-            } = event
-            else {
+            let Event::Message { crc, offset, body } = event else {
                 continue;
             };
-            if offset != login_offset {
+            let Ok(base) = self.schemas.base(crc) else {
+                continue;
+            };
+            let Some(id) = base.checked_add(u32::from(offset)) else {
+                continue;
+            };
+            if !accept(crc, id) {
                 continue;
             }
-            let Ok(fields) = self.schemas.decode(OUT_CONNECT, LOGIN_MESSAGE, &body, true) else {
+            let Ok(fields) = self.schemas.decode(crc, id, &body, true) else {
                 continue;
             };
-            let (account, tournament) = match lobby_login::identify(&fields, self.local)? {
-                Login::Named { name, tournament } => (accounts.get(&name)?, tournament),
-                Login::LocalDefault => (local_default()?, false),
-                Login::IncompatibleRemote => {
-                    return Ok(LoginRequest::Rejected {
-                        reason: INCOMPATIBLE_CLIENT,
-                    });
-                }
-            };
-            let identity = Identity::create(account.account_lo, self.transport.sequence)?;
-            return Ok(LoginRequest::Prepared(PreparedLogin {
-                account,
-                identity,
-                tournament,
-            }));
+            return Ok(Some((crc, id, fields)));
         }
-        Ok(LoginRequest::Disconnected)
+        Ok(None)
     }
 
     /// Send an outbound JAM message with the wire index announced by this client.
@@ -279,6 +305,7 @@ mod tests {
         catalog::ItemDb,
         jam_cipher::Jam,
         jam_framing::{self, FrameReader},
+        lobby_practice::{GAME_REQUEST, is_request},
         lobby_presence::FRIENDS,
         lobby_ranked::{COMPETITIVE_CTF, Queue, RANKED},
     };
@@ -318,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn negotiates_pings_and_prepares_the_first_valid_login() {
+    fn negotiates_pings_and_accepts_practice_messages_after_login() {
         let temporary = tempfile::tempdir().unwrap();
         let accounts = Accounts::new(
             temporary.path().join("profiles"),
@@ -338,6 +365,12 @@ mod tests {
                         "20500":[{"type":12,"off":168,"count":0,"array":false}],
                         "20503":[{"type":8,"off":120,"count":0,"array":false},
                                  {"type":0,"off":128,"count":0,"array":false}]
+                    },
+                    "A6E53896":{"24000":[
+                        {"type":2,"off":120,"count":0,"array":false},
+                        {"type":12,"off":128,"count":0,"array":false},
+                        {"type":7,"off":168,"count":0,"array":false}
+                    ]
                     }
                 }"#,
             )
@@ -346,6 +379,10 @@ mod tests {
             let mut session = LobbySession::accept(stream, 2, &[42; 64], &accounts, &schemas)
                 .unwrap()
                 .unwrap();
+            assert_eq!(
+                session.receive_message().unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
             let LoginRequest::Prepared(prepared) = session
                 .prepare_login(&accounts, || panic!("named login used the local default"))
                 .unwrap()
@@ -375,6 +412,9 @@ mod tests {
                     .send(&(player::PERMISSIONS, 55500, player::features()))
                     .unwrap()
             );
+            let practice = session.receive_message().unwrap().unwrap();
+            assert!(is_request(&practice));
+            assert_eq!(practice.2[&0x80], Value::String(String::new()));
             assert!(session.send_disconnect(INCOMPATIBLE_CLIENT).unwrap());
         });
 
@@ -383,8 +423,13 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         let (mut tx, rx) = handshake(&mut client);
-        let mut announcement = vec![0, 0, 3, 0, 0, 0];
-        for group in [IN_CONNECT, OUT_CONNECT, player::PERMISSIONS + 1] {
+        let mut announcement = vec![0, 0, 4, 0, 0, 0];
+        for group in [
+            IN_CONNECT,
+            OUT_CONNECT,
+            player::PERMISSIONS + 1,
+            GAME_REQUEST,
+        ] {
             announcement.extend_from_slice(&group.to_le_bytes());
         }
         let mut outgoing = Vec::new();
@@ -392,11 +437,14 @@ mod tests {
             b"\x02\x01premature\0".as_slice(),
             &announcement,
             &jam_framing::PONG,
+            b"\x04\0\x02early\0\x04\0\0\0",
             b"\x03\x01wrong group\0",
             b"\x02\x00wrong message\0",
             b"\x02\x01unterminated",
             b"\x02\x01trailing byte\0X",
             b"\x02\x01 player \0",
+            b"\x04\0\x02\0\x04\0\0\0X",
+            b"\x04\0\x02\0\x04\0\0\0",
         ] {
             jam_framing::send_frame(&mut outgoing, &mut tx, frame).unwrap();
         }

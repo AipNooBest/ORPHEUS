@@ -1,6 +1,6 @@
 //! Outgoing game message queues and the delivery of successfully sent frames.
 
-use std::{collections::VecDeque, error::Error, fmt, mem};
+use std::{borrow::Borrow, collections::VecDeque, error::Error, fmt, mem};
 
 use crate::game_link::delivery;
 use crate::world::{EntityUpdate, FrameCandidates, SelectedFrame, WorldError, select_frame};
@@ -42,10 +42,10 @@ impl<E: Error + 'static> Error for SendError<E> {
     }
 }
 
-pub struct FrameRecords<'a> {
+pub struct FrameRecords<'a, Queued = EntityUpdate> {
     pub tick: u32,
     /// The match supplies the records eligible to send in dependency order.
-    pub queued: &'a [EntityUpdate],
+    pub queued: &'a [Queued],
     pub movements: &'a [EntityUpdate],
     pub owner_correction: bool,
     pub reliable_only: bool,
@@ -138,9 +138,9 @@ impl<T> GameEgress<T> {
     /// Select and attempt one frame. The transport owns packet sequence
     /// allocation and returns the sequence only after the datagram is sent.
     /// Record associations and queue removal follow that successful send.
-    pub fn send_frame<E>(
+    pub fn send_frame<E, Queued: Borrow<EntityUpdate>>(
         &mut self,
-        records: FrameRecords<'_>,
+        records: FrameRecords<'_, Queued>,
         ack_for_records: impl Fn(&[&EntityUpdate]) -> u32,
         mut identify: impl FnMut(RecordSource) -> T,
         send: impl FnOnce(Vec<u8>) -> Result<u32, E>,

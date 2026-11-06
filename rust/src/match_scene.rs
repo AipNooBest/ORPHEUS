@@ -4,9 +4,11 @@ use std::io;
 
 use crate::{
     bits::BitWriter,
+    game_body::yaw_rotation,
     game_bots::Bot,
     game_content::GameMap,
     game_instance::FREE_FOR_ALL_TEAM,
+    game_stats::GMP_STATS,
     script_graph::GraphStore,
     script_wire::{self, Instance, Layout, Variables},
     world::{
@@ -50,8 +52,13 @@ pub struct PlayerAppearance<'a> {
     pub entity: u32,
     pub slot: i8,
     pub team: u8,
+    pub card: &'a PlayerCard,
+}
+
+#[derive(Debug, Default)]
+pub struct PlayerCard {
     pub account: [u64; 2],
-    pub battle_tag: &'a str,
+    pub battle_tag: String,
     pub level: Option<u32>,
     pub portrait_frame: Option<u64>,
     pub ranked: Option<(i16, i16, i8)>,
@@ -65,6 +72,7 @@ pub fn player_create(
     owner_board: Option<Component>,
 ) -> io::Result<EntityUpdate> {
     use ComponentValue::*;
+    let card = player.card;
     let team = if map.free_for_all {
         FREE_FOR_ALL_TEAM
     } else {
@@ -75,27 +83,27 @@ pub fn player_create(
         fields(
             29,
             vec![
-                Some(DbId(player.account[0], player.account[1])),
-                (!player.battle_tag.is_empty()).then(|| Text(player.battle_tag.into())),
-                player.level.map(U32),
+                Some(DbId(card.account[0], card.account[1])),
+                (!card.battle_tag.is_empty()).then(|| Text(card.battle_tag.clone())),
+                card.level.map(U32),
                 None,
                 None,
                 None,
                 None,
-                player.ranked.map(|rank| I16(rank.0)),
-                player.ranked.map(|rank| I16(rank.1)),
-                player.ranked.map(|rank| I8(rank.2)),
+                card.ranked.map(|rank| I16(rank.0)),
+                card.ranked.map(|rank| I16(rank.1)),
+                card.ranked.map(|rank| I8(rank.2)),
             ],
         ),
         fields(
             74,
             vec![
-                player.portrait_frame.filter(|&guid| guid != 0).map(Id),
+                card.portrait_frame.filter(|&guid| guid != 0).map(Id),
                 None,
                 Some(I8(player.slot)),
                 None,
                 None,
-                player.role.filter(|&role| role != 0).map(I8),
+                card.role.filter(|&role| role != 0).map(I8),
                 Some(U8(1)),
                 Some(U8(1)),
             ],
@@ -105,7 +113,7 @@ pub fn player_create(
         components.extend(possession.components());
     }
     if let Some(board) = owner_board {
-        if board.index != 64 {
+        if board.index != GMP_STATS {
             return Err(invalid("the player board requires component 64"));
         }
         components.push(board);
@@ -137,8 +145,7 @@ pub fn bot_create(bot: &Bot, vitals: Option<&crate::vitals::Vitals>) -> io::Resu
     );
     let mut definition = Create::new(bot.spawn.body, vec![pools, team]);
     definition.position = bot.position.map(|position| position as f32);
-    let half = bot.yaw.round_ties_even() * std::f64::consts::PI / 65536.0;
-    definition.rotation = [0.0, half.sin() as f32, 0.0, half.cos() as f32];
+    definition.rotation = yaw_rotation(bot.yaw.round_ties_even());
     Ok(create(bot.entity, definition))
 }
 
@@ -240,16 +247,19 @@ mod tests {
                 mover.decel_ground_base,
             )
         });
-        let player = PlayerAppearance {
-            entity: 0xa000_0100,
-            slot: 0,
-            team: 1,
+        let card = PlayerCard {
             account: [0x1234_5678, 0x0100_0000_0000_0000],
-            battle_tag: "rust#2345",
+            battle_tag: "rust#2345".into(),
             level: Some(3000),
             portrait_frame: Some(0x0250_0000_0000_0f97),
             ranked: Some((3200, 120, 4)),
             role: Some(1),
+        };
+        let player = PlayerAppearance {
+            entity: 0xa000_0100,
+            slot: 0,
+            team: 1,
+            card: &card,
         };
         let board = stats.component(&PlayerStats::default(), map.mode_guid, None, None);
         let updates = initial_world(&map, &player, board, &bots).unwrap();

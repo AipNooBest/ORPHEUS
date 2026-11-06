@@ -5,20 +5,16 @@
 //! per-column expansion cache or a lock. Prop placement, analytic round props,
 //! and character contacts are handled by their respective world layers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
+use crate::collision_grid::{CELL_WIDTH, ColumnGrid, ColumnRange, cell};
 use crate::static_ray::{Vec3, inside_xz, triangle_distance};
 
-const CELL_WIDTH: f64 = 2.0;
-const LARGE_TRIANGLE_COLUMNS: u64 = 4096;
-const MAX_GRID_REFERENCES: usize = 1 << 24;
 const MAX_RAY_COLUMNS: usize = 1 << 16;
 const PLANE_EPSILON: f64 = 1e-12;
 const RAY_EPSILON: f64 = 1e-9;
-
-type Column = (i32, i32);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SceneTriangle {
@@ -78,11 +74,8 @@ struct Bounds {
 }
 
 impl Bounds {
-    fn columns(self) -> Option<(Column, Column)> {
-        Some((
-            (cell(self.min[0])?, cell(self.min[2])?),
-            (cell(self.max[0])?, cell(self.max[2])?),
-        ))
+    fn columns(self) -> Option<ColumnRange> {
+        ColumnRange::new([self.min[0], self.min[2]], [self.max[0], self.max[2]])
     }
 
     fn overlaps(self, other: Self) -> bool {
@@ -137,55 +130,30 @@ fn dot(a: Vec3, b: Vec3) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn cell(coordinate: f64) -> Option<i32> {
-    let value = (coordinate / CELL_WIDTH).floor();
-    (f64::from(i32::MIN)..=f64::from(i32::MAX))
-        .contains(&value)
-        .then_some(value as i32)
-}
-
-fn column_count((first_x, first_z): Column, (last_x, last_z): Column) -> u64 {
-    let width = (i64::from(last_x) - i64::from(first_x) + 1) as u64;
-    let depth = (i64::from(last_z) - i64::from(first_z) + 1) as u64;
-    width.saturating_mul(depth)
-}
-
 #[derive(Debug, Default)]
 pub struct TriangleIndex {
     triangles: Vec<IndexedTriangle>,
-    grid: HashMap<Column, Vec<u32>>,
-    large: Vec<u32>,
+    grid: ColumnGrid,
     lowest: Option<f64>,
 }
 
 impl TriangleIndex {
     pub fn new(triangles: impl IntoIterator<Item = SceneTriangle>) -> Result<Self, IndexError> {
         let mut index = Self::default();
-        let mut references = 0;
         for triangle in triangles {
             let number =
                 u32::try_from(index.triangles.len()).map_err(|_| IndexError::IndexLimit)?;
             let triangle = IndexedTriangle::new(triangle)?;
-            let (first, last) = triangle
+            let range = triangle
                 .bounds
                 .columns()
                 .ok_or(IndexError::InvalidTriangle)?;
-            let count = column_count(first, last);
             let bottom = triangle.bounds.min[1];
             index.lowest = Some(index.lowest.map_or(bottom, |value| value.min(bottom)));
-            if count > LARGE_TRIANGLE_COLUMNS {
-                index.large.push(number);
-            } else {
-                references += count as usize;
-                if references > MAX_GRID_REFERENCES {
-                    return Err(IndexError::IndexLimit);
-                }
-                for x in first.0..=last.0 {
-                    for z in first.1..=last.1 {
-                        index.grid.entry((x, z)).or_default().push(number);
-                    }
-                }
-            }
+            index
+                .grid
+                .insert(number, range)
+                .map_err(|_| IndexError::IndexLimit)?;
             index.triangles.push(triangle);
         }
         Ok(index)
@@ -195,15 +163,6 @@ impl TriangleIndex {
         self.lowest.unwrap_or(0.0)
     }
 
-    fn regular_column(&self, column: Column) -> impl Iterator<Item = u32> + '_ {
-        self.grid.get(&column).into_iter().flatten().copied()
-    }
-
-    fn column(&self, column: Column) -> impl Iterator<Item = u32> + '_ {
-        self.regular_column(column)
-            .chain(self.large.iter().copied())
-    }
-
     /// Return triangles whose bounds overlap the box, in first-column order.
     pub fn nearby(&self, min: Vec3, max: Vec3, category: u16) -> Vec<&SceneTriangle> {
         let bounds = Bounds { min, max };
@@ -211,11 +170,11 @@ impl TriangleIndex {
         if category == 0 || !(0..3).all(|axis| min[axis] <= max[axis]) {
             return found;
         }
-        let Some((first, last)) = bounds.columns() else {
+        let Some(range) = bounds.columns() else {
             return found;
         };
         let mut seen = HashSet::new();
-        let mut consider = |number: u32| {
+        self.grid.visit(range, |number| {
             let candidate = &self.triangles[number as usize];
             if candidate.triangle.mask & category != 0
                 && candidate.bounds.overlaps(bounds)
@@ -223,35 +182,7 @@ impl TriangleIndex {
             {
                 found.push(&candidate.triangle);
             }
-        };
-        // Oversized triangles appear in the first column even when that column
-        // has no regular triangles. Later appearances would be duplicates.
-        self.column(first).for_each(&mut consider);
-        let count = column_count(first, last);
-        if count > LARGE_TRIANGLE_COLUMNS && count > self.grid.len() as u64 {
-            let mut occupied: Vec<_> = self
-                .grid
-                .keys()
-                .copied()
-                .filter(|&(x, z)| {
-                    (x, z) != first
-                        && (first.0..=last.0).contains(&x)
-                        && (first.1..=last.1).contains(&z)
-                })
-                .collect();
-            occupied.sort_unstable();
-            for column in occupied {
-                self.regular_column(column).for_each(&mut consider);
-            }
-        } else {
-            for x in first.0..=last.0 {
-                for z in first.1..=last.1 {
-                    if (x, z) != first {
-                        self.regular_column((x, z)).for_each(&mut consider);
-                    }
-                }
-            }
-        }
+        });
         found
     }
 
@@ -274,7 +205,7 @@ impl TriangleIndex {
         };
         let mut best = f64::NEG_INFINITY;
         let mut hit = None;
-        for number in self.column(column) {
+        for number in self.grid.column(column) {
             let candidate = &self.triangles[number as usize];
             let [nx, ny, nz] = candidate.normal;
             if candidate.triangle.mask & category == 0
@@ -337,7 +268,7 @@ impl TriangleIndex {
             let end_y = oy + dy * end;
             let low = start_y.min(end_y) - RAY_EPSILON;
             let high = start_y.max(end_y) + RAY_EPSILON;
-            for number in self.column((x, z)) {
+            for number in self.grid.column((x, z)) {
                 let candidate = &self.triangles[number as usize];
                 if candidate.triangle.mask & category == 0
                     || candidate.bounds.max[1] < low

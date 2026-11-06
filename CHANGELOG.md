@@ -774,3 +774,11 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Ported the float32 GJK distance solver and one-sided capsule contacts against mesh triangles. The Python comparisons matched on 12,000 synthetic distance queries, 2,048 prepared mesh distance queries and 6,144 prepared capsule contact queries. Mesh candidate traversal, sweeps and character integration are pending.
 - Added the lobby clock, party payload and ranked rating projection. Verified the 50- and 51-message login subsets when the required ranked and solo party inputs were available.
 - Passed 169 public Rust tests, 24 optional runtime checks on each of two prepared packs, Cargo formatting, Clippy and Git diff checks. The native UDP worker still serves the loading phase. World delivery, hero selection and original-client acceptance are pending. The normal launch scripts still use Python.
+
+#### Rust headless Practice Range world delivery
+
+- Connected the decoded lobby Practice Range request to an account-backed world card and the native UDP worker. The headless test covers the encoded handoff, authenticated UDP, withheld ownership ACK, dropped entity creates, and the controller and mode scripts after their own create ACKs. The supported bootstrap uses the base graph bundle. The enriched bundle's authored bot graphs are detected before opening a seat and await the bot VM.
+- Loaded the scene outside the game tick and ran the bots against its prepared collision ground. Both runtime packs matched Python for 7,500 serialized movement records per pack. The world sender borrows queued entities and retains their shared records for retry.
+- Shared the collision grid between the float64 ray view and the float32 mesh candidate index. Matched 5,000 triangle-box checks and 4,400 ordered mesh queries against Python. All 4,799 earlier ray and scene query comparisons still matched.
+- Ported the hero catalog, graph-derived health pools and owner and observer body creates. The 64 body create vectors cover all 32 heroes. Decoded the original hero pick and open, close and toggle messages. Live hero selection, movement sweeps and original-client acceptance remain pending.
+- Passed 183 public Rust tests, 31 optional runtime checks on each prepared pack, Cargo formatting, Clippy and Git diff checks. The usual launch scripts still use Python.

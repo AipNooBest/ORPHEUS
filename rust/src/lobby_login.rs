@@ -109,7 +109,12 @@ impl Identity {
     }
 
     pub fn account(self) -> Fields {
-        id16(u64::from(self.account_lo), ID_HIGH_TAG)
+        let [low, high] = self.account_id();
+        id16(low, high)
+    }
+
+    pub fn account_id(self) -> [u64; 2] {
+        [u64::from(self.account_lo), ID_HIGH_TAG]
     }
 }
 

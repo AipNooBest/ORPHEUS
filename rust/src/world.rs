@@ -3,7 +3,7 @@
 //! The wire layout and component fields come from `ow174/game/world.py`.
 //! Frame selection follows the ordered send budget in `ow174/game/server.py`.
 
-use std::{error::Error, fmt};
+use std::{borrow::Borrow, error::Error, fmt};
 
 use crate::bits::{BitError, BitWriter};
 use crate::game_link::{HEADER_SIZE, MAX_DATAGRAM};
@@ -759,11 +759,11 @@ pub fn frame(
     Ok(out.into_bytes())
 }
 
-pub struct FrameCandidates<'a> {
+pub struct FrameCandidates<'a, Queued = EntityUpdate> {
     pub tick: u32,
     pub reliable: &'a [(u32, Vec<u8>)],
     pub unreliable: &'a [Vec<u8>],
-    pub queued: &'a [EntityUpdate],
+    pub queued: &'a [Queued],
     pub movements: &'a [EntityUpdate],
     /// The final movement, if present, corrects the owner.
     pub owner_correction: bool,
@@ -781,8 +781,8 @@ pub struct SelectedFrame<'a> {
 /// Fit candidates in channel priority order. This only selects a payload.
 /// Queue removal, resend bookkeeping and correction commits belong to the
 /// session and must happen after its datagram is sent successfully.
-pub fn select_frame<'a>(
-    candidates: FrameCandidates<'a>,
+pub fn select_frame<'a, Queued: Borrow<EntityUpdate>>(
+    candidates: FrameCandidates<'a, Queued>,
     ack_for_records: impl Fn(&[&EntityUpdate]) -> u32,
 ) -> Result<SelectedFrame<'a>, WorldError> {
     let FrameCandidates {
@@ -806,6 +806,7 @@ pub fn select_frame<'a>(
     } else {
         queued
             .iter()
+            .map(Borrow::borrow)
             .chain(movements)
             .take(MAX_ENTITY_RECORDS)
             .collect()
