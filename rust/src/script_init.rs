@@ -1,14 +1,16 @@
-//! Same-time initialization of authored statescript graphs.
+//! Initialization and supported frame events of authored statescript graphs.
 //!
 //! This covers Entry, typed variable writes, conditional links and static
 //! SubScript instances. Diagnostics make a partial snapshot unsuitable for
-//! gameplay replication. Timed, message, input and gameplay actions need the
-//! corresponding runtime before their graphs can be considered initialized.
+//! gameplay replication. The component also advances static waits and dispatches
+//! scoped message entries. Input, combat and other authored actions still need
+//! their corresponding runtime.
 
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashSet},
     error::Error,
     fmt,
+    sync::Arc,
 };
 
 use indexmap::IndexMap;
@@ -17,12 +19,14 @@ use serde_json::Value as Json;
 use crate::{
     script_expr::{self, Context, EmptyContext, EvalError, Scope, Variable, equal, truthy},
     script_graph::{Body, Graph, GraphStore, Node, asset_guid},
+    script_runtime::{FRAME_MS, QueueFull, Timeline, frame_start},
     script_wire::{Value, Variables},
 };
 
 pub const MAX_INIT_WORK: usize = 100_000;
 const MAX_PLUG_DEPTH: usize = 64;
-const MAX_EVENTS_AT_START: usize = 1000;
+const MAX_EVENTS_PER_UPDATE: usize = 1000;
+const MAX_PENDING_EVENTS: usize = 16_384;
 const ABORT_PLUG: &str = "m_F198FD3A";
 const SUBGRAPH_STATES: &str = "m_FF3DAF1E";
 
@@ -95,6 +99,11 @@ pub trait World {
     fn native(&mut self, _site: Site, _config: &Json) -> Option<Value> {
         None
     }
+
+    /// None leaves an encountered AI candidate explicitly unsupported.
+    fn selects_ai_behavior(&mut self, _site: Site) -> Option<bool> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -108,12 +117,16 @@ pub enum StateKind {
     BooleanSwitch(bool),
     SubScript { child: Option<u16> },
     MessageIdle,
+    Wait,
+    WaitFrames { target: u32 },
+    AiCandidate { selected: bool },
 }
 
 #[derive(Clone, Debug)]
 pub struct State {
     pub active: bool,
     pub activation: u16,
+    pub start_ms: u64,
     pub kind: StateKind,
     ending: bool,
     pending_change: bool,
@@ -152,6 +165,8 @@ pub struct Snapshot {
     pub entity: u32,
     pub variables: Variables,
     pub instances: IndexMap<u16, Instance>,
+    /// Pending state timers and finishes in their per-instance execution order.
+    pub pending_timers: IndexMap<u16, Vec<PendingTimer>>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -180,6 +195,14 @@ pub enum InitFault {
     EventBudget {
         instance: u16,
     },
+    PendingEvents {
+        limit: usize,
+    },
+    FrameOrder {
+        frame: u32,
+        now_ms: u64,
+    },
+    Halted,
     PlugDepth,
 }
 
@@ -211,12 +234,146 @@ impl fmt::Display for InitFault {
                     "statescript initialization event budget exhausted in instance {instance}"
                 )
             }
+            Self::PendingEvents { limit } => {
+                write!(f, "statescript pending event limit {limit} exceeded")
+            }
+            Self::FrameOrder { frame, now_ms } => {
+                write!(f, "statescript frame {frame} starts before {now_ms} ms")
+            }
+            Self::Halted => f.write_str("statescript component halted after a failed operation"),
             Self::PlugDepth => f.write_str("statescript initialization plug depth exceeded"),
         }
     }
 }
 
 impl Error for InitFault {}
+
+impl From<QueueFull> for InitFault {
+    fn from(error: QueueFull) -> Self {
+        Self::PendingEvents { limit: error.limit }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingTimer {
+    pub due_ms: u64,
+    pub raw_state: u16,
+    pub finish: bool,
+    pub parameter: u16,
+}
+
+/// A single body using the same authored graph engine as one-shot initialization.
+pub struct Component {
+    graphs: Arc<GraphStore>,
+    machine: Machine,
+    halted: bool,
+}
+
+impl Component {
+    pub fn start(
+        graphs: Arc<GraphStore>,
+        entity: u32,
+        entity_variables: Variables,
+        roots: Vec<Root>,
+        frame: u32,
+        world: &mut impl World,
+        max_work: usize,
+    ) -> Result<Self, InitFault> {
+        let mut machine = Machine::new(entity, entity_variables, frame, max_work)?;
+        Vm::new(&graphs, world, &mut machine).start(roots)?;
+        machine.capture_timers();
+        Ok(Self {
+            graphs,
+            machine,
+            halted: false,
+        })
+    }
+
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        (!self.halted).then_some(&self.machine.snapshot)
+    }
+
+    pub fn now_ms(&self) -> u64 {
+        self.machine.now_ms
+    }
+
+    /// Queue the authored entries of one instance at the current clock.
+    pub fn queue_message(
+        &mut self,
+        instance: u16,
+        message: u64,
+        parameters: Variables,
+    ) -> Result<usize, InitFault> {
+        if self.halted {
+            return Err(InitFault::Halted);
+        }
+        let Some(item) = self.machine.snapshot.instances.get(&instance) else {
+            return Ok(0);
+        };
+        let graph = self.graphs.graph(item.graph).expect("registered graph");
+        let entries: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                !node.client_only
+                    && node
+                        .field("m_gameMessage.m_gameMessage")
+                        .and_then(asset_guid)
+                        == Some(message)
+                    && (is_message_entry(node)
+                        || (node.is_state()
+                            && node.state.is_some_and(|raw| {
+                                item.states.get(&raw).is_some_and(|state| state.active)
+                            })))
+            })
+            .map(|node| node.pos)
+            .collect();
+        self.machine.queues.reserve(entries.len())?;
+        let parameters = Arc::new(parameters);
+        for &position in &entries {
+            self.machine.queues.push(
+                instance,
+                self.machine.now_ms,
+                Event::Message {
+                    position,
+                    parameters: Arc::clone(&parameters),
+                },
+            )?;
+        }
+        Ok(entries.len())
+    }
+
+    pub fn run_now(&mut self, world: &mut impl World) -> Result<(), InitFault> {
+        self.run(world, |vm| vm.run())
+    }
+
+    pub fn advance_frame(&mut self, frame: u32, world: &mut impl World) -> Result<(), InitFault> {
+        if frame_start(frame) < self.machine.now_ms {
+            return Err(InitFault::FrameOrder {
+                frame,
+                now_ms: self.machine.now_ms,
+            });
+        }
+        self.run(world, |vm| vm.advance_frame(frame))
+    }
+
+    fn run<W: World>(
+        &mut self,
+        world: &mut W,
+        operation: impl FnOnce(&mut Vm<'_, '_, '_, W>) -> Result<(), InitFault>,
+    ) -> Result<(), InitFault> {
+        if self.halted {
+            return Err(InitFault::Halted);
+        }
+        self.machine.work_left = self.machine.max_work;
+        let result = operation(&mut Vm::new(&self.graphs, world, &mut self.machine));
+        self.halted = result.is_err();
+        if result.is_ok() {
+            self.machine.capture_timers();
+        }
+        result
+    }
+}
 
 pub fn initialize(
     graphs: &GraphStore,
@@ -226,35 +383,10 @@ pub fn initialize(
     world: &mut impl World,
     max_work: usize,
 ) -> Result<Snapshot, InitFault> {
-    if max_work == 0 {
-        return Err(InitFault::InvalidBudget);
-    }
-    let mut seen = HashSet::new();
-    for root in &roots {
-        if root.id == 0 || !seen.insert(root.id) {
-            return Err(InitFault::InvalidRoot(root.id));
-        }
-    }
-    let mut vm = Vm {
-        graphs,
-        world,
-        snapshot: Snapshot {
-            entity,
-            variables: entity_variables,
-            instances: IndexMap::new(),
-            diagnostics: Vec::new(),
-        },
-        queues: BTreeMap::new(),
-        watchers: BTreeMap::new(),
-        next_id: 1,
-        work_left: max_work,
-        max_work,
-    };
-    for root in roots {
-        vm.create(root.id, root.graph, None, root.variables)?;
-    }
-    vm.run()?;
-    Ok(vm.snapshot)
+    let mut machine = Machine::new(entity, entity_variables, 0, max_work)?;
+    Vm::new(graphs, world, &mut machine).start(roots)?;
+    machine.capture_timers();
+    Ok(machine.snapshot)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -269,44 +401,145 @@ struct StateKey {
     raw: u16,
 }
 
-#[derive(Clone, Copy)]
 enum Event {
     Entry(u16),
     Begin(u16),
+    Finish(u16),
     Abort(u16),
     Changed(u16),
     Reevaluate(u16),
+    Timer(u16, u16),
+    Message {
+        position: u16,
+        parameters: Arc<Variables>,
+    },
 }
 
 impl Event {
-    fn state(self) -> Option<u16> {
-        match self {
-            Self::Entry(_) => None,
+    fn state(&self) -> Option<u16> {
+        match *self {
+            Self::Entry(_) | Self::Message { .. } => None,
             Self::Begin(state)
+            | Self::Finish(state)
             | Self::Abort(state)
             | Self::Changed(state)
-            | Self::Reevaluate(state) => Some(state),
+            | Self::Reevaluate(state)
+            | Self::Timer(state, _) => Some(state),
         }
     }
 }
 
-struct Vm<'graph, 'world, W> {
-    graphs: &'graph GraphStore,
-    world: &'world mut W,
+struct Machine {
     snapshot: Snapshot,
-    queues: BTreeMap<u16, VecDeque<Event>>,
+    queues: Timeline<Event>,
     watchers: BTreeMap<VarKey, Vec<StateKey>>,
+    frame_waits: BTreeMap<u16, IndexMap<u16, u32>>,
     next_id: u32,
     work_left: usize,
     max_work: usize,
+    frame: u32,
+    now_ms: u64,
 }
 
-impl<'graph, W: World> Vm<'graph, '_, W> {
+impl Machine {
+    fn new(
+        entity: u32,
+        variables: Variables,
+        frame: u32,
+        max_work: usize,
+    ) -> Result<Self, InitFault> {
+        if max_work == 0 {
+            return Err(InitFault::InvalidBudget);
+        }
+        Ok(Self {
+            snapshot: Snapshot {
+                entity,
+                variables,
+                instances: IndexMap::new(),
+                pending_timers: IndexMap::new(),
+                diagnostics: Vec::new(),
+            },
+            queues: Timeline::new(MAX_PENDING_EVENTS),
+            watchers: BTreeMap::new(),
+            frame_waits: BTreeMap::new(),
+            next_id: 1,
+            work_left: max_work,
+            max_work,
+            frame,
+            now_ms: frame_start(frame),
+        })
+    }
+
+    fn capture_timers(&mut self) {
+        self.snapshot.pending_timers.clear();
+        for &id in self.snapshot.instances.keys() {
+            let timers: Vec<_> = self
+                .queues
+                .iter(id)
+                .filter_map(|(due_ms, event)| {
+                    let (raw_state, finish, parameter) = match event {
+                        Event::Timer(raw, param) => (*raw, false, *param),
+                        Event::Finish(raw) => (*raw, true, 0),
+                        _ => return None,
+                    };
+                    Some(PendingTimer {
+                        due_ms,
+                        raw_state,
+                        finish,
+                        parameter,
+                    })
+                })
+                .collect();
+            if !timers.is_empty() {
+                self.snapshot.pending_timers.insert(id, timers);
+            }
+        }
+    }
+}
+
+struct Vm<'graph, 'world, 'machine, W> {
+    graphs: &'graph GraphStore,
+    world: &'world mut W,
+    machine: &'machine mut Machine,
+    parameters: Option<Arc<Variables>>,
+}
+
+impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
+    fn new(
+        graphs: &'graph GraphStore,
+        world: &'world mut W,
+        machine: &'machine mut Machine,
+    ) -> Self {
+        Self {
+            graphs,
+            world,
+            machine,
+            parameters: None,
+        }
+    }
+
+    fn start(&mut self, roots: Vec<Root>) -> Result<(), InitFault> {
+        let mut seen = HashSet::new();
+        for root in &roots {
+            if root.id == 0 || !seen.insert(root.id) {
+                return Err(InitFault::InvalidRoot(root.id));
+            }
+        }
+        for root in roots {
+            self.create(root.id, root.graph, None, root.variables)?;
+        }
+        self.run()
+    }
+
     fn spend(&mut self, operation: &'static str) -> Result<(), InitFault> {
-        self.work_left = self.work_left.checked_sub(1).ok_or(InitFault::WorkBudget {
-            limit: self.max_work,
-            operation,
-        })?;
+        self.machine.work_left =
+            self.machine
+                .work_left
+                .checked_sub(1)
+                .ok_or(InitFault::WorkBudget {
+                    limit: self.machine.max_work,
+                    operation,
+                })?;
         Ok(())
     }
 
@@ -321,7 +554,7 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
         let Some(definition) = self.graphs.graph(graph) else {
             self.report(
                 Site {
-                    entity: self.snapshot.entity,
+                    entity: self.machine.snapshot.entity,
                     instance: id,
                     graph,
                     node: None,
@@ -330,8 +563,8 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
             );
             return Ok(false);
         };
-        self.next_id = self.next_id.max(u32::from(id) + 1);
-        self.snapshot.instances.insert(
+        self.machine.next_id = self.machine.next_id.max(u32::from(id) + 1);
+        self.machine.snapshot.instances.insert(
             id,
             Instance {
                 graph,
@@ -345,69 +578,176 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
                 .node(*position)
                 .is_some_and(|node| !node.client_only && is_entry(node))
             {
-                self.post(id, Event::Entry(*position));
+                self.post(id, Event::Entry(*position))?;
             }
         }
         Ok(true)
     }
 
     fn run(&mut self) -> Result<(), InitFault> {
-        while self.queues.values().any(|events| !events.is_empty()) {
-            self.spend("component update")?;
-            let instances: Vec<_> = self.snapshot.instances.keys().copied().collect();
-            for id in instances {
-                let mut events = 0;
-                while let Some(event) = self.queues.get_mut(&id).and_then(VecDeque::pop_front) {
-                    if events == MAX_EVENTS_AT_START {
-                        return Err(InitFault::EventBudget { instance: id });
-                    }
-                    events += 1;
-                    self.spend("event dispatch")?;
-                    let key = |raw| StateKey { instance: id, raw };
-                    match event {
-                        Event::Entry(position) => {
-                            if let Some(node) = self.graph(id).node(position) {
-                                self.run_node(id, node, None, 0)?;
-                            }
+        loop {
+            self.update()?;
+            if self
+                .machine
+                .queues
+                .next_due()
+                .is_none_or(|due| due > self.machine.now_ms)
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    fn advance_frame(&mut self, frame: u32) -> Result<(), InitFault> {
+        self.machine.frame = frame;
+        self.machine.now_ms = frame_start(frame);
+        let end = self.machine.now_ms + FRAME_MS - 1;
+        loop {
+            let due = self
+                .machine
+                .queues
+                .next_due()
+                .filter(|&due| due <= end)
+                .unwrap_or(end);
+            self.machine.now_ms = self.machine.now_ms.max(due);
+            self.update()?;
+            if self.machine.now_ms == end
+                && self.machine.queues.next_due().is_none_or(|due| due > end)
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    fn update(&mut self) -> Result<(), InitFault> {
+        self.spend("component update")?;
+        let instances: Vec<_> = self.machine.snapshot.instances.keys().copied().collect();
+        for id in instances {
+            let mut events = 0;
+            while let Some(event) = self.machine.queues.pop_due(id, self.machine.now_ms) {
+                if events == MAX_EVENTS_PER_UPDATE {
+                    return Err(InitFault::EventBudget { instance: id });
+                }
+                events += 1;
+                self.spend("event dispatch")?;
+                let key = |raw| StateKey { instance: id, raw };
+                match event {
+                    Event::Entry(position) => {
+                        if let Some(node) = self.graph(id).node(position) {
+                            self.run_node(id, node, None, 0)?;
                         }
-                        Event::Begin(raw) => self.begin(key(raw), 0)?,
-                        Event::Abort(raw) => self.end(key(raw), 0)?,
-                        Event::Changed(raw) => self.changed(key(raw)),
-                        Event::Reevaluate(raw) => self.reevaluate(key(raw), 0)?,
+                    }
+                    Event::Begin(raw) => self.begin(key(raw), 0)?,
+                    Event::Finish(raw) => self.end(key(raw), true, 0)?,
+                    Event::Abort(raw) => self.end(key(raw), false, 0)?,
+                    Event::Changed(raw) => self.changed(key(raw))?,
+                    Event::Reevaluate(raw) => self.reevaluate(key(raw), 0)?,
+                    Event::Timer(raw, parameter) => self.timer(key(raw), parameter)?,
+                    Event::Message {
+                        position,
+                        parameters,
+                    } => {
+                        self.deliver(id, position, parameters)?;
                     }
                 }
             }
+            self.tick_frame_waits(id)?;
         }
         Ok(())
     }
 
     fn graph(&self, id: u16) -> &'graph Graph {
-        let graph = self.snapshot.instances[&id].graph;
+        let graph = self.machine.snapshot.instances[&id].graph;
         self.graphs.graph(graph).expect("registered graph")
     }
 
     fn site(&self, instance: u16, node: &Node) -> Site {
         Site {
-            entity: self.snapshot.entity,
+            entity: self.machine.snapshot.entity,
             instance,
-            graph: self.snapshot.instances[&instance].graph,
+            graph: self.machine.snapshot.instances[&instance].graph,
             node: Some(node.pos),
         }
     }
 
     fn report(&mut self, site: Site, issue: Issue) {
         let diagnostic = Diagnostic { site, issue };
-        if !self.snapshot.diagnostics.contains(&diagnostic) {
-            self.snapshot.diagnostics.push(diagnostic);
+        if !self.machine.snapshot.diagnostics.contains(&diagnostic) {
+            self.machine.snapshot.diagnostics.push(diagnostic);
         }
     }
 
-    fn post(&mut self, id: u16, event: Event) {
-        self.queues.entry(id).or_default().push_back(event);
+    fn post(&mut self, id: u16, event: Event) -> Result<(), InitFault> {
+        self.post_after(id, 0, event)
+    }
+
+    fn post_after(&mut self, id: u16, delay_ms: u64, event: Event) -> Result<(), InitFault> {
+        self.machine
+            .queues
+            .push(id, self.machine.now_ms.saturating_add(delay_ms), event)?;
+        Ok(())
+    }
+
+    fn deliver(
+        &mut self,
+        id: u16,
+        position: u16,
+        parameters: Arc<Variables>,
+    ) -> Result<(), InitFault> {
+        let Some(node) = self.graph(id).node(position) else {
+            return Ok(());
+        };
+        if node.is_state() {
+            if node.state.is_some_and(|raw| {
+                self.state(StateKey { instance: id, raw })
+                    .is_some_and(|state| state.active)
+            }) {
+                self.report(
+                    self.site(id, node),
+                    Issue::UnsupportedField("state game message delivery"),
+                );
+            }
+            return Ok(());
+        }
+        self.parameters = Some(parameters);
+        let result = self.deliver_entry(id, node);
+        self.parameters = None;
+        result
+    }
+
+    fn deliver_entry(&mut self, id: u16, node: &Node) -> Result<(), InitFault> {
+        let site = self.site(id, node);
+        for field in array_field(&node.fields, "m_params") {
+            if !field.is_object() {
+                continue;
+            }
+            let target = match script_expr::lvalue(field.get("m_out_Var").unwrap_or(&Json::Null)) {
+                Ok(Some(target)) => source_key(id, target),
+                Ok(None) => continue,
+                Err(error) => {
+                    self.report(site, Issue::Expression(error));
+                    return Ok(());
+                }
+            };
+            let key = field
+                .get("m_B5051BCE")
+                .and_then(asset_guid)
+                .map_or(0, |guid| guid as u16);
+            let value = self
+                .parameters
+                .as_deref()
+                .and_then(|params| params.get(&u32::from(key)))
+                .cloned()
+                .unwrap_or(Value::Null);
+            self.write(target, value)?;
+        }
+        self.follow(id, node, "m_outPlug", None, 0)?;
+        Ok(())
     }
 
     fn state(&self, key: StateKey) -> Option<&State> {
-        self.snapshot
+        self.machine
+            .snapshot
             .instances
             .get(&key.instance)?
             .states
@@ -415,7 +755,8 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
     }
 
     fn state_mut(&mut self, key: StateKey) -> Option<&mut State> {
-        self.snapshot
+        self.machine
+            .snapshot
             .instances
             .get_mut(&key.instance)?
             .states
@@ -431,10 +772,11 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
     ) -> Option<Value> {
         let site = self.site(id, node);
         let mut context = InstanceContext {
-            snapshot: &self.snapshot,
+            snapshot: &self.machine.snapshot,
             world: self.world,
             site,
             reads: Vec::new(),
+            parameters: self.parameters.as_deref(),
         };
         let result = script_expr::evaluate(config, &mut context);
         let reads = context.reads;
@@ -443,7 +785,7 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
                 .is_some_and(|state| state.active && !state.ending)
         }) {
             for key in reads {
-                let watchers = self.watchers.entry(key).or_default();
+                let watchers = self.machine.watchers.entry(key).or_default();
                 if !watchers.contains(&watcher) {
                     watchers.push(watcher);
                 }
@@ -458,27 +800,28 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
         }
     }
 
-    fn write(&mut self, key: VarKey, value: Value) {
-        let old = stored(&self.snapshot, key);
+    fn write(&mut self, key: VarKey, value: Value) -> Result<(), InitFault> {
+        let old = stored(&self.machine.snapshot, key);
         let changed = !same(&old, &value);
         match key {
-            VarKey::Entity(id) => self.snapshot.variables.insert(id, value),
-            VarKey::Instance(instance, id) => self.snapshot.instances[&instance]
+            VarKey::Entity(id) => self.machine.snapshot.variables.insert(id, value),
+            VarKey::Instance(instance, id) => self.machine.snapshot.instances[&instance]
                 .variables
                 .insert(id, value),
         };
         if !changed {
-            return;
+            return Ok(());
         }
-        let watchers = self.watchers.get(&key).cloned().unwrap_or_default();
+        let watchers = self.machine.watchers.get(&key).cloned().unwrap_or_default();
         for watcher in watchers {
             if let Some(state) = self.state_mut(watcher) {
                 if state.active && !state.pending_change {
                     state.pending_change = true;
-                    self.post(watcher.instance, Event::Changed(watcher.raw));
+                    self.post(watcher.instance, Event::Changed(watcher.raw))?;
                 }
             }
         }
+        Ok(())
     }
 
     fn follow(
@@ -517,7 +860,7 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
                     } else {
                         Event::Begin(raw)
                     };
-                    self.post(id, event);
+                    self.post(id, event)?;
                     taken = true;
                 }
             } else {
@@ -645,7 +988,7 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
                 return Ok(false);
             };
             if let Ok(index) = usize::try_from(index) {
-                let mut items = match stored(&self.snapshot, target) {
+                let mut items = match stored(&self.machine.snapshot, target) {
                     Value::Array(items) => items,
                     Value::Null => Vec::new(),
                     value => vec![value],
@@ -659,21 +1002,22 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
                 }
                 if index >= items.len() {
                     let extra = index + 1 - items.len();
-                    self.work_left =
-                        self.work_left
+                    self.machine.work_left =
+                        self.machine
+                            .work_left
                             .checked_sub(extra)
                             .ok_or(InitFault::WorkBudget {
-                                limit: self.max_work,
+                                limit: self.machine.max_work,
                                 operation: "SetVar array extension",
                             })?;
                     items.resize(index + 1, Value::Null);
                 }
                 items[index] = value;
-                self.write(target, Value::Array(items));
+                self.write(target, Value::Array(items))?;
                 return Ok(true);
             }
         }
-        self.write(target, value);
+        self.write(target, value)?;
         Ok(true)
     }
 
@@ -682,7 +1026,7 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
         let Some(node) = self.graph(id).state(usize::from(key.raw)) else {
             self.report(
                 Site {
-                    entity: self.snapshot.entity,
+                    entity: self.machine.snapshot.entity,
                     instance: id,
                     graph: self.graph(id).index,
                     node: None,
@@ -691,7 +1035,21 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
             );
             return Ok(());
         };
-        if self.state(key).is_some_and(|state| state.active) {
+        if let Some(state) = self.state(key).filter(|state| state.active) {
+            let kind = state.kind;
+            if configured(node, "m_0DBAFD7F") {
+                match kind {
+                    StateKind::Wait => {
+                        self.machine
+                            .queues
+                            .retain(id, |_, event| event.state() != Some(key.raw));
+                        self.state_mut(key).expect("active wait").start_ms = self.machine.now_ms;
+                        self.arm_wait(key, node)?;
+                    }
+                    StateKind::WaitFrames { .. } => self.arm_frame_wait(key, node)?,
+                    _ => (),
+                }
+            }
             return Ok(());
         }
         let kind = match node.class.as_str() {
@@ -699,6 +1057,9 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
             "STUStatescriptStateBooleanSwitch" => StateKind::BooleanSwitch(false),
             "STU_37D754C8" | "STUStatescriptStateSubScript" => StateKind::SubScript { child: None },
             "STUStatescriptStateGameMessageEntry" => StateKind::MessageIdle,
+            "STUStatescriptStateWait" if !configured(node, "m_BF1A93B0") => StateKind::Wait,
+            "STU_D74D4F47" => StateKind::WaitFrames { target: 0 },
+            "STU_91EF24A9" => StateKind::AiCandidate { selected: false },
             _ => {
                 self.report(
                     self.site(id, node),
@@ -711,14 +1072,15 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
             .state(key)
             .map_or(1, |state| state.activation.wrapping_add(1));
         for raw in raw_indices(array_field(&node.fields, "m_exclusiveStateIndices")) {
-            self.end(StateKey { instance: id, raw }, depth + 1)?;
+            self.end(StateKey { instance: id, raw }, false, depth + 1)?;
             self.drop_begin(id, raw);
         }
-        self.snapshot.instances[&id].states.insert(
+        self.machine.snapshot.instances[&id].states.insert(
             key.raw,
             State {
                 active: true,
                 activation,
+                start_ms: self.machine.now_ms,
                 kind,
                 ending: false,
                 pending_change: false,
@@ -745,11 +1107,103 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
             StateKind::MessageIdle => {
                 self.follow(id, node, "m_33DA5163", Some(key), depth)?;
             }
+            StateKind::Wait => self.arm_wait(key, node)?,
+            StateKind::WaitFrames { .. } => self.arm_frame_wait(key, node)?,
+            StateKind::AiCandidate { .. } => {
+                let site = self.site(id, node);
+                if let Some(selected) = self.world.selects_ai_behavior(site) {
+                    self.state_mut(key).expect("active AI candidate").kind =
+                        StateKind::AiCandidate { selected };
+                    if selected {
+                        self.follow(id, node, "m_6F92F4BD", Some(key), depth)?;
+                    }
+                } else {
+                    self.report(site, Issue::UnsupportedField("AI behavior selection"));
+                }
+            }
             StateKind::Plain => (),
         }
         self.follow(id, node, "m_onBeginPlug", Some(key), depth)?;
         self.follow(id, node, "m_subgraphPlug", Some(key), depth)?;
         self.try_complete(key, node, depth)
+    }
+
+    fn arm_wait(&mut self, key: StateKey, node: &Node) -> Result<(), InitFault> {
+        let id = key.instance;
+        let Some(seconds) = self.evaluate(id, node, field(&node.fields, "m_timeout"), Some(key))
+        else {
+            return Ok(());
+        };
+        let milliseconds = ((script_expr::to_float(&seconds) * 1000.0) as f32).round();
+        if !milliseconds.is_finite() {
+            self.report(self.site(id, node), Issue::UnsupportedField("Wait timeout"));
+            return Ok(());
+        }
+        if milliseconds <= 0.0 {
+            self.post(id, Event::Finish(key.raw))
+        } else {
+            self.post_after(id, milliseconds as u64, Event::Timer(key.raw, 1))
+        }
+    }
+
+    fn arm_frame_wait(&mut self, key: StateKey, node: &Node) -> Result<(), InitFault> {
+        let id = key.instance;
+        let Some(value) = self.evaluate(id, node, field(&node.fields, "m_3016B9A1"), None) else {
+            return Ok(());
+        };
+        let count = script_expr::to_int(&value, 0) as u32;
+        let target = self.machine.frame.wrapping_add(count);
+        self.state_mut(key).expect("active frame wait").kind = StateKind::WaitFrames { target };
+        if target <= self.machine.frame {
+            self.clear_frame_wait(key);
+            self.post(id, Event::Finish(key.raw))
+        } else {
+            self.machine
+                .frame_waits
+                .entry(id)
+                .or_default()
+                .insert(key.raw, target);
+            Ok(())
+        }
+    }
+
+    fn tick_frame_waits(&mut self, id: u16) -> Result<(), InitFault> {
+        let Some(waits) = self.machine.frame_waits.get(&id) else {
+            return Ok(());
+        };
+        let due: Vec<_> = waits
+            .iter()
+            .filter_map(|(&raw, &target)| (target <= self.machine.frame).then_some(raw))
+            .collect();
+        for raw in due {
+            self.spend("frame wait tick")?;
+            self.clear_frame_wait(StateKey { instance: id, raw });
+            self.post(id, Event::Finish(raw))?;
+        }
+        Ok(())
+    }
+
+    fn clear_frame_wait(&mut self, key: StateKey) {
+        if let Some(waits) = self.machine.frame_waits.get_mut(&key.instance) {
+            waits.shift_remove(&key.raw);
+            if waits.is_empty() {
+                self.machine.frame_waits.remove(&key.instance);
+            }
+        }
+    }
+
+    fn timer(&mut self, key: StateKey, parameter: u16) -> Result<(), InitFault> {
+        let Some(state) = self.state(key).filter(|state| state.active) else {
+            return Ok(());
+        };
+        if state.kind == StateKind::Wait && parameter == 1 {
+            self.post(key.instance, Event::Finish(key.raw))?;
+        }
+        let node = self
+            .graph(key.instance)
+            .state(usize::from(key.raw))
+            .expect("active timer state");
+        self.try_complete(key, node, 0)
     }
 
     fn spawn_child(&mut self, key: StateKey, node: &Node) -> Result<Option<u16>, InitFault> {
@@ -789,10 +1243,11 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
                 Scope::Entity => entity_vars.insert(target.id, value),
             };
         }
-        let child = u16::try_from(self.next_id).map_err(|_| InitFault::InstanceIdExhausted)?;
+        let child =
+            u16::try_from(self.machine.next_id).map_err(|_| InitFault::InstanceIdExhausted)?;
         if self.create(child, graph, Some((id, key.raw)), vars)? {
             // The reference sets child binding bases directly before Entry.
-            self.snapshot.variables.extend(entity_vars);
+            self.machine.snapshot.variables.extend(entity_vars);
             return Ok(Some(child));
         }
         Ok(None)
@@ -810,14 +1265,14 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
                 Some(key),
                 depth,
             )? {
-                self.post(key.instance, Event::Abort(key.raw));
+                self.post(key.instance, Event::Abort(key.raw))?;
                 break;
             }
         }
         Ok(())
     }
 
-    fn changed(&mut self, key: StateKey) {
+    fn changed(&mut self, key: StateKey) -> Result<(), InitFault> {
         if let Some(state) = self.state_mut(key) {
             state.pending_change = false;
             if state.active
@@ -825,9 +1280,10 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
                 && matches!(state.kind, StateKind::BooleanSwitch(_))
             {
                 state.pending_timer = true;
-                self.post(key.instance, Event::Reevaluate(key.raw));
+                self.post(key.instance, Event::Reevaluate(key.raw))?;
             }
         }
+        Ok(())
     }
 
     fn reevaluate(&mut self, key: StateKey, depth: usize) -> Result<(), InitFault> {
@@ -873,7 +1329,7 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
         Ok(())
     }
 
-    fn end(&mut self, key: StateKey, depth: usize) -> Result<(), InitFault> {
+    fn end(&mut self, key: StateKey, finished: bool, depth: usize) -> Result<(), InitFault> {
         if depth >= MAX_PLUG_DEPTH {
             return Err(InitFault::PlugDepth);
         }
@@ -890,9 +1346,10 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
             .graph(id)
             .state(usize::from(key.raw))
             .expect("active state node");
-        if let Some(queue) = self.queues.get_mut(&id) {
-            queue.retain(|event| event.state() != Some(key.raw));
-        }
+        self.machine
+            .queues
+            .retain(id, |_, event| event.state() != Some(key.raw));
+        self.clear_frame_wait(key);
         self.exit_subgraph(id, node, "m_subgraphPlug", depth + 1)?;
         match kind {
             StateKind::BooleanSwitch(branch) => {
@@ -902,6 +1359,9 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
             StateKind::MessageIdle => {
                 self.exit_subgraph(id, node, "m_33DA5163", depth + 1)?;
                 self.exit_subgraph(id, node, "m_452862E6", depth + 1)?;
+            }
+            StateKind::AiCandidate { selected: true } => {
+                self.exit_subgraph(id, node, "m_6F92F4BD", depth + 1)?;
             }
             _ => (),
         }
@@ -913,11 +1373,16 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
         if matches!(kind, StateKind::SubScript { .. }) {
             state.kind = StateKind::SubScript { child: None };
         }
-        self.watchers.retain(|_, watchers| {
+        self.machine.watchers.retain(|_, watchers| {
             watchers.retain(|watcher| *watcher != key);
             !watchers.is_empty()
         });
-        self.follow(id, node, "m_onAbortPlug", Some(key), depth)?;
+        let ending = if finished {
+            "m_onFinishedPlug"
+        } else {
+            "m_onAbortPlug"
+        };
+        self.follow(id, node, ending, Some(key), depth)?;
         self.follow(id, node, "m_onEndPlug", Some(key), depth)?;
         Ok(())
     }
@@ -933,36 +1398,35 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
             return Ok(());
         };
         for raw in raw_indices(array_field(plug, SUBGRAPH_STATES)) {
-            self.end(StateKey { instance: id, raw }, depth)?;
+            self.end(StateKey { instance: id, raw }, false, depth)?;
             self.drop_begin(id, raw);
         }
         Ok(())
     }
 
     fn drop_begin(&mut self, id: u16, raw: u16) {
-        if let Some(queue) = self.queues.get_mut(&id) {
-            queue.retain(|event| !matches!(event, Event::Begin(state) if *state == raw));
-        }
+        let now = self.machine.now_ms;
+        self.machine.queues.retain(id, |due, event| {
+            due != now || !matches!(event, Event::Begin(state) if *state == raw)
+        });
     }
 
     fn destroy(&mut self, id: u16) -> Result<(), InitFault> {
         let mut pending = vec![id];
         while let Some(id) = pending.pop() {
             self.spend("instance teardown")?;
-            pending.extend(
-                self.snapshot
-                    .instances
-                    .iter()
-                    .filter_map(|(&child, instance)| {
-                        instance
-                            .parent
-                            .is_some_and(|(parent, _)| parent == id)
-                            .then_some(child)
-                    }),
-            );
-            self.snapshot.instances.shift_remove(&id);
-            self.queues.remove(&id);
-            self.watchers.retain(|key, watchers| {
+            pending.extend(self.machine.snapshot.instances.iter().filter_map(
+                |(&child, instance)| {
+                    instance
+                        .parent
+                        .is_some_and(|(parent, _)| parent == id)
+                        .then_some(child)
+                },
+            ));
+            self.machine.snapshot.instances.shift_remove(&id);
+            self.machine.queues.remove(id);
+            self.machine.frame_waits.remove(&id);
+            self.machine.watchers.retain(|key, watchers| {
                 if matches!(key, VarKey::Instance(instance, _) if *instance == id) {
                     return false;
                 }
@@ -976,6 +1440,21 @@ impl<'graph, W: World> Vm<'graph, '_, W> {
 
 fn is_entry(node: &Node) -> bool {
     matches!(node.class.as_str(), "STUStatescriptEntry" | "STU_571CC72E")
+}
+
+fn is_message_entry(node: &Node) -> bool {
+    node.class == "STUStatescriptEntryGameMessage"
+}
+
+fn configured(node: &Node, name: &str) -> bool {
+    match field(&node.fields, name) {
+        Json::Null | Json::Bool(false) => false,
+        Json::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        Json::String(value) => !value.is_empty(),
+        Json::Array(value) => !value.is_empty(),
+        Json::Object(value) => !value.is_empty(),
+        Json::Bool(true) => true,
+    }
 }
 
 fn field<'a>(fields: &'a Json, name: &str) -> &'a Json {
@@ -1028,6 +1507,7 @@ struct InstanceContext<'a, W> {
     world: &'a mut W,
     site: Site,
     reads: Vec<VarKey>,
+    parameters: Option<&'a Variables>,
 }
 
 impl<W: World> InstanceContext<'_, W> {
@@ -1057,6 +1537,13 @@ impl<W: World> Context for InstanceContext<'_, W> {
 
     fn parent_entity(&mut self, _levels: u8) -> Value {
         self.owner()
+    }
+
+    fn parameter(&mut self, id: u32) -> Value {
+        self.parameters
+            .and_then(|parameters| parameters.get(&id))
+            .cloned()
+            .unwrap_or(Value::Null)
     }
 
     fn owner(&mut self) -> Value {
@@ -1354,6 +1841,159 @@ mod tests {
         assert!(matches!(run(43, MAX_INIT_WORK), Err(InitFault::PlugDepth)));
     }
 
+    #[test]
+    fn queued_messages_abort_and_rearm_waits_without_crossing_instance_scope() {
+        let message_node = |position, message, input| {
+            node(
+                position,
+                "STUStatescriptEntryGameMessage",
+                None,
+                json!({
+                    "m_gameMessage": {"m_gameMessage":message},
+                    "m_params": [{"m_B5051BCE":"0x0A40000000000004","m_out_Var":var(4,false)}],
+                    "m_outPlug": plug(&[(1,input)],&[])
+                }),
+            )
+        };
+        let timed = graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntry",
+                    None,
+                    json!({
+                        "m_outPlug":plug(&[(1,"m_beginPlug"),(5,"m_beginPlug")],&[])
+                    }),
+                ),
+                node(
+                    1,
+                    "STUStatescriptStateWait",
+                    Some(0),
+                    json!({
+                        "m_timeout":{"$":"STUConfigVarFloat","m_value":0.02},
+                        "m_0DBAFD7F":1,
+                        "m_onFinishedPlug":plug(&[(2,"m_inPlug")],&[]),
+                        "m_onAbortPlug":plug(&[(3,"m_inPlug")],&[]),
+                    }),
+                ),
+                node(
+                    2,
+                    "STUStatescriptActionSetVar",
+                    None,
+                    json!({
+                        "m_out_Var":var(10,false), "m_value": true
+                    }),
+                ),
+                node(
+                    3,
+                    "STUStatescriptActionSetVar",
+                    None,
+                    json!({
+                        "m_out_Var":var(10,false), "m_value": false
+                    }),
+                ),
+                message_node(4, "0x0240000000000001", "m_beginPlug"),
+                node(
+                    5,
+                    "STU_D74D4F47",
+                    Some(1),
+                    json!({
+                        "m_3016B9A1":{"$":"STUConfigVarInt","m_value":1},
+                        "m_onFinishedPlug":plug(&[(6,"m_inPlug")],&[]),
+                    }),
+                ),
+                node(
+                    6,
+                    "STUStatescriptActionSetVar",
+                    None,
+                    json!({
+                        "m_out_Var":var(11,false), "m_value": true
+                    }),
+                ),
+                message_node(7, "0x0240000000000002", ABORT_PLUG),
+            ],
+            json!([1, 5]),
+            json!([0, 4, 7]),
+        );
+        let mut component = Component::start(
+            Arc::new(store(vec![timed])),
+            42,
+            Variables::new(),
+            vec![Root::new(7, 42), Root::new(1, 42)],
+            1,
+            &mut EmptyWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        let timer = |due_ms| PendingTimer {
+            due_ms,
+            raw_state: 0,
+            finish: false,
+            parameter: 1,
+        };
+        let snapshot = component.snapshot().unwrap();
+        assert!(snapshot.initialization_complete());
+        assert_eq!(snapshot.pending_timers[&7], [timer(36)]);
+        assert_eq!(snapshot.pending_timers[&1], [timer(36)]);
+        assert_eq!(
+            snapshot.instances[&7].states[&1].kind,
+            StateKind::WaitFrames { target: 2 }
+        );
+
+        component.advance_frame(1, &mut EmptyWorld).unwrap();
+        assert_eq!(component.now_ms(), 31);
+        assert_eq!(
+            component
+                .queue_message(
+                    7,
+                    0x0240_0000_0000_0001,
+                    Variables::from([(4, Value::Integer(15))])
+                )
+                .unwrap(),
+            1
+        );
+        component.run_now(&mut EmptyWorld).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert_eq!(snapshot.pending_timers[&7], [timer(51)]);
+        assert_eq!(snapshot.pending_timers[&1], [timer(36)]);
+        assert_eq!(snapshot.instances[&7].variables[&4], Value::Integer(15));
+        assert!(!snapshot.instances[&1].variables.contains_key(&4));
+        assert_eq!(snapshot.instances[&7].states[&0].activation, 1);
+        assert_eq!(snapshot.instances[&7].states[&0].start_ms, 31);
+        assert!(matches!(
+            component.advance_frame(1, &mut EmptyWorld),
+            Err(InitFault::FrameOrder { .. })
+        ));
+        component.advance_frame(2, &mut EmptyWorld).unwrap();
+        assert_eq!(
+            component
+                .queue_message(7, 0x0240_0000_0000_0002, Variables::new())
+                .unwrap(),
+            1
+        );
+        component.run_now(&mut EmptyWorld).unwrap();
+        component.advance_frame(3, &mut EmptyWorld).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert!(snapshot.pending_timers.is_empty());
+        assert_eq!(snapshot.instances[&7].variables[&10], Value::Bool(false));
+        assert_eq!(snapshot.instances[&1].variables[&10], Value::Bool(true));
+        assert_eq!(snapshot.instances[&7].variables[&11], Value::Bool(true));
+        assert_eq!(snapshot.instances[&1].variables[&11], Value::Bool(true));
+
+        for _ in 0..=MAX_EVENTS_PER_UPDATE {
+            component
+                .queue_message(7, 0x0240_0000_0000_0001, Variables::new())
+                .unwrap();
+        }
+        assert_eq!(
+            component.run_now(&mut EmptyWorld),
+            Err(InitFault::EventBudget { instance: 7 })
+        );
+        assert!(component.snapshot().is_none());
+        assert_eq!(component.run_now(&mut EmptyWorld), Err(InitFault::Halted));
+    }
+
     struct ReferenceWorld;
 
     impl World for ReferenceWorld {
@@ -1363,8 +2003,15 @@ mod tests {
                 (0x0c18, "STU_AC829876") => Some(Value::Bool(true)),
                 (0x0c18, "STU_4A101787" | "STU_A77AC2AC") => Some(Value::Null),
                 (0x288a, "STU_37F20D24") => Some(Value::Null),
+                (0x0b92, "STU_71A87E92" | "STU_2200A66D") if matches!(site.node, Some(7 | 11)) => {
+                    Some(Value::Null)
+                }
                 _ => None,
             }
+        }
+
+        fn selects_ai_behavior(&mut self, site: Site) -> Option<bool> {
+            (site.graph == 0x0b92 && site.node == Some(1)).then_some(false)
         }
     }
 
@@ -1374,6 +2021,97 @@ mod tests {
             .iter()
             .filter_map(|(&raw, state)| state.active.then_some(raw))
             .collect()
+    }
+
+    #[test]
+    #[ignore = "requires a local 1.74 Practice Range NPC graph pack with graph 0B92"]
+    fn firing_placement_reset_and_timer_boundaries_match_python() {
+        let runtime = PathBuf::from(
+            std::env::var_os("ORPHEUS_RUNTIME_DIR").expect("set ORPHEUS_RUNTIME_DIR"),
+        );
+        let graphs =
+            Arc::new(GraphStore::load(runtime.join("data/game_graphs_174.json.gz")).unwrap());
+        assert!(
+            graphs.graph(0x0b92).is_some(),
+            "the runtime pack lacks Practice Range graph 0B92"
+        );
+        let mut component = Component::start(
+            graphs,
+            0xa100_0000,
+            Variables::new(),
+            vec![Root::new(1, 0x0b92)],
+            100,
+            &mut ReferenceWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        // Python BotWorld with no selected AI target, frame 100, scoped RESET.
+        assert_eq!(
+            component
+                .queue_message(1, 0x0240_0000_0000_0013, Variables::new())
+                .unwrap(),
+            1
+        );
+        component.run_now(&mut ReferenceWorld).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert!(
+            snapshot.initialization_complete(),
+            "{:?}",
+            snapshot.diagnostics
+        );
+        assert_eq!(active(snapshot, 1), [5, 12]);
+        assert_eq!(snapshot.instances[&1].variables[&889], Value::Bool(false));
+        assert_eq!(
+            snapshot.pending_timers[&1],
+            [
+                PendingTimer {
+                    due_ms: 2100,
+                    raw_state: 5,
+                    finish: false,
+                    parameter: 1
+                },
+                PendingTimer {
+                    due_ms: 4350,
+                    raw_state: 12,
+                    finish: false,
+                    parameter: 1
+                },
+            ]
+        );
+        for frame in 101..=130 {
+            component.advance_frame(frame, &mut ReferenceWorld).unwrap();
+        }
+        assert_eq!(component.now_ms(), 2095);
+        assert_eq!(active(component.snapshot().unwrap(), 1), [5, 12]);
+        component.advance_frame(131, &mut ReferenceWorld).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert!(
+            snapshot.initialization_complete(),
+            "{:?}",
+            snapshot.diagnostics
+        );
+        assert_eq!(active(snapshot, 1), [12, 0]);
+        assert_eq!(
+            snapshot.instances[&1].states[&0].kind,
+            StateKind::AiCandidate { selected: false }
+        );
+        assert_eq!(snapshot.instances[&1].states[&0].start_ms, 2100);
+        assert_eq!(snapshot.instances[&1].variables[&889], Value::Bool(false));
+        for frame in 132..=270 {
+            component.advance_frame(frame, &mut ReferenceWorld).unwrap();
+        }
+        assert_eq!(component.now_ms(), 4335);
+        assert_eq!(active(component.snapshot().unwrap(), 1), [12, 0]);
+        component.advance_frame(271, &mut ReferenceWorld).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert!(
+            snapshot.initialization_complete(),
+            "{:?}",
+            snapshot.diagnostics
+        );
+        assert_eq!(active(snapshot, 1), [0]);
+        assert_eq!(snapshot.instances[&1].variables[&889], Value::Bool(true));
+        assert!(snapshot.pending_timers.is_empty());
     }
 
     #[test]

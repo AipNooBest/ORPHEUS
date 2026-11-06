@@ -9,21 +9,26 @@ use std::{
 };
 
 use crate::{
-    game_body::{BodyCreate, BodyView, body_create},
+    commands::{Command, CommandQueue},
+    game_body::{BodyCreate, BodyView, body_create, owner_pose},
     game_bots::BOT_RECORD_DELAY,
-    game_clock::SEND_EVERY,
+    game_clock::{MAX_LEASE_FRAME, SEND_EVERY},
     game_controller::ControllerFrame,
     game_egress::{DeliveryReport, RecordSource},
     game_heroes::Hero,
     game_messages::Message,
     game_parameters::{ClientGameMessage, HeroSelectRequest},
     match_scene::{PlayerAppearance, Possession, team_bit},
+    mover::Mover,
     scene_assets::PreparedScene,
     script_stream::{ScriptChunk, Stream},
-    world::{EntityUpdate, GAME_MODE_ENTITY, Movement, Operation, SkinTheme},
+    world::{EntityUpdate, GAME_MODE_ENTITY, Operation, SkinTheme},
 };
 
 const BODY_REUSE_DELAY: Duration = Duration::from_secs(30);
+// Resource bound for this worker. The reference keeps 64 predicted states and
+// 32 commands. A farther-ahead command can be retried once the clock catches up.
+const MAX_INPUT_LEAD: u32 = 96;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BodyId {
@@ -113,6 +118,8 @@ pub(crate) struct WorldDelivery {
     bound: Option<BodyId>,
     generation: u64,
     bodies: HashMap<u32, (u64, Lifetime)>,
+    commands: CommandQueue,
+    mover: Option<Mover>,
 }
 
 impl WorldDelivery {
@@ -130,6 +137,8 @@ impl WorldDelivery {
             bound: None,
             generation: 0,
             bodies: HashMap::new(),
+            commands: CommandQueue::new(),
+            mover: None,
         }
     }
 
@@ -137,6 +146,7 @@ impl WorldDelivery {
         self.queued.clear();
         self.started = None;
         self.presentation_due = false;
+        self.mover = None;
     }
 
     fn push(&mut self, record: Record) {
@@ -340,6 +350,34 @@ impl WorldDelivery {
         Ok(())
     }
 
+    pub(crate) fn command_ack(&self, tick: u32) -> u32 {
+        self.commands.last_frame().unwrap_or(tick)
+    }
+
+    pub(crate) fn take_commands(
+        &mut self,
+        scene: &PreparedScene,
+        tick: u32,
+        quanta: u32,
+        commands: &[Command],
+    ) -> io::Result<Option<u32>> {
+        if self.started.is_none() || commands.is_empty() {
+            return Ok(None);
+        }
+        let (accepted, fresh, boundary) = command_prefix(&self.commands, tick, commands);
+        let dt = f64::from(quanta) / 1_000_000.0;
+        if let Some(mover) = &mut self.mover {
+            for (index, &command) in fresh.iter().enumerate() {
+                if let Err(error) = mover.step(scene.movement_index(), command, dt, |_, _| {}) {
+                    self.commands.consume(&fresh[..index]);
+                    return Err(invalid(error));
+                }
+            }
+        }
+        self.commands = accepted;
+        Ok(boundary)
+    }
+
     fn next_body(&self, now: Duration) -> Option<u32> {
         let suffix = self.body.map_or(0, |body| body.id.entity & 0xff);
         (0..255)
@@ -365,18 +403,15 @@ impl WorldDelivery {
             .spawn_point(viewer.team, 0)
             .ok_or_else(|| invalid("no spawn for the selected hero"))?;
         let yaw = (yaw * 65536.0 / 360.0).round_ties_even() as i32;
-        let pose = Movement {
-            position,
-            yaw,
-            ..Movement::default()
-        };
+        let mover = scene.player_mover(hero.body, viewer.team, position, yaw)?;
+        let pose = owner_pose(mover.pose());
         let create = body_create(
             BodyCreate {
                 entity,
                 hero,
                 team_bit: team_bit(viewer.team)?,
-                position,
-                yaw,
+                position: pose.position,
+                yaw: pose.yaw,
                 skin,
                 vitals: None,
             },
@@ -406,6 +441,7 @@ impl WorldDelivery {
             hero: hero.guid,
             skin,
         });
+        self.mover = Some(mover);
         self.bound = None;
         self.select_open = false;
         self.push(Record {
@@ -445,9 +481,10 @@ impl WorldDelivery {
         open: bool,
         hero: Option<u64>,
     ) -> io::Result<Record> {
+        let command_frame = self.command_ack(tick);
         let chunk = self
             .controller
-            .full_owner(tick, |cmfd| {
+            .full_owner(command_frame, |cmfd| {
                 scene.controller().controller_frame(
                     cmfd,
                     ControllerFrame {
@@ -497,6 +534,25 @@ impl WorldDelivery {
     }
 }
 
+fn command_prefix(
+    queue: &CommandQueue,
+    tick: u32,
+    commands: &[Command],
+) -> (CommandQueue, Vec<Command>, Option<u32>) {
+    // Classify the lease boundary independently of the resource window so a
+    // fresh unencodable frame still closes its old link.
+    let mut accepted = queue.clone();
+    let (mut fresh, boundary) = accepted.before_limit(commands, MAX_LEASE_FRAME, None);
+    let limit = tick.saturating_add(MAX_INPUT_LEAD);
+    let count = fresh.partition_point(|command| command.frame <= limit);
+    if count < fresh.len() {
+        fresh.truncate(count);
+        accepted = queue.clone();
+        accepted.consume(&fresh);
+    }
+    (accepted, fresh, boundary)
+}
+
 fn invalid(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
@@ -504,6 +560,126 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        game_clock::FIRST_TICK, game_content::GameMap, game_heroes::SOLDIER,
+        game_instance::RETAIL_QUANTA, match_scene::PlayerCard, scene_assets::SceneAssets,
+    };
+
+    fn forward(frame: u32) -> Command {
+        Command {
+            frame,
+            forward: 127,
+            ..Command::default()
+        }
+    }
+
+    #[test]
+    fn native_command_window_keeps_duplicates_and_future_input_unacknowledged() {
+        let mut queue = CommandQueue::new();
+        queue.consume(&[forward(1000)]);
+        let (accepted, fresh, boundary) = command_prefix(
+            &queue,
+            1000,
+            &[
+                forward(1000),
+                forward(1001),
+                forward(1096),
+                forward(1097),
+                forward(20_000),
+            ],
+        );
+        assert_eq!(fresh, [forward(1001), forward(1096)]);
+        assert_eq!(boundary, None);
+        assert_eq!(queue.last_frame(), Some(1000));
+        assert_eq!(accepted.last_frame(), Some(1096));
+
+        let empty = CommandQueue::new();
+        let (accepted, fresh, boundary) =
+            command_prefix(&empty, 1000, &[forward(MAX_LEASE_FRAME + 1)]);
+        assert!(fresh.is_empty());
+        assert_eq!(boundary, Some(MAX_LEASE_FRAME + 1));
+        assert_eq!(accepted.last_frame(), None);
+        let (accepted, fresh, boundary) = command_prefix(
+            &empty,
+            MAX_LEASE_FRAME - 2,
+            &[forward(MAX_LEASE_FRAME - 1), forward(MAX_LEASE_FRAME + 1)],
+        );
+        assert_eq!(fresh, [forward(MAX_LEASE_FRAME - 1)]);
+        assert_eq!(boundary, Some(MAX_LEASE_FRAME + 1));
+        assert_eq!(accepted.last_frame(), Some(MAX_LEASE_FRAME - 1));
+    }
+
+    #[test]
+    #[ignore = "requires a prepared 104319 Practice Range pack without bot VM graphs"]
+    fn native_world_moves_the_player_once_per_fresh_command_and_keeps_the_clock_on_switch() {
+        let runtime = std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap();
+        let assets = SceneAssets::load(runtime).unwrap();
+        let scene = assets.prepare(GameMap::practice_range()).unwrap();
+        let owner = 0xa000_0100;
+        let viewer = PlayerAppearance {
+            entity: owner,
+            slot: 0,
+            team: 0,
+            card: &PlayerCard::default(),
+        };
+        let mut world = WorldDelivery::new(owner);
+        let first = FIRST_TICK + 1;
+        assert_eq!(
+            world
+                .take_commands(&scene, FIRST_TICK, RETAIL_QUANTA, &[forward(first)])
+                .unwrap(),
+            None
+        );
+        assert_eq!(world.command_ack(FIRST_TICK), FIRST_TICK);
+        world.start(&scene, &viewer, FIRST_TICK).unwrap();
+        // The reference accepts commands while the hero selector is open.
+        world
+            .take_commands(&scene, FIRST_TICK, RETAIL_QUANTA, &[forward(first)])
+            .unwrap();
+        assert_eq!(world.command_ack(FIRST_TICK + 2), first);
+        let hero = scene.heroes().get(SOLDIER).unwrap();
+        world
+            .switch(
+                &scene,
+                &viewer,
+                FIRST_TICK,
+                owner | 1,
+                hero,
+                SkinTheme::default(),
+            )
+            .unwrap();
+        let initial = world.mover.as_ref().unwrap().pose();
+        let commands: Vec<_> = (first + 1..=first + 24)
+            .map(|frame| Command {
+                yaw: initial.yaw,
+                ..forward(frame)
+            })
+            .collect();
+        world
+            .take_commands(&scene, FIRST_TICK + 3, RETAIL_QUANTA, &commands)
+            .unwrap();
+        let moved = world.mover.as_ref().unwrap().pose();
+        assert_eq!(moved.frame, Some(first + 24));
+        assert_ne!(moved.position, initial.position);
+        assert_eq!(world.command_ack(FIRST_TICK + 90), first + 24);
+        world
+            .take_commands(&scene, FIRST_TICK + 30, RETAIL_QUANTA, &commands)
+            .unwrap();
+        assert_eq!(world.mover.as_ref().unwrap().pose(), moved);
+
+        world
+            .switch(
+                &scene,
+                &viewer,
+                FIRST_TICK + 30,
+                owner | 2,
+                hero,
+                SkinTheme::default(),
+            )
+            .unwrap();
+        assert_eq!(world.mover.as_ref().unwrap().pose(), initial);
+        assert_eq!(world.command_ack(FIRST_TICK + 30), first + 24);
+    }
     use crate::game_egress::PacketDelivery;
 
     const OWNER: u32 = 0xa000_0100;

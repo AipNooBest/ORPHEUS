@@ -193,13 +193,17 @@ pub fn write_value(
 
 pub type Variables = IndexMap<u32, Value>;
 
-fn variable(out: &mut BitWriter, value: &Value, encoding: ValueEncoding) -> Result<(), WireError> {
+pub(crate) fn variable(
+    out: &mut BitWriter,
+    value: &Value,
+    encoding: ValueEncoding,
+) -> Result<(), WireError> {
     write_value(out, value, encoding)?;
     out.bit(false); // no bindings
     Ok(())
 }
 
-fn variable_list(
+pub(crate) fn variable_list(
     out: &mut BitWriter,
     variables: &Variables,
     encoding: ValueEncoding,
@@ -275,6 +279,22 @@ impl Instance {
     }
 }
 
+pub(crate) fn write_descriptor(
+    out: &mut BitWriter,
+    graph: u16,
+    parent: Option<(u16, u16)>,
+) -> Result<(), WireError> {
+    out.bits(u64::from(graph), 16)?;
+    out.bits(0, 2)?; // this entity, flag clear
+    out.bit(parent.is_some());
+    if let Some((parent, state)) = parent {
+        out.w_var(u32::from(parent));
+        out.w_var(u32::from(state));
+    }
+    out.bit(false); // no references
+    Ok(())
+}
+
 pub fn owner_full(
     command_frame: u32,
     instances: &[Instance],
@@ -322,14 +342,7 @@ fn full_frame(
         }
         out.w_u16(instance.id - last);
         last = instance.id;
-        out.bits(u64::from(instance.layout.graph), 16)?;
-        out.bits(0, 2)?; // this entity, flag clear
-        out.bit(instance.parent.is_some());
-        if let Some((parent, state)) = instance.parent {
-            out.w_var(u32::from(parent));
-            out.w_var(u32::from(state));
-        }
-        out.bit(false); // no references
+        write_descriptor(&mut out, instance.layout.graph, instance.parent)?;
     }
     out.w_u16(0);
     variable_list(&mut out, variables, encoding)?;

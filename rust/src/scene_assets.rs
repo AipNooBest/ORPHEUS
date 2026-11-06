@@ -14,14 +14,17 @@ use crate::{
     accounts::parse_guid,
     bits::BitWriter,
     collision_cache::{chunk_guid, read_movement_cache},
+    collision_index::TriangleIndex,
     collision_scene::CollisionScene,
+    contact_world::ContactWorld,
     game_bots::{Bot, BotCatalog, BotWalk},
-    game_content::GameMap,
+    game_content::{GameMap, PRACTICE_RANGE_MAP, PRACTICE_RANGE_MODE},
     game_controller::Controller,
     game_heroes::HeroCatalog,
     game_pools::PoolCatalog,
     game_stats::{PlayerStats, StatsCatalog},
     match_scene::{PlayerAppearance, initial_world, mode_ui},
+    mover::Mover,
     mover_settings::MoverCatalog,
     script_graph::GraphStore,
     script_wire::Variables,
@@ -35,7 +38,7 @@ pub struct SceneAssets {
     mode_props: BTreeMap<u64, BTreeSet<u64>>,
     graphs: GraphStore,
     bots: BotCatalog,
-    movers: MoverCatalog,
+    movers: Arc<MoverCatalog>,
     stats: StatsCatalog,
     heroes: Arc<HeroCatalog>,
     pools: Arc<PoolCatalog>,
@@ -44,11 +47,13 @@ pub struct SceneAssets {
 pub struct PreparedScene {
     map: GameMap,
     ground: CollisionScene,
+    contacts: Option<Arc<ContactWorld>>,
     controller: Controller,
     mode_ui: BitWriter,
     initial_board: Component,
     bots: Vec<Bot>,
     scripted_bots: usize,
+    movers: Arc<MoverCatalog>,
     heroes: Arc<HeroCatalog>,
     pools: Arc<PoolCatalog>,
 }
@@ -64,7 +69,7 @@ impl SceneAssets {
             mode_props: read_mode_props(&data.join("collision_props_174.json"))?,
             graphs,
             bots: BotCatalog::load(data.join("ai_spawners_174.json"))?,
-            movers: MoverCatalog::load(data.join("game_movers_174.json"))?,
+            movers: Arc::new(MoverCatalog::load(data.join("game_movers_174.json"))?),
             stats: StatsCatalog::load(data.join("game_stats_174.json"))?,
             heroes: Arc::new(HeroCatalog::load(data.join("game_heroes_174.json"))?),
             pools,
@@ -108,6 +113,12 @@ impl SceneAssets {
             .iter()
             .filter(|bot| self.graphs.entity_body(bot.spawn.body).is_some())
             .count();
+        let contacts = (map.map_guid == PRACTICE_RANGE_MAP
+            && map.mode_guid == PRACTICE_RANGE_MODE
+            && scripted_bots == 0)
+            .then(|| ContactWorld::from_movement_cache(cache, identifiers).map(Arc::new))
+            .transpose()
+            .map_err(invalid)?;
         let controller = Controller::load(&self.graphs, map.mode_guid)?;
         let mode_ui = mode_ui(&self.graphs, &Variables::new())?;
         let initial_board =
@@ -116,11 +127,13 @@ impl SceneAssets {
         Ok(PreparedScene {
             map,
             ground,
+            contacts,
             controller,
             mode_ui,
             initial_board,
             bots,
             scripted_bots,
+            movers: Arc::clone(&self.movers),
             heroes: Arc::clone(&self.heroes),
             pools: Arc::clone(&self.pools),
         })
@@ -134,6 +147,42 @@ impl PreparedScene {
 
     pub fn scripted_bots(&self) -> usize {
         self.scripted_bots
+    }
+
+    pub(crate) fn movement_ready(&self) -> bool {
+        self.contacts.is_some()
+    }
+
+    pub(crate) fn movement_index(&self) -> &TriangleIndex {
+        self.ground.triangles()
+    }
+
+    pub(crate) fn player_mover(
+        &self,
+        body: u64,
+        team: u8,
+        position: [f64; 3],
+        yaw: i32,
+    ) -> io::Result<Mover> {
+        let contacts = self.contacts.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the scene has no native player collision",
+            )
+        })?;
+        let category = match (self.map.free_for_all, team) {
+            (false, 0) => 0x08,
+            (false, 1) => 0x10,
+            _ => MOVER_CATEGORY,
+        };
+        Mover::new(
+            *self.movers.for_body(Some(body)),
+            Arc::clone(contacts),
+            position,
+            yaw,
+            category,
+        )
+        .map_err(invalid)
     }
 
     pub fn heroes(&self) -> &HeroCatalog {

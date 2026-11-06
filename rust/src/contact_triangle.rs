@@ -9,7 +9,9 @@ use std::sync::OnceLock;
 
 use crate::collision_cache::Mesh;
 use crate::contact_gjk::{SimplexCache, gjk};
-use crate::contact_math::{TINY, Vec3, add, cross, dot, minps, mul, normalize, rsqrt, scale, sub};
+use crate::contact_math::{
+    TINY, Vec3, add, cross, dot, maxps, minps, mul, normalize, rsqrt, scale, sub,
+};
 use crate::contact_round::{
     Capsule, ContactPoint, Feature, FeatureId, FeatureKind, Manifold, clamp01, splat_tiny,
 };
@@ -28,6 +30,7 @@ pub struct ContactTriangle {
     corners: [Vec3; 3],
     wings: [Option<Vec3>; 3],
     normal: Vec3,
+    bounds: [Vec3; 2],
     neighbors: OnceLock<[Vec3; 3]>,
     pub index: u32,
     pub mask: u16,
@@ -48,6 +51,10 @@ impl ContactTriangle {
             corners,
             wings,
             normal: normalize(cross(sub(b, a), sub(c, a))),
+            bounds: [
+                std::array::from_fn(|k| minps(minps(a[k], b[k]), c[k])),
+                std::array::from_fn(|k| maxps(maxps(a[k], b[k]), c[k])),
+            ],
             neighbors: OnceLock::new(),
             index,
             mask,
@@ -85,6 +92,10 @@ impl ContactTriangle {
 
     pub fn normal(&self) -> Vec3 {
         self.normal
+    }
+
+    pub(crate) fn contact_bounds(&self) -> [Vec3; 2] {
+        self.bounds
     }
 
     pub fn neighbor_normals(&self) -> &[Vec3; 3] {
@@ -135,6 +146,16 @@ fn atan2_approx(y: f32, x: f32) -> f32 {
 
 /// Closest points of two finite segments in the contact engine's f32 order.
 pub fn closest_segments(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> (Vec3, Vec3) {
+    let (pa, pb) = closest_parameters(a0, a1, b0, b1);
+    let gap = sub(pb, pa);
+    if dot(gap, gap).partial_cmp(&TINY) != Some(Ordering::Greater) {
+        return (pa, pa);
+    }
+    let n = normalize(gap);
+    (add(scale(n, 0.0), pa), sub(pb, scale(n, 0.0)))
+}
+
+pub(crate) fn closest_parameters(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> (Vec3, Vec3) {
     let d1 = sub(a1, a0);
     let d2 = sub(b1, b0);
     let r = sub(a0, b0);
@@ -173,12 +194,7 @@ pub fn closest_segments(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> (Vec3, Vec3) 
         };
         (pa, pb) = (add(scale(d1, s), a0), add(scale(d2, t), b0));
     }
-    let gap = sub(pb, pa);
-    if dot(gap, gap).partial_cmp(&TINY) != Some(Ordering::Greater) {
-        return (pa, pa);
-    }
-    let n = normalize(gap);
-    (add(scale(n, 0.0), pa), sub(pb, scale(n, 0.0)))
+    (pa, pb)
 }
 
 #[derive(Clone, Copy)]

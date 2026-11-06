@@ -15,14 +15,14 @@ use crate::contact_gjk::PointSetSize;
 use crate::contact_gjk::sweep::{
     CastFrame, CastOptions, CastShape, MeshProbe, ShapeHit, mesh_sweep, shape_cast,
 };
-use crate::contact_math::{ContactFrame, add, maxps, minps, mul, scale, sub};
+use crate::contact_math::{ContactFrame, Vec3, add, maxps, minps, mul, scale, sub};
 use crate::contact_mesh::{ContactBounds, ContactMesh, ContactMeshError};
 use crate::contact_round::{RoundObstacle, RoundShape};
 use crate::contact_triangle::SKIN;
 
 const STATIC_COLUMN_WIDTH: f64 = 4.0;
 const HUGE_PROXY_COLUMNS: u64 = 1024;
-const STATIC_MARGIN: f32 = 0.1;
+pub(crate) const PROXY_MARGIN: f32 = 0.1;
 const SWEEP_REACH: f64 = 0.05;
 
 #[derive(Debug)]
@@ -108,8 +108,8 @@ impl StaticShape {
         }
         let matrix = frame.map(CastFrame::from);
         let fat = shape_bounds(&geometry, frame, matrix).map(|bounds| ContactBounds {
-            low: sub(bounds.low, [STATIC_MARGIN; 3]),
-            high: add(bounds.high, [STATIC_MARGIN; 3]),
+            low: sub(bounds.low, [PROXY_MARGIN; 3]),
+            high: add(bounds.high, [PROXY_MARGIN; 3]),
         });
         if fat
             .is_some_and(|bounds| !valid_box(bounds.low.map(f64::from), bounds.high.map(f64::from)))
@@ -189,17 +189,33 @@ fn shape_bounds(
             let Some(frame) = frame else {
                 return Some(ContactBounds { low, high });
             };
-            let [c0, c1, c2] = transform
-                .columns()
-                .map(|column| column.map(|x| maxps(0.0 - x, x)));
-            let center = frame.place(scale(add(low, high), 0.5));
-            let [hx, hy, hz] = scale(sub(high, low), 0.5);
-            let extent = add(add(scale(c1, hy), scale(c0, hx)), scale(c2, hz));
-            Some(ContactBounds {
-                low: sub(center, extent),
-                high: add(extent, center),
-            })
+            Some(oriented_box(
+                ContactBounds { low, high },
+                frame,
+                absolute_columns(transform),
+            ))
         }
+    }
+}
+
+pub(crate) fn absolute_columns(matrix: CastFrame) -> [Vec3; 3] {
+    matrix
+        .columns()
+        .map(|column| column.map(|x| maxps(0.0 - x, x)))
+}
+
+pub(crate) fn oriented_box(
+    bounds: ContactBounds,
+    frame: ContactFrame,
+    [c0, c1, c2]: [Vec3; 3],
+) -> ContactBounds {
+    let ContactBounds { low, high } = bounds;
+    let center = frame.place(scale(add(low, high), 0.5));
+    let [hx, hy, hz] = scale(sub(high, low), 0.5);
+    let extent = add(add(scale(c1, hy), scale(c0, hx)), scale(c2, hz));
+    ContactBounds {
+        low: sub(center, extent),
+        high: add(extent, center),
     }
 }
 
@@ -211,7 +227,7 @@ fn columns(low: [f64; 3], high: [f64; 3]) -> Option<ColumnRange> {
     ColumnRange::for_width([low[0], low[2]], [high[0], high[2]], STATIC_COLUMN_WIDTH)
 }
 
-fn overlaps(low: [f64; 3], high: [f64; 3], bounds: ContactBounds) -> bool {
+pub(crate) fn overlaps(low: [f64; 3], high: [f64; 3], bounds: ContactBounds) -> bool {
     (0..3).all(|k| {
         !(high[k] - f64::from(bounds.low[k])).is_sign_negative()
             && !(f64::from(bounds.high[k]) - low[k]).is_sign_negative()
@@ -448,7 +464,6 @@ fn placed_geometry(
 mod tests {
     use super::*;
     use crate::collision_cache::Triangle;
-    use crate::contact_math::Vec3;
     use crate::contact_round::{Capsule, Sphere};
     use serde_json::json;
 

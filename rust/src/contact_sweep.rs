@@ -14,7 +14,7 @@ use crate::contact_math::{
 use crate::contact_mesh::ContactMesh;
 use crate::contact_triangle::{SKIN, TOUCH};
 
-const CAST_TOLERANCE: f32 = 0.00125;
+pub(crate) const CAST_TOLERANCE: f32 = 0.00125;
 const CAST_DEEP: f32 = 0.0001;
 const SWEEP_BOX: f32 = 0.02;
 

@@ -143,7 +143,7 @@ impl GameService {
         player: MatchPlayer,
         card: PlayerCard,
     ) -> io::Result<Handoff> {
-        if scene.map().mode_guid != PRACTICE_RANGE_MODE || scene.scripted_bots() != 0 {
+        if scene.map().mode_guid != PRACTICE_RANGE_MODE || !scene.movement_ready() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "the native world bootstrap requires the solo Practice Range without bot VM graphs",
@@ -553,7 +553,7 @@ impl State {
                 world,
                 ..
             } = peer;
-            let _ = ingress.receive(&self.schemas, &payload, |message| {
+            let commands = ingress.receive(&self.schemas, &payload, |message| {
                 match MessageKind::from(message.id) {
                     MessageKind::Ping => {
                         let received = wall_nanoseconds();
@@ -581,6 +581,16 @@ impl State {
                     _ => {}
                 }
             });
+            if let (Ok(commands), Some(prepared)) = (commands, &room.world) {
+                let quanta = room.players[slot].quanta();
+                let result =
+                    world.take_commands(&prepared.scene, self.clock.frame(), quanta, &commands);
+                if !matches!(result, Ok(None)) {
+                    world.clear();
+                    *loading = MapReadiness::default();
+                    self.send_home(connection, now);
+                }
+            }
         }
     }
 
@@ -645,6 +655,7 @@ impl State {
                         .map_or_else(Vec::new, |world| peer.world.movement(&world.scene, tick))
                 };
                 let queued = peer.world.ready();
+                let command_ack = peer.world.command_ack(tick);
                 let sent = peer.egress.send_frame(
                     FrameRecords {
                         tick,
@@ -653,7 +664,7 @@ impl State {
                         owner_correction: false,
                         reliable_only: drain,
                     },
-                    |_| tick,
+                    |_| command_ack,
                     |source| match source {
                         RecordSource::Queued(index) => queued[index].tracked(),
                         RecordSource::Movement(index) => {
@@ -1106,6 +1117,39 @@ mod tests {
             .collect()
     }
 
+    fn input_batch(first: u32, count: u8, yaw: i16) -> Vec<u8> {
+        let mut input = BitWriter::new();
+        input.bits(0, 24).unwrap(); // latency and key flags
+        input.bits(u64::from(count), 8).unwrap();
+        input.bits(u64::from(first), 32).unwrap();
+        input.bit(true); // new throttles
+        input.bit(true); // compact throttle direction
+        input.bit(true); // moving
+        input.bits(2, 3).unwrap(); // forward
+        input.signed(i64::from(yaw), 16).unwrap();
+        input.signed(0, 16).unwrap();
+        input.bits(0, 24).unwrap(); // buttons
+        input.bits(0, 8).unwrap(); // action
+        input.bits(0, 16).unwrap(); // extra
+        for _ in 1..count {
+            input.bit(false); // next consecutive frame
+            input.bit(false); // no changed fields
+        }
+        let mut payload = BitWriter::new();
+        write_channel(&mut payload, &[], &[]).unwrap();
+        payload.bit(true);
+        payload.bits(input.bit_len() as u64, 32).unwrap();
+        payload.raw_bits(input.as_bytes(), input.bit_len()).unwrap();
+        payload.into_bytes()
+    }
+
+    fn input_ack(schemas: &Schemas, packet: &Packet) -> u32 {
+        let mut reader = BitReader::new(&packet.payload);
+        reader.var_a().unwrap();
+        read_channel(&mut reader, schemas).unwrap();
+        reader.var_a().unwrap()
+    }
+
     #[test]
     #[ignore = "requires a prepared 104319 Practice Range scene"]
     fn prepared_world_waits_for_ownership_and_retries_baselines_before_scripts() {
@@ -1419,6 +1463,42 @@ mod tests {
         assert_eq!(describe(&records), expected);
         assert_eq!(verify_controller(&records, SOLDIER, false), first_cmfd);
         assert!(client.window.accept(retry.seq));
+
+        let tick = BitReader::new(&retry.payload).var_a().unwrap();
+        let first_input = tick + 32;
+        let mut newest = first_input + 4;
+        let await_input = |client: &mut Client, expected| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let packet = client.receive();
+                assert!(client.window.accept(packet.seq));
+                if input_ack(schemas, &packet) == expected {
+                    assert!(
+                        world_records(schemas, &packet)
+                            .iter()
+                            .all(|record| record.entity != FIRST || !record.movement)
+                    );
+                    return;
+                }
+                client.send(ACK, Vec::new());
+                assert!(
+                    Instant::now() < deadline,
+                    "waiting for command acknowledgement"
+                );
+            }
+        };
+        client.send(ACK, input_batch(first_input, 5, -31010));
+        await_input(client, newest);
+        client.send(ACK, input_batch(newest + 2_000, 1, -31010));
+        for _ in 0..2 {
+            let packet = client.receive();
+            assert!(client.window.accept(packet.seq));
+            assert_eq!(input_ack(schemas, &packet), newest);
+            client.send(ACK, Vec::new());
+        }
+        newest += 1;
+        client.send(ACK, input_batch(newest, 1, -31010));
+        await_input(client, newest);
 
         let mut open = vec![1, 1];
         open.extend(OWNER.to_le_bytes());
