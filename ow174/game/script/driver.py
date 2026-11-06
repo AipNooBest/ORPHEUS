@@ -403,8 +403,14 @@ class BodyScript(ReplicatedBody):
         elif charge > seen[0]:
             seen[0], seen[1] = charge, now
         elif seen[1] + self._ULT_STALL_SECONDS < now:
-            log.info("[game] %X: ultimate meter stuck at %.1f for %.0f s", self.entity, charge,
-                     now - seen[1])
+            base = self.stream.base
+            acked = next((v for (owner, var), (v, _) in base.vars.items() if var == ULT_CHARGE), None)
+            log.info(
+                "[game] %X: ultimate meter stuck at %.1f for %.0f s (client has %s; frames %d acked %d,"
+                " pending %d, cmfd %d, commands %d)",
+                self.entity, charge, now - seen[1], acked, self.stream.last, self.stream.base_last,
+                len(self.stream.pending), self.stream.cmfd, self.frame,
+            )
             seen[1] = now  # report again after the next interval if it stays stuck
 
     # --- what the client gets ----------------------------------------------------------------------
