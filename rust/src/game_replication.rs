@@ -30,7 +30,11 @@ use crate::{
     script_player::OwnerBodySpawn,
     script_snapshot_wire::{ProjectedSnapshot, SnapshotEncoder, View},
     script_stream::{BodyStream, DeltaKind, ScriptChunk, Stream},
-    world::{EntityUpdate, GAME_MODE_ENTITY, LeaseBlock, MAX_PAYLOAD, Operation, SkinTheme, frame},
+    vitals::Vitals,
+    world::{
+        Component as WorldComponent, EntityUpdate, GAME_MODE_ENTITY, LeaseBlock, MAX_PAYLOAD,
+        Operation, SkinTheme, frame,
+    },
 };
 
 const BODY_REUSE_DELAY: Duration = Duration::from_secs(30);
@@ -65,6 +69,15 @@ pub(crate) trait OwnerBodyRuntime: Send {
     fn encoder(&self) -> SnapshotEncoder<'_>;
     fn advance(&mut self, command: Command, mover: &Mover, step: BodyStep) -> io::Result<()>;
     fn frame_ms(&self) -> u32;
+
+    fn vitals(&self) -> Option<&Vitals> {
+        None
+    }
+
+    /// New health revisions supersede older ones, including any slot clears.
+    fn take_health_update(&mut self) -> Option<WorldComponent> {
+        None
+    }
 
     fn leases(&self) -> &[LeaseBlock] {
         &[]
@@ -244,7 +257,7 @@ enum Delivery {
     BotCreate {
         after: Option<u32>,
     },
-    BotHealth {
+    Health {
         revision: u64,
     },
     BotDestroy,
@@ -441,7 +454,7 @@ pub(crate) struct WorldDelivery {
     queued: Vec<Arc<Record>>,
     created: HashSet<u32>,
     bots: HashMap<u32, BotLifetime>,
-    bot_health: HashMap<u32, u64>,
+    health_updates: HashMap<u32, u64>,
     health_revision: u64,
     started: Option<u32>,
     pub(crate) presentation_due: bool,
@@ -465,7 +478,7 @@ impl WorldDelivery {
             queued: Vec::new(),
             created: HashSet::new(),
             bots: HashMap::new(),
-            bot_health: HashMap::new(),
+            health_updates: HashMap::new(),
             health_revision: 0,
             started: None,
             presentation_due: false,
@@ -487,7 +500,7 @@ impl WorldDelivery {
         self.queued.clear();
         self.created.clear();
         self.bots.clear();
-        self.bot_health.clear();
+        self.health_updates.clear();
         self.started = None;
         self.presentation_due = false;
         self.mover = None;
@@ -512,22 +525,27 @@ impl WorldDelivery {
         self.mode.delivered() != 0
     }
 
-    pub(crate) fn bot_health_pending(&self, entity: u32) -> bool {
-        self.bot_health.contains_key(&entity)
+    pub(crate) fn health_pending(&self, entity: u32) -> bool {
+        self.health_updates.contains_key(&entity)
     }
 
-    pub(crate) fn queue_bot_health(&mut self, update: EntityUpdate) {
+    pub(crate) fn queue_health(&mut self, update: EntityUpdate) {
         let entity = update.entity;
-        if self.bots.get(&entity) != Some(&BotLifetime::Live) {
+        let live_bot = self.bots.get(&entity) == Some(&BotLifetime::Live);
+        let live_body = self.body.is_some_and(|body| {
+            body.id.entity == entity
+                && self.bodies.get(&entity) == Some(&(body.id.generation, Lifetime::Live))
+        });
+        if !live_bot && !live_body {
             return;
         }
         self.health_revision = self.health_revision.wrapping_add(1);
         let revision = self.health_revision;
-        self.bot_health.insert(entity, revision);
+        self.health_updates.insert(entity, revision);
         self.remove_stale();
         self.push(Record {
             update,
-            delivery: Delivery::BotHealth { revision },
+            delivery: Delivery::Health { revision },
         });
     }
 
@@ -540,7 +558,7 @@ impl WorldDelivery {
         self.bots.insert(old, BotLifetime::Retiring);
         self.bots.insert(new, BotLifetime::Live);
         self.created.remove(&old);
-        self.bot_health.remove(&old);
+        self.health_updates.remove(&old);
         self.remove_stale();
         self.push(Record {
             update: EntityUpdate {
@@ -562,7 +580,7 @@ impl WorldDelivery {
             Delivery::Baseline | Delivery::Script { close: false, .. } => true,
             Delivery::BotCreate { .. } => self.bots.get(&entity) == Some(&BotLifetime::Live),
             Delivery::BotDestroy => self.bots.get(&entity) == Some(&BotLifetime::Retiring),
-            Delivery::BotHealth { revision } => self.bot_health.get(&entity) == Some(&revision),
+            Delivery::Health { revision } => self.health_updates.get(&entity) == Some(&revision),
             Delivery::Script {
                 last, close: true, ..
             } => last == self.controller.latest_data(),
@@ -616,8 +634,8 @@ impl WorldDelivery {
                     (true, Delivery::BotDestroy) => {
                         self.bots.remove(&record.update.entity);
                     }
-                    (true, Delivery::BotHealth { .. }) => {
-                        self.bot_health.remove(&record.update.entity);
+                    (true, Delivery::Health { .. }) => {
+                        self.health_updates.remove(&record.update.entity);
                     }
                     (true, Delivery::CreateBody(id)) => {
                         self.created.insert(id.entity);
@@ -677,7 +695,7 @@ impl WorldDelivery {
                     {
                         return None;
                     }
-                    Delivery::BotHealth { .. } if !self.identity_ready(record.update.entity) => {
+                    Delivery::Health { .. } if !self.identity_ready(record.update.entity) => {
                         return None;
                     }
                     Delivery::CreateBody(id) if Some(id) == body => created = true,
@@ -742,7 +760,7 @@ impl WorldDelivery {
         send: impl FnOnce(Vec<u8>) -> Result<u32, E>,
     ) -> Result<SentFrame, SendError<E>> {
         if !reliable_only {
-            self.prepare_body_script();
+            self.prepare_body_updates();
         }
         let script = self.body_script.as_ref();
         let history = script.and_then(|script| script.corrections.as_ref());
@@ -801,12 +819,9 @@ impl WorldDelivery {
         Ok(sent)
     }
 
-    fn prepare_body_script(&mut self) {
-        let Some(script) = &mut self.body_script else {
-            return;
-        };
+    fn prepare_body_updates(&mut self) {
         // A split input gap can update physics history immediately. The owner
-        // VM stream publishes only after the queued command completes.
+        // VM and health publish only after the queued command completes.
         if matches!(
             self.input.work.front(),
             Some(InputWork::Command {
@@ -816,6 +831,19 @@ impl WorldDelivery {
         ) {
             return;
         }
+        if let Some(update) = self.body_script.as_mut().and_then(|script| {
+            let health = script.runtime.take_health_update()?;
+            Some(EntityUpdate {
+                entity: script.id.entity,
+                operation: Some(Operation::Update(vec![health])),
+                ..EntityUpdate::default()
+            })
+        }) {
+            self.queue_health(update);
+        }
+        let Some(script) = &mut self.body_script else {
+            return;
+        };
         let (record, replaced) = match script.next_record(self.created.contains(&script.id.entity))
         {
             Ok(Some(record)) => record,
@@ -1186,7 +1214,7 @@ impl WorldDelivery {
                 position: pose.position,
                 yaw: pose.yaw,
                 skin,
-                vitals: None,
+                vitals: script.as_ref().and_then(|script| script.runtime.vitals()),
             },
             BodyView::Owner {
                 pose: Some(pose),
@@ -1225,21 +1253,26 @@ impl WorldDelivery {
             delivery: Delivery::Possession(id),
         });
         if let Some(old) = old {
-            self.created.remove(&old.id.entity);
-            self.bodies
-                .insert(old.id.entity, (old.id.generation, Lifetime::Retiring));
-            self.push(Record {
-                update: EntityUpdate {
-                    entity: old.id.entity,
-                    operation: Some(Operation::Destroy),
-                    ..EntityUpdate::default()
-                },
-                delivery: Delivery::DestroyBody(old.id),
-            });
+            self.retire_body(old.id);
         }
         self.push(close);
         self.remove_stale();
         Ok(())
+    }
+
+    fn retire_body(&mut self, id: BodyId) {
+        self.created.remove(&id.entity);
+        self.health_updates.remove(&id.entity);
+        self.bodies
+            .insert(id.entity, (id.generation, Lifetime::Retiring));
+        self.push(Record {
+            update: EntityUpdate {
+                entity: id.entity,
+                operation: Some(Operation::Destroy),
+                ..EntityUpdate::default()
+            },
+            delivery: Delivery::DestroyBody(id),
+        });
     }
 
     fn controller_chunk(
@@ -1341,7 +1374,10 @@ mod tests {
         script_runtime::FRAME_MS,
         world::{MAX_ENTITY_RECORDS, Movement},
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     fn forward(frame: u32) -> Command {
         Command {
@@ -1397,7 +1433,7 @@ mod tests {
             update: create(old),
             delivery: Delivery::BotCreate { after: None },
         });
-        world.queue_bot_health(health_update(160.0));
+        world.queue_health(health_update(160.0));
         assert_eq!(world.ready().len(), 1);
         assert!(!world.identity_ready(old));
         let spawn = send(&mut world, 0);
@@ -1406,18 +1442,18 @@ mod tests {
         assert!(world.identity_ready(old));
 
         let earlier_health = send(&mut world, 0);
-        world.queue_bot_health(health_update(0.0));
+        world.queue_health(health_update(0.0));
         resolve(&mut world, earlier_health, false);
         let ready = world.ready();
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].record.update, health_update(0.0));
         let terminal = send(&mut world, 0);
         resolve(&mut world, Arc::clone(&terminal), false);
-        assert!(world.bot_health_pending(old));
+        assert!(world.health_pending(old));
         let terminal_retry = send(&mut world, 0);
         assert!(Arc::ptr_eq(&terminal, &terminal_retry));
         resolve(&mut world, terminal_retry, true);
-        assert!(!world.bot_health_pending(old));
+        assert!(!world.health_pending(old));
 
         world.replace_bot(BotReplacement {
             retired: old,
@@ -1441,7 +1477,7 @@ mod tests {
         assert_eq!(replacement.update.entity, new);
         resolve(&mut world, replacement, true);
         resolve(&mut world, terminal, false);
-        world.queue_bot_health(health_update(120.0));
+        world.queue_health(health_update(120.0));
         assert!(world.ready().is_empty());
         assert!(!world.identity_ready(old));
         assert!(world.identity_ready(new));
@@ -1747,6 +1783,7 @@ mod tests {
         codecs: CodecTable,
         modifiers: BTreeMap<ModifierKey, Modifier>,
         failed: Arc<AtomicBool>,
+        health_update: Arc<Mutex<Option<WorldComponent>>>,
     }
 
     impl OwnerBodyRuntime for SyntheticOwner {
@@ -1770,16 +1807,16 @@ mod tests {
             FRAME_MS as u32
         }
 
+        fn take_health_update(&mut self) -> Option<WorldComponent> {
+            self.health_update.lock().unwrap().take()
+        }
+
         fn movement_modifiers(&self) -> Option<&BTreeMap<ModifierKey, Modifier>> {
             Some(&self.modifiers)
         }
     }
 
-    fn synthetic_owner(
-        entity: u32,
-        frame: u32,
-        failed: Arc<AtomicBool>,
-    ) -> Box<dyn OwnerBodyRuntime> {
+    fn synthetic_owner(entity: u32, frame: u32, failed: Arc<AtomicBool>) -> SyntheticOwner {
         let graphs = Arc::new(
             GraphStore::from_json(
                 br#"{"version":1,"bodies":{},"missing":[],"graphs":[{
@@ -1801,13 +1838,14 @@ mod tests {
             MAX_INIT_WORK,
         )
         .unwrap();
-        Box::new(SyntheticOwner {
+        SyntheticOwner {
             component,
             graphs,
             codecs: CodecTable::from_json(r#"{"classes":{}}"#).unwrap(),
             modifiers: BTreeMap::new(),
             failed,
-        })
+            health_update: Arc::default(),
+        }
     }
 
     fn activate_script(world: &mut WorldDelivery, id: BodyId, hero: u64, failed: Arc<AtomicBool>) {
@@ -1818,8 +1856,8 @@ mod tests {
             .bodies
             .insert(id.entity, (id.generation, Lifetime::Live));
         world.created.remove(&id.entity);
-        world.body_script =
-            Some(BodyScript::new(body, 100, synthetic_owner(id.entity, 100, failed)).unwrap());
+        let runtime = Box::new(synthetic_owner(id.entity, 100, failed));
+        world.body_script = Some(BodyScript::new(body, 100, runtime).unwrap());
     }
 
     fn transmit(
@@ -1848,6 +1886,73 @@ mod tests {
             egress.acknowledge(sequence + 1, u64::from(arrived)),
             Duration::ZERO,
         );
+    }
+
+    #[test]
+    fn owner_health_waits_for_creation_and_discards_superseded_lifetimes() {
+        use crate::world::{ARMOUR_POOL, POOLS, health, pool, pool_component};
+
+        let id = avatar(1, 1);
+        let mut world = WorldDelivery::new(OWNER);
+        world.started = Some(100);
+        world.body = Some(body(id));
+        world
+            .bodies
+            .insert(id.entity, (id.generation, Lifetime::Live));
+        let runtime = synthetic_owner(id.entity, 100, Arc::default());
+        let pending = Arc::clone(&runtime.health_update);
+        world.body_script = Some(BodyScript::new(body(id), 100, Box::new(runtime)).unwrap());
+        world.push(record(id.entity, Delivery::CreateBody(id)));
+
+        let mut egress = GameEgress::default();
+        let first = health(160.0, 200.0, 50.0, 0.0);
+        *pending.lock().unwrap() = Some(first.clone());
+        let sent = world
+            .send_frame(100, Vec::new(), false, &mut egress, |_| Ok::<_, ()>(0))
+            .unwrap();
+        assert_eq!(sent.records, [RecordSource::Queued(0)]);
+        assert!(world.health_pending(id.entity));
+        assert!(world.ready().is_empty());
+        transport_outcome(&mut world, &mut egress, 0, true);
+
+        let old = world.ready()[0].tracked();
+        assert_eq!(old.update.operation, Some(Operation::Update(vec![first])));
+        world.sent(&[0]);
+        let latest = pool_component([
+            (0, pool(1, 0, 200.0, 120.0)),
+            (ARMOUR_POOL * POOLS, [0; 20]),
+        ]);
+        *pending.lock().unwrap() = Some(latest.clone());
+        let rejected = world.send_frame(101, Vec::new(), false, &mut egress, |_| Err::<u32, _>(()));
+        assert!(matches!(rejected, Err(SendError::Transport(()))));
+        world.acknowledge(outcome(Arc::clone(&old), false), Duration::ZERO);
+        world.acknowledge(outcome(old, true), Duration::ZERO);
+        assert!(world.health_pending(id.entity));
+        let mut updates = world
+            .ready()
+            .into_iter()
+            .filter(|item| matches!(item.record.delivery, Delivery::Health { .. }));
+        let ready = updates.next().expect("latest health revision");
+        assert!(updates.next().is_none());
+        let latest_record = ready.tracked();
+        assert_eq!(
+            latest_record.update.operation,
+            Some(Operation::Update(vec![latest]))
+        );
+
+        world.sent(&[ready.index]);
+        world.body = Some(body(avatar(2, 2)));
+        world.cancel_body_script();
+        world.retire_body(id);
+        world.remove_stale();
+        world.queue_health(latest_record.update.clone());
+        world.acknowledge(outcome(latest_record, false), Duration::ZERO);
+        assert!(!world.health_pending(id.entity));
+        assert!(!world.identity_ready(id.entity));
+        let [destroy] = world.queued.as_slice() else {
+            panic!("expected only the retired body's destroy record");
+        };
+        assert!(matches!(destroy.delivery, Delivery::DestroyBody(retired) if retired == id));
     }
 
     #[test]

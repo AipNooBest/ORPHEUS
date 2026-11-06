@@ -12,7 +12,7 @@ use crate::{
     game_heroes::{Hero, SOLDIER},
     game_hitscan::HitDefinition,
     game_instance::RETAIL_QUANTA,
-    game_pools::{FALLBACK_POOLS, HealthPools, PoolKind},
+    game_pools::{BODY_GRAPH, FALLBACK_POOLS, HealthPools},
     game_replication::{BodyStep, OwnerBodyRuntime},
     mover::Mover,
     mover_modifiers::{Modifier, ModifierKey},
@@ -23,7 +23,8 @@ use crate::{
     script_runtime::FRAME_MS,
     script_snapshot_wire::{SnapshotEncoder, View},
     script_wire::{Value, Variables},
-    world::GAME_MODE_ENTITY,
+    vitals::{PoolKind, Vitals},
+    world::{Component as EntityComponent, GAME_MODE_ENTITY},
 };
 
 #[derive(Clone, Copy)]
@@ -89,6 +90,7 @@ impl PlayerBodyFactory {
         if spawn.quanta != RETAIL_QUANTA {
             return Err(unsupported("the owner VM requires the 16 ms retail clock"));
         }
+        let has_authored_pools = self.roots.iter().any(|root| root.graph == BODY_GRAPH);
         let mut world = BodyWorld {
             graphs: Arc::clone(&self.graphs),
             controller: spawn.controller,
@@ -97,7 +99,12 @@ impl PlayerBodyFactory {
             throttles: [0; 2],
             mode: self.mode,
             hero: self.hero,
-            pools: self.pools,
+            vitals: if has_authored_pools {
+                Vitals::empty()
+            } else {
+                self.pools.unwrap_or(FALLBACK_POOLS).vitals()
+            },
+            pool_types_known: self.pools.is_some() || has_authored_pools,
         };
         let mut component = Component::start(
             Arc::clone(&self.graphs),
@@ -112,6 +119,7 @@ impl PlayerBodyFactory {
         component
             .advance_frame(spawn.frame, &mut world)
             .map_err(unsupported)?;
+        world.vitals.clear_changed();
         let modifiers = component
             .movement_modifiers(&mut world)
             .map_err(unsupported)?;
@@ -134,6 +142,19 @@ pub(crate) struct PlayerBodyRuntime {
 }
 
 impl OwnerBodyRuntime for PlayerBodyRuntime {
+    fn vitals(&self) -> Option<&Vitals> {
+        Some(&self.world.vitals)
+    }
+
+    fn take_health_update(&mut self) -> Option<EntityComponent> {
+        let vitals = &mut self.world.vitals;
+        if !vitals.has_changed() {
+            return None;
+        }
+        vitals.clear_changed();
+        Some(vitals.cumulative_component())
+    }
+
     fn snapshot(&self) -> Option<&Snapshot> {
         self.component.snapshot()
     }
@@ -228,7 +249,8 @@ struct BodyWorld {
     throttles: [i8; 2],
     mode: u64,
     hero: u64,
-    pools: Option<HealthPools>,
+    vitals: Vitals,
+    pool_types_known: bool,
 }
 
 impl World for BodyWorld {
@@ -275,21 +297,39 @@ impl World for BodyWorld {
         }
     }
 
-    fn has_owner_health(&self, site: Site) -> bool {
-        self.is_player_site(site)
+    fn body_health(&self, site: Site, kind: Option<PoolKind>, maximum: bool) -> Option<f64> {
+        if !self.is_player_site(site) || (kind.is_some() && !self.pool_types_known) {
+            return None;
+        }
+        let amount = self.vitals.amount(kind, maximum);
+        (amount.is_finite() && amount >= 0.0).then_some(amount)
     }
 
-    fn body_pool(
+    fn add_health_pool(
         &mut self,
         site: Site,
         kind: PoolKind,
         maximum: f64,
-        current: Option<f64>,
-    ) -> Option<f64> {
+        current: f64,
+    ) -> Option<u32> {
+        if !self.is_player_site(site) || !self.pool_types_known {
+            return None;
+        }
+        self.vitals.add_pool(kind, maximum, current)
+    }
+
+    fn health_pool_current(&self, site: Site, pool: u32) -> Option<f64> {
         if !self.is_player_site(site) {
             return None;
         }
-        self.pools?.amount(kind, maximum, current)
+        self.vitals.pool_current(pool)
+    }
+
+    fn remove_health_pool(&mut self, site: Site, pool: u32) -> Option<f64> {
+        if !self.is_player_site(site) {
+            return None;
+        }
+        self.vitals.remove_pool(pool)
     }
 
     fn related_entity(&mut self, site: Site, relation: EntityRelation, entity: u32) -> Option<u32> {
@@ -505,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn health_queries_read_the_existing_owner_variables() {
+    fn health_queries_read_the_authoritative_vitals() {
         use crate::script_expr::EvalError;
         use serde_json::json;
 
@@ -520,10 +560,14 @@ mod tests {
         let maximum = json!({"$": "STU_7D7D2470", "m_entity": owner});
         assert_eq!(evaluate(&mut runtime, &current), Ok(Value::Float(200.0)));
         assert_eq!(evaluate(&mut runtime, &maximum), Ok(Value::Float(200.0)));
-        runtime
-            .component
-            .set_entity_variable(253, Value::Float(125.0), &mut runtime.world)
-            .unwrap();
+        runtime.world.vitals.damage(
+            75.0,
+            crate::vitals::Death {
+                time: 0.0,
+                frame: spawn.frame,
+                killer: spawn.entity + 1,
+            },
+        );
         assert_eq!(evaluate(&mut runtime, &current), Ok(Value::Float(125.0)));
         assert_eq!(evaluate(&mut runtime, &maximum), Ok(Value::Float(200.0)));
 
@@ -542,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_health_queries_require_a_known_pool_distribution() {
+    fn typed_health_queries_read_the_live_distribution_after_damage() {
         use crate::script_expr::EvalError;
         use serde_json::json;
 
@@ -574,10 +618,12 @@ mod tests {
         );
         factory.pools = Some(FALLBACK_POOLS);
         let mut single = factory.start(spawn).unwrap();
-        single
-            .component
-            .set_entity_variable(253, Value::Float(125.0), &mut single.world)
-            .unwrap();
+        let hit = crate::vitals::Death {
+            time: 0.0,
+            frame: spawn.frame,
+            killer: spawn.entity + 1,
+        };
+        single.world.vitals.damage(75.0, hit);
         for (kind, amount) in [(0, 125.0), (1, 0.0), (2, 0.0)] {
             assert_eq!(
                 evaluate(&mut single, &query(current, kind)),
@@ -598,51 +644,30 @@ mod tests {
                 );
             }
         }
-        body.component
-            .set_entity_variable(253, Value::Float(250.0), &mut body.world)
-            .unwrap();
-        assert_eq!(
-            evaluate(&mut body, &query(current, 2)),
-            unsupported(current)
-        );
+        assert!(body.take_health_update().is_none());
+        assert_eq!(body.world.vitals.damage(30.0, hit).dealt, 27.5);
+        for (kind, amount) in [(0, 200.0), (1, 47.5), (2, 0.0)] {
+            assert_eq!(
+                evaluate(&mut body, &query(current, kind)),
+                Ok(Value::Float(amount))
+            );
+        }
         assert_eq!(
             evaluate(&mut body, &query(maximum, 2)),
             Ok(Value::Float(25.0))
         );
-        body.component
-            .set_entity_variable(253, Value::Float(0.0), &mut body.world)
-            .unwrap();
+        assert_eq!(
+            body.take_health_update(),
+            Some(body.world.vitals.component())
+        );
+        assert!(body.take_health_update().is_none());
+        assert!(body.world.vitals.damage(1000.0, hit).killed);
         for kind in [0, 1, 2] {
             assert_eq!(
                 evaluate(&mut body, &query(current, kind)),
                 Ok(Value::Float(0.0))
             );
         }
-        body.component
-            .set_entity_variable(1737, Value::Float(300.0), &mut body.world)
-            .unwrap();
-        assert_eq!(
-            evaluate(&mut body, &query(maximum, 2)),
-            unsupported(maximum)
-        );
-
-        factory.pools = Some(HealthPools {
-            shields: 0.0,
-            ..mixed
-        });
-        factory.variables.insert(253, Value::Float(225.0));
-        factory.variables.insert(1732, Value::Float(225.0));
-        factory.variables.insert(1737, Value::Float(250.0));
-        let mut without_shields = factory.start(spawn).unwrap();
-        assert_eq!(
-            evaluate(&mut without_shields, &query(current, 2)),
-            Ok(Value::Float(0.0))
-        );
-        assert_eq!(
-            evaluate(&mut without_shields, &query(current, 0)),
-            unsupported(current)
-        );
-
         let mut named = query(current, 0);
         named["m_7BE02F89"] = json!({"$":"STUConfigVarIdentifier","m_identifier":"0x01"});
         let mut foreign = query(current, 0);
@@ -916,7 +941,8 @@ mod tests {
             throttles: [0; 2],
             mode: PRACTICE_RANGE_MODE,
             hero: SOLDIER,
-            pools: Some(pools),
+            vitals: Vitals::empty(),
+            pool_types_known: true,
         };
         let mut component = Component::start(
             graphs,
@@ -958,6 +984,14 @@ mod tests {
             .map(|(&id, instance)| (id, instance.graph, instance.parent))
             .collect();
         assert_eq!(instances, expected);
+        let body_pools = &snapshot.instances[&1];
+        assert!(body_pools.states[&0].active);
+        assert_eq!(
+            body_pools.states[&0].kind,
+            StateKind::HealthPool { pool: Some(1) }
+        );
+        assert_eq!(body_pools.variables[&520], Value::Float(200.0));
+        assert_eq!(world.vitals.component(), pools.vitals().component());
         assert_eq!(
             snapshot.instances[&1].variables[&9737],
             Value::Entity(world.entity)
@@ -1039,7 +1073,7 @@ mod tests {
             health_switch.kind,
             crate::script_init::StateKind::BooleanSwitch(true)
         );
-        for (graph, node) in [(0x0033, 66), (0x08b6, 2)] {
+        for (graph, node) in [(0x0033, 1), (0x0033, 66), (0x08b6, 2)] {
             assert!(!snapshot.diagnostics.iter().any(|diagnostic| {
                 diagnostic.site.graph == graph && diagnostic.site.node == Some(node)
             }));
@@ -1096,12 +1130,81 @@ mod tests {
                 Ok(Value::Null)
             );
         }
-        component
-            .set_entity_variable(253, Value::Float(125.0), &mut world)
-            .unwrap();
+        world.vitals.damage(
+            75.0,
+            crate::vitals::Death {
+                time: 0.0,
+                frame: FIRST_TICK + 1,
+                killer: world.entity + 1,
+            },
+        );
+        component.advance_frame(FIRST_TICK + 1, &mut world).unwrap();
+        let damaged = component.snapshot().unwrap();
+        assert_eq!(damaged.variables[&253], Value::Float(125.0));
+        assert_eq!(damaged.variables[&1732], Value::Float(125.0));
+        assert_eq!(damaged.variables[&1737], Value::Float(200.0));
+        assert_eq!(damaged.instances[&1].variables[&520], Value::Float(125.0));
         assert_eq!(
             component.evaluate_state_config(12, 48, &full_health, &mut world),
             Ok(Value::Bool(false))
         );
+    }
+
+    #[test]
+    #[ignore = "requires the separately prepared 104319 hero and graph catalogs"]
+    fn authored_armour_and_shield_roots_reproduce_the_reference_body_pools() {
+        use crate::game_clock::FIRST_TICK;
+        use std::path::PathBuf;
+
+        let root = PathBuf::from(std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap());
+        let heroes =
+            crate::game_heroes::HeroCatalog::load(root.join("data/game_heroes_174.json")).unwrap();
+        let graphs = Arc::new(GraphStore::load(root.join("data/game_graphs_174.json.gz")).unwrap());
+        let catalog = crate::game_pools::PoolCatalog::from_graphs(&graphs).unwrap();
+        for (hero, secondary_state) in [(0x02e0_0000_0000_0007, 3), (0x02e0_0000_0000_0068, 1)] {
+            let body = &graphs.bodies()[&heroes.get(hero).unwrap().body];
+            let pools = catalog.hero_pools(hero).unwrap();
+            let roots = crate::script_init::player_roots(body, &graphs)
+                .unwrap()
+                .into_iter()
+                .filter(|root| root.graph == BODY_GRAPH)
+                .collect();
+            let health = pools.total();
+            let mut world = BodyWorld {
+                graphs: Arc::clone(&graphs),
+                controller: 0xa000_0100,
+                entity: 0xa000_0101,
+                position: [0.0; 3],
+                throttles: [0; 2],
+                mode: PRACTICE_RANGE_MODE,
+                hero,
+                vitals: Vitals::empty(),
+                pool_types_known: true,
+            };
+            let component = Component::start(
+                Arc::clone(&graphs),
+                world.entity,
+                crate::script_init::player_entity_variables(body, health, health),
+                roots,
+                FIRST_TICK,
+                &mut world,
+                MAX_INIT_WORK,
+            )
+            .unwrap();
+            let snapshot = component.snapshot().unwrap();
+            assert!(!snapshot.diagnostics.iter().any(|item| {
+                matches!(item.issue, crate::script_init::Issue::UnsupportedField(field) if field.starts_with("health pool"))
+            }));
+            let states = &snapshot.instances[&1].states;
+            assert_eq!(
+                states[&secondary_state].kind,
+                crate::script_init::StateKind::HealthPool { pool: Some(1) }
+            );
+            assert_eq!(
+                states[&0].kind,
+                crate::script_init::StateKind::HealthPool { pool: Some(2) }
+            );
+            assert_eq!(world.vitals.component(), pools.vitals().component());
+        }
     }
 }

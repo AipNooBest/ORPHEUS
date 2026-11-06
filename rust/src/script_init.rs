@@ -19,7 +19,6 @@ use serde_json::Value as Json;
 
 use crate::{
     commands::Command,
-    game_pools::PoolKind,
     mover_modifiers::{Modifier, ModifierKey, Operation},
     script_expr::{
         self, Context, EmptyContext, EntityRelation, EvalError, Scope, StackPriority, Variable,
@@ -28,6 +27,7 @@ use crate::{
     script_graph::{Body, Graph, GraphStore, Node, asset_guid},
     script_runtime::{ButtonEdge, FRAME_MS, QueueFull, Timeline, button_edges, frame_start},
     script_wire::{Value, Variables},
+    vitals::PoolKind,
 };
 
 pub const MAX_INIT_WORK: usize = 100_000;
@@ -118,6 +118,7 @@ pub fn player_roots(body: &Body, graphs: &GraphStore) -> Result<Vec<Root>, InitF
 }
 
 const OWNER_HEALTH: u32 = 253;
+const HUD_HEALTH: u32 = 1732;
 const HUD_MAX_HEALTH: u32 = 1737;
 
 pub fn player_entity_variables(body: &Body, health: f64, maximum_health: f64) -> Variables {
@@ -131,7 +132,7 @@ pub fn player_entity_variables(body: &Body, health: f64, maximum_health: f64) ->
         (29, Value::Array(slots)),
         (16_515, Value::Integer(first as i64)),
         (OWNER_HEALTH, Value::Float(health)),
-        (1732, Value::Float(health)),
+        (HUD_HEALTH, Value::Float(health)),
         (HUD_MAX_HEALTH, Value::Float(maximum_health)),
         (342, Value::Float(0.0)),
     ])
@@ -168,18 +169,26 @@ pub trait World {
         None
     }
 
-    fn has_owner_health(&self, _site: Site) -> bool {
-        false
+    /// A missing kind reads the total across all pools.
+    fn body_health(&self, _site: Site, _kind: Option<PoolKind>, _maximum: bool) -> Option<f64> {
+        None
     }
 
-    /// A missing current total requests the pool maximum.
-    fn body_pool(
+    fn add_health_pool(
         &mut self,
         _site: Site,
         _kind: PoolKind,
         _maximum: f64,
-        _current: Option<f64>,
-    ) -> Option<f64> {
+        _current: f64,
+    ) -> Option<u32> {
+        None
+    }
+
+    fn health_pool_current(&self, _site: Site, _pool: u32) -> Option<f64> {
+        None
+    }
+
+    fn remove_health_pool(&mut self, _site: Site, _pool: u32) -> Option<f64> {
         None
     }
 
@@ -218,6 +227,9 @@ impl World for EmptyWorld {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateKind {
     Plain,
+    HealthPool {
+        pool: Option<u32>,
+    },
     BooleanSwitch(bool),
     DelayedSwitch {
         current: bool,
@@ -2376,6 +2388,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 StateKind::Plain
             }
             "STU_7B9E8909" => StateKind::Plain,
+            "STUStatescriptStateHealthPool" if is_base_health_pool(node) => {
+                StateKind::HealthPool { pool: None }
+            }
             "STUStatescriptStateBooleanSwitch" => StateKind::BooleanSwitch(false),
             "STU_B591EBFE" => StateKind::DelayedSwitch {
                 current: false,
@@ -2435,6 +2450,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         );
         match kind {
             StateKind::GamePadVibration => self.post(id, Event::Finish(key.raw))?,
+            StateKind::HealthPool { .. } => self.begin_health_pool(key, node)?,
             StateKind::BooleanSwitch(_) => {
                 let Some(value) =
                     self.evaluate(id, node, field(&node.fields, "m_condition"), Some(key))
@@ -2501,6 +2517,78 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         self.follow(id, node, "m_onBeginPlug", Some(key), depth)?;
         self.follow(id, node, "m_subgraphPlug", Some(key), depth)?;
         self.try_complete(key, node, depth)
+    }
+
+    fn begin_health_pool(&mut self, key: StateKey, node: &Node) -> Result<(), InitFault> {
+        let id = key.instance;
+        let site = self.site(id, node);
+        if !matches!(
+            self.evaluate(id, node, field(&node.fields, "m_FA3ECC43"), None),
+            Some(Value::Entity(target)) if target == site.entity
+        ) {
+            self.report(site, Issue::UnsupportedField("health pool target"));
+            return Ok(());
+        }
+        let Some(maximum) = self
+            .evaluate(id, node, field(&node.fields, "m_amount"), Some(key))
+            .and_then(pool_number)
+        else {
+            self.report(site, Issue::UnsupportedField("health pool capacity"));
+            return Ok(());
+        };
+        let initial = field(&node.fields, "m_BCFDD2E9");
+        let current = if initial.is_null() {
+            maximum
+        } else {
+            let Some(current) = self.evaluate(id, node, initial, None).and_then(pool_number) else {
+                self.report(site, Issue::UnsupportedField("health pool initial amount"));
+                return Ok(());
+            };
+            current
+        };
+        let kind = pool_kind(field(&node.fields, "m_7E8B666C")).expect("validated pool kind");
+        let Some(pool) = self.world.add_health_pool(site, kind, maximum, current) else {
+            self.report(site, Issue::UnsupportedField("health pool registration"));
+            return Ok(());
+        };
+        self.state_mut(key).expect("active health pool").kind =
+            StateKind::HealthPool { pool: Some(pool) };
+        self.register_tick(key, self.machine.now_ms);
+        self.publish_health_pool(key, node, current)
+    }
+
+    fn publish_health_pool(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        current: f64,
+    ) -> Result<(), InitFault> {
+        let output = script_expr::lvalue(field(&node.fields, "m_CEAB19E8"))
+            .expect("validated health pool output")
+            .expect("health pool output variable");
+        let output = source_key(key.instance, output);
+        let current = Value::Float(current);
+        if !same(&self.machine.value(output, None), &current) {
+            self.write(output, current)?;
+        }
+        self.publish_health_totals(self.site(key.instance, node))
+    }
+
+    fn publish_health_totals(&mut self, site: Site) -> Result<(), InitFault> {
+        for (variable, maximum) in [
+            (OWNER_HEALTH, false),
+            (HUD_HEALTH, false),
+            (HUD_MAX_HEALTH, true),
+        ] {
+            if let Some(amount) = self.world.body_health(site, None, maximum) {
+                let key = VarKey::Entity(variable);
+                let value = Value::Float(amount);
+                if !same(&self.machine.value(key, None), &value) {
+                    self.write(key, value)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn begin_stack(&mut self, key: StateKey, node: &Node, depth: usize) -> Result<(), InitFault> {
@@ -3276,6 +3364,14 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                             .expect("delayed switch");
                         self.recheck_delayed_switch(key, node, 0)?;
                     }
+                    Some(StateKind::HealthPool { pool: Some(pool) }) => {
+                        let node = self.graph(id).state(usize::from(raw)).expect("health pool");
+                        if let Some(current) =
+                            self.world.health_pool_current(self.site(id, node), pool)
+                        {
+                            self.publish_health_pool(key, node, current)?;
+                        }
+                    }
                     Some(StateKind::Switch { .. }) => self.post(id, Event::Reevaluate(raw))?,
                     Some(StateKind::Ability { .. }) => self.activate_ability(key, 0)?,
                     Some(StateKind::ChaseVar) => self.tick_chase(key)?,
@@ -3506,6 +3602,16 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 self.update_stack(key)?;
             } else if state.active && state.kind == StateKind::Watch {
                 self.check_watch(key)?;
+            } else if state.active && matches!(state.kind, StateKind::HealthPool { pool: Some(_) })
+            {
+                let node = self
+                    .graph(key.instance)
+                    .state(usize::from(key.raw))
+                    .expect("active health pool");
+                self.report(
+                    self.site(key.instance, node),
+                    Issue::UnsupportedField("changing health pool capacity"),
+                );
             }
         }
         Ok(())
@@ -3862,6 +3968,11 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         self.clear_tick(key);
         self.exit_subgraph(id, node, "m_subgraphPlug", depth + 1)?;
         match kind {
+            StateKind::HealthPool { pool: Some(pool) } => {
+                if let Some(current) = self.world.remove_health_pool(self.site(id, node), pool) {
+                    self.publish_health_pool(key, node, current)?;
+                }
+            }
             StateKind::BooleanSwitch(branch) => {
                 self.exit_subgraph(id, node, branch_path(branch), depth + 1)?
             }
@@ -3907,6 +4018,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         state.delayed_timers = [false; 2];
         if matches!(kind, StateKind::SubScript { .. }) {
             state.kind = StateKind::SubScript { child: None };
+        }
+        if matches!(kind, StateKind::HealthPool { .. }) {
+            state.kind = StateKind::HealthPool { pool: None };
         }
         if matches!(kind, StateKind::LogicalButton { .. }) {
             state.kind = StateKind::LogicalButton { down: false };
@@ -3980,13 +4094,22 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 .filter_map(|(&raw, state)| {
                     (state.linked_variable.is_some()
                         || state.ability_stack.is_some()
-                        || matches!(state.kind, StateKind::WeaponVolley { .. }))
+                        || matches!(
+                            state.kind,
+                            StateKind::WeaponVolley { .. }
+                                | StateKind::HealthPool { pool: Some(_) }
+                        ))
                     .then_some((raw, state.kind))
                 })
                 .collect();
             for (raw, kind) in outputs {
                 let key = StateKey { instance: id, raw };
-                if matches!(kind, StateKind::WeaponVolley { .. }) {
+                if let StateKind::HealthPool { pool: Some(pool) } = kind {
+                    let node = self.graph(id).state(usize::from(raw)).expect("health pool");
+                    let site = self.site(id, node);
+                    self.world.remove_health_pool(site, pool);
+                    self.publish_health_totals(site)?;
+                } else if matches!(kind, StateKind::WeaponVolley { .. }) {
                     self.finish_volley(key, 0)?;
                 } else if kind == StateKind::ChaseVar {
                     self.finish_chase(key, 0)?;
@@ -4053,6 +4176,56 @@ fn is_networked_for_code_synced(node: &Node) -> bool {
                             && field(field(value, "m_value"), "$").as_str().is_some()
                     })
             })
+}
+
+fn is_base_health_pool(node: &Node) -> bool {
+    let config = |name| field(&node.fields, name);
+    let is_owner = |value| script_expr::native_shape(value, "STU_B5A0CAF0", None);
+    let flag = |name, expected| {
+        let value = config(name);
+        script_expr::native_shape(value, "STUConfigVarBool", Some("m_value"))
+            && match field(value, "m_value") {
+                Json::Bool(flag) => *flag == expected,
+                Json::Number(flag) => flag.as_u64() == Some(u64::from(expected)),
+                _ => false,
+            }
+    };
+    let source = config("m_69A20070");
+    node.is_networked()
+        && [
+            "m_7BE02F89",
+            "m_C99FAFDD",
+            "m_FF79E783",
+            "m_AF1104D0",
+            "m_BFA825EA",
+        ]
+        .into_iter()
+        .all(|name| config(name).is_null())
+        && pool_kind(config("m_7E8B666C")).is_some()
+        && is_owner(config("m_FA3ECC43"))
+        && script_expr::native_shape(source, "STU_FEDD683C", Some("m_entity"))
+        && is_owner(field(source, "m_entity"))
+        && flag("m_4895B8B6", true)
+        && flag("m_64839023", false)
+        && flag("m_0E8A5C8E", false)
+        && matches!(script_expr::lvalue(config("m_CEAB19E8")), Ok(Some(_)))
+}
+
+fn pool_kind(value: &Json) -> Option<PoolKind> {
+    match value.as_u64()? {
+        0 => Some(PoolKind::Health),
+        1 => Some(PoolKind::Armour),
+        2 => Some(PoolKind::Shields),
+        _ => None,
+    }
+}
+
+fn pool_number(value: Value) -> Option<f64> {
+    match value {
+        Value::Float(amount) => Some(amount),
+        Value::Integer(amount) => Some(amount as f64),
+        _ => None,
+    }
 }
 
 fn ability_is_stacked(node: &Node) -> bool {
@@ -4286,30 +4459,12 @@ impl<W: World> Context for InstanceContext<'_, W> {
         self.world.body_scale(self.site, entity, &scale_override)
     }
 
-    fn body_health(&mut self, entity: u32, maximum: bool) -> Option<f64> {
-        if entity != self.site.entity || !self.world.has_owner_health(self.site) {
+    fn body_health(&mut self, entity: u32, kind: Option<PoolKind>, maximum: bool) -> Option<f64> {
+        if entity != self.site.entity {
             return None;
         }
-        let variable = if maximum {
-            HUD_MAX_HEALTH
-        } else {
-            OWNER_HEALTH
-        };
-        match self.read(VarKey::Entity(variable)) {
-            Value::Float(health) if health.is_finite() && health >= 0.0 => Some(health),
-            _ => None,
-        }
-    }
-
-    fn body_pool(&mut self, entity: u32, kind: PoolKind, maximum: bool) -> Option<f64> {
-        let most = self.body_health(entity, true)?;
-        let current = if maximum {
-            None
-        } else {
-            Some(self.body_health(entity, false)?)
-        };
         self.read_native = true;
-        self.world.body_pool(self.site, kind, most, current)
+        self.world.body_health(self.site, kind, maximum)
     }
 
     fn native(&mut self, config: &Json) -> Option<Value> {
@@ -4579,6 +4734,148 @@ mod tests {
             let states = &snapshot.instances[&1].states;
             assert!(!states[&0].active && !states[&1].active);
         }
+    }
+
+    #[test]
+    fn base_health_pool_keeps_remaining_amount_before_on_end_and_restarts_fresh() {
+        use crate::vitals::{Death, Vitals};
+
+        struct PoolWorld(Vitals);
+        impl World for PoolWorld {
+            fn body_health(&self, _: Site, kind: Option<PoolKind>, maximum: bool) -> Option<f64> {
+                Some(self.0.amount(kind, maximum))
+            }
+
+            fn add_health_pool(
+                &mut self,
+                _: Site,
+                kind: PoolKind,
+                maximum: f64,
+                current: f64,
+            ) -> Option<u32> {
+                self.0.add_pool(kind, maximum, current)
+            }
+
+            fn health_pool_current(&self, _: Site, pool: u32) -> Option<f64> {
+                self.0.pool_current(pool)
+            }
+
+            fn remove_health_pool(&mut self, _: Site, pool: u32) -> Option<f64> {
+                self.0.remove_pool(pool)
+            }
+        }
+
+        let entry = |position, class, message, input| {
+            node(
+                position,
+                class,
+                None,
+                json!({
+                    "m_gameMessage": {"m_gameMessage":message},
+                    "m_outPlug": plug(&[(1, input)], &[])
+                }),
+            )
+        };
+        let flag = |value| json!({"$":"STUConfigVarBool","m_value":value});
+        let owner = json!({"$":"STU_B5A0CAF0"});
+        let fixture = graph(
+            42,
+            vec![
+                entry(0, "STUStatescriptEntry", "", "m_beginPlug"),
+                node(
+                    1,
+                    "STUStatescriptStateHealthPool",
+                    Some(0),
+                    json!({
+                        "m_FA3ECC43":owner, "m_7E8B666C":0,
+                        "m_amount":var(100,true), "m_BCFDD2E9":var(101,true),
+                        "m_69A20070":{"$":"STU_FEDD683C","m_entity":owner},
+                        "m_4895B8B6":flag(true), "m_64839023":flag(false), "m_0E8A5C8E":flag(false),
+                        "m_CEAB19E8":var(102,true),
+                        "m_onEndPlug":plug(&[(4,"m_inPlug")], &[])
+                    }),
+                ),
+                entry(
+                    2,
+                    "STUStatescriptEntryGameMessage",
+                    "0x0240000000000002",
+                    ABORT_PLUG,
+                ),
+                entry(
+                    3,
+                    "STUStatescriptEntryGameMessage",
+                    "0x0240000000000003",
+                    "m_beginPlug",
+                ),
+                node(
+                    4,
+                    "STUStatescriptActionSetVar",
+                    None,
+                    json!({
+                        "m_out_Var":var(101,true), "m_value":var(102,true)
+                    }),
+                ),
+            ],
+            json!([1]),
+            json!([0, 2, 3]),
+        );
+        let mut world = PoolWorld(Vitals::empty());
+        let mut component = Component::start(
+            Arc::new(store(vec![fixture])),
+            42,
+            Variables::from([(100, Value::Float(200.0)), (101, Value::Float(175.0))]),
+            vec![Root::new(1, 42)],
+            0,
+            &mut world,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        assert!(component.snapshot().unwrap().initialization_complete());
+        assert_eq!((world.0.total(), world.0.maximum()), (175.0, 200.0));
+        world.0.damage(
+            25.0,
+            Death {
+                time: 0.0,
+                frame: 0,
+                killer: 43,
+            },
+        );
+        component
+            .queue_message(1, 0x0240_0000_0000_0002, Variables::new())
+            .unwrap();
+        component.run_now(&mut world).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert_eq!(snapshot.variables[&101], Value::Float(150.0));
+        assert_eq!(snapshot.variables[&OWNER_HEALTH], Value::Float(0.0));
+        assert!(!snapshot.instances[&1].states[&0].active);
+        assert_eq!(world.0.total(), 0.0);
+        component
+            .queue_message(1, 0x0240_0000_0000_0003, Variables::new())
+            .unwrap();
+        component.run_now(&mut world).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert_eq!(
+            snapshot.instances[&1].states[&0].kind,
+            StateKind::HealthPool { pool: Some(2) }
+        );
+        assert_eq!(snapshot.variables[&OWNER_HEALTH], Value::Float(150.0));
+        assert_eq!(world.0.pool_current(1), None);
+        assert_eq!(world.0.pool_current(2), Some(150.0));
+        component
+            .set_entity_variable(100, Value::Float(225.0), &mut world)
+            .unwrap();
+        component.run_now(&mut world).unwrap();
+        assert_eq!(world.0.maximum(), 200.0);
+        assert!(
+            component
+                .snapshot()
+                .unwrap()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.issue == Issue::UnsupportedField("changing health pool capacity")
+                })
+        );
     }
 
     fn delayed_switch_fixture(mut fields: Json) -> Arc<GraphStore> {

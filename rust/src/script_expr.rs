@@ -5,7 +5,7 @@ use std::{error::Error, fmt};
 use serde_json::Value as Json;
 
 pub use crate::script_wire::Value;
-use crate::{accounts::parse_guid, game_pools::PoolKind, script_graph::asset_guid};
+use crate::{accounts::parse_guid, script_graph::asset_guid, vitals::PoolKind};
 
 pub(crate) const EPSILON: f64 = 1.192_092_895_507_812_5e-5;
 const MAX_CONFIG_DEPTH: usize = 64;
@@ -121,11 +121,12 @@ pub trait Context {
         None
     }
 
-    fn body_health(&mut self, _entity: u32, _maximum: bool) -> Option<f64> {
-        None
-    }
-
-    fn body_pool(&mut self, _entity: u32, _kind: PoolKind, _maximum: bool) -> Option<f64> {
+    fn body_health(
+        &mut self,
+        _entity: u32,
+        _kind: Option<PoolKind>,
+        _maximum: bool,
+    ) -> Option<f64> {
         None
     }
 
@@ -569,7 +570,7 @@ impl Evaluator {
                     return Err(EvalError::UnsupportedConfig(class.into()));
                 };
                 let health = context
-                    .body_health(entity, class == "STU_7D7D2470")
+                    .body_health(entity, None, class == "STU_7D7D2470")
                     .ok_or_else(|| EvalError::UnsupportedConfig(class.into()))?;
                 Value::Float(health)
             }
@@ -600,7 +601,7 @@ impl Evaluator {
                     return Err(unsupported());
                 };
                 let health = context
-                    .body_pool(entity, kind, class == "STU_68883EAC")
+                    .body_health(entity, Some(kind), class == "STU_68883EAC")
                     .ok_or_else(unsupported)?;
                 Value::Float(rounded(health))
             }

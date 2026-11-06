@@ -400,7 +400,7 @@ impl Peer {
     }
 
     fn bot_hit(&mut self, hit: BotHit) {
-        self.world.queue_bot_health(hit.health);
+        self.world.queue_health(hit.health);
         for notice in hit.notices.into_iter().flatten() {
             if self.combat_ui.notices.len() == MAX_PENDING_COMBAT_NOTICES {
                 self.combat_ui.notices.pop_front();
@@ -447,7 +447,7 @@ impl Peer {
                 .get(&entity)
                 .is_some_and(|&ordinal| !self.egress.delivered_through(ordinal));
             if now < expires
-                && (has_notice || waiting_for_reliable || self.world.bot_health_pending(entity))
+                && (has_notice || waiting_for_reliable || self.world.health_pending(entity))
             {
                 self.combat_ui
                     .replacements

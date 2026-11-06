@@ -1135,6 +1135,7 @@ fn state_payload(state: &State, codec: &Codec) -> Option<StatePayload> {
     Some(match (state.kind, codec.codec.as_deref()) {
         (
             StateKind::Plain
+            | StateKind::HealthPool { .. }
             | StateKind::Wait
             | StateKind::AiCandidate { .. }
             | StateKind::MovementMod

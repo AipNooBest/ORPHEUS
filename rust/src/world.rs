@@ -334,34 +334,25 @@ pub fn pool(id: u32, kind: u32, most: f32, now: f32) -> [u8; 20] {
     data
 }
 
-pub fn health(now: f32, most: f32, armour: f32, shields: f32) -> Component {
-    health_pools(
-        [most, armour, shields].map(f64::from),
-        [now, armour, shields].map(f64::from),
-        [true; 3],
-    )
-}
-
-/// Encode selected pools without changing the IDs assigned to the full body.
-pub(crate) fn health_pools(maximum: [f64; 3], current: [f64; 3], include: [bool; 3]) -> Component {
+/// Encode supplied pool fields at `kind * POOLS + slot`, omitting all others.
+/// A zero ID clears a slot. ORPHEUS writes an all-zero blob for a clear;
+/// the client's ancillary bytes for a native clear have not been verified.
+pub(crate) fn pool_component(slots: impl IntoIterator<Item = (usize, [u8; 20])>) -> Component {
     let mut fields = vec![None; 3 * POOLS];
-    let mut id = 1;
-    for kind in [SHIELDS_POOL, ARMOUR_POOL, HEALTH_POOL] {
-        let most = maximum[kind];
-        if kind != HEALTH_POOL && (most <= 0.0 || most.is_nan()) {
-            continue;
-        }
-        if include[kind] {
-            fields[kind * POOLS] = Some(ComponentValue::Blob20(pool(
-                id,
-                kind as u32,
-                most as f32,
-                current[kind] as f32,
-            )));
-        }
-        id += 1;
+    for (field, bytes) in slots {
+        fields[field] = Some(ComponentValue::Blob20(bytes));
     }
     Component { index: 51, fields }
+}
+
+pub fn health(now: f32, most: f32, armour: f32, shields: f32) -> Component {
+    crate::vitals::Vitals::with_current_health(
+        f64::from(most),
+        f64::from(armour),
+        f64::from(shields),
+        f64::from(now),
+    )
+    .component()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1009,6 +1000,28 @@ mod tests {
                 tick: 3975
             })
         ));
+    }
+
+    #[test]
+    fn sparse_pool_update_distinguishes_depletion_removal_and_omission() {
+        let component = pool_component([
+            (SHIELDS_POOL * POOLS + 15, [0; 20]),
+            (
+                ARMOUR_POOL * POOLS + 1,
+                pool(2, ARMOUR_POOL as u32, 50.0, 0.0),
+            ),
+        ]);
+        let record = update(0, &[component]).unwrap();
+        // The frozen world.update emits fields 17 and 47 in mask order.
+        assert_eq!(record.bit_len(), 400);
+        assert_eq!(
+            record.as_bytes(),
+            hex(concat!(
+                "01330700000200008000",
+                "0200000000004842000000000100000000010001",
+                "0000000000000000000000000000000000000000",
+            ))
+        );
     }
 
     #[test]

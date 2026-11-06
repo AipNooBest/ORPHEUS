@@ -65,8 +65,9 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
   the separate possessed-body and current-possessor queries and the health pool type selectors.
   Its `registry.go` and `states.go` provide behavior references for the synced game-code state,
   the tips state and the input bridge. Its `switch.go` and `instance.go` corroborate delayed
-  branch timing and event ordering. Gamayun identifies its Go implementation as AGPL-3.0-or-later
-  and retains the MIT notice for inherited code.
+  branch timing and event ordering. Its `internal/world/health.go` provides an independent comparison
+  for the component 51 fields and the provisional pool ID order. Gamayun identifies its Go implementation
+  as AGPL-3.0-or-later and retains the MIT notice for inherited code.
 - **The Claudewatch contributors** supplied the Beta 1.0.0.3 research lead for attacker-side hit-confirm effects
   and separate entity and announcer voice messages. ORPHEUS checks these leads against 104319 client data before
   implementing them. The reference is a locally reviewed binary distribution.
