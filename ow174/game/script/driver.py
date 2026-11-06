@@ -389,6 +389,23 @@ class BodyScript(ReplicatedBody):
         if cost > 0 and charge < cost:
             step = f32(cost * self.frame_ms / (1000.0 * self.ult_seconds))
             self.set_ult_charge(min(cost, f32(charge + step)))
+        self._note_ult_stall(charge)
+
+    _ULT_STALL_SECONDS = 10.0
+
+    def _note_ult_stall(self, charge: float) -> None:
+        """A stalled meter with a running rule means the meter's frames do not reach the client (or the
+        client's commands stop the script); say so once per interval instead of leaving it silent."""
+        now = self.component.now / 1000.0
+        seen = getattr(self, "_ult_stall", None)
+        if seen is None:
+            self._ult_stall = seen = [charge, now]
+        elif charge > seen[0]:
+            seen[0], seen[1] = charge, now
+        elif seen[1] + self._ULT_STALL_SECONDS < now:
+            log.info("[game] %X: ultimate meter stuck at %.1f for %.0f s", self.entity, charge,
+                     now - seen[1])
+            seen[1] = now  # report again after the next interval if it stays stuck
 
     # --- what the client gets ----------------------------------------------------------------------
 
