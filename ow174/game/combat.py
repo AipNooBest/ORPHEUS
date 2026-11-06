@@ -49,6 +49,7 @@ What the server decides here:
 
 import logging
 import math
+import os
 from collections import deque
 from dataclasses import dataclass
 
@@ -62,6 +63,8 @@ from ow174.game.script.bot import DIED, BotScript
 from ow174.game.script.driver import Snapshot
 from ow174.game.statescript import InstanceWire, StateWire, remote_full_frame
 from ow174.game.world import ARMOUR_POOL, HEALTH_POOL, OP_DESTROY, POOLS, SHIELDS_POOL
+
+_NO_COMBAT_NOTICES = os.environ.get("OW174_NO_COMBAT_NOTICES") == "1"  # ablation lever (this run only)
 
 log = logging.getLogger("ow174.game")
 
@@ -819,6 +822,8 @@ class Combat:
 
     def _tell_hit(self, shooter, target: Target, dealt: float, flags: int, frame: int) -> None:
         """25001 to the shooter: the hit marker and the target's health bar (frame: the shot's)."""
+        if _NO_COMBAT_NOTICES:
+            return
         value = {
             "+0x78": {"+0x0": {"+0x0": target.entity}, "+0x4": max(1, round(dealt)), "+0x8": flags},
             "+0x84": frame & 0xFFFFFFFF,
@@ -828,6 +833,8 @@ class Combat:
     def _kill_notice(self, killer, victim) -> None:
         """25005 to the killer: "ELIMINATED: <name>" (1126.07C; +0x89 assist would be 01F0.07C, +0x88 a
         score shown when above 0). Its handler (0x7FF7895D2B50) reads only +0x84, +0x88 and +0x89."""
+        if _NO_COMBAT_NOTICES:
+            return
         entity = _source_entity(victim)
         notice = {
             "+0x78": 0,
