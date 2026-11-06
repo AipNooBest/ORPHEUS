@@ -47,6 +47,7 @@ CALLBACK_OPERATIONS = {
     "left": {"take_out", "expire_handoff"},
     "clock_ready": {"create_match"},
 }
+RECEIVE_OPERATIONS = {"expire_handoff"}
 
 
 class ServerJournalError(RuntimeError):
@@ -122,6 +123,9 @@ class _LoopSocket(_MemorySocket):
             self.session._fail("scheduler consumed too many receive outcomes")
         self.session._observe({"kind": "socket_receive", "size": size})
         received = self.receives.popleft()
+        if type(received) is dict:
+            self.session._receive_actions(received["actions"])
+            received = received["outcome"]
         if not self.receives:
             self.session.server.running = False
         if received is None:
@@ -213,6 +217,15 @@ class _Session:
                 self._fail(f"callback action failed: {type(error).__name__}")
             self._observe({"kind": "callback_result", "result": result})
 
+    def _receive_actions(self, actions):
+        for operation, arguments in actions:
+            self._observe({"kind": "receive_action", "operation": operation, "arguments": arguments})
+            try:
+                result = self._dispatch(operation, arguments)
+            except Exception as error:  # noqa: BLE001 - action errors are not socket errors
+                self._fail(f"receive action failed: {type(error).__name__}")
+            self._observe({"kind": "receive_result", "result": result})
+
     def _match(self, identifier):
         if type(identifier) is not tuple or len(identifier) != 2:
             self._fail("invalid match reference")
@@ -268,6 +281,20 @@ class _Session:
         if type(receives) is not list or not receives:
             self._fail("scheduler receives must be a nonempty list")
         for received in receives:
+            if type(received) is dict:
+                _fields(received, {"outcome", "actions"}, "scheduler receive")
+                actions = received["actions"]
+                if type(actions) not in (tuple, list) or not actions:
+                    self._fail("receive actions must be a nonempty ordered sequence")
+                for action in actions:
+                    if type(action) is not tuple or len(action) != 2:
+                        self._fail("invalid receive action")
+                    operation, arguments = action
+                    if type(operation) is not str or operation not in RECEIVE_OPERATIONS:
+                        self._fail("unsupported receive action")
+                    _fields(arguments, OPERATIONS[operation], "receive action arguments")
+                    _integer(arguments["conn"], "handoff connection", minimum=1)
+                received = received["outcome"]
             if received is None:
                 continue
             if type(received) is not tuple or len(received) != 2:
@@ -413,7 +440,8 @@ class RecordingServerSession(_Session):
     sendto is an optional in-memory outcome source, not a live socket. Without it,
     all sends succeed with len(data). A scheduler root can dispatch explicit server
     operations from its observed callbacks, including create_match after clock
-    rollover. A controlled lobby handler can record a reservation check through
+    rollover. A scripted receive can expire a handoff while the game lock is
+    released. A controlled lobby handler can record a reservation check through
     handoff_pending and a seat cancellation through expire_handoff. The
     surrounding lobby is external.
     """

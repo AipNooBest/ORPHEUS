@@ -554,8 +554,88 @@ class ServerJournalTests(unittest.TestCase):
         self.assertEqual(lifecycle[1]["arguments"], args)
         self.assertEqual(lifecycle[2]["result"], "left before its game connected")
 
+    def test_bounded_receive_can_expire_handoff_on_either_side_of_syn(self):
+        expire_handoff = GameServer.expire_handoff
+
+        def expire_without_outer_lock(server, conn):
+            self.assertFalse(server.lock._is_owned())
+            self.assertTrue(server.running)
+            return expire_handoff(server, conn)
+
+        def expire_on_receive(outcomes, index, args):
+            receives = outcomes.copy()
+            receives[index] = {
+                "outcome": receives[index], "actions": [("expire_handoff", args)],
+            }
+            return receives
+
+        for receive_index in (0, 1):
+            with self.subTest(receive_index=receive_index):
+                source = SchedulerSource(
+                    ("start", 10.0), ("timeout", 10.0), ("datagram", 100.1),
+                    ("due", 10.0), ("next_tick", 10.0), ("tick", 100.1),
+                    ("timeout", 10.005), ("due", 10.01),
+                )
+                session, sent = self.make(source=source, verify_stored_state=True)
+                (handoff,) = session.create_match(MAP, [(1, "Alpha", SOLDIER, 0, False)])
+                peer = Peer(session, handoff, sent, ("127.0.0.1", 43000))
+                syn = peer.cipher.seal(Packet(handoff.conn, flags=SYN | ACK))
+                original_socket = session.server.sock
+                outcomes = [(syn, peer.address), None]
+                args = {"conn": handoff.conn}
+
+                with (
+                    mock.patch("socket.socket", side_effect=AssertionError("must not create sockets")),
+                    mock.patch.object(GameServer, "expire_handoff", expire_without_outer_lock),
+                ):
+                    session.run_loop(expire_on_receive(outcomes, receive_index, args))
+                    document, replay, result = self.verify(session)
+                    changed = copy.deepcopy(document)
+                    root = changed["roots"][-1]
+                    arguments = replay_values.decode(root["arguments"])
+                    arguments["receives"] = expire_on_receive(outcomes, 1 - receive_index, args)
+                    root["arguments"] = replay_values.encode(arguments)
+                    with self.assertRaises(ServerJournalError):
+                        replay_server_session(changed, resolver=session.registry.resolve)
+
+                self.assertTrue(result["stored_state_verified"])
+                self.assertIs(session.server.sock, original_socket)
+                admitted = receive_index == 1
+                self.assertEqual(result["send_attempts"], int(admitted))
+                if admitted:
+                    [(reply, address)] = sent
+                    self.assertEqual(address, peer.address)
+                    self.assertEqual(peer.cipher.open(reply).flags, SYN | ACK)
+                else:
+                    self.assertEqual(sent, [])
+                for server in (session.server, replay.server):
+                    self.assertFalse(server.running)
+                    self.assertEqual(server.tick, FIRST_TICK + 1)
+                    self.assertNotIn(handoff.conn, server.handoffs)
+                    if admitted:
+                        self.assertTrue(server.clients[handoff.conn].open)
+                    else:
+                        self.assertNotIn(handoff.conn, server.clients)
+                        self.assertIsNone(server.player_of(1))
+                effects = [replay_values.decode(row)[1] for row in document["roots"][-1]["effects"]]
+                action = {"kind": "receive_action", "operation": "expire_handoff", "arguments": args}
+                result_effect = {"kind": "receive_result", "result": not admitted}
+                action_index = effects.index(action)
+                self.assertEqual(effects[action_index - 1]["kind"], "socket_receive")
+                self.assertEqual(effects[action_index + 1], result_effect)
+                callback = {"kind": "joined" if admitted else "left", "player": (handoff.match_id, 0)}
+                if admitted:
+                    self.assertLess(effects.index(callback), action_index)
+                else:
+                    self.assertGreater(effects.index(callback), action_index)
+
     def test_bounded_loop_rejects_malformed_receives_before_running(self):
-        for receives in ([], [b"not an outcome"], [("error", (True, "not a valid errno"))]):
+        bad_actions = ([], [("take_out", {"player": None, "reason": "callback only"})],
+                       [("expire_handoff", {"conn": True})], [("expire_handoff", {"conn": 1, "extra": 0})])
+        cases = [[], [b"not an outcome"], [("error", (True, "not a valid errno"))],
+                 [{"outcome": None}], [{"outcome": {}, "actions": [("expire_handoff", {"conn": 1})]}]]
+        cases.extend([{"outcome": None, "actions": actions}] for actions in bad_actions)
+        for receives in cases:
             with self.subTest(receives=receives):
                 session, _ = self.make()
                 with mock.patch.object(GameServer, "_run") as run, self.assertRaises(ServerJournalError):
@@ -563,6 +643,26 @@ class ServerJournalTests(unittest.TestCase):
                 run.assert_not_called()
                 self.assertEqual(session.server.tick, FIRST_TICK)
                 self.assertFalse(session.server.running)
+
+    def test_bounded_loop_receive_action_fault_is_not_a_socket_error(self):
+        session, sent = self.make()
+        (handoff,) = session.create_match(MAP, [(1, "Alpha", SOLDIER, 0, False)])
+        socket_before = session.server.sock
+        waiting = session.server.handoffs[handoff.conn]
+        receives = [{"outcome": None, "actions": [("expire_handoff", {"conn": handoff.conn})]}]
+        with (
+            mock.patch.object(GameServer, "expire_handoff", side_effect=OSError("action failure")),
+            self.assertRaisesRegex(ServerJournalError, "receive action failed: OSError") as caught,
+        ):
+            session.run_loop(receives)
+        self.assertIs(session.server.sock, socket_before)
+        self.assertFalse(session.server.running)
+        self.assertEqual(session.server.tick, FIRST_TICK)
+        self.assertEqual(session.server.handoffs[handoff.conn], waiting)
+        self.assertEqual(sent, [])
+        with self.assertRaises(ServerJournalError) as finish:
+            session.finish()
+        self.assertIs(finish.exception, caught.exception)
 
     def test_bounded_loop_rejects_unmatched_callback_actions(self):
         session, sent = self.make()

@@ -29,6 +29,22 @@ alongside environment reads, sent datagrams and callback observations. The
 original in-memory socket and stopped server state are restored at the root
 boundary. Successive run_loop roots each have a fresh scheduler deadline.
 
+A receive row may wrap one of the same outcomes with an ordered nonempty
+list or tuple of actions. The only supported operation at this boundary
+is expire_handoff.
+
+  {"outcome": (datagram, address), "actions": [("expire_handoff", {"conn": conn})]}
+
+The harness dispatches the action after socket_receive and before returning
+the outcome to the scheduler, while the game lock is released. It records
+receive_action and receive_result effects with their read positions. This can
+reproduce a lobby seat expiry before a pending SYN is dispatched, or after
+an earlier receive admitted that client. It keeps the scheduler deadline
+within one root and exercises scripted ordering. Plain receive rows keep
+their existing behavior. Invalid actions fail before the scheduler starts.
+An action failure faults the journal and restores the stopped server and
+its original in-memory socket.
+
 Optional callback actions are an ordered list or tuple of entries of the form
 (kind, (match_id, player_slot), operation, arguments). Use kind "joined" or
 "left". The player reference identifies the callback's match and slot.
