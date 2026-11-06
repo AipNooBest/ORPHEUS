@@ -31,6 +31,7 @@ STORED_SCOPE = "controlled-roots-wire-and-registered-state"
 OPERATIONS = {
     "create_match": {"game_map", "players", "card"},
     "join_match": {"match_id", "players"},
+    "handoff_pending": {"conn"},
     "expire_handoff": {"conn"},
     "datagram": {"data", "address", "now"},
     "tick": {"now", "missed"},
@@ -235,6 +236,8 @@ class _Session:
             return result
         if operation == "join_match":
             return self.server.join_match(self._match(args["match_id"]), args["players"])
+        if operation == "handoff_pending":
+            return self.server.handoff_pending(_integer(args["conn"], "handoff connection", minimum=1))
         if operation == "expire_handoff":
             return self.server.expire_handoff(_integer(args["conn"], "handoff connection", minimum=1))
         if operation == "datagram":
@@ -410,8 +413,9 @@ class RecordingServerSession(_Session):
     sendto is an optional in-memory outcome source, not a live socket. Without it,
     all sends succeed with len(data). A scheduler root can dispatch explicit server
     operations from its observed callbacks, including create_match after clock
-    rollover. A controlled lobby handler can record a seat cancellation through
-    expire_handoff; the surrounding lobby is external.
+    rollover. A controlled lobby handler can record a reservation check through
+    handoff_pending and a seat cancellation through expire_handoff. The
+    surrounding lobby is external.
     """
 
     _recording = True
@@ -438,6 +442,10 @@ class RecordingServerSession(_Session):
         self._initialize_server()
         self._initial = replay_values.encode((self.server.tick, self._indices()))
         self._initial_state = self._stored_hash()
+
+    def handoff_pending(self, conn: int) -> bool:
+        """Route the controlled lobby's reservation check through its game journal root."""
+        return self.apply("handoff_pending", {"conn": conn})
 
     def expire_handoff(self, conn: int) -> bool:
         """Route a controlled lobby cancellation through its game journal root."""

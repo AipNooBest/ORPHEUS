@@ -6,6 +6,7 @@ import logging
 import sys
 import unittest
 from pathlib import Path
+from threading import RLock
 from types import SimpleNamespace
 from unittest import mock
 
@@ -378,6 +379,76 @@ class ServerJournalTests(unittest.TestCase):
             self.assertEqual(server.handoffs, {})
             self.assertEqual(set(server.clients), {second.conn})
             self.assertTrue(server.clients[second.conn].open)
+
+    def test_delayed_game_found_replays_the_reservation_check_and_admission(self):
+        deadline = 100.0 + HANDOFF_SECONDS
+        for now, pending in ((deadline - 0.001, True), (deadline, False)):
+            with self.subTest(pending=pending):
+                source = FixedSource()
+                session, sent = self.make(source=source, verify_stored_state=True)
+                (handoff,) = session.create_match(MAP, [(1, "Alpha", SOLDIER, 0, False)])
+                lobby = SimpleNamespace(
+                    account=SimpleNamespace(account_lo=1),
+                    logged_in=True,
+                    send=mock.Mock(),
+                    sock=SimpleNamespace(getsockname=lambda: ("127.0.0.1", 3724)),
+                    log=lambda *_: None,
+                )
+                game = SimpleNamespace(
+                    port=session.server.port,
+                    handoff_pending=session.handoff_pending,
+                    expire_handoff=session.expire_handoff,
+                )
+                matchmaker = Matchmaker(SimpleNamespace(
+                    game=game, state_lock=RLock(), session_of={1: lobby}.get,
+                    settings=SimpleNamespace(game_host=""),
+                    social=SimpleNamespace(general={}, open_match_chat=lambda *_: {}),
+                ))
+                found = Found(lobby, Ticket(SimpleNamespace(), {}, 0, 100.0), handoff, MAP.name)
+                matchmaker.found[1] = found
+
+                with mock.patch.object(source, "wall_time", return_value=now) as wall_time:
+                    matchmaker._found_over([found])
+                wall_time.assert_called_once_with(callsite="server.handoff.pending")
+                self.assertEqual(matchmaker.found, {})
+                lobby_output = [call.args[1:] for call in lobby.send.call_args_list]
+                self.assertEqual([identifier for identifier, _ in lobby_output],
+                                 [20404, 20402, 20600] if pending else [])
+                self.assertEqual(session.server.handoffs[handoff.conn][2], deadline if pending else 0.0)
+
+                if pending:
+                    payload = lobby_output[-1][1]["+0x80"]
+                    handoff = dataclasses.replace(
+                        handoff, conn=payload["+0x28"],
+                        key_in=bytes(payload["+0xAE"]), key_out=bytes(payload["+0xCE"]),
+                    )
+                peer = Peer(session, handoff, sent, ("127.0.0.1", 43000))
+                peer.send(flags=SYN, now=now)
+                if pending:
+                    self.assertEqual(peer.cipher.open(sent[0][0]).flags, SYN | ACK)
+                    peer.send(now=now)
+                else:
+                    self.assertEqual(sent, [])
+                session.tick(deadline)
+                session.report_callbacks()
+                document, replay, result = self.verify(session)
+
+                self.assertTrue(result["stored_state_verified"])
+                check = document["roots"][1]
+                self.assertEqual(check["operation"], "handoff_pending")
+                self.assertEqual(replay_values.decode(check["arguments"]), {"conn": handoff.conn})
+                self.assertIs(replay_values.decode(check["result"]), pending)
+                self.assertEqual(check["state_before"], check["state_after"])
+                self.assertEqual(replay_values.decode(document["roots"][-1]["effects"][0])[1], {
+                    "kind": "joined" if pending else "left", "player": (handoff.match_id, 0),
+                })
+                for server in (session.server, replay.server):
+                    self.assertNotIn(handoff.conn, server.handoffs)
+                    if pending:
+                        self.assertTrue(server.clients[handoff.conn].open)
+                    else:
+                        self.assertNotIn(handoff.conn, server.clients)
+                        self.assertIsNone(server.player_of(1))
 
     def test_bounded_loop_replays_syn_before_the_due_tick_and_early_receives(self):
         deadline = 100.0 + HANDOFF_SECONDS
