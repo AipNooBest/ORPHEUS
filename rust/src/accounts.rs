@@ -233,7 +233,7 @@ mod guid {
     }
 }
 
-fn parse_guid(text: &str) -> Option<u64> {
+pub(crate) fn parse_guid(text: &str) -> Option<u64> {
     let text = trim_name(text);
     let text = text.strip_prefix('+').unwrap_or(text);
     let (digits, radix) = match text.as_bytes() {

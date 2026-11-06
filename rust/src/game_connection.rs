@@ -11,6 +11,7 @@ use crate::match_handoff::Handoff;
 pub const HANDOFF_TIME: Duration = Duration::from_secs(60);
 pub const SILENCE_TIME: Duration = Duration::from_secs(10);
 pub const LEAVE_GRACE: Duration = Duration::from_secs(3);
+pub const MAX_CONNECTION_ID: u32 = 0x0fff_ffff;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Rejected {
@@ -113,7 +114,7 @@ impl GameConnections {
         cipher: LinkCipher,
         deadline: Duration,
     ) -> bool {
-        if !(1..=0x0fff_ffff).contains(&connection) {
+        if !(1..=MAX_CONNECTION_ID).contains(&connection) {
             return false;
         }
         let std::collections::hash_map::Entry::Vacant(entry) = self.connections.entry(connection)

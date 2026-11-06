@@ -54,6 +54,8 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
   Battle.net listener.
 - **[lzma-rust2](https://github.com/hasenbanck/lzma-rust2)** supplies XZ decoding for the movement
   and expanded-ray collision caches.
+- **[Mio](https://github.com/tokio-rs/mio)** supplies portable UDP readiness polling and cross-thread
+  wakeups for the Rust game worker.
 - **TripleFault and Gamayun contributors** supplied a same-build comparison for encrypted combat scenarios and
   tick measurement design. This is a behavior reference. Gamayun identifies its Go implementation as
   AGPL-3.0-or-later and retains the MIT notice for inherited code.

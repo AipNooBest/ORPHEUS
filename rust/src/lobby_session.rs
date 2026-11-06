@@ -8,6 +8,7 @@ use std::{collections::BTreeMap, io, net::TcpStream, sync::Arc, time::Duration};
 use crate::{
     accounts::{Account, Accounts, account_id_for, battle_tag},
     battle_tag_query,
+    collection::{Collection, HERO_CATALOG, PROGRESSION},
     jam_codec::{Fields, Schemas, Value},
     jam_handshake::server_handshake,
     lobby_login::{self, INCOMPATIBLE_CLIENT, Identity, LOGIN_MESSAGE, Login, OUT_CONNECT},
@@ -46,7 +47,6 @@ pub struct PreparedLogin {
 }
 
 pub struct LoginContent<'a> {
-    pub portrait_frame: u64,
     pub menu_hero: Option<u64>,
     pub extra_skins: &'a [u64],
     pub wall_time: u64,
@@ -151,6 +151,7 @@ impl PreparedLogin {
         &self,
         schemas: &Schemas,
         templates: &RetailTemplates,
+        collection: &Collection,
         content: LoginContent<'_>,
     ) -> io::Result<Vec<LobbyMessage>> {
         let profile = self.account.profile();
@@ -158,7 +159,7 @@ impl PreparedLogin {
         let record = player::record(
             &profile,
             identity,
-            content.portrait_frame,
+            collection.portrait_frame(&profile),
             content.wall_time,
         );
         let mut messages = vec![
@@ -171,6 +172,10 @@ impl PreparedLogin {
             (IN_CONNECT, 20505, templates.preload(content.extra_skins)?),
         ];
         messages.extend(player::endorsements(&profile, identity, content.wall_time));
+        messages.extend([
+            (PROGRESSION, 24300, collection.progression(&profile)?),
+            (HERO_CATALOG, 24900, collection.hero_catalog(&profile)?),
+        ]);
         let replay = templates.at_login(
             &profile,
             identity,
@@ -223,6 +228,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use crate::{
+        catalog::ItemDb,
         jam_cipher::Jam,
         jam_framing::{self, FrameReader},
     };
@@ -404,6 +410,8 @@ mod tests {
         .join("data");
         let schemas = Schemas::load(runtime.join("schemas_174.json")).unwrap();
         let templates = RetailTemplates::load(runtime.join("retail_templates.json")).unwrap();
+        let items = Arc::new(ItemDb::load(&runtime).unwrap());
+        let collection = Collection::new(&templates, items).unwrap();
         let temporary = tempfile::tempdir().unwrap();
         let accounts = Accounts::new(
             temporary.path().join("profiles"),
@@ -416,48 +424,75 @@ mod tests {
             account,
             tournament: false,
         };
-        let messages = prepared
-            .available_messages(
-                &schemas,
-                &templates,
-                LoginContent {
-                    portrait_frame: 1,
-                    menu_hero: None,
-                    extra_skins: &[],
-                    wall_time: 1_700_000_000,
-                    server_time: 1_700_010_000,
-                },
-            )
-            .unwrap();
-        let keys: Vec<_> = messages.iter().map(|&(crc, id, _)| (crc, id)).collect();
-        assert_eq!(
-            keys[..6],
-            [
-                (IN_CONNECT, 20500),
-                (IN_CONNECT, 20502),
-                (IN_CONNECT, 20505),
-                (player::ENDORSEMENTS, 52002),
-                (player::ENDORSEMENTS, 52005),
-                (player::ENDORSEMENTS, 52006),
-            ]
-        );
-        assert_eq!(keys[keys.len() - 2..], [(PING, 35500), (LOBBY, 20802)]);
-        assert!(keys[6..].contains(&(LOBBY, 20812)));
-        assert_eq!(messages.len(), 43);
-        let mut digest = Sha256::new();
-        for (crc, id, fields) in messages {
-            let mut wire = schemas.header(crc, 1, id).unwrap();
-            wire.extend(schemas.encode(crc, id, &fields).unwrap());
-            digest.update(crc.to_le_bytes());
-            digest.update(id.to_le_bytes());
-            digest.update(u32::try_from(wire.len()).unwrap().to_le_bytes());
-            digest.update(wire);
-        }
         // Python Content.login_messages and PlayerMessages.settings, filtered
         // to the same subset and encoded with a normalized wire index of one.
-        assert_eq!(
-            format!("{:x}", digest.finalize()),
-            "5ce6db394b93e7780fdf6f118b15c3a7561341f2fe778117be10c382c14f9d60"
-        );
+        for (level, unlock_all, frame, expected_digest) in [
+            (
+                100,
+                false,
+                0x0250_0000_0000_0921,
+                "dd3592d1567584386b3edc6229a9db3fc972d9b56727647f2c277751ad7e8b1e",
+            ),
+            (
+                3000,
+                true,
+                0x0250_0000_0000_0f97,
+                "64a5bdca92b80b4daf210c82f05c4e665c471c5c41e309de9da769a20511dc66",
+            ),
+        ] {
+            {
+                let mut profile = prepared.account.profile();
+                profile.level = level;
+                profile.unlock_all = unlock_all;
+            }
+            let messages = prepared
+                .available_messages(
+                    &schemas,
+                    &templates,
+                    &collection,
+                    LoginContent {
+                        menu_hero: None,
+                        extra_skins: &[],
+                        wall_time: 1_700_000_000,
+                        server_time: 1_700_010_000,
+                    },
+                )
+                .unwrap();
+            let keys: Vec<_> = messages.iter().map(|&(crc, id, _)| (crc, id)).collect();
+            assert_eq!(
+                keys[..8],
+                [
+                    (IN_CONNECT, 20500),
+                    (IN_CONNECT, 20502),
+                    (IN_CONNECT, 20505),
+                    (player::ENDORSEMENTS, 52002),
+                    (player::ENDORSEMENTS, 52005),
+                    (player::ENDORSEMENTS, 52006),
+                    (PROGRESSION, 24300),
+                    (HERO_CATALOG, 24900),
+                ]
+            );
+            assert_eq!(keys[keys.len() - 2..], [(PING, 35500), (LOBBY, 20802)]);
+            assert!(keys[8..].contains(&(LOBBY, 20812)));
+            let Value::Struct(card) = &messages[1].2[&0x78] else {
+                panic!("missing player card");
+            };
+            let Value::Struct(progression) = &messages[6].2[&0x78] else {
+                panic!("missing progression");
+            };
+            assert_eq!(card[&0x28], Value::Unsigned(frame));
+            assert_eq!(progression[&0x58], card[&0x28]);
+            assert_eq!(messages.len(), 45);
+            let mut digest = Sha256::new();
+            for (crc, id, fields) in messages {
+                let mut wire = schemas.header(crc, 1, id).unwrap();
+                wire.extend(schemas.encode(crc, id, &fields).unwrap());
+                digest.update(crc.to_le_bytes());
+                digest.update(id.to_le_bytes());
+                digest.update(u32::try_from(wire.len()).unwrap().to_le_bytes());
+                digest.update(wire);
+            }
+            assert_eq!(format!("{:x}", digest.finalize()), expected_digest);
+        }
     }
 }

@@ -11,7 +11,7 @@ use std::path::Path;
 
 const BOOL: u8 = 0;
 const STRUCT: u8 = 14;
-const MAX_ARRAY_COUNT: usize = 0x40000;
+pub(crate) const MAX_ARRAY_COUNT: usize = 0x40000;
 
 /// A JAM message or inline struct, keyed by the field's in-memory offset.
 pub type Fields = BTreeMap<u32, Value>;

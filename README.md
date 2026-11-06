@@ -27,7 +27,7 @@ An automated result covers the fixture or replay named in its evidence. A manual
 
 ## Run locally
 
-The Rust crate includes transport, protocol codecs, account storage, a local Battle.net listener, world-frame encoding and the runtime preparation tool. Run `cargo test --locked --all-targets` with stable Rust to verify the public fixtures. The current game server entry point runs the Python implementation described below.
+The Rust crate includes transport, protocol codecs, account and collection handling, a local Battle.net listener, a UDP match worker and the runtime preparation tool. The UDP worker serves match loading and exercises reliable retransmission in loopback tests. World creation and simulation are still being ported. Run `cargo test --locked --all-targets` with stable Rust to verify the public fixtures. The current game server entry point runs the Python implementation described below.
 
 The documented environment is Windows with Python 3.12. Node.js 24 is used for the dashboard test. The public source checks can run without the game or any prepared runtime.
 
