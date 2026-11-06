@@ -37,7 +37,7 @@ import gzip
 import json
 import re
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, lru_cache
 
 from ow174.game.script.expr import Asset
 from ow174.paths import DATA_DIR
@@ -60,19 +60,33 @@ def is_plug(value) -> bool:
     return isinstance(value, dict) and "$" in value and "links" in value
 
 
+@lru_cache(maxsize=1024)
+def _field_path(path: str) -> tuple[tuple[str, tuple[int, ...]], ...] | None:
+    steps = []
+    for part in path.split("."):
+        match = PATH_PART.fullmatch(part)
+        if match is None:
+            return None
+        indexes = tuple(int(index) for index in re.findall(r"\[(\d+)\]", match[2]))
+        steps.append((match[1], indexes))
+    return tuple(steps)
+
+
 def field_at(fields: dict, path: str):
     """The value at a field path such as "m_onBeginPlug", "m_transitionPlug[0]" or "m_45216F79.m_D44EB181";
     None when it is not there."""
+    steps = _field_path(path)
+    if steps is None:
+        return None
     value = fields
-    for part in path.split("."):
-        match = PATH_PART.fullmatch(part)
-        if match is None or not isinstance(value, dict):
+    for name, indexes in steps:
+        if not isinstance(value, dict):
             return None
-        value = value.get(match.group(1))
-        for index in re.findall(r"\[(\d+)\]", match.group(2)):
-            if not isinstance(value, list) or int(index) >= len(value):
+        value = value.get(name)
+        for index in indexes:
+            if not isinstance(value, list) or index >= len(value):
                 return None
-            value = value[int(index)]
+            value = value[index]
     return value
 
 

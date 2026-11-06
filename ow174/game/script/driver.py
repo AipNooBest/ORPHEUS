@@ -637,9 +637,9 @@ def _reads(cfg, var: int) -> bool:
 
 
 def warm_up() -> None:
-    """Load the graph data and build one body, so that the first player's body does not cost a tick
-    0.35 s."""
+    """Load shared graph and codec data before the first match update."""
     BodyScript(SOLDIER, 0, 0)
+    stec_classes()
 
 
 class _CreateArrived:

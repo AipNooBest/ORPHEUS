@@ -48,6 +48,20 @@ def run(body: BodyScript, frames: int, buttons: int) -> None:
         body.command(body.frame + 1, buttons)
 
 
+class FieldPathTests(unittest.TestCase):
+    def test_reused_nested_paths_read_current_fields(self):
+        path = "m_entries[0][1].m_target"
+        fields = {"m_entries": [[None, {"m_target": 1}]]}
+        self.assertEqual(graphs.field_at(fields, path), 1)
+        fields["m_entries"][0][1]["m_target"] = 2
+        self.assertEqual(graphs.field_at(fields, path), 2)
+        self.assertEqual(graphs.field_at({"m_entries": [[None, {"m_target": 0}]]}, path), 0)
+        self.assertIsNone(graphs.field_at({"m_entries": [[None]]}, path))
+        self.assertIsNone(graphs.field_at({"m_entries": {"0": []}}, path))
+        self.assertIsNone(graphs.field_at(fields, "m_entries[0][-1].m_target"))
+        self.assertIsNone(graphs.field_at(fields, "m_entries[0][1]..m_target"))
+
+
 class SpawnTests(unittest.TestCase):
     def test_the_instances(self):
         body = soldier()

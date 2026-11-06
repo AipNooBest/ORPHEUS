@@ -1055,7 +1055,7 @@ class GameServer:
 
     def start(self) -> None:
         """Bind the port and run the server thread. Raises OSError when the port is taken."""
-        warm_up()  # the statescript data (0.35 s), so that the first hero body does not stall a tick
+        warm_up()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         _ignore_connection_resets(self.sock)
         self.sock.bind((self.host, self.port))
