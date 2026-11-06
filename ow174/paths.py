@@ -30,7 +30,7 @@ LOBBY_RUNTIME_DATA = (
 MATCH_RUNTIME_DATA = (
     "ai_spawners_174.json", "collision_keys_174.json", "collision_props_174.json", "game_graphs_174.json.gz",
     "game_heroes_174.json", "game_maps_174.json", "game_movers_174.json", "game_schemas_174.json",
-    "game_stats_174.json", "statescript_codecs_174.json",
+    "game_stats_174.json", "game_ult_charge_174.json", "statescript_codecs_174.json",
 )
 
 

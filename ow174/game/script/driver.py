@@ -24,7 +24,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
-from ow174.game import pools
+from ow174.game import pools, ult_charge
 from ow174.game.bits import BitWriter
 from ow174.game.commands import FRAME_HALF, FRAME_MASK, frame_distance
 from ow174.game.content import SOLDIER
@@ -96,8 +96,9 @@ TRUSTED_NATIVES = {
 }
 POLLED_SWITCHES = {"STUStatescriptStateBooleanSwitch", "STU_DEBD057B"}
 # The ultimate: its charge #342e is server data (no graph adds to it; the ultimate's graph sets it to 0 when
-# it starts), its cost #338e comes from the Entries. The server has no damage or healing yet, so the
-# charge fills by itself in ULT_SECONDS (0: never), and not while the ultimate runs.
+# it starts), its cost #338e comes from the Entries. Combat credits it (combat.py through ult_charge.py);
+# the passive fills the rest in ULT_SECONDS (0: never) so a server with no combat rule still charges, and
+# nothing charges while the ultimate runs.
 ULT_CHARGE, ULT_COST = 342, 338
 ULT_SECONDS = 60.0
 VOLLEY = "STUStatescriptStateWeaponVolley"
@@ -360,6 +361,17 @@ class BodyScript(ReplicatedBody):
     def set_ult_charge(self, points: float) -> None:
         """Set the ultimate's charge (#342e; the cost is #338e): a GM command, or damage and healing later."""
         self.component.set(ULT_CHARGE, f32(points))
+
+    def credit_ult(self, kind: str, amount: float) -> None:
+        """A combat event of this body (combat.py): dealt damage or done healing in HP, or an elimination
+        (amount unused). The hero's rule in ult_charge.py turns it into points of the meter's own scale;
+        a rule that does not charge gives nothing, and the meter never passes its cost."""
+        cost = expr.to_float(self.component.entity_var(ULT_COST).value())
+        points = ult_charge.points(kind, self.hero, amount, cost)
+        if points <= 0.0:
+            return
+        charge = expr.to_float(self.component.entity_var(ULT_CHARGE).value())
+        self.set_ult_charge(max(0.0, min(cost, f32(charge + points))))
 
     def _charge_ult(self) -> None:
         if self.ult_seconds <= 0 or any(state.flags & nodes.Ability.RUNNING for state in self.ultimates):

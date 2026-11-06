@@ -33,6 +33,8 @@ What the server decides here:
 - Quick melee: 0043 st4 (ModifyHealth) on what its st5 TrackTargets would find (MELEE). The Biotic Field
   heals through heal_area (projectiles.py). A dead body's statescript takes no presses (the VM's
   owner_dead, as the client's LogicalButton 0x7FF78AAAC570), so the dead do not shoot.
+- The attacker's ultimate: its body script credits the meter for the damage dealt and the healing done,
+  and once more per elimination (ult_charge.py; the rates are data, the client's meter only shows the var).
 - Bodies are capsules from the feet to the mover's height (radius the mover's, DATA; unverified as a hitbox),
   a hit at or above the eye height less HEAD_BELOW is critical (unverified). Shots stop at the map's collision
   (the mover's part of it, which the server keeps). Allies are not hit.
@@ -50,7 +52,7 @@ import math
 from collections import deque
 from dataclasses import dataclass
 
-from ow174.game import bots, observers, pools, projectiles, stats, voicelines, world
+from ow174.game import bots, observers, pools, projectiles, stats, ult_charge, voicelines, world
 from ow174.game.bits import BitWriter
 from ow174.game.collision import MOVER, World
 from ow174.game.commands import Command
@@ -758,6 +760,7 @@ class Combat:
             if given <= 0.0:
                 continue
             healer.stats.add(stats.HEALING, given)
+            self._credit_ult(healer, ult_charge.HEALING, given)
             self._sync_body_health(target.owner, vitals)
 
     @staticmethod
@@ -765,6 +768,14 @@ class Combat:
         script = getattr(owner, "body_script", None)
         if script is not None:
             script.set_health(vitals.total, sum(vitals.most.values()))
+
+    @staticmethod
+    def _credit_ult(actor, kind: str, amount: float) -> None:
+        """The actor's own body charges its ultimate from the event (ult_charge.py); a bot has no
+        chargeable body script yet, so for now bots deal damage without feeding a meter."""
+        script = getattr(actor, "body_script", None)
+        if script is not None:
+            script.credit_ult(kind, amount)
 
     def _collision(self):
         from ow174.game.collision import CollisionError
@@ -796,6 +807,7 @@ class Combat:
             flags = (CRITICAL if critical else 0) | (KILLING if killed else 0)
             self._tell_hit(shooter, target, dealt, flags, frame)
             shooter.stats.add(stats.HERO_DAMAGE, dealt)
+            self._credit_ult(shooter, ult_charge.DAMAGE, dealt)
         victim = target.owner
         if killed and isinstance(victim, bots.Bot):
             # The NPC death script owns its terminal health change and death event ordering.
@@ -848,6 +860,7 @@ class Combat:
         self.respawns.append((self.now + BOT_RESPAWN, bot))
         if not isinstance(killer, bots.Bot):
             killer.stats.add(stats.ELIMINATIONS)
+            self._credit_ult(killer, ult_charge.KILL, 0.0)
             self._kill_notice(killer, bot)
         log.info("[game] %s: %s killed %s", self.match.label(), killer.name, bot.name)
         script = bot.body_script
@@ -890,6 +903,7 @@ class Combat:
         source = _source_entity(killer)
         if killer is not victim and not bot_killer:
             killer.stats.add(stats.ELIMINATIONS)
+            self._credit_ult(killer, ult_charge.KILL, 0.0)
             self._kill_notice(killer, victim)
         if victim.client is not None:
             how = KILLED_BY if killer is not victim else 0
