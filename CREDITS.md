@@ -48,6 +48,8 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
 - **[RustCrypto](https://github.com/RustCrypto)** maintains the AES-GCM, HMAC and SHA-256 crates used by the Rust
   transport. **[The Rust Random Project](https://github.com/rust-random/getrandom)** supplies access to operating
   system randomness for the lobby challenge.
+- **[Prost](https://github.com/tokio-rs/prost)** and **[prost-reflect](https://github.com/andrewhickman/prost-reflect)**
+  supply protobuf framing and reflection over the external Battle.net descriptors.
 - **TripleFault and Gamayun contributors** supplied a same-build comparison for encrypted combat scenarios and
   tick measurement design. This is a behavior reference. Gamayun identifies its Go implementation as
   AGPL-3.0-or-later and retains the MIT notice for inherited code.

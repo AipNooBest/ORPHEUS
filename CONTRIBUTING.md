@@ -17,7 +17,17 @@ Use a fork and a short topic branch for a pull request. Test with your own Git a
 
 ## Public source checks
 
-Run these from the repository root. They use public source and synthetic fixtures and do not launch the client. Run them with `ORPHEUS_RUNTIME_DIR` unset to match CI.
+The Rust protocol crate uses synthetic inputs by default. Run the following from the repository root with stable Rust, `rustfmt` and `clippy`.
+
+```powershell
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+```
+
+To run the additional Rust checks with an authorized 104319 runtime, set `ORPHEUS_RUNTIME_DIR` to that runtime and `ORPHEUS_BNET_DESCRIPTORS` to its `bnet/descriptors.pb`, then run `cargo test --locked --lib -- --ignored`.
+
+Run the following Python and JavaScript checks from the repository root with `ORPHEUS_RUNTIME_DIR` unset to match CI. They use public source and synthetic fixtures.
 
 ```powershell
 Remove-Item Env:ORPHEUS_RUNTIME_DIR -ErrorAction SilentlyContinue

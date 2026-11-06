@@ -11,7 +11,7 @@ The migration target is a Rust implementation of ORPHEUS for retail build 1.74.0
 | Windows deployment | Launcher, retail relay and server-only distribution | Build the Windows tools and relay, and boot the audited checkout from the separate runtime. Verify supported connection paths with the original client. |
 | Cutover | Change the normal entry points and remove superseded implementations | Pass the prior behavioral suite, confirm original-client acceptance, and complete a server-only smoke test of the audited public checkout. |
 
-The first Rust crate ports the transport and protocol layer. The Python server remains the runnable entry point while the lobby and simulation are ported. Public Rust tests use synthetic protocol vectors and local loopback connections. They need neither a client nor prepared deployment data.
+The Rust crate has the JAM handshake, lobby transport and schema codec, Battle.net framing, game UDP packet and message codecs, and client command admission. The Python server remains the runnable entry point while service handlers and simulation are ported. Public Rust tests use synthetic protocol vectors and local loopback connections. They need neither a client nor prepared deployment data.
 
 ```powershell
 cargo test --locked --all-targets
