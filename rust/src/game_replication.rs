@@ -25,6 +25,7 @@ use crate::{
     mover_modifiers::{Modifier, ModifierKey},
     scene_assets::PreparedScene,
     script_init::Snapshot,
+    script_player::OwnerBodySpawn,
     script_snapshot_wire::{ProjectedSnapshot, SnapshotEncoder, View},
     script_stream::{BodyStream, DeltaKind, ScriptChunk, Stream},
     world::{EntityUpdate, GAME_MODE_ENTITY, LeaseBlock, MAX_PAYLOAD, Operation, SkinTheme, frame},
@@ -688,6 +689,7 @@ impl WorldDelivery {
         viewer: &PlayerAppearance<'_>,
         tick: u32,
         now: Duration,
+        quanta: u32,
         message: &Message,
     ) -> io::Result<()> {
         if !self.can_handle_game_message() {
@@ -720,7 +722,7 @@ impl WorldDelivery {
                 {
                     self.queue_controller(scene, tick, false, Some(hero.guid))?;
                 } else if let Some(entity) = self.next_body(now) {
-                    self.switch(scene, viewer, tick, entity, hero, skin)?;
+                    self.switch(scene, viewer, tick, quanta, entity, (hero, skin))?;
                 }
             }
             Some(HeroSelectRequest::OpenOrClose(wanted)) => {
@@ -781,7 +783,7 @@ impl WorldDelivery {
                     tick,
                     received,
                 } => {
-                    let _ = self.game_message(scene, viewer, tick, received, &message);
+                    let _ = self.game_message(scene, viewer, tick, received, quanta, &message);
                     remaining -= 1;
                 }
                 InputWork::Command {
@@ -845,10 +847,11 @@ impl WorldDelivery {
         scene: &PreparedScene,
         viewer: &PlayerAppearance<'_>,
         tick: u32,
+        quanta: u32,
         entity: u32,
-        hero: &Hero,
-        skin: SkinTheme,
+        selection: (&Hero, SkinTheme),
     ) -> io::Result<()> {
+        let (hero, skin) = selection;
         let (position, yaw) = scene
             .map()
             .spawn_point(viewer.team, 0)
@@ -868,7 +871,15 @@ impl WorldDelivery {
         };
         let start_frame = self.input.processed.unwrap_or(tick);
         let script = scene
-            .owner_body_runtime(hero, entity, start_frame)
+            .owner_body_runtime(
+                hero,
+                OwnerBodySpawn {
+                    entity,
+                    frame: start_frame,
+                    position: pose.position,
+                    quanta,
+                },
+            )
             .ok()
             .flatten()
             .and_then(|runtime| BodyScript::new(body, start_frame, runtime).ok());
@@ -1164,9 +1175,9 @@ mod tests {
                 &scene,
                 &viewer,
                 FIRST_TICK,
+                RETAIL_QUANTA,
                 owner | 1,
-                hero,
-                SkinTheme::default(),
+                (hero, SkinTheme::default()),
             )
             .unwrap();
         assert!(world.body_script.is_none());
@@ -1653,14 +1664,9 @@ mod tests {
         let runtime = std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap();
         let assets = SceneAssets::load(runtime).unwrap();
         let mut scene = assets.prepare(GameMap::practice_range()).unwrap();
-        let failed = Arc::new(AtomicBool::new(false));
-        let runtime_fault = Arc::clone(&failed);
-        scene.owner_body_factory = Some(Arc::new(move |_, entity, frame| {
-            Ok(Some(synthetic_owner(
-                entity,
-                frame,
-                Arc::clone(&runtime_fault),
-            )))
+        let (factory, _) = crate::script_player::fixture_body_factory();
+        scene.owner_body_factory = Some(Arc::new(move |_, spawn| {
+            Ok(Some(Box::new(factory.start(spawn)?)))
         }));
         let viewer = PlayerAppearance {
             entity: OWNER,
@@ -1676,9 +1682,9 @@ mod tests {
                 &scene,
                 &viewer,
                 FIRST_TICK,
+                RETAIL_QUANTA,
                 OWNER | 1,
-                hero,
-                SkinTheme::default(),
+                (hero, SkinTheme::default()),
             )
             .unwrap();
         let tick = FIRST_TICK + 1;
@@ -1703,19 +1709,19 @@ mod tests {
             [RecordSource::Queued(0), RecordSource::Movement(0)]
         );
 
-        failed.store(true, Ordering::Relaxed);
-        world.queue_commands(tick + 1, &[forward(tick + 1)]);
+        let after_unposed_gap = tick + 65;
+        world.queue_commands(after_unposed_gap, &[forward(after_unposed_gap)]);
         assert_eq!(
             world
                 .advance_input(&scene, &viewer, RETAIL_QUANTA, 16)
                 .unwrap(),
             (1, false)
         );
-        assert_eq!(world.command_ack(tick + 1), tick + 1);
+        assert_eq!(world.command_ack(after_unposed_gap), after_unposed_gap);
         assert!(world.body_script.is_none());
         transport_outcome(&mut world, &mut egress, 1, false);
         assert!(
-            transmit(&mut world, &mut egress, tick + 1, 2)
+            transmit(&mut world, &mut egress, after_unposed_gap, 2)
                 .1
                 .records
                 .is_empty()

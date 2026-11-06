@@ -13,9 +13,11 @@ use crate::bits::{BitError, BitWriter};
 use crate::script_codecs::{Codec, CodecTable, PayloadError, PayloadMode, StatePayload};
 use crate::script_expr::equal;
 use crate::script_graph::{Graph, GraphStore, Node, asset_guid};
-use crate::script_init::{Snapshot, StateKind};
+use crate::script_init::{Snapshot, StackBinding, State, StateKind};
 use crate::script_stream::{BodyStream, ChangeKey, DeltaKind, ScriptChunk, StreamError};
-use crate::script_wire::{self, Instance, Layout, Value, ValueEncoding, Variables, WireError};
+use crate::script_wire::{
+    self, Binding, Bindings, Instance, Layout, Value, ValueEncoding, Variables, WireError,
+};
 
 const OWNER_HEALTH: u32 = 253;
 
@@ -30,7 +32,7 @@ pub struct ProjectedSnapshot {
     entity: u32,
     view: View,
     entity_exclusions: BTreeSet<u32>,
-    variables: Variables,
+    variables: ProjectedVariables,
     instances: BTreeMap<u16, ProjectedInstance>,
 }
 
@@ -52,7 +54,7 @@ impl ProjectedSnapshot {
 struct ProjectedInstance {
     graph: u32,
     parent: Option<(u16, u16)>,
-    variables: Variables,
+    variables: ProjectedVariables,
     states: BTreeMap<u16, ProjectedState>,
     events: Vec<ProjectedEvent>,
 }
@@ -61,6 +63,24 @@ struct ProjectedInstance {
 struct ProjectedState {
     active: bool,
     payload: StatePayload,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ProjectedVariables {
+    values: Variables,
+    bindings: Bindings,
+}
+
+impl ProjectedVariables {
+    fn write(&self, out: &mut BitWriter, owner: u16) -> Result<(), WireError> {
+        script_wire::bound_variable_list(
+            out,
+            &self.values,
+            ValueEncoding::Compact,
+            owner,
+            &self.bindings,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,9 +105,14 @@ pub enum SnapshotError {
         diagnostics: usize,
         first: String,
     },
-    UnsupportedBindings {
-        entity: u32,
-        variables: usize,
+    MissingBoundValue {
+        owner: u16,
+        variable: u32,
+    },
+    InvalidBinding {
+        owner: u16,
+        variable: u32,
+        binding: StackBinding,
     },
     MissingGraph {
         instance: u16,
@@ -132,10 +157,20 @@ impl fmt::Display for SnapshotError {
                     "body {entity:08X} has {diagnostics} initialization diagnostics, first {first}"
                 )
             }
-            Self::UnsupportedBindings { entity, variables } => {
+            Self::MissingBoundValue { owner, variable } => {
                 write!(
                     f,
-                    "body {entity:08X} has {variables} variables with unsupported stack bindings"
+                    "missing resolved value for bound variable {owner}:{variable}"
+                )
+            }
+            Self::InvalidBinding {
+                owner,
+                variable,
+                binding,
+            } => {
+                write!(
+                    f,
+                    "invalid stack binding {binding:?} for variable {owner}:{variable}"
                 )
             }
             Self::MissingGraph { instance, graph } => {
@@ -245,12 +280,6 @@ impl<'a> SnapshotEncoder<'a> {
                 first: format!("{:?}", snapshot.diagnostics.first()),
             });
         }
-        if !snapshot.bindings.is_empty() {
-            return Err(SnapshotError::UnsupportedBindings {
-                entity: snapshot.entity,
-                variables: snapshot.bindings.len(),
-            });
-        }
         let mut entity_exclusions = frozen
             .cloned()
             .unwrap_or_else(|| BTreeSet::from([OWNER_HEALTH]));
@@ -258,7 +287,8 @@ impl<'a> SnapshotEncoder<'a> {
         for (&id, instance) in &snapshot.instances {
             let graph = self.graph(id, instance.graph)?;
             let exclusions = server_only_variables(graph);
-            let variables = replicated_variables(&instance.variables, &exclusions);
+            let variables =
+                self.project_variables(snapshot, id, &instance.variables, &exclusions, view)?;
             if frozen.is_none() {
                 entity_exclusions.extend(exclusions);
             }
@@ -284,7 +314,7 @@ impl<'a> SnapshotEncoder<'a> {
                 }
                 let payload = codec
                     .filter(|codec| codec.projected())
-                    .and_then(|codec| state_payload(state.kind, codec))
+                    .and_then(|codec| state_payload(state, codec))
                     .ok_or_else(|| SnapshotError::UnsupportedState {
                         site,
                         class: node.class.clone(),
@@ -313,13 +343,92 @@ impl<'a> SnapshotEncoder<'a> {
                 },
             );
         }
+        let variables =
+            self.project_variables(snapshot, 0, &snapshot.variables, &entity_exclusions, view)?;
         Ok(ProjectedSnapshot {
             entity: snapshot.entity,
             view,
-            variables: replicated_variables(&snapshot.variables, &entity_exclusions),
+            variables,
             entity_exclusions,
             instances,
         })
+    }
+
+    fn project_variables(
+        &self,
+        snapshot: &Snapshot,
+        owner: u16,
+        values: &Variables,
+        excluded: &BTreeSet<u32>,
+        view: View,
+    ) -> Result<ProjectedVariables, SnapshotError> {
+        let mut projected = ProjectedVariables::default();
+        for (&variable, base) in values {
+            if excluded.contains(&variable) {
+                continue;
+            }
+            let key = (owner, variable);
+            let bindings = snapshot.bindings.get(&key);
+            let value = match snapshot.resolved_bindings.get(&key) {
+                Some(resolved) => resolved,
+                None if bindings.is_some() => {
+                    return Err(SnapshotError::MissingBoundValue { owner, variable });
+                }
+                None => base,
+            };
+            if let Some(bindings) = bindings.filter(|_| view == View::Owner) {
+                let links = self.project_bindings(snapshot, owner, variable, bindings)?;
+                if !links.is_empty() {
+                    projected.bindings.insert(variable, links);
+                }
+            }
+            if !matches!(value, Value::Null) || projected.bindings.contains_key(&variable) {
+                projected.values.insert(variable, value.clone());
+            }
+        }
+        Ok(projected)
+    }
+
+    fn project_bindings(
+        &self,
+        snapshot: &Snapshot,
+        owner: u16,
+        variable: u32,
+        bindings: &[StackBinding],
+    ) -> Result<Vec<Binding>, SnapshotError> {
+        let mut links = Vec::with_capacity(bindings.len());
+        for &binding in bindings {
+            let invalid = || SnapshotError::InvalidBinding {
+                owner,
+                variable,
+                binding,
+            };
+            let source = snapshot
+                .instances
+                .get(&binding.instance)
+                .ok_or_else(invalid)?;
+            if !source
+                .states
+                .get(&binding.raw_state)
+                .is_some_and(|state| state.active && matches!(state.kind, StateKind::Stack { .. }))
+            {
+                return Err(invalid());
+            }
+            let graph = self.graph(binding.instance, source.graph)?;
+            let node = graph
+                .state(usize::from(binding.raw_state))
+                .ok_or_else(invalid)?;
+            if node.is_networked() {
+                links.push(Binding {
+                    instance: binding.instance,
+                    state: binding.raw_state,
+                    state_bits: graph.header.states_bits,
+                    priority: binding.priority.level,
+                    above: binding.priority.above_equals,
+                });
+            }
+        }
+        Ok(links)
     }
 
     /// The owner's first tree and the observer's first frame share the H0
@@ -329,7 +438,7 @@ impl<'a> SnapshotEncoder<'a> {
         for (&id, instance) in &snapshot.instances {
             let graph = self.graph(id, instance.graph)?;
             let mut wire = Instance::new(id, Layout::try_from(graph)?, instance.parent);
-            wire.variables = instance.variables.clone();
+            wire.variables = instance.variables.values.clone();
             for (slot, (_, var)) in graph.presence_vars().enumerate() {
                 if let Some(value) = var.0.and_then(|var| wire.variables.swap_remove(&var)) {
                     wire.presence.insert(slot, value);
@@ -340,7 +449,10 @@ impl<'a> SnapshotEncoder<'a> {
             }
             instances.push(wire);
         }
-        Ok(script_wire::remote_full(&instances, &snapshot.variables)?)
+        Ok(script_wire::remote_full(
+            &instances,
+            &snapshot.variables.values,
+        )?)
     }
 
     /// Prepare the baseline for this body's delivery stream. The body create
@@ -353,7 +465,9 @@ impl<'a> SnapshotEncoder<'a> {
         let payload = self.full(snapshot)?;
         let mut baseline = snapshot.clone();
         if baseline.view == View::Owner {
+            baseline.variables.bindings.clear();
             for instance in baseline.instances.values_mut() {
+                instance.variables.bindings.clear();
                 instance.states.clear();
                 instance.events.clear();
             }
@@ -483,7 +597,7 @@ impl<'a> SnapshotEncoder<'a> {
                 states.insert(raw, now);
                 delta.keys.insert(key);
             }
-            if descriptor || !variables.is_empty() || !states.is_empty() {
+            if descriptor || !variables.values.is_empty() || !states.is_empty() {
                 delta.instances.insert(
                     id,
                     InstanceDelta {
@@ -562,13 +676,13 @@ impl<'a> SnapshotEncoder<'a> {
             }
         }
         body.w_u16(0);
-        script_wire::variable_list(&mut body, &delta.variables, ValueEncoding::Compact)?;
+        delta.variables.write(&mut body, 0)?;
         for (&id, instance) in &delta.instances {
             let Some(current) = instance.current else {
                 continue;
             };
             let graph = self.graph(id, current.graph)?;
-            write_delta_variables(&mut body, graph, &instance.variables)?;
+            write_delta_variables(&mut body, id, graph, &instance.variables)?;
             self.delta_states(&mut body, id, graph, &instance.states, mode)?;
         }
         if let PayloadMode::Owner { frame_time, .. } = mode {
@@ -814,7 +928,7 @@ impl<'a> SnapshotEncoder<'a> {
 
 #[derive(Default)]
 struct SnapshotDelta<'a> {
-    variables: Variables,
+    variables: ProjectedVariables,
     instances: BTreeMap<u16, InstanceDelta<'a>>,
     keys: BTreeSet<ChangeKey>,
 }
@@ -823,21 +937,26 @@ struct SnapshotDelta<'a> {
 struct InstanceDelta<'a> {
     current: Option<&'a ProjectedInstance>,
     descriptor: bool,
-    variables: Variables,
+    variables: ProjectedVariables,
     states: BTreeMap<u16, Option<&'a ProjectedState>>,
 }
 
 fn delta_variables(
     instance: u16,
-    before: Option<&Variables>,
-    current: &Variables,
+    before: Option<&ProjectedVariables>,
+    current: &ProjectedVariables,
     touched: &BTreeSet<ChangeKey>,
     changes: &mut BTreeSet<ChangeKey>,
-) -> Variables {
+) -> ProjectedVariables {
     let ids: BTreeSet<_> = current
+        .values
         .keys()
         .copied()
-        .chain(before.into_iter().flat_map(|vars| vars.keys().copied()))
+        .chain(
+            before
+                .into_iter()
+                .flat_map(|vars| vars.values.keys().copied()),
+        )
         .chain(
             touched
                 .range(ChangeKey::Variable(instance, 0)..=ChangeKey::Variable(instance, u32::MAX))
@@ -847,15 +966,20 @@ fn delta_variables(
                 }),
         )
         .collect();
-    let mut result = Variables::new();
+    let mut result = ProjectedVariables::default();
     for id in ids {
-        let now = current.get(&id).unwrap_or(&Value::Null);
+        let now = current.values.get(&id).unwrap_or(&Value::Null);
         let was = before
-            .and_then(|vars| vars.get(&id))
+            .and_then(|vars| vars.values.get(&id))
             .unwrap_or(&Value::Null);
+        let bindings = current.bindings.get(&id);
+        let previous_bindings = before.and_then(|vars| vars.bindings.get(&id));
         let key = ChangeKey::Variable(instance, id);
-        if touched.contains(&key) || !equal(now, was) {
-            result.insert(id, now.clone());
+        if touched.contains(&key) || !equal(now, was) || bindings != previous_bindings {
+            result.values.insert(id, now.clone());
+            if let Some(bindings) = bindings {
+                result.bindings.insert(id, bindings.clone());
+            }
             changes.insert(key);
         }
     }
@@ -889,25 +1013,26 @@ fn write_mask(out: &mut BitWriter, width: usize, chosen: &BTreeSet<usize>) {
 
 fn write_delta_variables(
     out: &mut BitWriter,
+    owner: u16,
     graph: &Graph,
-    vars: &Variables,
+    vars: &ProjectedVariables,
 ) -> Result<(), WireError> {
     let mut sync = BTreeMap::new();
-    let mut extra = vars.clone();
+    let mut extra = vars.values.clone();
     for (slot, var) in graph.sync_vars.iter().enumerate() {
-        if let Some(value) = var
-            .0
-            .filter(|_| var.1 == 0)
-            .and_then(|id| extra.swap_remove(&id))
-        {
-            sync.insert(slot, value);
+        let Some(id) = var.0.filter(|_| var.1 == 0) else {
+            continue;
+        };
+        if let Some(value) = extra.swap_remove(&id) {
+            sync.insert(slot, (id, value));
         }
     }
     write_mask(out, graph.sync_vars.len(), &sync.keys().copied().collect());
-    for value in sync.values() {
-        script_wire::variable(out, value, ValueEncoding::Compact)?;
+    for (id, value) in sync.values() {
+        let links = vars.bindings.get(id).map_or(&[][..], Vec::as_slice);
+        script_wire::bound_variable(out, value, ValueEncoding::Compact, owner, links)?;
     }
-    script_wire::variable_list(out, &extra, ValueEncoding::Compact)
+    script_wire::bound_variable_list(out, &extra, ValueEncoding::Compact, owner, &vars.bindings)
 }
 
 fn server_only_variables(graph: &Graph) -> BTreeSet<u32> {
@@ -922,25 +1047,19 @@ fn server_only_variables(graph: &Graph) -> BTreeSet<u32> {
         .collect()
 }
 
-fn replicated_variables(values: &Variables, excluded: &BTreeSet<u32>) -> Variables {
-    values
-        .iter()
-        .filter(|(id, value)| !excluded.contains(*id) && !matches!(*value, Value::Null))
-        .map(|(&id, value)| (id, value.clone()))
-        .collect()
-}
-
 fn presenter(node: &Node) -> bool {
     node.class == "STUStatescriptStateUXPresenter" || node.fields.get("m_45216F79").is_some()
 }
 
-fn state_payload(kind: StateKind, codec: &Codec) -> Option<StatePayload> {
-    Some(match (kind, codec.codec.as_deref()) {
-        (StateKind::Plain | StateKind::Wait | StateKind::AiCandidate { .. }, Some("none"))
-            if codec.empty() =>
-        {
-            StatePayload::new()
-        }
+fn state_payload(state: &State, codec: &Codec) -> Option<StatePayload> {
+    Some(match (state.kind, codec.codec.as_deref()) {
+        (
+            StateKind::Plain
+            | StateKind::Wait
+            | StateKind::AiCandidate { .. }
+            | StateKind::MovementMod,
+            Some("none"),
+        ) if codec.empty() => StatePayload::new(),
         (StateKind::BooleanSwitch(current), Some("switch")) => {
             StatePayload::from([("current".into(), Value::Bool(current))])
         }
@@ -952,6 +1071,26 @@ fn state_payload(kind: StateKind, codec: &Codec) -> Option<StatePayload> {
         (StateKind::WaitFrames { target }, Some("frames")) => {
             StatePayload::from([("target".into(), Value::Integer(i64::from(target)))])
         }
+        (StateKind::LogicalButton { .. }, Some("button")) => StatePayload::from([(
+            "counter".into(),
+            Value::Integer(i64::from(state.activation & 15)),
+        )]),
+        (StateKind::Stack { top, under }, Some("stack")) => StatePayload::from([
+            ("top".into(), Value::Bool(top)),
+            ("under".into(), Value::Bool(under)),
+        ]),
+        (StateKind::Ability { flags }, Some("ability")) => {
+            StatePayload::from([("flags".into(), Value::Integer(i64::from(flags)))])
+        }
+        (StateKind::Anim, Some("anim")) => StatePayload::from([(
+            "counter".into(),
+            Value::Integer(i64::from(state.activation & 7)),
+        )]),
+        (StateKind::Effect, Some("counter2")) => StatePayload::from([(
+            "counter".into(),
+            Value::Integer(i64::from(state.activation & 3)),
+        )]),
+        (StateKind::SendMessage, Some("send")) => StatePayload::new(),
         _ => return None,
     })
 }
@@ -975,6 +1114,13 @@ mod tests {
             "layout":[{"op":"if","c":"H","then":[{"op":"bits","f":"has_sender","n":1}],"else":[]},
                       {"op":"bits","f":"stacked","n":1}]},
         "12340005":{"name":"STUStatescriptStateWait","codec":"none","stec":false,"status":"VERIFIED","layout":[]},
+        "594C2D80":{"name":"STUStatescriptStateStack","codec":"stack","stec":false,"status":"VERIFIED",
+            "layout":[{"op":"if","c":"H","then":[{"op":"bits","f":"top","n":1},
+                      {"op":"bits","f":"under","n":1}],"else":[]}]},
+        "B480A974":{"name":"STUStatescriptStateLogicalButton","codec":"button","stec":true,"status":"VERIFIED",
+            "layout":[{"op":"if","c":"H","then":[{"op":"bits","f":"counter","n":4}],"else":[]}]},
+        "C38B92B4":{"name":"STUStatescriptStateAbility","codec":"ability","stec":false,"status":"VERIFIED",
+            "layout":[{"op":"bits","f":"flags","n":8},{"op":"link","f":"link"},{"op":"bits","f":"has_cur","n":1}]},
         "D74D4F47":{"name":"STU_D74D4F47","codec":"frames","stec":false,"status":"VERIFIED",
             "layout":[{"op":"bits","f":"target","n":32}]}
     }}"#;
@@ -1108,10 +1254,14 @@ mod tests {
         assert_eq!(owner.entity(), ENTITY);
         assert_eq!(owner.instance_count(), 2);
         assert_eq!(owner.instances[&2].parent, Some((1, 1)));
-        assert_eq!(owner.variables.keys().copied().collect::<Vec<_>>(), [7, 55]);
+        assert_eq!(
+            owner.variables.values.keys().copied().collect::<Vec<_>>(),
+            [7, 55]
+        );
         assert_eq!(
             owner.instances[&1]
                 .variables
+                .values
                 .keys()
                 .copied()
                 .collect::<Vec<_>>(),
@@ -1186,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn stack_bindings_block_initial_and_later_projection_for_both_views() {
+    fn stack_projection_rejects_missing_values_and_invalid_owner_binding_sources() {
         let (graphs, mut snapshot) = fixture();
         let codecs = CodecTable::from_json(CODECS).unwrap();
         let encoder = SnapshotEncoder::new(&graphs, &codecs);
@@ -1196,31 +1346,182 @@ mod tests {
             vec![crate::script_init::StackBinding {
                 instance: 1,
                 raw_state: 2,
+                priority: crate::script_expr::StackPriority {
+                    level: 0,
+                    above_equals: true,
+                },
             }],
         );
         for view in [View::Owner, View::Observer] {
             assert!(matches!(
                 encoder.project(&snapshot, view),
-                Err(SnapshotError::UnsupportedBindings {
-                    entity: ENTITY,
-                    variables: 1
+                Err(SnapshotError::MissingBoundValue {
+                    owner: 0,
+                    variable: 55,
                 })
             ));
         }
+        snapshot
+            .resolved_bindings
+            .insert((0, 55), Value::Bool(true));
         assert!(matches!(
             encoder.project_next(&snapshot, &baseline),
-            Err(SnapshotError::UnsupportedBindings {
-                entity: ENTITY,
-                variables: 1
+            Err(SnapshotError::InvalidBinding {
+                owner: 0,
+                variable: 55,
+                ..
             })
         ));
     }
 
+    #[test]
+    fn initial_owner_delta_matches_python_stack_bindings_and_payloads() {
+        let entry = |targets: &[u16]| {
+            let links: Vec<_> = targets.iter().map(|&id| (id, "m_beginPlug")).collect();
+            node(
+                0,
+                "STUStatescriptEntry",
+                None,
+                json!({"m_outPlug":{"$":"Plug","links":links}}),
+            )
+        };
+        let stack = |position, raw, variable, entity, value, priority: Option<&str>| {
+            node(
+                position,
+                "STUStatescriptStateStack",
+                Some(raw),
+                json!({
+                    "m_out_Var":{"$":"STUConfigVarDynamic","m_identifier":variable,"m_60DB8F99":entity},
+                    "m_value":value,
+                    "m_priority":{"m_priority":priority},
+                }),
+            )
+        };
+        let mut root = Root::new(1, 42);
+        root.variables.insert(100, Value::Integer(9));
+        let main = graph(
+            42,
+            vec![
+                entry(&[1, 2, 3, 4]),
+                stack(1, 0, 100, false, 17, Some("0x0C40000000000001")),
+                stack(2, 1, 7, true, 31, None),
+                node(
+                    3,
+                    "STUStatescriptStateLogicalButton",
+                    Some(2),
+                    json!({"m_logicalButton":{"$":"STUConfigVarLogicalButton","m_logicalButton":20}}),
+                ),
+                node(
+                    4,
+                    "STUStatescriptStateAbility",
+                    Some(3),
+                    json!({"m_A5F1A77B":{"$":"STUConfigVarLogicalButton","m_logicalButton":35}}),
+                ),
+            ],
+            json!([1, 2, 3, 4]),
+            json!([0]),
+            json!([1, 3, 4]),
+            json!([[100, 0, 1]]),
+        );
+        let mut other = graph(
+            43,
+            vec![
+                entry(&[1]),
+                stack(1, 0, 7, true, 24, Some("0x0C40000000000002")),
+            ],
+            json!([1]),
+            json!([0]),
+            json!([1]),
+            json!([]),
+        );
+        other["header"]["m_statesBitCount"] = json!(6);
+        let graphs = GraphStore::from_json(
+            &serde_json::to_vec(&json!({
+                "version":1, "graphs":[main,other], "bodies":{}, "missing":[]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let snapshot = initialize(
+            &graphs,
+            ENTITY,
+            Variables::from([(7, Value::Integer(4))]),
+            vec![root, Root::new(2, 43)],
+            &mut EmptyWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        let codecs = CodecTable::from_json(CODECS).unwrap();
+        let encoder = SnapshotEncoder::new(&graphs, &codecs);
+        let owner = encoder.project(&snapshot, View::Owner).unwrap();
+        let observer = encoder.project(&snapshot, View::Observer).unwrap();
+        assert_eq!(snapshot.variables[&7], Value::Integer(4));
+        assert_eq!(owner.variables.values[&7], Value::Integer(31));
+        assert_eq!(
+            owner.instances[&1].variables.values[&100],
+            Value::Integer(17)
+        );
+        assert_eq!(owner.variables.bindings[&7].len(), 2);
+        assert!(observer.variables.bindings.is_empty());
+        assert!(observer.instances[&1].variables.bindings.is_empty());
+        // Python body_full_frame, remote_full_frame, then owner_delta at CmFD 1001.
+        check(
+            &encoder.full(&owner).unwrap(),
+            111,
+            "081500102b00003a900f004a0400",
+        );
+        check(
+            &encoder.full(&observer).unwrap(),
+            126,
+            "081500102b00003a900f004a047f000c",
+        );
+        let mut stream = BodyStream::new(ENTITY);
+        let full = encoder.queue_full(&mut stream, &owner).unwrap();
+        stream.create_arrived();
+        assert!(stream.arrived(full.last).advanced);
+        let (_, baseline) = stream.base().unwrap();
+        assert!(baseline.variables.bindings.is_empty());
+        assert!(baseline.instances[&1].variables.bindings.is_empty());
+        let kind = DeltaKind::InitialOwner(1001);
+        let delta = encoder
+            .differences(baseline, &owner, &BTreeSet::new(), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(delta.variables.values[&7], Value::Integer(31));
+        assert_eq!(
+            delta.instances[&1].variables.values[&100],
+            Value::Integer(17)
+        );
+        check(
+            &encoder.delta_frame(&owner, &delta, kind, 16).unwrap(),
+            222,
+            "2a7d40af40003a908f89004e0189008012116000f0db11009b981800",
+        );
+        let mut unbound = owner.clone();
+        unbound.variables.bindings.clear();
+        unbound
+            .instances
+            .get_mut(&1)
+            .unwrap()
+            .variables
+            .bindings
+            .clear();
+        let delta = encoder
+            .differences(&owner, &unbound, &BTreeSet::new(), &BTreeSet::new())
+            .unwrap();
+        assert_eq!(delta.variables.values[&7], Value::Integer(31));
+        assert_eq!(
+            delta.instances[&1].variables.values[&100],
+            Value::Integer(17)
+        );
+        assert!(delta.variables.bindings.is_empty());
+        assert!(delta.instances[&1].variables.bindings.is_empty());
+    }
+
     fn after_body_change(mut snapshot: ProjectedSnapshot) -> ProjectedSnapshot {
-        snapshot.variables.swap_remove(&55);
+        snapshot.variables.values.swap_remove(&55);
         let root = snapshot.instances.get_mut(&1).unwrap();
-        root.variables.insert(100, Value::Integer(99));
-        root.variables.swap_remove(&200);
+        root.variables.values.insert(100, Value::Integer(99));
+        root.variables.values.swap_remove(&200);
         root.states
             .get_mut(&0)
             .unwrap()
@@ -1397,13 +1698,14 @@ mod tests {
         let initial = encoder.project(&snapshot, View::Observer).unwrap();
         snapshot.instances.clear();
         let next = encoder.project_next(&snapshot, &initial).unwrap();
-        assert!(!next.variables.contains_key(&420));
-        assert!(!next.variables.contains_key(&OWNER_HEALTH));
+        assert!(!next.variables.values.contains_key(&420));
+        assert!(!next.variables.values.contains_key(&OWNER_HEALTH));
         assert!(
             encoder
                 .project(&snapshot, View::Observer)
                 .unwrap()
                 .variables
+                .values
                 .contains_key(&420)
         );
     }

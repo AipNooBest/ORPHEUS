@@ -5,7 +5,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use serde::Deserialize;
@@ -18,16 +18,21 @@ use crate::{
     collision_scene::CollisionScene,
     contact_world::ContactWorld,
     game_bots::{Bot, BotCatalog, BotWalk},
+    game_clock::FIRST_TICK,
     game_content::{GameMap, PRACTICE_RANGE_MAP, PRACTICE_RANGE_MODE},
     game_controller::Controller,
-    game_heroes::{Hero, HeroCatalog},
+    game_heroes::{Hero, HeroCatalog, SOLDIER},
+    game_instance::RETAIL_QUANTA,
     game_pools::PoolCatalog,
     game_replication::OwnerBodyRuntime,
     game_stats::{PlayerStats, StatsCatalog},
     match_scene::{PlayerAppearance, initial_world, mode_ui},
     mover::Mover,
+    mover_posture::snap,
     mover_settings::MoverCatalog,
+    script_codecs::CodecTable,
     script_graph::GraphStore,
+    script_player::{OwnerBodySpawn, PlayerBodyFactory},
     script_wire::Variables,
     world::{Component, EntityUpdate},
 };
@@ -35,12 +40,14 @@ use crate::{
 const MOVER_CATEGORY: u16 = 0x18;
 
 type OwnerBodyFactory =
-    dyn Fn(&Hero, u32, u32) -> io::Result<Option<Box<dyn OwnerBodyRuntime>>> + Send + Sync;
+    dyn Fn(&Hero, OwnerBodySpawn) -> io::Result<Option<Box<dyn OwnerBodyRuntime>>> + Send + Sync;
 
 pub struct SceneAssets {
     collision: PathBuf,
     mode_props: BTreeMap<u64, BTreeSet<u64>>,
-    graphs: GraphStore,
+    graphs: Arc<GraphStore>,
+    codecs: Option<Arc<CodecTable>>,
+    practice_owner_body: OnceLock<Option<Arc<OwnerBodyFactory>>>,
     bots: BotCatalog,
     movers: Arc<MoverCatalog>,
     stats: StatsCatalog,
@@ -67,12 +74,19 @@ impl SceneAssets {
     pub fn load(runtime: impl AsRef<Path>) -> io::Result<Self> {
         let runtime = runtime.as_ref();
         let data = runtime.join("data");
-        let graphs = GraphStore::load(data.join("game_graphs_174.json.gz"))?;
+        let graphs = Arc::new(GraphStore::load(data.join("game_graphs_174.json.gz"))?);
+        let codecs = match CodecTable::load(data.join("statescript_codecs_174.json")) {
+            Ok(table) => Some(Arc::new(table)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         let pools = Arc::new(PoolCatalog::from_graphs(&graphs)?);
         Ok(Self {
             collision: runtime.join("collision"),
             mode_props: read_mode_props(&data.join("collision_props_174.json"))?,
             graphs,
+            codecs,
+            practice_owner_body: OnceLock::new(),
             bots: BotCatalog::load(data.join("ai_spawners_174.json"))?,
             movers: Arc::new(MoverCatalog::load(data.join("game_movers_174.json"))?),
             stats: StatsCatalog::load(data.join("game_stats_174.json"))?,
@@ -129,6 +143,11 @@ impl SceneAssets {
         let initial_board =
             self.stats
                 .component(&PlayerStats::default(), map.mode_guid, None, None);
+        let owner_body_factory = contacts.as_ref().and_then(|_| {
+            self.practice_owner_body
+                .get_or_init(|| self.prepare_owner_body(&GameMap::practice_range()))
+                .clone()
+        });
         Ok(PreparedScene {
             map,
             ground,
@@ -141,9 +160,43 @@ impl SceneAssets {
             movers: Arc::clone(&self.movers),
             heroes: Arc::clone(&self.heroes),
             pools: Arc::clone(&self.pools),
-            // No hero body has completed the native runtime path yet.
-            owner_body_factory: None,
+            owner_body_factory,
         })
+    }
+
+    fn prepare_owner_body(&self, map: &GameMap) -> Option<Arc<OwnerBodyFactory>> {
+        let hero = self.heroes.get(SOLDIER)?;
+        let (position, _) = map.spawn_point(0, 0)?;
+        let prepared = self
+            .codecs
+            .as_ref()
+            .ok_or_else(|| "the owner statescript codec table is unavailable".to_owned())
+            .and_then(|codecs| {
+                PlayerBodyFactory::prepare(
+                    Arc::clone(&self.graphs),
+                    Arc::clone(codecs),
+                    map.mode_guid,
+                    hero,
+                    self.pools.body_pools(hero.guid).total(),
+                    OwnerBodySpawn {
+                        entity: 0xa000_0101,
+                        frame: FIRST_TICK,
+                        position: position.map(snap),
+                        quanta: RETAIL_QUANTA,
+                    },
+                )
+                .map_err(|error| error.to_string())
+            });
+        Some(Arc::new(move |hero, spawn| {
+            if hero.guid != SOLDIER {
+                return Ok(None);
+            }
+            let factory = prepared
+                .as_ref()
+                .map_err(|reason| io::Error::new(io::ErrorKind::Unsupported, reason.clone()))?;
+            let runtime: Box<dyn OwnerBodyRuntime> = Box::new(factory.start(spawn)?);
+            Ok(Some(runtime))
+        }))
     }
 }
 
@@ -195,12 +248,11 @@ impl PreparedScene {
     pub(crate) fn owner_body_runtime(
         &self,
         hero: &Hero,
-        entity: u32,
-        frame: u32,
+        spawn: OwnerBodySpawn,
     ) -> io::Result<Option<Box<dyn OwnerBodyRuntime>>> {
         self.owner_body_factory
             .as_ref()
-            .map_or(Ok(None), |factory| factory(hero, entity, frame))
+            .map_or(Ok(None), |factory| factory(hero, spawn))
     }
 
     pub fn heroes(&self) -> &HeroCatalog {
@@ -276,6 +328,33 @@ mod tests {
     use super::*;
     use crate::world::movement_record;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    #[ignore = "requires the baseline 104319 Practice Range pack without bot VM graphs"]
+    fn stock_soldier_requires_more_vm_support_before_prepared_attach() {
+        let runtime = PathBuf::from(std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap());
+        let assets = SceneAssets::load(runtime).unwrap();
+        let scene = assets.prepare(GameMap::practice_range()).unwrap();
+        assert!(scene.movement_ready());
+        let hero = scene.heroes().get(SOLDIER).unwrap();
+        let spawn = OwnerBodySpawn {
+            entity: 0xa000_0101,
+            frame: FIRST_TICK,
+            position: scene.map().spawn_point(0, 0).unwrap().0.map(snap),
+            quanta: RETAIL_QUANTA,
+        };
+        let Err(blocked) = scene.owner_body_runtime(hero, spawn) else {
+            panic!("the stock owner VM was expected to require more graph support");
+        };
+        assert_eq!(blocked.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            blocked.to_string().contains("initialization diagnostics"),
+            "{blocked}"
+        );
+        eprintln!("prepared Soldier owner VM: {blocked}");
+        let tracer = scene.heroes().find_hero("Tracer").unwrap();
+        assert!(scene.owner_body_runtime(tracer, spawn).unwrap().is_none());
+    }
 
     #[test]
     #[ignore = "requires a prepared 104319 Practice Range pack"]

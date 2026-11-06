@@ -46,6 +46,7 @@ pub enum WireError {
     GraphIndex(u32),
     SlotOutOfRange,
     InvalidVariable,
+    InvalidBinding,
     InvalidValue,
     ChunkRange,
 }
@@ -59,6 +60,9 @@ impl fmt::Display for WireError {
             Self::GraphIndex(index) => write!(f, "script graph {index} exceeds the wire index"),
             Self::SlotOutOfRange => f.write_str("script slot is outside the graph layout"),
             Self::InvalidVariable => f.write_str("zero terminates the script variable list"),
+            Self::InvalidBinding => {
+                f.write_str("script binding is outside its wire representation")
+            }
             Self::InvalidValue => f.write_str("script value is outside its wire representation"),
             Self::ChunkRange => f.write_str("script chunk range or length exceeds the wire width"),
         }
@@ -193,20 +197,85 @@ pub fn write_value(
 
 pub type Variables = IndexMap<u32, Value>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Binding {
+    pub instance: u16,
+    pub state: u16,
+    pub state_bits: u8,
+    pub priority: i8,
+    pub above: bool,
+}
+
+pub(crate) type Bindings = BTreeMap<u32, Vec<Binding>>;
+
 pub(crate) fn variable(
     out: &mut BitWriter,
     value: &Value,
     encoding: ValueEncoding,
 ) -> Result<(), WireError> {
-    write_value(out, value, encoding)?;
-    out.bit(false); // no bindings
-    Ok(())
+    bound_variable(out, value, encoding, 0, &[])
 }
 
 pub(crate) fn variable_list(
     out: &mut BitWriter,
     variables: &Variables,
     encoding: ValueEncoding,
+) -> Result<(), WireError> {
+    bound_variable_list(out, variables, encoding, 0, &Bindings::new())
+}
+
+pub(crate) fn bound_variable(
+    out: &mut BitWriter,
+    value: &Value,
+    encoding: ValueEncoding,
+    own: u16,
+    bindings: &[Binding],
+) -> Result<(), WireError> {
+    write_value(out, value, encoding)?;
+    match bindings.len() {
+        0 => out.bit(false),
+        1 => out.bits(0b01, 2)?,
+        2 => out.bits(0b011, 3)?,
+        count => {
+            let count = u16::try_from(count).map_err(|_| WireError::InvalidBinding)?;
+            out.bits(0b111, 3)?;
+            out.w_u16(count);
+        }
+    }
+    for binding in bindings {
+        if binding.instance == 0
+            || binding.state_bits > u16::BITS as u8
+            || u32::from(binding.state) >= 1 << binding.state_bits
+        {
+            return Err(WireError::InvalidBinding);
+        }
+        out.bit(false); // no path
+        out.bit(binding.instance != own);
+        if binding.instance != own {
+            out.bit(false); // positive instance ID
+            out.w_u16(binding.instance);
+        }
+        out.bits(u64::from(binding.state), usize::from(binding.state_bits))?;
+        out.bit(false); // stack output slot zero
+        let explicit = binding.priority != 0 || !binding.above;
+        out.bit(explicit);
+        if explicit {
+            out.bit(true); // integer priority
+            out.bit(binding.priority < 0);
+            out.w_var(u32::from(binding.priority.unsigned_abs()));
+            out.bit(binding.above);
+        }
+        out.bit(false); // no per-frame re-resolution
+    }
+    Ok(())
+}
+
+pub(crate) fn bound_variable_list(
+    out: &mut BitWriter,
+    variables: &Variables,
+    encoding: ValueEncoding,
+    own: u16,
+    bindings: &Bindings,
 ) -> Result<(), WireError> {
     out.bit(!variables.is_empty());
     if !variables.is_empty() {
@@ -215,7 +284,8 @@ pub(crate) fn variable_list(
                 return Err(WireError::InvalidVariable);
             }
             out.w_var(id);
-            variable(out, value, encoding)
+            let links = bindings.get(&id).map_or(&[][..], Vec::as_slice);
+            bound_variable(out, value, encoding, own, links)
         };
         if encoding.compact() {
             let mut ids: Vec<_> = variables.keys().copied().collect();

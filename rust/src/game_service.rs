@@ -1103,7 +1103,21 @@ mod tests {
         entity: u32,
         operation: Option<u8>,
         movement: bool,
-        script: Option<(u32, Vec<u8>)>,
+        script: Option<ReceivedChunk>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ReceivedChunk {
+        first: u32,
+        span: u32,
+        width: usize,
+        data: Vec<u8>,
+    }
+
+    impl ReceivedChunk {
+        fn bits(&self) -> BitReader<'_> {
+            BitReader::with_range(&self.data, 0, self.width).unwrap()
+        }
     }
 
     impl WorldRecord {
@@ -1133,11 +1147,16 @@ mod tests {
                 }
                 if reader.bit().unwrap() {
                     assert!(!reader.bit().unwrap());
-                    assert_eq!(reader.w_u32().unwrap(), 0);
+                    let first = reader.w_u32().unwrap();
                     let span = reader.w_var().unwrap();
                     assert!(!reader.bit().unwrap());
                     let width = reader.w_var().unwrap() as usize;
-                    record.script = Some((span, reader.raw_bits(width).unwrap()));
+                    record.script = Some(ReceivedChunk {
+                        first,
+                        span,
+                        width,
+                        data: reader.raw_bits(width).unwrap(),
+                    });
                 }
                 if !reader.bit().unwrap() {
                     return record;
@@ -1268,6 +1287,16 @@ mod tests {
     #[test]
     #[ignore = "requires a prepared 104319 Practice Range scene"]
     fn prepared_world_waits_for_ownership_and_retries_baselines_before_scripts() {
+        exercise_prepared_world(false);
+    }
+
+    #[test]
+    #[ignore = "requires a prepared 104319 Practice Range scene without bot VM graphs"]
+    fn prepared_worker_retries_a_concrete_owner_vm_on_encrypted_loopback() {
+        exercise_prepared_world(true);
+    }
+
+    fn exercise_prepared_world(owner_fixture: bool) {
         use crate::{
             accounts::Accounts,
             catalog::ItemDb,
@@ -1275,11 +1304,12 @@ mod tests {
             game_bots::BOT_ENTITY,
             jam_codec::id16,
             lobby_login::Identity,
-            lobby_practice::{CREATE_GAME, GAME_REQUEST, SoloPracticeHandoff, dispatch_prepared},
+            lobby_practice::{CREATE_GAME, GAME_REQUEST, SoloPracticeHandoff, dispatch_scene},
             lobby_session::PreparedLogin,
             match_handoff::{HANDOFF, HANDOFF_MESSAGE},
             retail_templates::RetailTemplates,
             scene_assets::SceneAssets,
+            script_player::fixture_body_factory,
         };
 
         const CONTROLLER: u32 = 0xa000_0100;
@@ -1318,7 +1348,7 @@ mod tests {
             ])
         };
         let mut outgoing = Vec::new();
-        let result = dispatch_prepared(
+        let result = dispatch_scene(
             &request,
             &login,
             &server,
@@ -1328,8 +1358,21 @@ mod tests {
                 general: channel([7, 8], 7),
                 match_channel: channel(MATCH, 6),
             },
-            &assets,
-            &collection,
+            (&assets, &collection),
+            |map| {
+                let mut scene = assets.prepare(map)?;
+                if owner_fixture {
+                    assert!(!scripted_bots);
+                    let (factory, _) = fixture_body_factory();
+                    scene.owner_body_factory = Some(Arc::new(move |hero, spawn| {
+                        if hero.guid != crate::game_heroes::SOLDIER {
+                            return Ok(None);
+                        }
+                        Ok(Some(Box::new(factory.start(spawn)?)))
+                    }));
+                }
+                Ok(scene)
+            },
             |(crc, id, fields)| {
                 let bytes = lobby.encode(*crc, *id, fields).unwrap();
                 outgoing.push((*crc, *id, lobby.decode(*crc, *id, &bytes, true).unwrap()));
@@ -1449,14 +1492,14 @@ mod tests {
                     assert!(creates.contains(&record.entity));
                     moving_bot = true;
                 }
-                if let Some((span, script)) = record.script {
-                    assert_eq!(span, 1);
+                if let Some(script) = record.script {
+                    assert_eq!((script.first, script.span), (0, 1));
                     if record.entity == GAME_MODE_ENTITY {
-                        assert_eq!(script, [0x08, 0x5b, 0x06, 0x00, 0x0c]);
+                        assert_eq!(script.data, [0x08, 0x5b, 0x06, 0x00, 0x0c]);
                         mode = true;
                     } else {
                         assert_eq!(record.entity, CONTROLLER);
-                        let mut bits = BitReader::new(&script);
+                        let mut bits = script.bits();
                         assert_eq!(bits.bits(3).unwrap(), 2);
                         assert!(bits.w_var().unwrap() >= crate::game_clock::FIRST_TICK);
                         controller = true;
@@ -1466,8 +1509,141 @@ mod tests {
             client.send(ACK, Vec::new());
         }
         assert!(mode && controller && moving_bot);
-        exercise_hero_selection(&mut client, &schemas, &assets);
+        if owner_fixture {
+            exercise_owner_vm(&mut client, &schemas);
+        } else {
+            exercise_hero_selection(&mut client, &schemas, &assets);
+        }
         server.stop().unwrap();
+    }
+
+    fn send_game_message(
+        client: &mut Client,
+        schemas: &Schemas,
+        ordinal: u32,
+        guid: u64,
+        parameters: Vec<u8>,
+    ) {
+        let fields = Fields::from([
+            (
+                0x78,
+                Value::Struct(Fields::from([(
+                    0,
+                    Value::Unsigned(u64::from(player_entity(0))),
+                )])),
+            ),
+            (0x80, Value::Blob(parameters)),
+            (0xa8, Value::Unsigned(guid)),
+            (0xb0, Value::Signed(3)),
+        ]);
+        let message = encode(
+            schemas,
+            crate::game_parameters::CLIENT_GAME_MESSAGE,
+            &fields,
+        )
+        .unwrap();
+        let mut payload = BitWriter::new();
+        write_channel(&mut payload, &[(ordinal, message)], &[]).unwrap();
+        client.send(ACK, payload.into_bytes());
+    }
+
+    fn exercise_owner_vm(client: &mut Client, schemas: &Schemas) {
+        use crate::{game_heroes::SOLDIER, game_parameters::PICK_HERO};
+
+        let owner = player_entity(0);
+        let body = owner | 1;
+        send_game_message(
+            client,
+            schemas,
+            1,
+            PICK_HERO,
+            SOLDIER.to_le_bytes().to_vec(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let start = loop {
+            let packet = client.receive();
+            let records = world_records(schemas, &packet);
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.entity != body || record.script.is_none())
+            );
+            assert!(client.window.accept(packet.seq));
+            client.send(ACK, Vec::new());
+            if records
+                .iter()
+                .any(|record| record.entity == body && record.is_create())
+            {
+                let controller = records
+                    .iter()
+                    .find(|record| record.entity == owner && record.script.is_some())
+                    .unwrap();
+                let mut bits = controller.script.as_ref().unwrap().bits();
+                assert_eq!(bits.bits(3).unwrap(), 2);
+                break bits.w_var().unwrap();
+            }
+            assert!(Instant::now() < deadline, "waiting for fixture body create");
+        };
+        let wait_chunk = |client: &mut Client| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let packet = client.receive();
+                if let Some(script) = world_records(schemas, &packet)
+                    .into_iter()
+                    .find(|record| record.entity == body && record.script.is_some())
+                    .and_then(|record| record.script)
+                {
+                    return (packet.seq, script);
+                }
+                assert!(client.window.accept(packet.seq));
+                client.send(ACK, Vec::new());
+                assert!(Instant::now() < deadline, "waiting for fixture body script");
+            }
+        };
+        let skip_chunk = |client: &mut Client, payload| {
+            let packet = client.receive();
+            assert!(
+                world_records(schemas, &packet)
+                    .iter()
+                    .all(|record| record.entity != body || record.script.is_none())
+            );
+            assert!(client.window.accept(packet.seq));
+            client.send(ACK, payload);
+        };
+        let accept_chunk = |client: &mut Client, sequence| {
+            assert!(client.window.accept(sequence));
+            client.send(ACK, Vec::new());
+        };
+        let check_delta = |chunk: &ReceivedChunk, corrected, command_frame| {
+            let mut bits = chunk.bits();
+            assert_eq!(bits.bits(3).unwrap(), if corrected { 6 } else { 2 });
+            assert_eq!(bits.w_var().unwrap(), command_frame);
+        };
+
+        let (_, h0) = wait_chunk(client);
+        assert_eq!((h0.first, h0.span), (0, 1));
+        assert_eq!(h0.bits().bits(2).unwrap(), 0);
+        skip_chunk(client, Vec::new());
+        let (sequence, retry) = wait_chunk(client);
+        assert_eq!(retry, h0);
+        accept_chunk(client, sequence);
+
+        let (_, c0) = wait_chunk(client);
+        assert_eq!((c0.first, c0.span), (2, 0));
+        check_delta(&c0, false, start);
+        skip_chunk(client, input_batch(start + 1, 16, 0));
+        let (sequence, retry) = wait_chunk(client);
+        assert_eq!(retry, c0);
+        accept_chunk(client, sequence);
+
+        let (_, c1) = wait_chunk(client);
+        assert_eq!((c1.first, c1.span), (3, 0));
+        check_delta(&c1, true, start + 16);
+        skip_chunk(client, input_batch(start + 17, 1, 0));
+        let (sequence, cumulative) = wait_chunk(client);
+        assert_eq!((cumulative.first, cumulative.span), (3, 1));
+        check_delta(&cumulative, true, start + 17);
+        accept_chunk(client, sequence);
     }
 
     fn exercise_hero_selection(
@@ -1477,26 +1653,14 @@ mod tests {
     ) {
         use crate::{
             game_heroes::SOLDIER,
-            game_parameters::{CLIENT_GAME_MESSAGE, OPEN_OR_CLOSE, PICK_HERO},
+            game_parameters::{OPEN_OR_CLOSE, PICK_HERO},
         };
         const OWNER: u32 = 0xa000_0100;
         const FIRST: u32 = OWNER | 1;
         const SECOND: u32 = OWNER | 2;
 
         let send = |client: &mut Client, ordinal, guid, parameters| {
-            let fields = Fields::from([
-                (
-                    0x78,
-                    Value::Struct(Fields::from([(0, Value::Unsigned(u64::from(OWNER)))])),
-                ),
-                (0x80, Value::Blob(parameters)),
-                (0xa8, Value::Unsigned(guid)),
-                (0xb0, Value::Signed(3)),
-            ]);
-            let message = encode(schemas, CLIENT_GAME_MESSAGE, &fields).unwrap();
-            let mut payload = BitWriter::new();
-            write_channel(&mut payload, &[(ordinal, message)], &[]).unwrap();
-            client.send(ACK, payload.into_bytes());
+            send_game_message(client, schemas, ordinal, guid, parameters);
         };
         let next_body_frame = |client: &mut Client, body| {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -1522,7 +1686,7 @@ mod tests {
                     (
                         record.entity,
                         record.operation,
-                        record.script.as_ref().map(|(span, _)| *span),
+                        record.script.as_ref().map(|script| script.span),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1530,12 +1694,13 @@ mod tests {
         let controller =
             crate::game_controller::Controller::load(assets.graphs(), PRACTICE_RANGE_MODE).unwrap();
         let verify_controller = |records: &[WorldRecord], hero, open| {
-            let (_, script) = records
+            let script = records
                 .iter()
                 .find(|record| record.entity == OWNER && record.script.is_some())
                 .and_then(|record| record.script.as_ref())
                 .expect("hero selection controller frame");
-            let mut reader = BitReader::new(script);
+            assert_eq!(script.first, 0);
+            let mut reader = script.bits();
             assert_eq!(reader.bits(3).unwrap(), 2);
             let cmfd = reader.w_var().unwrap();
             let expected = controller
@@ -1550,7 +1715,8 @@ mod tests {
                     },
                 )
                 .unwrap();
-            assert_eq!(script, expected.as_bytes());
+            assert_eq!(script.width, expected.bit_len());
+            assert_eq!(script.data, expected.as_bytes());
             cmfd
         };
 

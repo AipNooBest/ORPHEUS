@@ -79,6 +79,50 @@ pub fn body_roots(body: &Body) -> Result<Vec<Root>, InitFault> {
     Ok(roots)
 }
 
+/// Initial body bindings, then the manager and equipped weapon slots in asset order.
+pub fn player_roots(body: &Body, graphs: &GraphStore) -> Result<Vec<Root>, InitFault> {
+    let mut roots = body_roots(body)?;
+    let mut id = roots.last().map_or(0, |root| root.id);
+    let mut append = |graph, slot: Option<usize>| {
+        id = id.checked_add(1).ok_or(InitFault::InstanceIdExhausted)?;
+        let mut root = Root::new(id, graph);
+        if let Some(slot) = slot {
+            root.variables.insert(28, Value::Integer(slot as i64));
+        }
+        roots.push(root);
+        Ok::<_, InitFault>(())
+    };
+    if let Some(manager) = body.manager {
+        append(manager, None)?;
+    }
+    for (slot, graph) in body.weapons.iter().enumerate() {
+        if let Some(graph) = graph {
+            append(*graph, Some(slot))?;
+        }
+    }
+    if let Some(root) = roots.iter().find(|root| graphs.graph(root.graph).is_none()) {
+        return Err(InitFault::MissingPlayerGraph(root.graph));
+    }
+    Ok(roots)
+}
+
+pub fn player_entity_variables(body: &Body, health: f64, maximum_health: f64) -> Variables {
+    let slots = body
+        .weapons
+        .iter()
+        .map(|weapon| Value::Bool(weapon.is_some()))
+        .collect();
+    let first = body.weapons.iter().position(Option::is_some).unwrap_or(0);
+    Variables::from([
+        (29, Value::Array(slots)),
+        (16_515, Value::Integer(first as i64)),
+        (253, Value::Float(health)),
+        (1732, Value::Float(health)),
+        (1737, Value::Float(maximum_health)),
+        (342, Value::Float(0.0)),
+    ])
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Site {
     pub entity: u32,
@@ -110,6 +154,17 @@ pub trait World {
     fn selects_ai_behavior(&mut self, _site: Site) -> Option<bool> {
         None
     }
+
+    /// The world owns delivery outside the current body.
+    fn send_message(
+        &mut self,
+        _source: Site,
+        _target: u32,
+        _message: u64,
+        _parameters: &Variables,
+    ) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]
@@ -130,6 +185,9 @@ pub enum StateKind {
     Stack { top: bool, under: bool },
     Ability { flags: u8 },
     MovementMod,
+    Anim,
+    Effect,
+    SendMessage,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -187,6 +245,8 @@ pub struct Snapshot {
     pub pending_timers: IndexMap<u16, Vec<PendingTimer>>,
     /// Stack links by (instance or zero for the entity, variable).
     pub bindings: IndexMap<(u16, u32), Vec<StackBinding>>,
+    /// Effective wire values for the bound variables, separate from their stored bases.
+    pub resolved_bindings: IndexMap<(u16, u32), Value>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -203,6 +263,7 @@ pub enum InitFault {
     InvalidBudget,
     InvalidRoot(u16),
     InstanceIdExhausted,
+    MissingPlayerGraph(u32),
     RootBinding {
         id: u16,
         graph: u32,
@@ -235,6 +296,9 @@ impl fmt::Display for InitFault {
             Self::InvalidRoot(id) => write!(f, "invalid or duplicate statescript root {id}"),
             Self::InstanceIdExhausted => {
                 f.write_str("statescript initialization instance IDs exhausted")
+            }
+            Self::MissingPlayerGraph(graph) => {
+                write!(f, "player statescript graph {graph:04X} is missing")
             }
             Self::RootBinding { id, graph, error } => {
                 write!(
@@ -286,6 +350,7 @@ pub struct PendingTimer {
 pub struct StackBinding {
     pub instance: u16,
     pub raw_state: u16,
+    pub priority: StackPriority,
 }
 
 /// A single body using the same authored graph engine as one-shot initialization.
@@ -369,40 +434,8 @@ impl Component {
         if self.halted {
             return Err(InitFault::Halted);
         }
-        let Some(item) = self.machine.snapshot.instances.get(&instance) else {
-            return Ok(0);
-        };
-        let graph = self.graphs.graph(item.graph).expect("registered graph");
-        let entries: Vec<_> = graph
-            .nodes
-            .iter()
-            .filter(|node| {
-                !node.client_only
-                    && node
-                        .field("m_gameMessage.m_gameMessage")
-                        .and_then(asset_guid)
-                        == Some(message)
-                    && (is_message_entry(node)
-                        || (node.is_state()
-                            && node.state.is_some_and(|raw| {
-                                item.states.get(&raw).is_some_and(|state| state.active)
-                            })))
-            })
-            .map(|node| node.pos)
-            .collect();
-        self.machine.queues.reserve(entries.len())?;
-        let parameters = Arc::new(parameters);
-        for &position in &entries {
-            self.machine.queues.push(
-                instance,
-                self.machine.now_ms,
-                Event::Message {
-                    position,
-                    parameters: Arc::clone(&parameters),
-                },
-            )?;
-        }
-        Ok(entries.len())
+        self.machine
+            .queue_entries(&self.graphs, Some(instance), message, parameters)
     }
 
     pub fn run_now(&mut self, world: &mut impl World) -> Result<(), InitFault> {
@@ -562,6 +595,7 @@ impl Machine {
                 instances: IndexMap::new(),
                 pending_timers: IndexMap::new(),
                 bindings: IndexMap::new(),
+                resolved_bindings: IndexMap::new(),
                 diagnostics: Vec::new(),
             },
             queues: Timeline::new(MAX_PENDING_EVENTS),
@@ -604,26 +638,74 @@ impl Machine {
                 self.snapshot.pending_timers.insert(id, timers);
             }
         }
-        self.snapshot.bindings = self
-            .stacks
-            .iter()
-            .map(|(&variable, entries)| {
-                let key = match variable {
-                    VarKey::Entity(id) => (0, id),
-                    VarKey::Instance(instance, id) => (instance, id),
-                };
-                (
-                    key,
-                    entries
-                        .iter()
-                        .map(|entry| StackBinding {
-                            instance: entry.state.instance,
-                            raw_state: entry.state.raw,
-                        })
-                        .collect(),
-                )
-            })
-            .collect();
+        self.snapshot.bindings.clear();
+        self.snapshot.resolved_bindings.clear();
+        for (&variable, entries) in &self.stacks {
+            let key = match variable {
+                VarKey::Entity(id) => (0, id),
+                VarKey::Instance(instance, id) => (instance, id),
+            };
+            let Some(top) = entries.last() else { continue };
+            let bindings = entries
+                .iter()
+                .map(|entry| StackBinding {
+                    instance: entry.state.instance,
+                    raw_state: entry.state.raw,
+                    priority: entry.priority,
+                })
+                .collect();
+            self.snapshot.bindings.insert(key, bindings);
+            self.snapshot
+                .resolved_bindings
+                .insert(key, top.value.clone());
+        }
+    }
+
+    fn queue_entries(
+        &mut self,
+        graphs: &GraphStore,
+        recipient: Option<u16>,
+        message: u64,
+        parameters: Variables,
+    ) -> Result<usize, InitFault> {
+        let mut entries = Vec::new();
+        for (&id, item) in &self.snapshot.instances {
+            if recipient.is_some_and(|recipient| recipient != id) {
+                continue;
+            }
+            let graph = graphs.graph(item.graph).expect("registered graph");
+            entries.extend(
+                graph
+                    .nodes
+                    .iter()
+                    .filter(|node| {
+                        !node.client_only
+                            && node
+                                .field("m_gameMessage.m_gameMessage")
+                                .and_then(asset_guid)
+                                == Some(message)
+                            && (is_message_entry(node)
+                                || (node.is_state()
+                                    && node.state.is_some_and(|raw| {
+                                        item.states.get(&raw).is_some_and(|state| state.active)
+                                    })))
+                    })
+                    .map(|node| (id, node.pos)),
+            );
+        }
+        self.queues.reserve(entries.len())?;
+        let parameters = Arc::new(parameters);
+        for &(instance, position) in &entries {
+            self.queues.push(
+                instance,
+                self.now_ms,
+                Event::Message {
+                    position,
+                    parameters: Arc::clone(&parameters),
+                },
+            )?;
+        }
+        Ok(entries.len())
     }
 
     fn value(&self, key: VarKey, below: Option<StateKey>) -> Value {
@@ -1273,18 +1355,6 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         let Some(node) = self.graph(id).node(position) else {
             return Ok(());
         };
-        if node.is_state() {
-            if node.state.is_some_and(|raw| {
-                self.state(StateKey { instance: id, raw })
-                    .is_some_and(|state| state.active)
-            }) {
-                self.report(
-                    self.site(id, node),
-                    Issue::UnsupportedField("state game message delivery"),
-                );
-            }
-            return Ok(());
-        }
         self.parameters = Some(parameters);
         let result = self.deliver_entry(id, node);
         self.parameters = None;
@@ -1292,6 +1362,24 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
     }
 
     fn deliver_entry(&mut self, id: u16, node: &Node) -> Result<(), InitFault> {
+        let path = if node.is_state() {
+            let Some(raw) = node.state else { return Ok(()) };
+            let key = StateKey { instance: id, raw };
+            let Some(state) = self.state(key).filter(|state| state.active) else {
+                return Ok(());
+            };
+            if state.kind != StateKind::MessageIdle {
+                self.report(
+                    self.site(id, node),
+                    Issue::UnsupportedField("state game message delivery"),
+                );
+                return Ok(());
+            }
+            self.exit_subgraph(id, node, "m_33DA5163", 1)?;
+            ("m_452862E6", Some(key))
+        } else {
+            ("m_outPlug", None)
+        };
         let site = self.site(id, node);
         for field in array_field(&node.fields, "m_params") {
             if !field.is_object() {
@@ -1305,20 +1393,79 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                     return Ok(());
                 }
             };
-            let key = field
-                .get("m_B5051BCE")
-                .and_then(asset_guid)
-                .map_or(0, |guid| guid as u16);
+            let key = parameter_id(field);
             let value = self
                 .parameters
                 .as_deref()
-                .and_then(|params| params.get(&u32::from(key)))
+                .and_then(|params| params.get(&key))
                 .cloned()
                 .unwrap_or(Value::Null);
             self.write(target, value)?;
         }
-        self.follow(id, node, "m_outPlug", None, 0)?;
+        self.follow(id, node, path.0, path.1, 0)?;
         Ok(())
+    }
+
+    fn send_game_message(&mut self, id: u16, node: &Node) -> Result<bool, InitFault> {
+        let Some(message) = node
+            .field("m_gameMessage.m_gameMessage")
+            .and_then(asset_guid)
+            .filter(|&id| id != 0)
+        else {
+            return Ok(true);
+        };
+        let mut parameters = Variables::new();
+        for parameter in array_field(&node.fields, "m_params")
+            .iter()
+            .filter(|value| value.is_object())
+        {
+            self.spend("game message parameter")?;
+            let Some(value) = self.evaluate(id, node, field(parameter, "m_value"), None) else {
+                return Ok(false);
+            };
+            parameters.insert(parameter_id(parameter), value);
+        }
+        let site = self.site(id, node);
+        let target = node
+            .fields
+            .get("m_targets")
+            .or_else(|| node.fields.get("m_target"))
+            .unwrap_or(&Json::Null);
+        let value = if target.is_null() {
+            Value::Entity(site.entity)
+        } else {
+            let Some(value) = self.evaluate(id, node, target, None) else {
+                return Ok(false);
+            };
+            value
+        };
+        let entities: Vec<_> = match value {
+            Value::Entity(entity) if entity != 0 => vec![entity],
+            Value::Array(items) => items
+                .into_iter()
+                .filter_map(|value| {
+                    let Value::Entity(entity) = value else {
+                        return None;
+                    };
+                    (entity != 0 && entity & 0x1fff_ffff != 0x1fff_ffff).then_some(entity)
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        for entity in entities {
+            self.spend("game message routing")?;
+            if entity == site.entity {
+                self.machine
+                    .queue_entries(self.graphs, None, message, parameters.clone())?;
+            } else if !self.world.send_message(site, entity, message, &parameters) {
+                self.report(
+                    site,
+                    Issue::UnsupportedField("external game message delivery"),
+                );
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn state(&self, key: StateKey) -> Option<&State> {
@@ -1512,6 +1659,13 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 self.follow(id, node, "m_outPlug", None, depth)?;
                 Ok(true)
             }
+            "STUStatescriptActionSendGameMessage" => {
+                if !self.send_game_message(id, node)? {
+                    return Ok(false);
+                }
+                self.follow(id, node, "m_outPlug", None, depth)?;
+                Ok(true)
+            }
             "STU_12F5D52D" => {
                 let mut complete = true;
                 for item in array_field(&node.fields, "m_143D4C5B") {
@@ -1677,7 +1831,11 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             return Ok(());
         }
         let kind = match node.class.as_str() {
-            "STUStatescriptState" | "STU_9D7BF987" => StateKind::Plain,
+            // These client presentation states use the base state lifecycle on the server.
+            "STUStatescriptState"
+            | "STU_9D7BF987"
+            | "STUStatescriptStateDataFlowMapping"
+            | "STUStatescriptStateUXPresenter" => StateKind::Plain,
             "STUStatescriptStateBooleanSwitch" => StateKind::BooleanSwitch(false),
             "STU_37D754C8" | "STUStatescriptStateSubScript" => StateKind::SubScript { child: None },
             "STUStatescriptStateGameMessageEntry" => StateKind::MessageIdle,
@@ -1693,6 +1851,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 StateKind::Ability { flags: 0 }
             }
             "STU_316CFEF2" => StateKind::MovementMod,
+            "STUStatescriptStateAnim" => StateKind::Anim,
+            "STU_691BFA55" | "STU_7CA2FBAF" => StateKind::Effect,
+            "STU_38EE1100" => StateKind::SendMessage,
             _ => {
                 self.report(
                     self.site(id, node),
@@ -1759,7 +1920,11 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             StateKind::LogicalButton { .. } => self.enter_button(key, node, depth)?,
             StateKind::Stack { .. } => self.begin_stack(key, node, depth)?,
             StateKind::Ability { .. } => self.register_tick(key, self.machine.now_ms),
-            StateKind::Plain | StateKind::MovementMod => (),
+            StateKind::Anim => self.arm_animation(key, node)?,
+            StateKind::SendMessage => {
+                self.send_game_message(id, node)?;
+            }
+            StateKind::Plain | StateKind::MovementMod | StateKind::Effect => (),
         }
         self.follow(id, node, "m_onBeginPlug", Some(key), depth)?;
         self.follow(id, node, "m_subgraphPlug", Some(key), depth)?;
@@ -2079,6 +2244,44 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         }
     }
 
+    fn arm_animation(&mut self, key: StateKey, node: &Node) -> Result<(), InitFault> {
+        let id = key.instance;
+        let duration = field(&node.fields, "m_86701C3E");
+        if duration.is_null() {
+            self.report(
+                self.site(id, node),
+                Issue::UnsupportedField("animation asset duration"),
+            );
+            return Ok(());
+        }
+        let Some(seconds) = self.evaluate(id, node, duration, None) else {
+            return Ok(());
+        };
+        let delay = ((script_expr::to_float(&seconds) * 1000.0) as f32).round();
+        if !delay.is_finite() {
+            self.report(
+                self.site(id, node),
+                Issue::UnsupportedField("animation duration"),
+            );
+            return Ok(());
+        }
+        let removes_self = field(&node.fields, "m_154DBA91");
+        let client_ends = if removes_self.is_null() {
+            false
+        } else {
+            let Some(value) = self.evaluate(id, node, removes_self, None) else {
+                return Ok(());
+            };
+            truthy(&value)
+        };
+        let delay_ms = delay.max(0.0) as u64;
+        self.post_after(id, delay_ms, Event::Timer(key.raw, 1))?;
+        if !client_ends {
+            self.post_after(id, delay_ms, Event::Finish(key.raw))?;
+        }
+        Ok(())
+    }
+
     fn arm_frame_wait(&mut self, key: StateKey, node: &Node) -> Result<(), InitFault> {
         let id = key.instance;
         let Some(value) = self.evaluate(id, node, field(&node.fields, "m_3016B9A1"), None) else {
@@ -2112,6 +2315,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             && !self.button_held(key, node)
         {
             self.set_button_down(key, node, false, 0)?;
+        }
+        if kind == StateKind::Anim && parameter == 1 {
+            self.follow(key.instance, node, "m_A3B86BB0", Some(key), 0)?;
         }
         self.try_complete(key, node, 0)
     }
@@ -2427,6 +2633,13 @@ fn configured(node: &Node, name: &str) -> bool {
         Json::Object(value) => !value.is_empty(),
         Json::Bool(true) => true,
     }
+}
+
+fn parameter_id(config: &Json) -> u32 {
+    config
+        .get("m_B5051BCE")
+        .and_then(asset_guid)
+        .map_or(0, |guid| u32::from(guid as u16))
 }
 
 fn field<'a>(fields: &'a Json, name: &str) -> &'a Json {
@@ -3070,14 +3283,23 @@ mod tests {
             [
                 StackBinding {
                     instance: 1,
-                    raw_state: 0
+                    raw_state: 0,
+                    priority: StackPriority {
+                        level: 0,
+                        above_equals: false
+                    }
                 },
                 StackBinding {
                     instance: 1,
-                    raw_state: 1
+                    raw_state: 1,
+                    priority: StackPriority {
+                        level: 0,
+                        above_equals: true
+                    }
                 }
             ]
         );
+        assert_eq!(snapshot.resolved_bindings[&(0, 100)], Value::Float(11.0));
         assert_eq!(
             snapshot.instances[&1].states[&0].kind,
             StateKind::Stack {
@@ -3298,6 +3520,120 @@ mod tests {
             .iter()
             .filter_map(|(&raw, state)| state.active.then_some(raw))
             .collect()
+    }
+
+    #[test]
+    fn animation_callback_routes_a_typed_self_message_to_the_live_receiver() {
+        let message = json!({"$":"STUConfigVarGameMessage","m_gameMessage":"0x0240000000000001"});
+        let source = graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntry",
+                    None,
+                    json!({"m_outPlug":plug(&[(1,"m_beginPlug")],&[])}),
+                ),
+                node(
+                    1,
+                    "STUStatescriptStateAnim",
+                    Some(0),
+                    json!({
+                        "m_86701C3E":{"$":"STUConfigVarFloat","m_value":0.025},
+                        "m_A3B86BB0":plug(&[(2,"m_inPlug")],&[]),
+                        "m_onFinishedPlug":plug(&[(3,"m_inPlug")],&[])
+                    }),
+                ),
+                node(
+                    2,
+                    "STUStatescriptActionSendGameMessage",
+                    None,
+                    json!({
+                        "m_gameMessage":message,
+                        "m_params":[{"m_B5051BCE":"0x0A40000000000123","m_value":true}]
+                    }),
+                ),
+                node(
+                    3,
+                    "STUStatescriptActionSetVar",
+                    None,
+                    json!({"m_out_Var":var(101,false),"m_value":true}),
+                ),
+            ],
+            json!([1]),
+            json!([0]),
+        );
+        let receiver = graph(
+            43,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntry",
+                    None,
+                    json!({"m_outPlug":plug(&[(1,"m_beginPlug")],&[])}),
+                ),
+                node(
+                    1,
+                    "STUStatescriptStateGameMessageEntry",
+                    Some(0),
+                    json!({
+                        "m_gameMessage":message,
+                        "m_33DA5163":plug(&[(2,"m_beginPlug")],&[1]),
+                        "m_452862E6":plug(&[(3,"m_beginPlug")],&[2]),
+                        "m_params":[{"m_B5051BCE":"0x0A40000000000123","m_out_Var":var(7,false)}]
+                    }),
+                ),
+                node(2, "STUStatescriptState", Some(1), json!({})),
+                node(3, "STU_691BFA55", Some(2), json!({})),
+            ],
+            json!([1, 2, 3]),
+            json!([0]),
+        );
+        let mut component = Component::start(
+            Arc::new(store(vec![source, receiver])),
+            42,
+            Variables::new(),
+            vec![Root::new(1, 42), Root::new(2, 43)],
+            100,
+            &mut EmptyWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        let initial = component.snapshot().unwrap();
+        assert_eq!(initial.instances[&1].states[&0].kind, StateKind::Anim);
+        assert_eq!(active(initial, 2), [0, 1]);
+        assert_eq!(
+            initial.pending_timers[&1],
+            [
+                PendingTimer {
+                    due_ms: 1625,
+                    raw_state: 0,
+                    finish: false,
+                    parameter: 1
+                },
+                PendingTimer {
+                    due_ms: 1625,
+                    raw_state: 0,
+                    finish: true,
+                    parameter: 0
+                },
+            ]
+        );
+        component.advance_frame(100, &mut EmptyWorld).unwrap();
+        assert_eq!(active(component.snapshot().unwrap(), 2), [0, 1]);
+        component.advance_frame(101, &mut EmptyWorld).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert!(
+            snapshot.initialization_complete(),
+            "{:?}",
+            snapshot.diagnostics
+        );
+        assert_eq!(snapshot.instances[&1].variables[&101], Value::Bool(true));
+        assert!(!snapshot.instances[&1].states[&0].active);
+        assert_eq!(active(snapshot, 2), [0, 2]);
+        assert_eq!(snapshot.instances[&2].variables[&7], Value::Bool(true));
+        assert_eq!(snapshot.instances[&2].states[&2].kind, StateKind::Effect);
+        assert_eq!(snapshot.instances[&2].states[&2].start_ms, 1625);
     }
 
     #[test]

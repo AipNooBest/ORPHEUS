@@ -66,12 +66,13 @@ fn line_roots(offset: Vec3, velocity: Vec3, radius: f64) -> Option<[f64; 2]> {
 
 fn nearest_root(
     roots: Option<[f64; 2]>,
+    minimum: f64,
     length: f64,
     on_surface: impl Fn(f64) -> bool,
 ) -> Option<f64> {
-    roots?.into_iter().find(|&distance| {
-        MIN_SURFACE_DISTANCE < distance && distance <= length && on_surface(distance)
-    })
+    roots?
+        .into_iter()
+        .find(|&distance| minimum < distance && distance <= length && on_surface(distance))
 }
 
 /// Intersect the capsule around segment a--b. Coincident endpoints are a sphere.
@@ -83,6 +84,24 @@ pub fn round_hit(
     a: Vec3,
     b: Vec3,
     radius: f64,
+) -> Option<SurfaceHit> {
+    round_surface(
+        origin,
+        direction,
+        length,
+        [a, b],
+        radius,
+        MIN_SURFACE_DISTANCE,
+    )
+}
+
+fn round_surface(
+    origin: Vec3,
+    direction: Vec3,
+    length: f64,
+    [a, b]: [Vec3; 2],
+    radius: f64,
+    minimum: f64,
 ) -> Option<SurfaceHit> {
     if !valid_ray(origin, direction, length)
         || radius <= 0.0
@@ -100,7 +119,10 @@ pub fn round_hit(
     }
     let first_roots = line_roots(offset, direction, radius);
     let (axis, distance) = if span == 0.0 {
-        ([0.0; 3], nearest_root(first_roots, length, |_| true)?)
+        (
+            [0.0; 3],
+            nearest_root(first_roots, minimum, length, |_| true)?,
+        )
     } else {
         let axis = axis.map(|value| value / span);
         let axial_origin = dot(offset, axis);
@@ -108,14 +130,18 @@ pub fn round_hit(
         let axial_at = |distance| axial_origin + distance * axial_direction;
         // Each cap contributes only its outer hemisphere. Cross products
         // preserve the perpendicular distances to the cylinder's axis.
-        let first = nearest_root(first_roots, length, |distance| axial_at(distance) <= 0.0);
+        let first = nearest_root(first_roots, minimum, length, |distance| {
+            axial_at(distance) <= 0.0
+        });
         let second = nearest_root(
             line_roots(sub(origin, b), direction, radius),
+            minimum,
             length,
             |distance| axial_at(distance) >= span,
         );
         let cylinder = nearest_root(
             line_roots(cross(offset, axis), cross(direction, axis), radius),
+            minimum,
             length,
             |distance| (0.0..=span).contains(&axial_at(distance)),
         );
@@ -140,6 +166,37 @@ pub fn round_hit(
         distance,
         normal: normal.map(|value| value / magnitude),
     })
+}
+
+/// First contact with a target capsule, including a start inside its volume.
+pub fn capsule_entry_distance(
+    origin: Vec3,
+    direction: Vec3,
+    length: f64,
+    a: Vec3,
+    b: Vec3,
+    radius: f64,
+) -> Option<f64> {
+    if !valid_ray(origin, direction, length)
+        || radius <= 0.0
+        || !radius.is_finite()
+        || !a.into_iter().chain(b).all(f64::is_finite)
+    {
+        return None;
+    }
+    let axis = sub(b, a);
+    let offset = sub(origin, a);
+    let squared_length = dot(axis, axis);
+    let projection = if squared_length <= 1e-9 {
+        0.0
+    } else {
+        (dot(offset, axis) / squared_length).clamp(0.0, 1.0)
+    };
+    let separation = along(offset, axis, -projection);
+    if dot(separation, separation) <= radius * radius {
+        return Some(0.0);
+    }
+    round_surface(origin, direction, length, [a, b], radius, 0.0).map(|hit| hit.distance)
 }
 
 /// Two-sided Möller-Trumbore distance along a ray, before the caller's length bound.

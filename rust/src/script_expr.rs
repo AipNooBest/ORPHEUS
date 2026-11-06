@@ -462,6 +462,27 @@ impl Evaluator {
             "STUConfigVarLogicalButton" => {
                 Value::Integer(integer(child(config, "m_logicalButton"))?)
             }
+            // The body bindings and expression constants use this explicit null operand.
+            "STU_92CA44CC"
+                if fields.get("m_value") == Some(&Json::Null)
+                    && !json_truthy(child(config, "m_EE729DCB")) =>
+            {
+                Value::Null
+            }
+            "STU_58AA0A3B" => {
+                // The authored weapon-manager defaults take the false branch on an unset value.
+                // Populated input still lacks a verified predicate.
+                if self.config(value, context, nested)? != Value::Null {
+                    return Err(EvalError::UnsupportedConfig(class.into()));
+                }
+                Value::Bool(false)
+            }
+            "STUConfigVarAnimCategory"
+                if fields.get("m_category") == Some(&Json::Null)
+                    && child(config, "m_resourceKey").is_null() =>
+            {
+                Value::Null
+            }
             "STUConfigVarVec3" => {
                 let mut parts = [0.0; 3];
                 for (part, (upper, lower)) in

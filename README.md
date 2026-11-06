@@ -29,6 +29,8 @@ An automated result covers the fixture or replay named in its evidence. A manual
 
 The experimental `orpheus_server` binary runs the local Battle.net, lobby and UDP services together. Headless tests cover encrypted login with a saved profile, solo Practice Range loading, world creation, bot movement, hero selection and body replacement with the base graph bundle. The worker simulates ordinary player movement on prepared collision and bounds input catch-up across peers. Separate reference checks cover lobby content, logical button input, timed script events and the isolated Soldier: 76 Sprint graph. Live hero-script movement, owner corrections, full bot behavior and combat are still being ported. Run `cargo test --locked --all-targets` with stable Rust to verify the public fixtures. The regular game server entry point still uses Python.
 
+The current native work also covers owner script delivery with a fixture body under encrypted packet loss. Practice Range hitscan geometry, damage and hit notices have separate reference tests. The full Soldier body and its firing and reload path are still in development.
+
 The documented environment is Windows with Python 3.12. Node.js 24 is used for the dashboard test. The public source checks can run without the game or any prepared runtime.
 
 ```powershell
