@@ -59,6 +59,7 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
 - **[Mio](https://github.com/tokio-rs/mio)** supplies portable UDP readiness polling and cross-thread
   wakeups for the Rust game worker.
 - **[flate2](https://docs.rs/flate2/)** supplies gzip decoding for the external state graph bundle.
+- **roxmltree** parses the local DragonML entity definitions used by the runtime preparation tool. [Project source](https://github.com/RazrFalcon/roxmltree)
 - The statescript VM uses a deterministic SplitMix64 stream for local random expressions. The fixed-increment generator follows the public-domain implementation. [Sebastiano Vigna's SplitMix64](https://prng.di.unimi.it/splitmix.c)
 - **TripleFault and Gamayun contributors** supplied a same-build comparison for encrypted combat scenarios and
   tick measurement design. The locally reviewed 104319 VM code in `internal/vm/natives.go` also corroborates

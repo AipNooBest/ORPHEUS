@@ -5,7 +5,11 @@ use std::{error::Error, fmt};
 use serde_json::Value as Json;
 
 pub use crate::script_wire::Value;
-use crate::{accounts::parse_guid, script_graph::asset_guid, vitals::PoolKind};
+use crate::{
+    accounts::parse_guid,
+    script_graph::{asset_guid, target_tag_guid},
+    vitals::PoolKind,
+};
 
 pub(crate) const EPSILON: f64 = 1.192_092_895_507_812_5e-5;
 const MAX_CONFIG_DEPTH: usize = 64;
@@ -131,6 +135,16 @@ pub trait Context {
     }
 
     fn related_entity(&mut self, _relation: EntityRelation, _entity: u32) -> Option<u32> {
+        None
+    }
+
+    /// None leaves a tag fact unknown for this entity.
+    fn has_target_tag(&mut self, _entity: u32, _tag: u64) -> Option<bool> {
+        None
+    }
+
+    /// None leaves candidate flags unknown. A known absence can report zero.
+    fn entity_filter_flags(&mut self, _entity: u32) -> Option<u64> {
         None
     }
 
@@ -453,6 +467,110 @@ fn resource(value: &Json) -> Option<u64> {
     })
 }
 
+fn target_tag_config(config: &Json) -> Option<u64> {
+    if class(config) != Some("STU_357DABBB")
+        || !native_fields(config, &["m_7D7C86A1", "m_resourceKey"])
+        || !child(config, "m_resourceKey").is_null()
+    {
+        return None;
+    }
+    let tag = child(config, "m_7D7C86A1");
+    if tag.is_null() {
+        Some(0)
+    } else {
+        target_tag_guid(tag)
+    }
+}
+
+fn filter_exclusion(filter: &Json) -> Option<u64> {
+    if class(filter) != Some("STUConfigVarFilter")
+        || child(filter, "m_84065FD1").as_u64() != Some(0x3fff_ffff)
+    {
+        return None;
+    }
+    // The supported form has no selectors beyond candidate exclusions and the three tag lists.
+    let supported = filter
+        .as_object()?
+        .iter()
+        .all(|(key, value)| match key.as_str() {
+            "$" | "m_84065FD1" | "m_4EA686DB" | "m_B486603E" | "m_8B2A4DF3" | "m_C1903771" => true,
+            "m_EE729DCB" | "m_1E14CCA8" | "m_27CF71D5" | "m_66747E7D" | "m_89831602" => {
+                value.as_u64() == Some(0)
+            }
+            "m_93FA1642" => value.is_null() || value.as_array().is_some_and(Vec::is_empty),
+            "m_9C7BD8B8" => value.is_null() || target_tag_config(value) == Some(0),
+            "m_condition" | "m_F61726FE" | "m_B40362FC" => value.is_null(),
+            _ => false,
+        });
+    if !supported {
+        return None;
+    }
+    filter.get("m_4EA686DB").map_or(Some(0), Json::as_u64)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TagCondition {
+    Any,
+    All,
+    Exclude,
+}
+
+enum TagCheck {
+    Unused,
+    Accept,
+    Reject,
+    Unknown,
+}
+
+fn check_tag_set(
+    config: &Json,
+    condition: TagCondition,
+    entity: u32,
+    context: &mut impl Context,
+) -> Result<TagCheck, EvalError> {
+    let tags = if config.is_null() {
+        &[]
+    } else if native_shape(config, "STU_06610EBC", Some("m_configVars")) {
+        array_field(config, "m_configVars")?
+    } else {
+        std::slice::from_ref(config)
+    };
+    let mut has_tag = false;
+    let mut any_match = false;
+    let mut unknown = false;
+    for tag in tags {
+        let tag = target_tag_config(tag)
+            .ok_or_else(|| EvalError::UnsupportedConfig("STU_AC829876".into()))?;
+        if tag == 0 {
+            continue;
+        }
+        has_tag = true;
+        if any_match {
+            // Even a matching Any list must contain only supported operands.
+            continue;
+        }
+        match (condition, context.has_target_tag(entity, tag)) {
+            (TagCondition::Any, Some(true)) => any_match = true,
+            (TagCondition::All, Some(false)) | (TagCondition::Exclude, Some(true)) => {
+                return Ok(TagCheck::Reject);
+            }
+            (_, None) => unknown = true,
+            _ => (),
+        }
+    }
+    Ok(if any_match {
+        TagCheck::Accept
+    } else if unknown {
+        TagCheck::Unknown
+    } else if !has_tag {
+        TagCheck::Unused
+    } else if condition == TagCondition::Any {
+        TagCheck::Reject
+    } else {
+        TagCheck::Accept
+    })
+}
+
 fn resource_field(class: &str) -> Option<&'static str> {
     match class {
         "STUConfigVarIdentifier" => Some("m_identifier"),
@@ -542,6 +660,31 @@ impl Evaluator {
                 return self.expression(config, context, nested);
             }
             "STU_B5A0CAF0" => context.owner(),
+            "STU_25ECB55F" => {
+                let unsupported = || EvalError::UnsupportedConfig(class.into());
+                if !native_fields(config, &["m_entity", "m_88B0050A"]) {
+                    return Err(unsupported());
+                }
+                let tag = target_tag_guid(child(config, "m_88B0050A")).ok_or_else(unsupported)?;
+                match self.config(child(config, "m_entity"), context, nested)? {
+                    Value::Entity(entity) if valid_entity(entity) => Value::Bool(
+                        context
+                            .has_target_tag(entity, tag)
+                            .ok_or_else(unsupported)?,
+                    ),
+                    Value::Entity(_) | Value::Null => Value::Bool(false),
+                    _ => return Err(unsupported()),
+                }
+            }
+            "STU_AC829876" => {
+                return match self.entity_filter(config, context, nested) {
+                    Err(error @ EvalError::UnsupportedConfig(_)) => match context.native(config) {
+                        Some(value @ Value::Bool(_)) => Ok(value),
+                        _ => Err(error),
+                    },
+                    result => result,
+                };
+            }
             "STU_4A101787" | "STU_E95A9C77" if native_shape(config, class, None) => {
                 // The retail classes share a native evaluator that writes a typed false.
                 Value::Bool(false)
@@ -693,6 +836,52 @@ impl Evaluator {
             }
         };
         Ok(result)
+    }
+
+    fn entity_filter(
+        &mut self,
+        config: &Json,
+        context: &mut impl Context,
+        depth: usize,
+    ) -> Result<Value, EvalError> {
+        let unsupported = || EvalError::UnsupportedConfig("STU_AC829876".into());
+        if !native_fields(config, &["m_entity", "m_filter"]) {
+            return Err(unsupported());
+        }
+        let filter = child(config, "m_filter");
+        let exclude = filter_exclusion(filter).ok_or_else(unsupported)?;
+        let Value::Entity(entity) = self.config(child(config, "m_entity"), context, depth)? else {
+            return Err(unsupported());
+        };
+        if !valid_entity(entity) {
+            return Ok(Value::Bool(false));
+        }
+        let flags = if exclude == 0 {
+            None
+        } else {
+            context.entity_filter_flags(entity)
+        };
+        if flags.is_some_and(|flags| flags & exclude != 0) {
+            return Ok(Value::Bool(false));
+        }
+        let mut unknown = exclude != 0 && flags.is_none();
+        let mut has_fact = flags.is_some();
+        for (field, condition) in [
+            ("m_B486603E", TagCondition::Any),
+            ("m_8B2A4DF3", TagCondition::All),
+            ("m_C1903771", TagCondition::Exclude),
+        ] {
+            match check_tag_set(child(filter, field), condition, entity, context)? {
+                TagCheck::Unused => (),
+                TagCheck::Accept => has_fact = true,
+                TagCheck::Reject => return Ok(Value::Bool(false)),
+                TagCheck::Unknown => unknown = true,
+            }
+        }
+        if unknown || !has_fact && context.entity_filter_flags(entity).is_none() {
+            return Err(unsupported());
+        }
+        Ok(Value::Bool(true))
     }
 
     fn expression(
@@ -1238,6 +1427,129 @@ mod tests {
                 "m_D99EF254": floats,
             },
         })
+    }
+
+    const FILTER_OWNER: u32 = 0xa000_0101;
+    const REQUIRED_TAG: u64 = 0x0d60_0000_0000_0069;
+    const SECOND_TAG: u64 = 0x0d60_0000_0000_0042;
+    const EXCLUDED_TAG: u64 = 0x0d60_0000_0000_0041;
+
+    #[derive(Default)]
+    struct FilterWorld {
+        entity: Option<u32>,
+        flags: Option<u64>,
+        tags: BTreeMap<u64, bool>,
+    }
+
+    impl Context for FilterWorld {
+        fn owner(&mut self) -> Value {
+            self.entity.map_or(Value::Null, Value::Entity)
+        }
+
+        fn entity_filter_flags(&mut self, entity: u32) -> Option<u64> {
+            assert_eq!(entity, FILTER_OWNER);
+            self.flags
+        }
+
+        fn has_target_tag(&mut self, entity: u32, tag: u64) -> Option<bool> {
+            assert_eq!(entity, FILTER_OWNER);
+            self.tags.get(&tag).copied()
+        }
+    }
+
+    fn tag_config(tag: u64) -> Json {
+        json!({"$":"STU_357DABBB", "m_7D7C86A1":format!("0x{tag:016X}"), "m_resourceKey":null})
+    }
+
+    fn tag_list(tags: &[u64]) -> Json {
+        json!({
+            "$":"STU_06610EBC",
+            "m_configVars": tags.iter().copied().map(tag_config).collect::<Vec<_>>(),
+        })
+    }
+
+    fn entity_filter(exclusion: u64) -> Json {
+        json!({
+            "$":"STU_AC829876",
+            "m_entity":{"$":"STU_B5A0CAF0"},
+            "m_filter":{
+                "$":"STUConfigVarFilter",
+                "m_84065FD1":0x3fff_ffff,
+                "m_4EA686DB":exclusion,
+            },
+        })
+    }
+
+    #[test]
+    fn entity_filter_distinguishes_rejection_from_unavailable_facts() {
+        let mut config = entity_filter(2);
+        config["m_filter"]["m_9C7BD8B8"] =
+            json!({"$":"STU_357DABBB", "m_7D7C86A1":null, "m_resourceKey":null});
+        config["m_filter"]["m_8B2A4DF3"] = tag_config(REQUIRED_TAG);
+        let mut world = FilterWorld {
+            entity: Some(FILTER_OWNER),
+            ..Default::default()
+        };
+        let unknown = Err(EvalError::UnsupportedConfig("STU_AC829876".into()));
+        assert_eq!(evaluate(&config, &mut world), unknown);
+        world.tags.insert(REQUIRED_TAG, false);
+        assert_eq!(evaluate(&config, &mut world), Ok(Value::Bool(false)));
+        world.tags.insert(REQUIRED_TAG, true);
+        assert_eq!(evaluate(&config, &mut world), unknown);
+        world.flags = Some(0x100);
+        assert_eq!(evaluate(&config, &mut world), Ok(Value::Bool(true)));
+        world.flags = Some(2 | 0x100);
+        world.tags.clear();
+        assert_eq!(evaluate(&config, &mut world), Ok(Value::Bool(false)));
+        config["m_filter"]["m_66747E7D"] = json!(2);
+        assert_eq!(evaluate(&config, &mut world), unknown);
+    }
+
+    #[test]
+    fn entity_filter_applies_any_all_and_excluded_tag_lists() {
+        let mut config = entity_filter(0);
+        config["m_filter"]["m_B486603E"] = tag_list(&[SECOND_TAG, REQUIRED_TAG]);
+        config["m_filter"]["m_8B2A4DF3"] = tag_list(&[REQUIRED_TAG]);
+        config["m_filter"]["m_C1903771"] = tag_config(EXCLUDED_TAG);
+        let mut world = FilterWorld {
+            entity: Some(FILTER_OWNER),
+            tags: BTreeMap::from([(REQUIRED_TAG, true), (EXCLUDED_TAG, false)]),
+            ..Default::default()
+        };
+        assert_eq!(evaluate(&config, &mut world), Ok(Value::Bool(true)));
+        world.tags.insert(REQUIRED_TAG, false);
+        assert_eq!(evaluate(&config, &mut world), Ok(Value::Bool(false)));
+        world.tags.insert(REQUIRED_TAG, true);
+        world.tags.insert(EXCLUDED_TAG, true);
+        assert_eq!(evaluate(&config, &mut world), Ok(Value::Bool(false)));
+        world.tags.remove(&EXCLUDED_TAG);
+        let unsupported = Err(EvalError::UnsupportedConfig("STU_AC829876".into()));
+        assert_eq!(evaluate(&config, &mut world), unsupported);
+        world.tags.insert(EXCLUDED_TAG, false);
+        config["m_filter"]["m_B486603E"]["m_configVars"] =
+            json!([tag_config(REQUIRED_TAG), {"$":"unresolved-tag-config"}]);
+        assert_eq!(evaluate(&config, &mut world), unsupported,);
+    }
+
+    #[test]
+    fn direct_target_tag_query_reads_membership_on_the_typed_entity() {
+        let query = json!({
+            "$":"STU_25ECB55F", "m_88B0050A":"0x0D60000000000069", "m_entity":{"$":"STU_B5A0CAF0"}
+        });
+        let mut world = FilterWorld {
+            entity: Some(FILTER_OWNER),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(&query, &mut world),
+            Err(EvalError::UnsupportedConfig("STU_25ECB55F".into())),
+        );
+        for present in [true, false] {
+            world.tags.insert(REQUIRED_TAG, present);
+            assert_eq!(evaluate(&query, &mut world), Ok(Value::Bool(present)));
+        }
+        world.entity = None;
+        assert_eq!(evaluate(&query, &mut world), Ok(Value::Bool(false)));
     }
 
     #[test]

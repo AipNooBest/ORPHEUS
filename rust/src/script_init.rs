@@ -192,6 +192,14 @@ pub trait World {
         None
     }
 
+    fn has_target_tag(&self, _site: Site, _entity: u32, _tag: u64) -> Option<bool> {
+        None
+    }
+
+    fn entity_filter_flags(&self, _site: Site, _entity: u32) -> Option<u64> {
+        None
+    }
+
     /// None means this relationship is unsupported for the supplied entity.
     fn related_entity(
         &mut self,
@@ -4470,6 +4478,16 @@ impl<W: World> Context for InstanceContext<'_, W> {
     fn native(&mut self, config: &Json) -> Option<Value> {
         self.read_native = true;
         self.world.native(self.site, config)
+    }
+
+    fn has_target_tag(&mut self, entity: u32, tag: u64) -> Option<bool> {
+        self.read_native = true;
+        self.world.has_target_tag(self.site, entity, tag)
+    }
+
+    fn entity_filter_flags(&mut self, entity: u32) -> Option<u64> {
+        self.read_native = true;
+        self.world.entity_filter_flags(self.site, entity)
     }
 
     fn related_entity(&mut self, relation: EntityRelation, entity: u32) -> Option<u32> {

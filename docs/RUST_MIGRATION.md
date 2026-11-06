@@ -35,6 +35,8 @@ The common body graph registers its authored base health, armour and shield pool
 
 The base graph bundle can include authored mode values without adding bot graphs. Supply the target build's `.0C5` XML directory as `--mode-xml` to [the graph extractor](../tools/extract_game_graphs.py), write its output outside the repository, then pass that output to `prepare_server_runtime --game-graphs` when assembling the external bundle. Mode values and graph data stay local.
 
+For authored target tags, pass the target build's exported `.003` XML directory to the Rust `prepare_server_runtime --target-tags-xml` option. The preparation command writes the tag lists into the external graph bundle and hashes the result in the runtime manifest. Missing definitions leave any existing tag data intact. Older bundles can still load, with an omitted tag list treated as unknown. The owner VM uses the direct body definition for the supported tag predicates. Instance overrides, runtime tag changes and exclusion flags without authoritative world data still need support.
+
 The frozen Python server serves the regular entry points until cutover. The native server currently serves the solo base Practice Range on loopback. Other matchmaking modes, social actions, the dashboard and original-client acceptance are pending.
 
 ```powershell

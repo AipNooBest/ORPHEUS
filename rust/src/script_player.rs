@@ -1,6 +1,10 @@
 //! Prepared owner statescript for a live body in build 104319.
 
-use std::{collections::BTreeMap, io, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    sync::Arc,
+};
 
 use serde_json::Value as Json;
 
@@ -44,6 +48,7 @@ pub(crate) struct PlayerBodyFactory {
     roots: Vec<Root>,
     variables: Variables,
     pools: Option<HealthPools>,
+    target_tags: Option<BTreeSet<u64>>,
 }
 
 impl PlayerBodyFactory {
@@ -65,6 +70,7 @@ impl PlayerBodyFactory {
         let roots = crate::script_init::player_roots(body, &graphs).map_err(unsupported)?;
         let health = pools.unwrap_or(FALLBACK_POOLS).total();
         let variables = crate::script_init::player_entity_variables(body, health, health);
+        let target_tags = body.target_tags.clone();
         let factory = Self {
             graphs,
             codecs,
@@ -73,6 +79,7 @@ impl PlayerBodyFactory {
             roots,
             variables,
             pools,
+            target_tags,
         };
         let runtime = factory.start(probe)?;
         let encoder = runtime.encoder();
@@ -105,6 +112,7 @@ impl PlayerBodyFactory {
                 self.pools.unwrap_or(FALLBACK_POOLS).vitals()
             },
             pool_types_known: self.pools.is_some() || has_authored_pools,
+            target_tags: self.target_tags.clone(),
         };
         let mut component = Component::start(
             Arc::clone(&self.graphs),
@@ -251,6 +259,7 @@ struct BodyWorld {
     hero: u64,
     vitals: Vitals,
     pool_types_known: bool,
+    target_tags: Option<BTreeSet<u64>>,
 }
 
 impl World for BodyWorld {
@@ -330,6 +339,13 @@ impl World for BodyWorld {
             return None;
         }
         self.vitals.remove_pool(pool)
+    }
+
+    fn has_target_tag(&self, site: Site, entity: u32, tag: u64) -> Option<bool> {
+        if !self.is_player_site(site) || entity != self.entity {
+            return None;
+        }
+        Some(self.target_tags.as_ref()?.contains(&tag))
     }
 
     fn related_entity(&mut self, site: Site, relation: EntityRelation, entity: u32) -> Option<u32> {
@@ -943,6 +959,7 @@ mod tests {
             hero: SOLDIER,
             vitals: Vitals::empty(),
             pool_types_known: true,
+            target_tags: body.target_tags.clone(),
         };
         let mut component = Component::start(
             graphs,
@@ -1078,10 +1095,20 @@ mod tests {
                 diagnostic.site.graph == graph && diagnostic.site.node == Some(node)
             }));
         }
+        let filter_diagnostic = snapshot
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.site.graph == 0x004b && diagnostic.site.node == Some(21));
+        assert_eq!(filter_diagnostic, world.target_tags.is_none());
+        if world.target_tags.is_some() {
+            let filter = &snapshot.instances[&2].states[&14];
+            assert!(filter.active);
+            assert_eq!(filter.kind, StateKind::BooleanSwitch(false));
+        }
 
+        let authored_graphs = Arc::clone(&world.graphs);
         let authored_field = |graph, position, field: &str| {
-            world
-                .graphs
+            authored_graphs
                 .graph(graph)
                 .unwrap()
                 .node(position)
@@ -1094,6 +1121,26 @@ mod tests {
         let watch_possessor = authored_field(0x01cf, 41, "m_B7A3CF78");
         let shield_refill = authored_field(0x0033, 66, "m_BD83C8E6");
         let health_present = authored_field(0x08b6, 2, "m_condition");
+        if let Some(original_tags) = world.target_tags.clone() {
+            let filter = authored_field(0x004b, 21, "m_condition");
+            let tag_query = authored_field(0x0043, 45, "m_condition");
+            let required = crate::script_graph::target_tag_guid(&tag_query["m_88B0050A"]).unwrap();
+            assert!(!original_tags.contains(&required));
+            for present in [false, true] {
+                if present {
+                    world.target_tags.as_mut().unwrap().insert(required);
+                }
+                assert_eq!(
+                    component.evaluate_state_config(2, 14, &filter, &mut world),
+                    Ok(Value::Bool(present))
+                );
+                assert_eq!(
+                    component.evaluate_state_config(3, 0, &tag_query, &mut world),
+                    Ok(Value::Bool(present))
+                );
+            }
+            world.target_tags = Some(original_tags);
+        }
         let rifle_conditions =
             [81, 83].map(|position| authored_field(0x0254, position, "m_condition"));
         // 01C7 st48 reads the same current and maximum health as the
@@ -1180,6 +1227,7 @@ mod tests {
                 hero,
                 vitals: Vitals::empty(),
                 pool_types_known: true,
+                target_tags: body.target_tags.clone(),
             };
             let component = Component::start(
                 Arc::clone(&graphs),
