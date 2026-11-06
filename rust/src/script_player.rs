@@ -18,7 +18,7 @@ use crate::{
     game_instance::RETAIL_QUANTA,
     game_pools::{BODY_GRAPH, FALLBACK_POOLS, HealthPools},
     game_replication::{BodyStep, OwnerBodyRuntime},
-    mover::Mover,
+    mover::{Mover, sample_movement_flags},
     mover_modifiers::{Modifier, ModifierKey},
     script_codecs::CodecTable,
     script_expr::{EntityRelation, native_shape, to_float, valid_entity},
@@ -28,7 +28,7 @@ use crate::{
     script_snapshot_wire::{SnapshotEncoder, View},
     script_wire::{Value, Variables},
     vitals::{PoolKind, Vitals},
-    world::{Component as EntityComponent, GAME_MODE_ENTITY},
+    world::{Component as EntityComponent, GAME_MODE_ENTITY, Movement},
 };
 
 #[derive(Clone, Copy)]
@@ -37,7 +37,7 @@ pub(crate) struct OwnerBodySpawn {
     pub entity: u32,
     pub body_filter: u64,
     pub frame: u32,
-    pub position: [f64; 3],
+    pub pose: Movement,
     pub quanta: u32,
 }
 
@@ -107,7 +107,8 @@ impl PlayerBodyFactory {
             controller: spawn.controller,
             entity: spawn.entity,
             body_filter: spawn.body_filter,
-            position: spawn.position,
+            position: spawn.pose.position,
+            movement: spawn.pose,
             throttles: [0; 2],
             mode: self.mode,
             hero: self.hero,
@@ -186,7 +187,12 @@ impl OwnerBodyRuntime for PlayerBodyRuntime {
                 "the owner VM frame is outside the command sequence",
             ));
         }
-        self.world.position = mover.pose().position;
+        let pose = mover.pose();
+        self.world.position = pose.position;
+        // Command gaps and timer advances retain the last movement record.
+        if step == BodyStep::Posed {
+            self.world.movement = pose;
+        }
         if step == BodyStep::UnposedTimer {
             self.component
                 .advance_frame(command.frame, &mut self.world)
@@ -262,6 +268,7 @@ struct BodyWorld {
     entity: u32,
     body_filter: u64,
     position: [f64; 3],
+    movement: Movement,
     throttles: [i8; 2],
     mode: u64,
     hero: u64,
@@ -309,6 +316,13 @@ impl World for BodyWorld {
         } else {
             [0.0; 3]
         }
+    }
+
+    fn movement_sample(&self, site: Site) -> Option<u16> {
+        if !self.is_player_site(site) {
+            return None;
+        }
+        sample_movement_flags(&self.movement)
     }
 
     fn body_scale(&mut self, site: Site, target: u32, override_value: &Value) -> Option<f64> {
@@ -501,7 +515,10 @@ pub(crate) fn fixture_body_factory() -> (PlayerBodyFactory, OwnerBodySpawn) {
         entity: 0xa000_0101,
         body_filter: crate::match_scene::team_bit(0).unwrap(),
         frame: 100,
-        position: [1.0, 2.0, 3.0],
+        pose: Movement {
+            position: [1.0, 2.0, 3.0],
+            ..Movement::default()
+        },
         quanta: RETAIL_QUANTA,
     };
     let factory = PlayerBodyFactory::prepare(
@@ -962,13 +979,22 @@ mod tests {
         assert_eq!(snapshot.instances[&3].variables[&28], Value::Integer(1));
         assert_eq!(snapshot.variables[&1732], Value::Float(200.0));
         assert_eq!(first.movement_modifiers().map(BTreeMap::len), Some(0));
-        assert_eq!(first.world.position(spawn.entity), spawn.position);
+        assert_eq!(first.world.position(spawn.entity), spawn.pose.position);
+        assert_eq!(first.world.movement, spawn.pose);
         assert_eq!(second.snapshot().unwrap().entity, spawn.entity + 1);
 
+        let site = Site {
+            entity: spawn.entity,
+            instance: 1,
+            graph: 42,
+            node: None,
+        };
+        assert_eq!(first.world.movement_sample(site), Some(2));
+        assert_eq!(second.world.movement_sample(site), None);
         let mut mover = Mover::new(
             MoverSettings::default(),
             Arc::new(ContactWorld::new(Vec::new()).unwrap()),
-            spawn.position,
+            spawn.pose.position,
             0,
             0x18,
         )
@@ -988,6 +1014,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first.world.position(spawn.entity), mover.pose().position);
+        let posed = mover.pose();
+        let sample = sample_movement_flags(&posed).expect("a regular posed movement record");
+        assert_eq!(first.world.movement, posed);
+        assert_eq!(first.world.movement_sample(site), Some(sample));
         assert_eq!(first.component.now_ms(), 102 * FRAME_MS - 1);
         assert_eq!(second.component.now_ms(), 101 * FRAME_MS - 1);
         let gap = Command {
@@ -996,26 +1026,36 @@ mod tests {
         };
         assert!(first.advance(gap, &mover, BodyStep::Posed).is_err());
         assert_eq!(first.component.now_ms(), 102 * FRAME_MS - 1);
+        let unposed_mover = Mover::new(
+            MoverSettings::default(),
+            Arc::new(ContactWorld::new(Vec::new()).unwrap()),
+            [4.0, 5.0, 6.0],
+            0,
+            0x18,
+        )
+        .unwrap();
         first
             .advance(
                 Command {
                     frame: 102,
                     ..Command::default()
                 },
-                &mover,
+                &unposed_mover,
                 BodyStep::UnposedBoundary,
             )
             .unwrap();
+        assert_eq!(first.world.movement, posed);
         first
             .advance(
                 Command {
                     frame: 200,
                     ..Command::default()
                 },
-                &mover,
+                &unposed_mover,
                 BodyStep::UnposedTimer,
             )
             .unwrap();
+        assert_eq!(first.world.movement, posed);
         first
             .advance(
                 Command {
@@ -1038,7 +1078,7 @@ mod tests {
         let mover = Mover::new(
             MoverSettings::default(),
             Arc::new(ContactWorld::new(Vec::new()).unwrap()),
-            spawn.position,
+            spawn.pose.position,
             0,
             0x18,
         )
@@ -1112,6 +1152,7 @@ mod tests {
             entity: 0xa000_0101,
             body_filter: crate::match_scene::team_bit(0).unwrap(),
             position: GameMap::practice_range().spawn_point(0, 0).unwrap().0,
+            movement: Movement::default(),
             throttles: [0; 2],
             mode: PRACTICE_RANGE_MODE,
             hero: SOLDIER,
@@ -1173,6 +1214,17 @@ mod tests {
             .map(|(&id, instance)| (id, instance.graph, instance.parent))
             .collect();
         assert_eq!(instances, expected);
+        let movement_graph = &snapshot.instances[&12];
+        let movement = &movement_graph.states[&4];
+        assert!(movement.active);
+        assert_eq!(movement.kind, StateKind::MovementSample(2));
+        assert_eq!(snapshot.variables[&545], Value::Bool(true));
+        assert!(
+            !snapshot
+                .diagnostics
+                .iter()
+                .any(|item| item.site.graph == 0x01c7 && item.site.node == Some(7))
+        );
         let body_pools = &snapshot.instances[&1];
         assert!(body_pools.states[&0].active);
         assert_eq!(
@@ -1470,6 +1522,7 @@ mod tests {
                 entity: 0xa000_0101,
                 body_filter: crate::match_scene::team_bit(0).unwrap(),
                 position: [0.0; 3],
+                movement: Movement::default(),
                 throttles: [0; 2],
                 mode: PRACTICE_RANGE_MODE,
                 hero,

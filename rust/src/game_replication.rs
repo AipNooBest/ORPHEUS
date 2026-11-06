@@ -1174,13 +1174,9 @@ impl WorldDelivery {
         selection: (&Hero, SkinTheme),
     ) -> io::Result<()> {
         let (hero, skin) = selection;
-        let (position, yaw) = scene
-            .map()
-            .spawn_point(viewer.team, 0)
-            .ok_or_else(|| invalid("no spawn for the selected hero"))?;
-        let yaw = (yaw * 65536.0 / 360.0).round_ties_even() as i32;
-        let mover = scene.player_mover(hero.body, viewer.team, position, yaw)?;
-        let pose = owner_pose(mover.pose());
+        let mover = scene.player_spawn_mover(hero.body, viewer.team)?;
+        let movement = mover.pose();
+        let pose = owner_pose(movement);
         let generation = self
             .generation
             .checked_add(1)
@@ -1201,7 +1197,7 @@ impl WorldDelivery {
                     entity,
                     body_filter,
                     frame: start_frame,
-                    position: pose.position,
+                    pose: movement,
                     quanta,
                 },
             )
@@ -1693,11 +1689,7 @@ mod tests {
                 if turn == 4 { gap.frame } else { actual.frame }
             );
         }
-        let (position, yaw) = scene.map().spawn_point(viewer.team, 0).unwrap();
-        let yaw = (yaw * 65536.0 / 360.0).round_ties_even() as i32;
-        let mut synchronous = scene
-            .player_mover(hero.body, viewer.team, position, yaw)
-            .unwrap();
+        let mut synchronous = scene.player_spawn_mover(hero.body, viewer.team).unwrap();
         for command in [actual, gap] {
             synchronous
                 .step(scene.movement_index(), command, 0.016, |_, _| {})
@@ -1714,9 +1706,7 @@ mod tests {
         );
         assert_eq!(world.body.unwrap().id.entity, owner | 2);
         assert_eq!(world.command_ack(FIRST_TICK + 90), later.frame);
-        let mut synchronous = scene
-            .player_mover(tracer.body, viewer.team, position, yaw)
-            .unwrap();
+        let mut synchronous = scene.player_spawn_mover(tracer.body, viewer.team).unwrap();
         synchronous
             .step(scene.movement_index(), later, 0.016, |_, _| {})
             .unwrap();

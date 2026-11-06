@@ -1156,6 +1156,9 @@ fn state_payload(state: &State, codec: &Codec) -> Option<StatePayload> {
                 ("undecided".into(), Value::Bool(undecided)),
             ])
         }
+        (StateKind::MovementSample(mask), Some("flags13")) => {
+            StatePayload::from([("value".into(), Value::Integer(i64::from(mask)))])
+        }
         (StateKind::SubScript { child }, Some("subscript")) => StatePayload::from([(
             "child".into(),
             Value::Integer(i64::from(child.unwrap_or_default())),
@@ -1289,7 +1292,10 @@ mod tests {
                       {"op":"bits","f":"has_volleys","n":1},{"op":"if","c":"has_volleys",
                        "then":[{"op":"w_u16","f":"volleys"}],"else":[]},{"op":"bits","f":"counter","n":6}]},
         "D74D4F47":{"name":"STU_D74D4F47","codec":"frames","stec":false,"status":"VERIFIED",
-            "layout":[{"op":"bits","f":"target","n":32}]}
+            "layout":[{"op":"bits","f":"target","n":32}]},
+        "96F1DBCF":{"name":"STU_96F1DBCF","codec":"flags13","stec":false,"status":"VERIFIED",
+            "layout":[{"op":"bits","f":"low","n":6},{"op":"bits","f":"more","n":1},
+                      {"op":"if","c":"more","then":[{"op":"bits","f":"high","n":7}],"else":[]}]}
     }}"#;
 
     fn node(position: u16, class: &str, state: Option<u16>, mut fields: Json) -> Json {
@@ -1896,6 +1902,70 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn movement_sample_uses_the_owner_flags_codec() {
+        struct Sample;
+        impl crate::script_init::World for Sample {
+            fn movement_sample(&self, _: Site) -> Option<u16> {
+                Some(0x842)
+            }
+        }
+
+        let fixture = graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntry",
+                    None,
+                    json!({
+                        "m_outPlug":{"$":"Plug","links":[[1,"m_beginPlug"]]}
+                    }),
+                ),
+                node(1, "STU_96F1DBCF", Some(0), json!({})),
+            ],
+            json!([1]),
+            json!([0]),
+            json!([]),
+            json!([]),
+        );
+        let graphs = GraphStore::from_json(
+            &serde_json::to_vec(&json!({"version":1,"graphs":[fixture],"bodies":{},"missing":[]}))
+                .unwrap(),
+        )
+        .unwrap();
+        let snapshot = initialize(
+            &graphs,
+            ENTITY,
+            Variables::new(),
+            vec![Root::new(1, 42)],
+            &mut Sample,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        let codecs = CodecTable::from_json(CODECS).unwrap();
+        let encoder = SnapshotEncoder::new(&graphs, &codecs);
+        let owner = encoder.project(&snapshot, View::Owner).unwrap();
+        let observer = encoder.project(&snapshot, View::Observer).unwrap();
+        assert!(observer.instances[&1].states.is_empty());
+        let payload = codecs
+            .codec("STU_96F1DBCF")
+            .unwrap()
+            .payload(
+                &owner.instances[&1].states[&0].payload,
+                PayloadMode::Owner {
+                    full: true,
+                    frame_time: 0,
+                    frame_ms: 16,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (payload.bit_len(), payload.as_bytes()),
+            (14, [0xc2, 0x10].as_slice())
+        );
     }
 
     #[test]

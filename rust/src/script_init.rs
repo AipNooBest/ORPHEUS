@@ -46,6 +46,20 @@ const LINK_PRIORITY: StackPriority = StackPriority {
 };
 const ABORT_PLUG: &str = "m_F198FD3A";
 const SUBGRAPH_STATES: &str = "m_FF3DAF1E";
+const MOVEMENT_BOOLEAN_OUTPUTS: [&str; 12] = [
+    "m_105DF1D6",
+    "m_49F4B33C",
+    "m_56AC7B36",
+    "m_16BC4759",
+    "m_F620FC2A",
+    "m_6306AA29",
+    "m_103A8581",
+    "m_958FF5C0",
+    "m_4C55BB03",
+    "m_2EB48682",
+    "m_45EB431F",
+    "m_BF152E27",
+];
 
 #[derive(Clone, Debug)]
 pub struct Root {
@@ -166,6 +180,11 @@ pub trait World {
 
     fn position(&mut self, _entity: u32) -> [f64; 3] {
         [0.0; 3]
+    }
+
+    /// The implicit owner's movement sample, if the world knows all its bits.
+    fn movement_sample(&self, _site: Site) -> Option<u16> {
+        None
     }
 
     fn native(&mut self, _site: Site, _config: &Json) -> Option<Value> {
@@ -293,6 +312,7 @@ pub enum StateKind {
         flags: u8,
     },
     MovementMod,
+    MovementSample(u16),
     Anim,
     Effect,
     SendMessage,
@@ -2466,6 +2486,12 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             },
             "STUStatescriptStateAbility" => StateKind::Ability { flags: 0 },
             "STU_316CFEF2" => StateKind::MovementMod,
+            "STU_96F1DBCF" if is_owner_movement_sampler(node) => {
+                match self.state(key).map(|state| state.kind) {
+                    Some(kind @ StateKind::MovementSample(_)) => kind,
+                    _ => StateKind::MovementSample(0),
+                }
+            }
             "STUStatescriptStateAnim" => StateKind::Anim,
             "STU_691BFA55" | "STU_7CA2FBAF" => StateKind::Effect,
             "STU_38EE1100" => StateKind::SendMessage,
@@ -2558,6 +2584,10 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 self.restart_cooldown(key, node, depth)?;
                 self.register_tick(key, self.machine.now_ms);
             }
+            StateKind::MovementSample(previous) => {
+                self.update_movement_sample(key, node, previous)?;
+                self.register_tick(key, self.machine.now_ms);
+            }
             StateKind::Anim => self.arm_animation(key, node)?,
             StateKind::SendMessage => {
                 self.send_game_message(id, node)?;
@@ -2588,6 +2618,44 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 .world
                 .related_entity(site, EntityRelation::AiControlEntity, site.entity)
                 == Some(0)
+    }
+
+    fn update_movement_sample(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        previous: u16,
+    ) -> Result<(), InitFault> {
+        let site = self.site(key.instance, node);
+        let Some(sample) = self
+            .world
+            .movement_sample(site)
+            .filter(|&mask| mask < 1 << 13)
+        else {
+            self.report(site, Issue::UnsupportedField("owner movement sample"));
+            return Ok(());
+        };
+        let changed = previous ^ sample;
+        if changed == 0 {
+            return Ok(());
+        }
+        self.state_mut(key).expect("active movement sample").kind =
+            StateKind::MovementSample(sample);
+        for (bit, name) in MOVEMENT_BOOLEAN_OUTPUTS.iter().enumerate() {
+            let mask = 1 << bit;
+            if changed & mask == 0 {
+                continue;
+            }
+            if let Some(variable) = script_expr::lvalue(field(&node.fields, name))
+                .expect("validated movement sample output")
+            {
+                self.write(
+                    source_key(key.instance, variable),
+                    Value::Bool(sample & mask != 0),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn begin_target_tag(&mut self, key: StateKey, node: &Node) -> Result<(), InitFault> {
@@ -3480,6 +3548,13 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                             self.publish_health_pool(key, node, current)?;
                         }
                     }
+                    Some(StateKind::MovementSample(previous)) => {
+                        let node = self
+                            .graph(id)
+                            .state(usize::from(raw))
+                            .expect("movement sample");
+                        self.update_movement_sample(key, node, previous)?;
+                    }
                     Some(StateKind::Switch { .. }) => self.post(id, Event::Reevaluate(raw))?,
                     Some(StateKind::Ability { .. }) => self.activate_ability(key, 0)?,
                     Some(StateKind::ChaseVar) => self.tick_chase(key)?,
@@ -4076,6 +4151,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         self.clear_tick(key);
         self.exit_subgraph(id, node, "m_subgraphPlug", depth + 1)?;
         match kind {
+            StateKind::MovementSample(previous) => {
+                self.update_movement_sample(key, node, previous)?;
+            }
             StateKind::TargetTag {
                 effect: Some(effect),
             } => {
@@ -4306,6 +4384,27 @@ fn is_client_subgraph_controller(graph: &Graph, node: &Node) -> bool {
             .next()
             .and_then(|(position, _)| graph.node(position?))
             .is_some_and(|target| target.client_only && !target.server_only)
+}
+
+fn is_owner_movement_sampler(node: &Node) -> bool {
+    node.is_networked()
+        && node.remote == -1
+        && [
+            "m_entity",
+            "m_A10CC74B",
+            "m_0B1AA8CA",
+            "m_4F8F2F3F",
+            "m_8BF03679",
+            "m_BF5B22B7",
+        ]
+        .iter()
+        .all(|name| field(&node.fields, name).is_null())
+        && ["m_E37BC6C2", "m_2102C541"]
+            .iter()
+            .all(|path| node.links(path).next().is_none())
+        && MOVEMENT_BOOLEAN_OUTPUTS
+            .iter()
+            .all(|name| script_expr::lvalue(field(&node.fields, name)).is_ok())
 }
 
 fn is_networked_for_code_synced(node: &Node) -> bool {
@@ -4898,6 +4997,99 @@ mod tests {
             let states = &snapshot.instances[&1].states;
             assert!(!states[&0].active && !states[&1].active);
         }
+    }
+
+    #[test]
+    fn movement_sample_updates_only_changed_authored_outputs() {
+        struct SampleWorld(Option<u16>);
+        impl World for SampleWorld {
+            fn movement_sample(&self, _: Site) -> Option<u16> {
+                self.0
+            }
+        }
+
+        let fixture = graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntry",
+                    None,
+                    json!({
+                        "m_outPlug":plug(&[(1,"m_beginPlug")], &[])
+                    }),
+                ),
+                node(
+                    1,
+                    "STU_96F1DBCF",
+                    Some(0),
+                    json!({
+                        "m_49F4B33C":var(100,true),
+                        "m_103A8581":var(101,false),
+                        "m_subgraphPlug":plug(&[(2,"m_beginPlug")], &[1])
+                    }),
+                ),
+                node(
+                    2,
+                    "STUStatescriptStateBooleanSwitch",
+                    Some(1),
+                    json!({
+                        "m_condition":var(100,true)
+                    }),
+                ),
+            ],
+            json!([1, 2]),
+            json!([0]),
+        );
+        let graphs = Arc::new(store(vec![fixture]));
+        let start = |world: &mut SampleWorld| {
+            Component::start(
+                Arc::clone(&graphs),
+                42,
+                Variables::new(),
+                vec![Root::new(1, 42)],
+                0,
+                world,
+                MAX_INIT_WORK,
+            )
+            .unwrap()
+        };
+        let mut world = SampleWorld(Some(2));
+        let mut component = start(&mut world);
+        let snapshot = component.snapshot().unwrap();
+        assert!(snapshot.initialization_complete());
+        let owner = &snapshot.instances[&1];
+        assert_eq!(owner.states[&0].kind, StateKind::MovementSample(2));
+        assert_eq!(owner.states[&1].kind, StateKind::BooleanSwitch(true));
+        assert_eq!(snapshot.variables[&100], Value::Bool(true));
+        assert!(!owner.variables.contains_key(&101));
+
+        world.0 = Some(1 | (1 << 6));
+        component.advance_frame(1, &mut world).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        let owner = &snapshot.instances[&1];
+        assert_eq!(owner.states[&0].kind, StateKind::MovementSample(65));
+        assert_eq!(owner.states[&1].kind, StateKind::BooleanSwitch(false));
+        assert_eq!(snapshot.variables[&100], Value::Bool(false));
+        assert_eq!(owner.variables[&101], Value::Bool(true));
+
+        world.0 = Some(0);
+        component.advance_frame(2, &mut world).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert_eq!(
+            snapshot.instances[&1].states[&0].kind,
+            StateKind::MovementSample(0)
+        );
+        assert_eq!(snapshot.instances[&1].variables[&101], Value::Bool(false));
+
+        let unsupported = start(&mut SampleWorld(None));
+        assert!(matches!(
+            unsupported.snapshot().unwrap().diagnostics.as_slice(),
+            [Diagnostic {
+                issue: Issue::UnsupportedField("owner movement sample"),
+                ..
+            }]
+        ));
     }
 
     #[test]

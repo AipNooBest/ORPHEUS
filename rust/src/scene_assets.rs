@@ -29,7 +29,6 @@ use crate::{
     match_scene::{PlayerAppearance, initial_world, mode_ui, team_bit},
     mover::Mover,
     mover_ground::NOT_GROUND,
-    mover_posture::snap,
     mover_settings::MoverCatalog,
     script_codecs::CodecTable,
     script_graph::GraphStore,
@@ -178,14 +177,7 @@ impl SceneAssets {
         let initial_board =
             self.stats
                 .component(&PlayerStats::default(), map.mode_guid, None, None);
-        let owner_body_factory = if is_practice_range(&map) && scripted_bots == 0 {
-            self.practice_owner_body
-                .get_or_init(|| self.prepare_owner_body(&GameMap::practice_range(), &initial_board))
-                .clone()
-        } else {
-            None
-        };
-        Ok(PreparedScene {
+        let mut scene = PreparedScene {
             map,
             ground,
             contacts,
@@ -197,29 +189,35 @@ impl SceneAssets {
             movers: Arc::clone(&self.movers),
             heroes: Arc::clone(&self.heroes),
             pools: Arc::clone(&self.pools),
-            owner_body_factory,
-        })
+            owner_body_factory: None,
+        };
+        if is_practice_range(scene.map()) && scripted_bots == 0 {
+            scene.owner_body_factory = self
+                .practice_owner_body
+                .get_or_init(|| self.prepare_owner_body(&scene))
+                .clone();
+        }
+        Ok(scene)
     }
 
-    fn prepare_owner_body(
-        &self,
-        map: &GameMap,
-        initial_board: &Component,
-    ) -> Option<Arc<OwnerBodyFactory>> {
+    fn prepare_owner_body(&self, scene: &PreparedScene) -> Option<Arc<OwnerBodyFactory>> {
         let hero = self.heroes.get(SOLDIER)?;
-        let (position, _) = map.spawn_point(0, 0)?;
         let prepared = self
             .codecs
             .as_ref()
             .ok_or_else(|| "the owner statescript codec table is unavailable".to_owned())
             .and_then(|codecs| {
-                let controller_on_fire = initial_on_fire(initial_board).ok_or_else(|| {
-                    "the controller's initial on-fire flag is unavailable".to_owned()
-                })?;
+                let controller_on_fire =
+                    initial_on_fire(&scene.initial_board).ok_or_else(|| {
+                        "the controller's initial on-fire flag is unavailable".to_owned()
+                    })?;
+                let mover = scene
+                    .player_spawn_mover(hero.body, 0)
+                    .map_err(|error| error.to_string())?;
                 PlayerBodyFactory::prepare(
                     Arc::clone(&self.graphs),
                     Arc::clone(codecs),
-                    map.mode_guid,
+                    scene.map.mode_guid,
                     hero,
                     self.pools.hero_pools(hero.guid),
                     controller_on_fire,
@@ -228,7 +226,7 @@ impl SceneAssets {
                         entity: 0xa000_0101,
                         body_filter: team_bit(0).map_err(|error| error.to_string())?,
                         frame: FIRST_TICK,
-                        position: position.map(snap),
+                        pose: mover.pose(),
                         quanta: RETAIL_QUANTA,
                     },
                 )
@@ -267,13 +265,12 @@ impl PreparedScene {
         self.ground.triangles()
     }
 
-    pub(crate) fn player_mover(
-        &self,
-        body: u64,
-        team: u8,
-        position: [f64; 3],
-        yaw: i32,
-    ) -> io::Result<Mover> {
+    pub(crate) fn player_spawn_mover(&self, body: u64, team: u8) -> io::Result<Mover> {
+        let (position, yaw) = self
+            .map
+            .spawn_point(team, 0)
+            .ok_or_else(|| invalid("no spawn for the selected hero"))?;
+        let yaw = (yaw * 65536.0 / 360.0).round_ties_even() as i32;
         let contacts = self.contacts.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -398,7 +395,7 @@ mod tests {
     use crate::game_bots::BOT_ENTITY;
 
     #[test]
-    #[ignore = "requires the baseline 104319 Practice Range pack without bot VM graphs"]
+    #[ignore = "requires a prepared 104319 Practice Range pack without bot VM graphs"]
     fn stock_soldier_requires_more_vm_support_before_prepared_attach() {
         let runtime = PathBuf::from(std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap());
         let assets = SceneAssets::load(runtime).unwrap();
@@ -410,17 +407,19 @@ mod tests {
             entity: 0xa000_0101,
             body_filter: team_bit(0).unwrap(),
             frame: FIRST_TICK,
-            position: scene.map().spawn_point(0, 0).unwrap().0.map(snap),
+            pose: scene.player_spawn_mover(hero.body, 0).unwrap().pose(),
             quanta: RETAIL_QUANTA,
         };
         let Err(blocked) = scene.owner_body_runtime(hero, spawn) else {
             panic!("the stock owner VM was expected to require more graph support");
         };
         assert_eq!(blocked.kind(), io::ErrorKind::Unsupported);
-        assert!(
-            blocked.to_string().contains("initialization diagnostics"),
-            "{blocked}"
-        );
+        let first_blocker = if assets.graphs.bodies()[&hero.body].target_tags.is_some() {
+            "UnsupportedAction(\"STUStatescriptActionEffect\")"
+        } else {
+            "UnsupportedConfig(\"STU_AC829876\")"
+        };
+        assert!(blocked.to_string().contains(first_blocker), "{blocked}");
         let tracer = scene.heroes().find_hero("Tracer").unwrap();
         assert!(scene.owner_body_runtime(tracer, spawn).unwrap().is_none());
     }

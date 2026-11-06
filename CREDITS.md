@@ -79,6 +79,10 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
   the operands for the instance exit, absent AI state and zero-resource lookup. Local client
   155284 inspection provides the queued exit, parent completion and typed zero return evidence.
   The frozen 104319 state decoder and runtime provide finish-event and teardown comparisons.
+- The build 104319 graph and codec tables corroborate the movement sampler's authored fields
+  and 13-bit owner payload. Local 155284 client inspection identifies its movement-record inputs,
+  changed-output writes and embedded record at owner context construction. The frozen 104319 mover
+  provides a separate comparison for the airborne, crouch, ground-contact and jump flags.
 - **The Claudewatch contributors** supplied the Beta 1.0.0.3 research lead for attacker-side hit-confirm effects
   and separate entity and announcer voice messages. ORPHEUS checks these leads against 104319 client data before
   implementing them. The reference is a locally reviewed binary distribution.

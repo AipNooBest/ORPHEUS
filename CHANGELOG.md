@@ -923,3 +923,10 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Completed the direct-owner AI state through the same-time finish queue when the world confirms no AI control entity. Added the typed zero asset returned by the fieldless resource lookup. The 104319 graph shapes match the local archive references, and later client inspection corroborates the execution paths.
 - The tagged Soldier startup retires instances 9 and 25 while retaining the allocated ID 26. Its preflight goes from 4 diagnostics to 1, the movement-record sampler at `01C7`, node `7`. Stock weapon attachment and original-client acceptance remain pending.
 - Passed 314 public Rust tests, 59 tagged base-runtime checks and 55 tagged enriched-runtime checks. The untagged bundle also passed the owner startup regression. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.
+
+#### Rust owner movement sampling
+
+- Started the authored movement sampler from the same mover used for the selected body's spawn, then fed it actual posed input and collision results. Unposed script time retains the latest movement record.
+- Reused the 104319 owner flags codec and updated only changed authored outputs. The regular mover provides stance, velocity, throttle, ground contact and jump facts. Scripted movement, foreign targets and linked sampler events still need support.
+- Used the embedded standing record at fresh owner construction based on the later client's constructor. The exact 104319 startup context still needs original-client evidence. Tagged Soldier startup reaches the crouch effect action at `01C7`, node `74`. Stock weapon attachment and client acceptance remain pending.
+- Passed 317 public Rust tests, 59 tagged base-runtime checks and 55 tagged enriched-runtime checks. The untagged bundle also passed the owner startup regression. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.

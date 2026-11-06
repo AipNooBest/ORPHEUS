@@ -10,14 +10,14 @@ use crate::{
 };
 
 const JUMP_LATCH: u32 = 0x1;
-const CROUCHED: u32 = 0x2;
-const JUMPED: u32 = 0x4;
+pub(crate) const CROUCHED: u32 = 0x2;
+pub(crate) const JUMPED: u32 = 0x4;
 const FELL: u32 = 0x8;
 const REAL_JUMP: u32 = 0x400;
 pub(crate) const TOUCHING: u32 = 0x20000;
-const NOT_GROUND_UNDER: u32 = 0x80000;
+pub(crate) const NOT_GROUND_UNDER: u32 = 0x80000;
 const TURN_HELD: u32 = 0x200000;
-const IN_AIR: u32 = 0x80000c;
+pub(crate) const IN_AIR: u32 = 0x80000c;
 
 const SPRING_REST: f32 = 1.0 / 512.0;
 const SPRING_STEPS: f32 = 32768.0;
