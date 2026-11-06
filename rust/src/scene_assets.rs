@@ -222,6 +222,7 @@ impl SceneAssets {
                     self.pools.hero_pools(hero.guid),
                     controller_on_fire,
                     OwnerBodySpawn {
+                        slot: 0,
                         controller: 0xa000_0100,
                         entity: 0xa000_0101,
                         body_filter: team_bit(0).map_err(|error| error.to_string())?,
@@ -403,6 +404,7 @@ mod tests {
         assert!(scene.movement_ready());
         let hero = scene.heroes().get(SOLDIER).unwrap();
         let spawn = OwnerBodySpawn {
+            slot: 0,
             controller: 0xa000_0100,
             entity: 0xa000_0101,
             body_filter: team_bit(0).unwrap(),

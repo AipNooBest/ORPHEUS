@@ -219,12 +219,9 @@ pub struct Impact {
 
 impl HitscanShot {
     pub fn from_command(origin: Vec3, command: &Command, reach: f64, hit: HitDefinition) -> Self {
-        let (yaw, pitch) = command.aim();
-        let (y_sin, y_cos) = (f64::from(yaw) * ANGLE_STEP).sin_cos();
-        let (p_sin, p_cos) = (f64::from(pitch) * ANGLE_STEP).sin_cos();
         Self {
             origin,
-            direction: [y_sin * p_cos, -p_sin, y_cos * p_cos],
+            direction: aim_direction(command),
             reach: if reach == 0.0 { DEFAULT_REACH } else { reach },
             hit,
         }
@@ -274,6 +271,13 @@ impl HitscanShot {
             loadout: self.hit.loadout,
         }))
     }
+}
+
+pub(crate) fn aim_direction(command: &Command) -> Vec3 {
+    let (yaw, pitch) = command.aim();
+    let (y_sin, y_cos) = (f64::from(yaw) * ANGLE_STEP).sin_cos();
+    let (p_sin, p_cos) = (f64::from(pitch) * ANGLE_STEP).sin_cos();
+    [y_sin * p_cos, -p_sin, y_cos * p_cos]
 }
 
 #[cfg(test)]

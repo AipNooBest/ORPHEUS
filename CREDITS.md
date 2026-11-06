@@ -83,6 +83,9 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
   and 13-bit owner payload. Local 155284 client inspection identifies its movement-record inputs,
   changed-output writes and embedded record at owner context construction. The frozen 104319 mover
   provides a separate comparison for the airborne, crouch, ground-contact and jump flags.
+- The frozen `ow174/game/projectiles.py` and `ow174/game/combat.py` provide the owner projectile
+  lease, exact packet acknowledgement, release and swept flight references. The local build 104319
+  Soldier weapon graph supplies Helix's authored lifetime, direct damage and splash settings.
 - **The Claudewatch contributors** supplied the Beta 1.0.0.3 research lead for attacker-side hit-confirm effects
   and separate entity and announcer voice messages. ORPHEUS checks these leads against 104319 client data before
   implementing them. The reference is a locally reviewed binary distribution.

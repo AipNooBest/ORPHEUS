@@ -11,15 +11,17 @@ use serde_json::Value as Json;
 use crate::{
     accounts::parse_guid,
     commands::Command,
-    game_combat::{PosedHitscan, eye_height},
+    game_combat::{PosedHitscan, PosedProjectile, PosedShot, eye_height},
     game_content::PRACTICE_RANGE_MODE,
     game_heroes::{Hero, SOLDIER},
-    game_hitscan::HitDefinition,
+    game_hitscan::{HitDefinition, aim_direction},
     game_instance::RETAIL_QUANTA,
     game_pools::{BODY_GRAPH, FALLBACK_POOLS, HealthPools},
+    game_projectiles::{ProjectileLeases, authored_number, local_prediction, predicted_sync},
     game_replication::{BodyStep, OwnerBodyRuntime},
     mover::{Mover, sample_movement_flags},
     mover_modifiers::{Modifier, ModifierKey},
+    projectile_flight::ProjectileBallistics,
     script_codecs::CodecTable,
     script_expr::{EntityRelation, native_shape, to_float, valid_entity},
     script_graph::GraphStore,
@@ -36,6 +38,7 @@ pub(crate) struct OwnerBodySpawn {
     pub controller: u32,
     pub entity: u32,
     pub body_filter: u64,
+    pub slot: u8,
     pub frame: u32,
     pub pose: Movement,
     pub quanta: u32,
@@ -139,11 +142,21 @@ impl PlayerBodyFactory {
         let modifiers = component
             .movement_modifiers(&mut world)
             .map_err(unsupported)?;
+        let leases = ProjectileLeases::from_authored(
+            &self.graphs,
+            component.snapshot().expect("body startup has a snapshot"),
+            spawn.slot,
+            spawn.frame,
+            |instance, raw, config| {
+                component.evaluate_state_config(instance, raw, config, &mut world)
+            },
+        )?;
         Ok(PlayerBodyRuntime {
             component,
             world,
             codecs: Arc::clone(&self.codecs),
             modifiers,
+            leases,
             frame: spawn.frame,
         })
     }
@@ -154,6 +167,7 @@ pub(crate) struct PlayerBodyRuntime {
     world: BodyWorld,
     codecs: Arc<CodecTable>,
     modifiers: Option<BTreeMap<ModifierKey, Modifier>>,
+    leases: ProjectileLeases,
     frame: u32,
 }
 
@@ -219,7 +233,11 @@ impl OwnerBodyRuntime for PlayerBodyRuntime {
         self.modifiers.as_ref()
     }
 
-    fn take_hitscan(&mut self, command: Option<Command>, mover: &Mover) -> Vec<PosedHitscan> {
+    fn projectile_leases(&self) -> Option<&ProjectileLeases> {
+        (!self.leases.blocks().is_empty()).then_some(&self.leases)
+    }
+
+    fn take_shots(&mut self, command: Option<Command>, mover: &Mover) -> Vec<PosedShot> {
         let shots = self.component.take_shots().unwrap_or_default();
         let Some(command) = command else {
             return Vec::new();
@@ -236,7 +254,43 @@ impl OwnerBodyRuntime for PlayerBodyRuntime {
                 };
                 let speed = node.field("m_projectileSpeed").unwrap_or(&Json::Null);
                 if !speed.is_null() && to_float(&evaluate(speed).ok()?) != 0.0 {
-                    return None;
+                    // The match flight handles one straight, owner-predicted projectile per shot.
+                    if !node.is_networked()
+                        || !local_prediction(node)
+                        || !predicted_sync(node, &mut evaluate).ok()?
+                        || node
+                            .field("m_projectileMotions")
+                            .is_some_and(|v| !v.is_null())
+                        || node.field("m_aimID").is_some_and(|v| !v.is_null())
+                        || authored_number(
+                            node.field("m_numProjectilesPerShot"),
+                            1.0,
+                            &mut evaluate,
+                        )
+                        .ok()?
+                            != 1.0
+                    {
+                        return None;
+                    }
+                    let ballistics =
+                        ProjectileBallistics::from_authored(node, &mut evaluate).ok()??;
+                    let definition = ballistics.definition?;
+                    self.leases.entity(definition, shot.frame, 0)?;
+                    if (ballistics.direct.is_none() && ballistics.blast.is_none())
+                        || ballistics.direct.is_some_and(|hit| hit.amount <= 0.0)
+                        || ballistics
+                            .blast
+                            .as_ref()
+                            .is_some_and(|blast| blast.hit.amount <= 0.0)
+                    {
+                        return None;
+                    }
+                    return Some(PosedShot::Projectile(PosedProjectile {
+                        shot,
+                        ballistics,
+                        origin,
+                        direction: aim_direction(&command),
+                    }));
                 }
                 let hit = HitDefinition::from_authored(node.field("m_6396149F")?, &mut evaluate)
                     .ok()??;
@@ -249,14 +303,14 @@ impl OwnerBodyRuntime for PlayerBodyRuntime {
                 } else {
                     to_float(&evaluate(reach).ok()?)
                 };
-                Some(PosedHitscan {
+                Some(PosedShot::Hitscan(PosedHitscan {
                     source: shot.entity,
                     origin,
                     command,
                     shot_frame: shot.frame,
                     reach,
                     hit,
-                })
+                }))
             })
             .collect()
     }
@@ -514,6 +568,7 @@ pub(crate) fn fixture_body_factory() -> (PlayerBodyFactory, OwnerBodySpawn) {
         controller: 0xa000_0100,
         entity: 0xa000_0101,
         body_filter: crate::match_scene::team_bit(0).unwrap(),
+        slot: 0,
         frame: 100,
         pose: Movement {
             position: [1.0, 2.0, 3.0],
@@ -538,8 +593,48 @@ pub(crate) fn fixture_body_factory() -> (PlayerBodyFactory, OwnerBodySpawn) {
 pub(crate) fn fixture_hitscan_factory(damage: f64) -> PlayerBodyFactory {
     use serde_json::json;
 
+    fixture_volley_factory(
+        20,
+        false,
+        json!({
+            "m_A17BE89B":2,"m_numShotsPerSecond":9,"m_FEC435C6":180,
+            "m_6396149F":{"m_modifyHealth":{"m_amount":damage},"m_A872C70E":2}
+        }),
+    )
+}
+
+#[cfg(test)]
+pub(crate) const FIXTURE_PROJECTILE_DEFINITION: u64 = 0x0400_0000_0000_072c;
+
+#[cfg(test)]
+pub(crate) fn fixture_projectile_factory(damage: f64) -> PlayerBodyFactory {
+    fixture_volley_factory(29, true, fixture_projectile_fields(damage))
+}
+
+#[cfg(test)]
+fn fixture_projectile_fields(damage: f64) -> Json {
+    serde_json::json!({
+        "m_A17BE89B":1,"m_numShotsPerSecond":1,"m_FEC435C6":100,
+        "m_45271E8C":true,"m_numProjectilesPerShot":1,
+        "m_projectileSpeed":50,"m_projectileLifetime":2,
+        "m_projectileEntity":{"$":"STUStatescriptWeaponProjectileEntity","m_A9A62FD0":1,
+            "m_entityDef":{"$":"STU_8556841E","m_EE729DCB":0,"m_resourceKey":null,
+                "m_entityDef":format!("0x{FIXTURE_PROJECTILE_DEFINITION:016X}")}},
+        "m_6396149F":{"m_modifyHealth":{"m_amount":damage}},
+        "m_D2D11CE9":{"m_modifyHealth":{"m_amount":80.0},"m_0D30E40C":[
+            {"m_radius":1,"m_B399CACB":1},
+            {"m_radius":3,"m_B399CACB":0.5}]}
+    })
+}
+
+#[cfg(test)]
+fn fixture_volley_factory(button: u8, networked: bool, mut volley: Json) -> PlayerBodyFactory {
+    use serde_json::json;
+
+    volley["m_2BBEEAB8"] = json!(true);
+    let remote = if networked { json!([2]) } else { json!([]) };
     let graph = json!({
-        "index":42,"items":3,"states":[1,2],"entries":[0],"remote":[],
+        "index":42,"items":3,"states":[1,2],"entries":[0],"remote":remote,
         "sync_vars":[],"containers":{},"unknown_nodes":[],"fields":{"m_680A2CB2":[0]},
         "header":{"m_nodesBitCount":4,"m_statesBitCount":4,
             "m_remoteSyncNodesBitCount":4,"m_syncVarsBitCount":4},
@@ -549,18 +644,22 @@ pub(crate) fn fixture_hitscan_factory(damage: f64) -> PlayerBodyFactory {
                 "m_outPlug":{"$":"Plug","links":[[1,"m_beginPlug"]],"m_FF3DAF1E":[]}}},
             {"pos":1,"class":"STUStatescriptStateLogicalButton","uid":1,"rid":1,"remote":-1,
                 "state":0,"client_only":false,"server_only":true,"fields":{
-                "m_2BBEEAB8":true,"m_logicalButton":20,
+                "m_2BBEEAB8":true,"m_logicalButton":button,
                 "m_onGoingDownPlug":{"$":"Plug","links":[[2,"m_beginPlug"]],"m_FF3DAF1E":[]}}},
-            {"pos":2,"class":"STUStatescriptStateWeaponVolley","uid":2,"rid":2,"remote":-1,
-                "state":1,"client_only":false,"server_only":true,"fields":{
-                "m_2BBEEAB8":true,"m_A17BE89B":2,"m_numShotsPerSecond":9,
-                "m_FEC435C6":180,"m_6396149F":{"m_modifyHealth":{"m_amount":damage},"m_A872C70E":2}}}
+            {"pos":2,"class":"STUStatescriptStateWeaponVolley","uid":2,"rid":2,
+                "remote":if networked { 0 } else { -1 },
+                "state":1,"client_only":false,"server_only":!networked,"fields":volley}
         ]
     });
     let bundle = json!({"version":1,"missing":[],"graphs":[graph],"bodies":{}});
     let mut factory = fixture_body_factory().0;
     factory.graphs =
         Arc::new(GraphStore::from_json(&serde_json::to_vec(&bundle).unwrap()).unwrap());
+    if networked {
+        factory.codecs = Arc::new(
+            CodecTable::from_json(include_str!("../../data/statescript_codecs_174.json")).unwrap(),
+        );
+    }
     factory.roots = vec![Root::new(1, 42)];
     factory
 }
@@ -1095,8 +1194,8 @@ mod tests {
             pitch: 30,
             ..Command::default()
         };
-        let shots = runtime.take_hitscan(Some(command), &mover);
-        let [shot] = shots.as_slice() else {
+        let shots = runtime.take_shots(Some(command), &mover);
+        let [PosedShot::Hitscan(shot)] = shots.as_slice() else {
             panic!("expected the opening shot")
         };
         assert_eq!(shot.source, spawn.entity);
@@ -1107,7 +1206,7 @@ mod tests {
             (shot.reach, shot.hit.amount, shot.hit.critical),
             (180.0, 20.0, 2.0)
         );
-        assert!(runtime.take_hitscan(Some(command), &mover).is_empty());
+        assert!(runtime.take_shots(Some(command), &mover).is_empty());
 
         runtime
             .advance(command, &mover, BodyStep::UnposedBoundary)
@@ -1123,8 +1222,104 @@ mod tests {
         runtime
             .advance(timer, &mover, BodyStep::UnposedTimer)
             .unwrap();
-        assert!(runtime.take_hitscan(None, &mover).is_empty());
-        assert!(runtime.take_hitscan(Some(timer), &mover).is_empty());
+        assert!(runtime.take_shots(None, &mover).is_empty());
+        assert!(runtime.take_shots(Some(timer), &mover).is_empty());
+    }
+
+    #[test]
+    fn secondary_volley_uses_authored_projectile_and_owner_lease() {
+        let factory = fixture_projectile_factory(40.0);
+        let (_, mut spawn) = fixture_body_factory();
+        spawn.slot = 2;
+        let mover = Mover::new(
+            MoverSettings::default(),
+            Arc::new(ContactWorld::new(Vec::new()).unwrap()),
+            spawn.pose.position,
+            0,
+            0x18,
+        )
+        .unwrap();
+        let fire = Command {
+            frame: spawn.frame + 1,
+            buttons: crate::commands::SECONDARY,
+            yaw: 16384,
+            ..Command::default()
+        };
+        let mut runtime = factory.start(spawn).unwrap();
+        assert_eq!(
+            runtime.projectile_leases().unwrap().entity(
+                FIXTURE_PROJECTILE_DEFINITION,
+                fire.frame,
+                0
+            ),
+            Some(0xa210_0065)
+        );
+        runtime.advance(fire, &mover, BodyStep::Posed).unwrap();
+        let shots = runtime.take_shots(Some(fire), &mover);
+        let [PosedShot::Projectile(rocket)] = shots.as_slice() else {
+            panic!("expected a predicted rocket");
+        };
+        assert_eq!(
+            (rocket.shot.entity, rocket.shot.frame),
+            (spawn.entity, fire.frame)
+        );
+        assert_eq!((rocket.shot.instance, rocket.shot.raw_state), (1, 1));
+        assert_eq!(rocket.origin, [1.0, 3.55, 3.0]);
+        assert_eq!(rocket.direction, aim_direction(&fire));
+        assert_eq!(
+            rocket.ballistics.definition,
+            Some(FIXTURE_PROJECTILE_DEFINITION)
+        );
+        assert_eq!(
+            (rocket.ballistics.speed, rocket.ballistics.lifetime),
+            (50.0, 2.0)
+        );
+        assert_eq!(rocket.ballistics.direct.unwrap().amount, 40.0);
+        assert_eq!(rocket.ballistics.blast.as_ref().unwrap().hit.amount, 80.0);
+        assert!(runtime.take_shots(Some(fire), &mover).is_empty());
+
+        let encoder = runtime.encoder();
+        let owner = encoder
+            .project(runtime.snapshot().unwrap(), View::Owner)
+            .unwrap();
+        assert_eq!(
+            owner.volley_identity(1, 1),
+            Some((rocket.shot.activation, rocket.shot.activation_ms))
+        );
+    }
+
+    #[test]
+    fn unsupported_projectile_modes_do_not_become_hitscan_or_straight_damage() {
+        use serde_json::json;
+
+        let (_, spawn) = fixture_body_factory();
+        let mover = Mover::new(
+            MoverSettings::default(),
+            Arc::new(ContactWorld::new(Vec::new()).unwrap()),
+            spawn.pose.position,
+            0,
+            0x18,
+        )
+        .unwrap();
+        let fire = Command {
+            frame: spawn.frame + 1,
+            buttons: crate::commands::SECONDARY,
+            ..Command::default()
+        };
+        for (field, value) in [
+            ("m_45271E8C", json!(false)),
+            ("m_projectileMotions", json!([{"$":"STU_E1A5B579"}])),
+            ("m_numProjectilesPerShot", json!(2)),
+            ("m_6396149F", json!({"m_modifyHealth":{"m_amount":-1.0}})),
+        ] {
+            let mut fields = fixture_projectile_fields(40.0);
+            fields[field] = value;
+            let mut runtime = fixture_volley_factory(29, true, fields)
+                .start(spawn)
+                .unwrap();
+            runtime.advance(fire, &mover, BodyStep::Posed).unwrap();
+            assert!(runtime.take_shots(Some(fire), &mover).is_empty(), "{field}");
+        }
     }
 
     #[test]

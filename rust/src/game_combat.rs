@@ -8,12 +8,14 @@ use std::{io, time::Duration};
 
 use crate::{
     commands::Command,
-    game_bots::{BOT_ENTITY, BOT_RECORD_DELAY, BOT_RESPAWN_TIME},
+    game_bots::{BOT_ENTITY, BOT_RECORD_DELAY, BOT_RESPAWN_TIME, Bot},
     game_combat_messages::CombatNotice,
     game_heroes::SOLDIER,
-    game_hitscan::{HitDefinition, HitscanShot, TargetHistory, ViewFrame},
+    game_hitscan::{HitDefinition, HitscanShot, Impact, TargetHistory, ViewFrame},
     match_scene::bot_create,
+    projectile_flight::{FlightEnd, ProjectileBallistics, ProjectileFlight},
     scene_assets::PreparedScene,
+    script_init::ShotEvent,
     vitals::{Death, Vitals},
     world::{EntityUpdate, Operation},
 };
@@ -34,6 +36,18 @@ pub(crate) struct PosedHitscan {
     pub shot_frame: u32,
     pub reach: f64,
     pub hit: HitDefinition,
+}
+
+pub(crate) enum PosedShot {
+    Hitscan(PosedHitscan),
+    Projectile(PosedProjectile),
+}
+
+pub(crate) struct PosedProjectile {
+    pub shot: ShotEvent,
+    pub ballistics: ProjectileBallistics,
+    pub origin: [f64; 3],
+    pub direction: [f64; 3],
 }
 
 #[derive(Clone, Copy)]
@@ -106,15 +120,14 @@ impl Combat {
     ) -> io::Result<Option<BotHit>> {
         let view = ViewFrame::from_command(&shot.command, context.quanta);
         let ray = HitscanShot::from_command(shot.origin, &shot.command, shot.reach, shot.hit);
+        let free_for_all = scene.map().free_for_all;
         let candidates = scene
             .bots()
             .iter()
             .zip(&self.targets)
             .filter_map(|(bot, target)| {
-                if bot.dead
-                    || bot.entity == shot.source
+                if !eligible_bot(bot, shot.source, context.team, free_for_all)
                     || !visible(bot.entity)
-                    || (!scene.map().free_for_all && bot.spawn.team == context.team)
                 {
                     return None;
                 }
@@ -131,22 +144,60 @@ impl Combat {
         else {
             return Ok(None);
         };
+        Ok(self.apply_bot_impact(scene, shot.source, shot.shot_frame, context, &impact))
+    }
+
+    pub(crate) fn step_projectile(
+        &mut self,
+        scene: &mut PreparedScene,
+        source: u32,
+        flight: &mut ProjectileFlight,
+        context: ShotContext,
+        hits: &mut Vec<BotHit>,
+    ) -> io::Result<Option<FlightEnd>> {
+        let free_for_all = scene.map().free_for_all;
+        let candidates: Vec<_> = scene
+            .bots()
+            .iter()
+            .filter(|bot| eligible_bot(bot, source, context.team, free_for_all))
+            .map(|bot| (bot.entity, scene.bot_target(bot)))
+            .collect();
+        let end = flight
+            .advance(context.tick, &candidates, |origin, direction, reach| {
+                scene.hitscan_wall(origin, direction, reach)
+            })
+            .map_err(io::Error::other)?;
+        if let Some(end) = &end {
+            hits.extend(end.impacts.iter().filter_map(|impact| {
+                self.apply_bot_impact(scene, source, context.tick, context, impact)
+            }));
+        }
+        Ok(end)
+    }
+
+    fn apply_bot_impact(
+        &mut self,
+        scene: &mut PreparedScene,
+        source: u32,
+        shot_frame: u32,
+        context: ShotContext,
+        impact: &Impact,
+    ) -> Option<BotHit> {
         let (bot, target) = scene
             .bots_mut()
             .iter_mut()
             .zip(&mut self.targets)
-            .find(|(bot, _)| bot.entity == impact.entity)
-            .expect("hitscan selected a current bot");
+            .find(|(bot, _)| !bot.dead && bot.entity == impact.entity)?;
         let result = target.vitals.damage(
             impact.damage,
             Death {
                 time: context.now.as_secs_f64(),
                 frame: context.tick,
-                killer: shot.source,
+                killer: source,
             },
         );
         if result.dealt == 0.0 {
-            return Ok(None);
+            return None;
         }
         if result.killed {
             bot.died(context.tick);
@@ -158,22 +209,22 @@ impl Combat {
             ..EntityUpdate::default()
         };
         target.vitals.clear_changed();
-        Ok(Some(BotHit {
+        Some(BotHit {
             notices: [
                 Some(CombatNotice::Hit {
                     target: bot.entity,
                     dealt: result.dealt,
                     critical: impact.critical,
                     killed: result.killed,
-                    shot_frame: shot.shot_frame,
+                    shot_frame,
                 }),
                 result.killed.then_some(CombatNotice::Elimination {
-                    killer: shot.source,
+                    killer: source,
                     victim: bot.entity,
                 }),
             ],
             health,
-        }))
+        })
     }
 
     pub(crate) fn respawn_due(
@@ -212,6 +263,10 @@ impl Combat {
             })
             .collect())
     }
+}
+
+fn eligible_bot(bot: &Bot, source: u32, team: u8, free_for_all: bool) -> bool {
+    !bot.dead && bot.entity != source && (free_for_all || bot.spawn.team != team)
 }
 
 #[cfg(test)]

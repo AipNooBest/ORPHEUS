@@ -13,27 +13,29 @@ use crate::{
     commands::{Command, CommandQueue},
     game_body::{BodyCreate, BodyView, body_create, owner_pose},
     game_bots::BOT_RECORD_DELAY,
-    game_clock::{MAX_LEASE_FRAME, SEND_EVERY},
-    game_combat::{BotReplacement, PosedHitscan},
+    game_clock::{MAX_LEASE_FRAME, SEND_EVERY, TICK_PERIOD},
+    game_combat::{BotReplacement, PosedHitscan, PosedProjectile, PosedShot},
     game_controller::ControllerFrame,
     game_egress::{DeliveryReport, FrameRecords, GameEgress, RecordSource, SendError, SentFrame},
     game_heroes::{Hero, SOLDIER},
     game_messages::Message,
     game_parameters::{ClientGameMessage, HeroSelectRequest},
+    game_projectiles::{OwnerProjectiles, ProjectileDelivery, ProjectileLeases, ProjectileToken},
     match_scene::{PlayerAppearance, Possession, team_bit},
     mover::Mover,
     mover_correction::CorrectionHistory,
     mover_kinematics::Poses,
     mover_modifiers::{Modifier, ModifierKey},
+    projectile_flight::{FlightEnd, ProjectileFlight},
     scene_assets::PreparedScene,
     script_init::Snapshot,
     script_player::OwnerBodySpawn,
     script_snapshot_wire::{ProjectedSnapshot, SnapshotEncoder, View},
-    script_stream::{BodyStream, DeltaKind, ScriptChunk, Stream},
+    script_stream::{BodyStream, ChangeKey, DeltaKind, ScriptChunk, Stream},
     vitals::Vitals,
     world::{
-        Component as WorldComponent, EntityUpdate, GAME_MODE_ENTITY, LeaseBlock, MAX_PAYLOAD,
-        Operation, SkinTheme, frame,
+        Component as WorldComponent, EntityUpdate, GAME_MODE_ENTITY, MAX_PAYLOAD, Operation,
+        SkinTheme, frame,
     },
 };
 
@@ -79,15 +81,15 @@ pub(crate) trait OwnerBodyRuntime: Send {
         None
     }
 
-    fn leases(&self) -> &[LeaseBlock] {
-        &[]
+    fn projectile_leases(&self) -> Option<&ProjectileLeases> {
+        None
     }
 
     fn movement_modifiers(&self) -> Option<&BTreeMap<ModifierKey, Modifier>> {
         None
     }
 
-    fn take_hitscan(&mut self, _command: Option<Command>, _mover: &Mover) -> Vec<PosedHitscan> {
+    fn take_shots(&mut self, _command: Option<Command>, _mover: &Mover) -> Vec<PosedShot> {
         Vec::new()
     }
 }
@@ -106,6 +108,8 @@ struct BodyScript {
     frame: u32,
     unsent_delta: Option<(u32, DeltaKind)>,
     corrections: Option<CorrectionHistory>,
+    projectiles: Option<OwnerProjectiles>,
+    flights: Vec<(ProjectileToken, ProjectileFlight)>,
 }
 
 impl BodyScript {
@@ -122,6 +126,10 @@ impl BodyScript {
             .map_err(invalid)?;
         let corrections = (body.hero == SOLDIER && runtime.movement_modifiers().is_some())
             .then(|| CorrectionHistory::new(body.id.entity, body.id.generation));
+        let projectiles = runtime
+            .projectile_leases()
+            .filter(|leases| !leases.blocks().is_empty())
+            .map(|leases| OwnerProjectiles::new(body.id.entity, leases.clone()));
         Ok(Self {
             id: body.id,
             runtime,
@@ -129,6 +137,8 @@ impl BodyScript {
             frame,
             unsent_delta: None,
             corrections,
+            projectiles,
+            flights: Vec::new(),
         })
     }
 
@@ -152,7 +162,7 @@ impl BodyScript {
         if step == BodyStep::UnposedTimer {
             // Combat discards the neutral interval's reports at its boundary.
             // Drain interior reports early so a long gap cannot fill the VM queue.
-            self.runtime.take_hitscan(None, mover);
+            self.runtime.take_shots(None, mover);
             return Ok(Vec::new());
         }
         if let Some(modifiers) = self.runtime.movement_modifiers() {
@@ -167,9 +177,39 @@ impl BodyScript {
         {
             history.record(mover.pose());
         }
-        Ok(self
+        let mut hitscan = Vec::new();
+        for shot in self
             .runtime
-            .take_hitscan((step == BodyStep::Posed).then_some(command), mover))
+            .take_shots((step == BodyStep::Posed).then_some(command), mover)
+        {
+            match shot {
+                PosedShot::Hitscan(shot) => hitscan.push(shot),
+                PosedShot::Projectile(shot) => self.launch_projectile(shot),
+            }
+        }
+        Ok(hitscan)
+    }
+
+    fn launch_projectile(&mut self, projectile: PosedProjectile) {
+        let Some((projectiles, definition)) = self
+            .projectiles
+            .as_mut()
+            .zip(projectile.ballistics.definition)
+        else {
+            return;
+        };
+        let bound = (projectile.ballistics.lifetime / TICK_PERIOD.as_secs_f64()).ceil() as u32;
+        let Some(flight) = ProjectileFlight::new(
+            projectile.ballistics,
+            projectile.origin,
+            projectile.direction,
+            None,
+        ) else {
+            return;
+        };
+        if let Some(token) = projectiles.admit(projectile.shot, definition, bound) {
+            self.flights.push((token, flight));
+        }
     }
 
     fn next_record(&mut self, created: bool) -> io::Result<Option<(Record, Option<u32>)>> {
@@ -237,7 +277,24 @@ impl BodyScript {
     }
 
     fn sent(&mut self, last: u32) {
-        self.stream.sent(last);
+        if let Some((report, projectiles)) = self.stream.sent(last).zip(self.projectiles.as_mut()) {
+            projectiles.owner_sent(
+                last,
+                report.command_frame,
+                |instance, raw| {
+                    report
+                        .changes
+                        .contains(&ChangeKey::State(instance, raw))
+                        .then(|| report.snapshot.volley_identity(instance, raw))
+                        .flatten()
+                },
+                |instance, raw| {
+                    report
+                        .changes
+                        .contains(&ChangeKey::VolleyIntroduction(instance, raw))
+                },
+            );
+        }
         if self.unsent_delta.is_some_and(|(queued, _)| queued == last) {
             self.unsent_delta = None;
         }
@@ -268,6 +325,14 @@ enum Delivery {
         id: BodyId,
         last: u32,
         delta: bool,
+    },
+    ProjectileConfirm {
+        id: BodyId,
+        token: ProjectileToken,
+    },
+    ProjectileDestroy {
+        id: BodyId,
+        token: ProjectileToken,
     },
     Script {
         last: u32,
@@ -468,6 +533,7 @@ pub(crate) struct WorldDelivery {
     input: InputQueue,
     mover: Option<Mover>,
     body_script: Option<BodyScript>,
+    projectile_destroys: HashMap<u32, (BodyId, ProjectileToken)>,
     hitscan: Vec<PosedHitscan>,
 }
 
@@ -492,6 +558,7 @@ impl WorldDelivery {
             input: InputQueue::default(),
             mover: None,
             body_script: None,
+            projectile_destroys: HashMap::new(),
             hitscan: Vec::new(),
         }
     }
@@ -504,7 +571,8 @@ impl WorldDelivery {
         self.started = None;
         self.presentation_due = false;
         self.mover = None;
-        self.cancel_body_script();
+        self.body_script = None;
+        self.projectile_destroys.clear();
         self.input.clear();
         self.hitscan.clear();
     }
@@ -595,6 +663,15 @@ impl WorldDelivery {
                 .body_script
                 .as_ref()
                 .is_some_and(|script| script.id == id),
+            Delivery::ProjectileConfirm { id, token } => self
+                .body_script
+                .as_ref()
+                .filter(|script| script.id == id)
+                .and_then(|script| script.projectiles.as_ref())
+                .is_some_and(|projectiles| projectiles.confirmation_current(token, entity)),
+            Delivery::ProjectileDestroy { id, token } => {
+                self.projectile_destroys.get(&entity) == Some(&(id, token))
+            }
         }
     }
 
@@ -610,14 +687,18 @@ impl WorldDelivery {
                 }
                 match (packet.arrived, record.delivery) {
                     (arrived, Delivery::BodyScript { last, .. }) => {
-                        let stream = &mut self
-                            .body_script
-                            .as_mut()
-                            .expect("current body stream")
-                            .stream;
-                        if arrived {
-                            stream.arrived(last);
-                        } else if stream.lost(last).retry {
+                        let script = self.body_script.as_mut().expect("current body stream");
+                        let delivery = if arrived {
+                            script.stream.arrived(last)
+                        } else {
+                            script.stream.lost(last)
+                        };
+                        if let Some((projectiles, arrived)) =
+                            script.projectiles.as_mut().zip(delivery.owner_report)
+                        {
+                            projectiles.owner_arrival(last, arrived);
+                        }
+                        if delivery.retry {
                             retry.push(record);
                         }
                     }
@@ -654,6 +735,16 @@ impl WorldDelivery {
                                 Lifetime::ReusableAt(now.saturating_add(BODY_REUSE_DELAY)),
                             ),
                         );
+                    }
+                    (true, Delivery::ProjectileConfirm { token, .. }) => {
+                        self.body_script
+                            .as_mut()
+                            .and_then(|script| script.projectiles.as_mut())
+                            .expect("current projectile tracker")
+                            .create_arrived(token, record.update.entity);
+                    }
+                    (true, Delivery::ProjectileDestroy { .. }) => {
+                        self.projectile_destroys.remove(&record.update.entity);
                     }
                     (true, Delivery::Script { last, .. }) if record.update.entity == self.owner => {
                         self.controller.arrived(last);
@@ -710,6 +801,12 @@ impl WorldDelivery {
                                 script.id == id && script.stream.ready_to_send(last)
                             }) =>
                     {
+                        return None;
+                    }
+                    Delivery::ProjectileConfirm { id, .. }
+                        if self.bound != Some(id) || !self.created.contains(&id.entity) =>
+                    {
+                        // Even a fallback confirmation needs an acknowledged owner lease.
                         return None;
                     }
                     _ => {}
@@ -869,6 +966,10 @@ impl WorldDelivery {
             if let Some(mover) = &mut self.mover {
                 let frame = mover.pose().frame.unwrap_or(script.frame);
                 mover.track_modifiers(frame, &BTreeMap::new());
+            }
+            if let Some(projectiles) = &mut script.projectiles {
+                self.queue_projectiles(script.id, projectiles.retire())
+                    .expect("projectile retirement has no release payload");
             }
             self.remove_stale();
         }
@@ -1043,6 +1144,63 @@ impl WorldDelivery {
         std::mem::take(&mut self.hitscan)
     }
 
+    pub(crate) fn advance_projectiles(
+        &mut self,
+        tick: u32,
+        mut step: impl FnMut(u32, &mut ProjectileFlight) -> io::Result<Option<FlightEnd>>,
+    ) -> io::Result<()> {
+        let Some(script) = &mut self.body_script else {
+            return Ok(());
+        };
+        let Some(projectiles) = &mut script.projectiles else {
+            return Ok(());
+        };
+        let id = script.id;
+        let mut deliveries = Vec::new();
+        script
+            .flights
+            .retain_mut(|(token, flight)| match step(id.entity, flight) {
+                Ok(None) => true,
+                Ok(Some(end)) => {
+                    let travelled = (end.travelled / TICK_PERIOD.as_secs_f64()).ceil() as u32;
+                    projectiles.flight_ended(*token, travelled, tick);
+                    false
+                }
+                Err(_) => {
+                    projectiles.cancel(*token, &mut deliveries);
+                    false
+                }
+            });
+        deliveries.extend(projectiles.advance(tick));
+        self.queue_projectiles(id, deliveries)
+    }
+
+    fn queue_projectiles(
+        &mut self,
+        id: BodyId,
+        deliveries: Vec<ProjectileDelivery>,
+    ) -> io::Result<()> {
+        if deliveries.is_empty() {
+            return Ok(());
+        }
+        for delivery in deliveries {
+            let update = delivery.update().map_err(invalid)?;
+            let delivery = match delivery {
+                ProjectileDelivery::Confirm { token, .. } => {
+                    self.projectile_destroys.remove(&update.entity);
+                    Delivery::ProjectileConfirm { id, token }
+                }
+                ProjectileDelivery::Destroy { token, .. } => {
+                    self.projectile_destroys.insert(update.entity, (id, token));
+                    Delivery::ProjectileDestroy { id, token }
+                }
+            };
+            self.push(Record { update, delivery });
+        }
+        self.remove_stale();
+        Ok(())
+    }
+
     /// One unit per physics pose, unposed VM frame, pre-body command, or queued game message.
     /// A fresh frame is committed only after its final pose has completed.
     pub(crate) fn advance_input(
@@ -1193,6 +1351,7 @@ impl WorldDelivery {
             .owner_body_runtime(
                 hero,
                 OwnerBodySpawn {
+                    slot: u8::try_from(viewer.slot).map_err(invalid)?,
                     controller: self.owner,
                     entity,
                     body_filter,
@@ -1218,7 +1377,8 @@ impl WorldDelivery {
                 pose: Some(pose),
                 leases: script
                     .as_ref()
-                    .map_or(&[], |script| script.runtime.leases()),
+                    .and_then(|script| script.runtime.projectile_leases())
+                    .map_or(&[], ProjectileLeases::blocks),
             },
             scene.pools(),
         );
@@ -1878,6 +2038,66 @@ mod tests {
             egress.acknowledge(sequence + 1, u64::from(arrived)),
             Duration::ZERO,
         );
+    }
+
+    #[test]
+    fn projectile_retirement_retries_destroys_and_ignores_stale_confirmations() {
+        use crate::script_init::ShotEvent;
+
+        const DEFINITION: u64 = 0x0400_0000_0000_072c;
+        let id = avatar(1, 1);
+        let mut world = WorldDelivery::new(OWNER);
+        world.started = Some(100);
+        activate_script(&mut world, id, SOLDIER, Arc::default());
+        let leases = ProjectileLeases::new(0, 100, [DEFINITION]).unwrap();
+        let alias = leases.entity(DEFINITION, 101, 0).unwrap();
+        let mut projectiles = OwnerProjectiles::new(id.entity, leases);
+        let token = projectiles
+            .admit(
+                ShotEvent {
+                    entity: id.entity,
+                    instance: 1,
+                    graph: 42,
+                    raw_state: 0,
+                    frame: 101,
+                    time_ms: 101 * FRAME_MS,
+                    activation: 1,
+                    activation_ms: 101 * FRAME_MS,
+                    ordinal: 0,
+                },
+                DEFINITION,
+                125,
+            )
+            .unwrap();
+        let confirmation = projectiles.advance(133);
+        world.body_script.as_mut().unwrap().projectiles = Some(projectiles);
+        world.queue_projectiles(id, confirmation).unwrap();
+        let old = Arc::clone(&world.queued[0]);
+        assert!(
+            matches!(old.delivery, Delivery::ProjectileConfirm { id: source, token: key }
+            if source == id && key == token)
+        );
+        assert!(eligible(&world).is_empty());
+        world.created.insert(id.entity);
+        world.bound = Some(id);
+        assert_eq!(eligible(&world), [0]);
+        world.sent(&[0]);
+
+        world.cancel_body_script();
+        activate_script(&mut world, avatar(2, 2), SOLDIER, Arc::default());
+        world.acknowledge(outcome(old, false), Duration::ZERO);
+        let destroy = Arc::clone(&world.queued[0]);
+        assert_eq!(world.queued.len(), 1);
+        assert_eq!(destroy.update.entity, alias);
+        assert!(destroy.update.ch2.is_none());
+        assert!(matches!(destroy.update.operation, Some(Operation::Destroy)));
+        world.sent(&[0]);
+        world.acknowledge(outcome(Arc::clone(&destroy), false), Duration::ZERO);
+        assert_eq!(world.queued.len(), 1);
+        world.sent(&[0]);
+        world.acknowledge(outcome(destroy, true), Duration::ZERO);
+        assert!(world.queued.is_empty());
+        assert!(world.projectile_destroys.is_empty());
     }
 
     #[test]
