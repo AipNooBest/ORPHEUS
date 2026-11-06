@@ -23,7 +23,7 @@ use crate::{
     script_codecs::CodecTable,
     script_expr::{EntityRelation, native_shape, to_float, valid_entity},
     script_graph::GraphStore,
-    script_init::{Component, MAX_INIT_WORK, Root, Site, Snapshot, World},
+    script_init::{Component, MAX_INIT_WORK, Root, Site, Snapshot, TargetTagEffect, World},
     script_runtime::FRAME_MS,
     script_snapshot_wire::{SnapshotEncoder, View},
     script_wire::{Value, Variables},
@@ -118,6 +118,7 @@ impl PlayerBodyFactory {
             },
             pool_types_known: self.pools.is_some() || has_authored_pools,
             target_tags: self.target_tags.clone(),
+            target_tag_effects: BTreeMap::new(),
             controller_on_fire: self.controller_on_fire,
         };
         let mut component = Component::start(
@@ -267,7 +268,14 @@ struct BodyWorld {
     vitals: Vitals,
     pool_types_known: bool,
     target_tags: Option<BTreeSet<u64>>,
+    target_tag_effects: BTreeMap<u64, TargetTagCounts>,
     controller_on_fire: bool,
+}
+
+#[derive(Default)]
+struct TargetTagCounts {
+    grants: u32,
+    suppressions: u32,
 }
 
 impl World for BodyWorld {
@@ -353,7 +361,47 @@ impl World for BodyWorld {
         if !self.is_player_site(site) || entity != self.entity {
             return None;
         }
+        if let Some(counts) = self.target_tag_effects.get(&tag) {
+            return Some(counts.suppressions == 0);
+        }
         Some(self.target_tags.as_ref()?.contains(&tag))
+    }
+
+    fn set_target_tag_effect(&mut self, site: Site, effect: TargetTagEffect, active: bool) -> bool {
+        if !self.is_player_site(site) || effect.entity != self.entity {
+            return false;
+        }
+        let counts = if active {
+            self.target_tag_effects.entry(effect.tag).or_default()
+        } else {
+            let Some(counts) = self.target_tag_effects.get_mut(&effect.tag) else {
+                return false;
+            };
+            counts
+        };
+        // The authored removal can mask existing grants. A later grant's
+        // precedence over an already-active suppression is still unknown.
+        if active && effect.present && counts.suppressions != 0 {
+            return false;
+        }
+        let count = if effect.present {
+            &mut counts.grants
+        } else {
+            &mut counts.suppressions
+        };
+        let next = if active {
+            count.checked_add(1)
+        } else {
+            count.checked_sub(1)
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        *count = next;
+        if counts.grants == 0 && counts.suppressions == 0 {
+            self.target_tag_effects.remove(&effect.tag);
+        }
+        true
     }
 
     fn entity_filter_flags(&self, site: Site, entity: u32) -> Option<u64> {
@@ -572,6 +620,101 @@ mod tests {
             evaluate(&mut runtime, &branch),
             Err(EvalError::UnsupportedConfig("STU_A77AC2AC".into()))
         );
+    }
+
+    #[test]
+    fn target_tag_effects_restore_authored_tags_and_remaining_grants() {
+        let (mut factory, spawn) = fixture_body_factory();
+        let authored = 0x0d60_0000_0000_0042;
+        let tag = 0x0d60_0000_0000_0422;
+        factory.target_tags = Some(BTreeSet::from([authored]));
+        let world = &mut factory.start(spawn).unwrap().world;
+        let site = Site {
+            entity: spawn.entity,
+            instance: 1,
+            graph: 42,
+            node: Some(1),
+        };
+        let read = |world: &BodyWorld, tag| world.has_target_tag(site, spawn.entity, tag);
+        let grant = TargetTagEffect {
+            entity: spawn.entity,
+            tag,
+            present: true,
+        };
+        let suppress = TargetTagEffect {
+            present: false,
+            ..grant
+        };
+        let mask_authored = TargetTagEffect {
+            tag: authored,
+            ..suppress
+        };
+
+        assert_eq!(read(world, authored), Some(true));
+        assert!(world.set_target_tag_effect(site, mask_authored, true));
+        assert_eq!(read(world, authored), Some(false));
+        assert!(world.set_target_tag_effect(site, mask_authored, false));
+        assert_eq!(read(world, authored), Some(true));
+
+        assert_eq!(read(world, tag), Some(false));
+        for _ in 0..2 {
+            assert!(world.set_target_tag_effect(site, grant, true));
+        }
+        assert_eq!(read(world, tag), Some(true));
+        for _ in 0..2 {
+            assert!(world.set_target_tag_effect(site, suppress, true));
+        }
+        assert_eq!(read(world, tag), Some(false));
+        assert!(!world.set_target_tag_effect(site, grant, true));
+        assert!(world.set_target_tag_effect(site, grant, false));
+        assert!(world.set_target_tag_effect(site, suppress, false));
+        assert_eq!(read(world, tag), Some(false));
+        assert!(world.set_target_tag_effect(site, suppress, false));
+        assert_eq!(read(world, tag), Some(true));
+        assert!(world.set_target_tag_effect(site, grant, false));
+        assert_eq!(read(world, tag), Some(false));
+        assert!(!world.set_target_tag_effect(site, grant, false));
+    }
+
+    #[test]
+    fn target_tag_effects_keep_unknown_tags_and_replacement_independent() {
+        let (factory, spawn) = fixture_body_factory();
+        let tag = 0x0d60_0000_0000_0422;
+        let site = Site {
+            entity: spawn.entity,
+            instance: 1,
+            graph: 42,
+            node: Some(1),
+        };
+        let read = |world: &BodyWorld| world.has_target_tag(site, spawn.entity, tag);
+        let effect = TargetTagEffect {
+            entity: spawn.entity,
+            tag,
+            present: true,
+        };
+        let mut runtime = factory.start(spawn).unwrap();
+        assert_eq!(read(&runtime.world), None);
+        let foreign = TargetTagEffect {
+            entity: spawn.controller,
+            ..effect
+        };
+        assert!(!runtime.world.set_target_tag_effect(site, foreign, true));
+        assert!(runtime.world.set_target_tag_effect(site, effect, true));
+        assert_eq!(read(&runtime.world), Some(true));
+        assert_eq!(
+            runtime.world.has_target_tag(site, spawn.entity, tag + 1),
+            None
+        );
+
+        let replacement = factory
+            .start(OwnerBodySpawn {
+                frame: spawn.frame + 1,
+                ..spawn
+            })
+            .unwrap();
+        assert_eq!(read(&replacement.world), None);
+        assert!(runtime.world.set_target_tag_effect(site, effect, false));
+        assert_eq!(read(&runtime.world), None);
     }
 
     #[test]
@@ -975,6 +1118,7 @@ mod tests {
             vitals: Vitals::empty(),
             pool_types_known: true,
             target_tags: body.target_tags.clone(),
+            target_tag_effects: BTreeMap::new(),
             controller_on_fire: false,
         };
         let mut component = Component::start(
@@ -1039,6 +1183,35 @@ mod tests {
         );
         assert_eq!(body_pools.variables[&520], Value::Float(200.0));
         assert_eq!(world.vitals.component(), pools.vitals().component());
+        let target_tag = &snapshot.instances[&12].states[&31];
+        let effect = TargetTagEffect {
+            entity: world.entity,
+            tag: 0x0d60_0000_0000_0422,
+            present: true,
+        };
+        assert!(target_tag.active);
+        assert_eq!(
+            target_tag.kind,
+            StateKind::TargetTag {
+                effect: Some(effect)
+            }
+        );
+        let site = Site {
+            entity: world.entity,
+            instance: 12,
+            graph: 0x01c7,
+            node: Some(96),
+        };
+        assert_eq!(
+            world.has_target_tag(site, world.entity, effect.tag),
+            Some(true)
+        );
+        assert!(
+            !snapshot
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.site == site)
+        );
         let Value::Map(messages) = &snapshot.instances[&24].variables[&29859] else {
             panic!("the authored message table must be a map");
         };
@@ -1095,7 +1268,12 @@ mod tests {
                 frame_ms: FRAME_MS as u32,
             },
         ] {
-            for class in ["STU_CD46AF93", "STU_F5A99B2A", "STU_D9843704"] {
+            for class in [
+                "STU_CD46AF93",
+                "STU_F5A99B2A",
+                "STU_D9843704",
+                "STU_E56BA8D8",
+            ] {
                 let codec = codecs.codec(class).unwrap();
                 assert_eq!(codec.payload(&BTreeMap::new(), mode).unwrap().bit_len(), 0);
             }
@@ -1333,6 +1511,7 @@ mod tests {
                 vitals: Vitals::empty(),
                 pool_types_known: true,
                 target_tags: body.target_tags.clone(),
+                target_tag_effects: BTreeMap::new(),
                 controller_on_fire: false,
             };
             let component = Component::start(

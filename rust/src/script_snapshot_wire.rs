@@ -1136,6 +1136,7 @@ fn state_payload(state: &State, codec: &Codec) -> Option<StatePayload> {
         (
             StateKind::Plain
             | StateKind::HealthPool { .. }
+            | StateKind::TargetTag { .. }
             | StateKind::Wait
             | StateKind::AiCandidate { .. }
             | StateKind::MovementMod

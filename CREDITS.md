@@ -72,6 +72,9 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
 - The frozen Python `ow174/game/onfire.py` and Gamayun's `internal/vm/natives.go` document the
   possessor's component 64 on-fire lookup. Gamayun's `internal/expr/value.go` provides a comparison
   for ordered map values and first-match lookup.
+- The local build 104319 graphs exported with OWLib provide the single-tag grant and suppression
+  paths in `01C7`, `01CF` and `0251`. Locally reviewed build 104319 codec tables from Gamayun and
+  Boi-027's research corroborate the inherited empty payload for state `STU_E56BA8D8`.
 - **The Claudewatch contributors** supplied the Beta 1.0.0.3 research lead for attacker-side hit-confirm effects
   and separate entity and announcer voice messages. ORPHEUS checks these leads against 104319 client data before
   implementing them. The reference is a locally reviewed binary distribution.

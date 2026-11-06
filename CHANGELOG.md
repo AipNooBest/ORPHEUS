@@ -909,3 +909,10 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Used the inherited state lifecycle and empty payload for the verified zero-valued state on the human owner branch. Other values remain unverified.
 - Reduced tagged 104319 Soldier startup diagnostics from 8 to 5. The first remaining operation is `STU_22926252` at `08B6`, node `11`. Stock weapon attachment and original-client acceptance remain pending.
 - Passed 308 public Rust tests, 59 tagged base-runtime checks and 55 tagged enriched-runtime checks. The untagged bundle also passed the owner startup regression. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.
+
+#### Rust target tag state lifetimes
+
+- Applied the single literal target-tag grant and suppression states from build 104319 to the owner body's shared tag lookup. State end and instance teardown release the effect. Overlapping supported effects preserve the authored base tags, and body replacement starts with fresh effects. A grant during an active suppression and changes to a foreign entity remain unverified.
+- Verified the stock Soldier graph grants tag `0422` at `01C7`, node `96` with or without a base tag list. Its state uses the inherited empty payload. The tagged 104319 preflight drops from 5 diagnostics to 4. The first remains `STU_22926252` at `08B6`, node `11`. Stock weapon attachment and original-client acceptance remain pending.
+- Clarified that the Python server stays frozen and is retired when Rust exceeds its verified coverage and passes cutover acceptance.
+- Passed 311 public Rust tests, 59 tagged base-runtime checks and 55 tagged enriched-runtime checks. The untagged bundle also passed the owner startup regression. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.

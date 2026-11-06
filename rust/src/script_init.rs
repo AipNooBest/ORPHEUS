@@ -146,6 +146,13 @@ pub struct Site {
     pub node: Option<u16>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TargetTagEffect {
+    pub entity: u32,
+    pub tag: u64,
+    pub present: bool,
+}
+
 /// External authored queries for this initialization. The caller owns mode,
 /// ruleset, and entity data and can decline a query without guessing its value.
 pub trait World {
@@ -196,6 +203,15 @@ pub trait World {
         None
     }
 
+    fn set_target_tag_effect(
+        &mut self,
+        _site: Site,
+        _effect: TargetTagEffect,
+        _active: bool,
+    ) -> bool {
+        false
+    }
+
     fn entity_filter_flags(&self, _site: Site, _entity: u32) -> Option<u64> {
         None
     }
@@ -241,6 +257,9 @@ pub enum StateKind {
     Plain,
     HealthPool {
         pool: Option<u32>,
+    },
+    TargetTag {
+        effect: Option<TargetTagEffect>,
     },
     BooleanSwitch(bool),
     DelayedSwitch {
@@ -2413,6 +2432,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             "STUStatescriptStateHealthPool" if is_base_health_pool(node) => {
                 StateKind::HealthPool { pool: None }
             }
+            "STU_E56BA8D8" if node.is_networked() && node.remote == -1 => {
+                StateKind::TargetTag { effect: None }
+            }
             "STUStatescriptStateBooleanSwitch" => StateKind::BooleanSwitch(false),
             "STU_B591EBFE" => StateKind::DelayedSwitch {
                 current: false,
@@ -2473,6 +2495,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         match kind {
             StateKind::GamePadVibration => self.post(id, Event::Finish(key.raw))?,
             StateKind::HealthPool { .. } => self.begin_health_pool(key, node)?,
+            StateKind::TargetTag { .. } => self.begin_target_tag(key, node)?,
             StateKind::BooleanSwitch(_) => {
                 let Some(value) =
                     self.evaluate(id, node, field(&node.fields, "m_condition"), Some(key))
@@ -2539,6 +2562,43 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         self.follow(id, node, "m_onBeginPlug", Some(key), depth)?;
         self.follow(id, node, "m_subgraphPlug", Some(key), depth)?;
         self.try_complete(key, node, depth)
+    }
+
+    fn begin_target_tag(&mut self, key: StateKey, node: &Node) -> Result<(), InitFault> {
+        let site = self.site(key.instance, node);
+        let add = field(&node.fields, "m_targetTags");
+        let suppress = field(&node.fields, "m_44D1BE94");
+        let (literal, present) = match (add.is_null(), suppress.is_null()) {
+            (false, true) => (add, true),
+            (true, false) => (suppress, false),
+            _ => {
+                self.report(site, Issue::UnsupportedField("target tag operands"));
+                return Ok(());
+            }
+        };
+        let Some(tag) = script_expr::target_tag_config(literal).filter(|&tag| tag != 0) else {
+            self.report(site, Issue::UnsupportedField("target tag literal"));
+            return Ok(());
+        };
+        let Some(Value::Entity(entity)) =
+            self.evaluate(key.instance, node, field(&node.fields, "m_31714AFC"), None)
+        else {
+            self.report(site, Issue::UnsupportedField("target tag entity"));
+            return Ok(());
+        };
+        let effect = TargetTagEffect {
+            entity,
+            tag,
+            present,
+        };
+        if !self.world.set_target_tag_effect(site, effect, true) {
+            self.report(site, Issue::UnsupportedField("target tag effect"));
+            return Ok(());
+        }
+        self.state_mut(key).expect("active target tag").kind = StateKind::TargetTag {
+            effect: Some(effect),
+        };
+        Ok(())
     }
 
     fn begin_health_pool(&mut self, key: StateKey, node: &Node) -> Result<(), InitFault> {
@@ -3990,6 +4050,12 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         self.clear_tick(key);
         self.exit_subgraph(id, node, "m_subgraphPlug", depth + 1)?;
         match kind {
+            StateKind::TargetTag {
+                effect: Some(effect),
+            } => {
+                self.world
+                    .set_target_tag_effect(self.site(id, node), effect, false);
+            }
             StateKind::HealthPool { pool: Some(pool) } => {
                 if let Some(current) = self.world.remove_health_pool(self.site(id, node), pool) {
                     self.publish_health_pool(key, node, current)?;
@@ -4043,6 +4109,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         }
         if matches!(kind, StateKind::HealthPool { .. }) {
             state.kind = StateKind::HealthPool { pool: None };
+        }
+        if matches!(kind, StateKind::TargetTag { .. }) {
+            state.kind = StateKind::TargetTag { effect: None };
         }
         if matches!(kind, StateKind::LogicalButton { .. }) {
             state.kind = StateKind::LogicalButton { down: false };
@@ -4120,13 +4189,21 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                             state.kind,
                             StateKind::WeaponVolley { .. }
                                 | StateKind::HealthPool { pool: Some(_) }
+                                | StateKind::TargetTag { effect: Some(_) }
                         ))
                     .then_some((raw, state.kind))
                 })
                 .collect();
             for (raw, kind) in outputs {
                 let key = StateKey { instance: id, raw };
-                if let StateKind::HealthPool { pool: Some(pool) } = kind {
+                if let StateKind::TargetTag {
+                    effect: Some(effect),
+                } = kind
+                {
+                    let node = self.graph(id).state(usize::from(raw)).expect("target tag");
+                    self.world
+                        .set_target_tag_effect(self.site(id, node), effect, false);
+                } else if let StateKind::HealthPool { pool: Some(pool) } = kind {
                     let node = self.graph(id).state(usize::from(raw)).expect("health pool");
                     let site = self.site(id, node);
                     self.world.remove_health_pool(site, pool);
@@ -4771,6 +4848,112 @@ mod tests {
             let states = &snapshot.instances[&1].states;
             assert!(!states[&0].active && !states[&1].active);
         }
+    }
+
+    #[test]
+    fn target_tag_releases_on_abort_and_subscript_teardown() {
+        #[derive(Default)]
+        struct TagWorld(Vec<(TargetTagEffect, bool)>);
+
+        impl World for TagWorld {
+            fn set_target_tag_effect(
+                &mut self,
+                _: Site,
+                effect: TargetTagEffect,
+                active: bool,
+            ) -> bool {
+                self.0.push((effect, active));
+                true
+            }
+        }
+
+        const ABORT: u64 = 0x0240_0000_0000_0002;
+        const RESTART: u64 = 0x0240_0000_0000_0003;
+        let entry = |position, message: Option<u64>, input| {
+            let (class, mut fields) = match message {
+                Some(message) => (
+                    "STUStatescriptEntryGameMessage",
+                    json!({"m_gameMessage":{"m_gameMessage":format!("0x{message:016X}")}}),
+                ),
+                None => ("STUStatescriptEntry", json!({})),
+            };
+            fields["m_outPlug"] = plug(&[(1, input)], &[]);
+            node(position, class, None, fields)
+        };
+        let parent = graph(
+            42,
+            vec![
+                entry(0, None, "m_beginPlug"),
+                node(
+                    1,
+                    "STU_37D754C8",
+                    Some(0),
+                    json!({
+                        "m_36F7B64C":{"m_36F7B64C":{"m_C974E369":{"m_graph":"0x058000000000002B"}}}
+                    }),
+                ),
+                entry(2, Some(ABORT), ABORT_PLUG),
+            ],
+            json!([1]),
+            json!([0, 2]),
+        );
+        let child = graph(
+            43,
+            vec![
+                entry(0, None, "m_beginPlug"),
+                node(
+                    1,
+                    "STU_E56BA8D8",
+                    Some(0),
+                    json!({
+                        "m_31714AFC":{"$":"STU_B5A0CAF0"},
+                        "m_44D1BE94":{"$":"STU_357DABBB","m_7D7C86A1":"0x0D60000000000042"}
+                    }),
+                ),
+                entry(2, Some(ABORT), ABORT_PLUG),
+                entry(3, Some(RESTART), "m_beginPlug"),
+            ],
+            json!([1]),
+            json!([0, 2, 3]),
+        );
+        let effect = TargetTagEffect {
+            entity: 42,
+            tag: 0x0d60_0000_0000_0042,
+            present: false,
+        };
+        let mut world = TagWorld::default();
+        let mut component = Component::start(
+            Arc::new(store(vec![parent, child])),
+            effect.entity,
+            Variables::new(),
+            vec![Root::new(1, 42)],
+            0,
+            &mut world,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        assert!(component.snapshot().unwrap().initialization_complete());
+        assert_eq!(world.0, [(effect, true)]);
+
+        for (id, message) in [(2, ABORT), (2, RESTART), (1, ABORT)] {
+            assert_eq!(
+                component
+                    .queue_message(id, message, Variables::new())
+                    .unwrap(),
+                1
+            );
+            component.run_now(&mut world).unwrap();
+        }
+        assert!(!component.snapshot().unwrap().instances.contains_key(&2));
+        assert_eq!(
+            world.0,
+            [
+                (effect, true),
+                (effect, false),
+                (effect, true),
+                (effect, false)
+            ]
+        );
     }
 
     #[test]

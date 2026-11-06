@@ -1,6 +1,6 @@
 # Rust migration
 
-The migration target is a Rust implementation of ORPHEUS for retail build 1.74.0.0.104319. New functionality and fixes go into Rust. The frozen Python server is a behavioral reference during the transition. Gameplay fidelity remains tracked in the [restoration roadmap](ROADMAP.md).
+The migration target is a Rust implementation of ORPHEUS for retail build 1.74.0.0.104319. All server functionality and fixes go into Rust. The frozen Python server is a read-only behavioral reference and transition entry point. Retire it as soon as Rust exceeds its verified coverage and passes the cutover checks below. Gameplay fidelity remains tracked in the [restoration roadmap](ROADMAP.md).
 
 | Stage | Scope | Exit criteria |
 | --- | --- | --- |
@@ -35,7 +35,7 @@ The common body graph registers its authored base health, armour and shield pool
 
 The base graph bundle can include authored mode values without adding bot graphs. Supply the target build's `.0C5` XML directory as `--mode-xml` to [the graph extractor](../tools/extract_game_graphs.py), write its output outside the repository, then pass that output to `prepare_server_runtime --game-graphs` when assembling the external bundle. Mode values and graph data stay local.
 
-For authored target tags, pass the target build's exported `.003` XML directory to the Rust `prepare_server_runtime --target-tags-xml` option. The preparation command writes the tag lists into the external graph bundle and hashes the result in the runtime manifest. Missing definitions leave any existing tag data intact. Older bundles can still load, with an omitted tag list treated as unknown. The owner VM uses the direct body definition for the supported tag predicates. Its fresh body also uses the same filter mask for component 26 creation and script queries. Instance overrides, runtime tag changes and further flag transitions still need support.
+For authored target tags, pass the target build's exported `.003` XML directory to the Rust `prepare_server_runtime --target-tags-xml` option. The preparation command writes the tag lists into the external graph bundle and hashes the result in the runtime manifest. Missing definitions leave any existing tag data intact. Older bundles can still load, with an omitted tag list treated as unknown. The owner VM combines the direct body definition with single literal tag grants and suppressions from active graph states. Those effects are scoped to the body and are released on state end or instance teardown. The fresh body also uses the same filter mask for component 26 creation and script queries. Instance overrides, grants that start during a suppression, foreign entities and further flag transitions still need verification.
 
 The owner VM reads the initial on-fire flag through the current possessor and the controller's component 64 baseline. The fire scoring and decay rules remain open. An authenticated human body has an explicitly absent AI control entity. For server-local message tables, the shared interpreter preserves the authored typed keys and values and uses their order for lookup. Network serialization of maps remains unverified.
 

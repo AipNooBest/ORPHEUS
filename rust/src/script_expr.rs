@@ -517,7 +517,7 @@ fn resource(value: &Json) -> Option<u64> {
     })
 }
 
-fn target_tag_config(config: &Json) -> Option<u64> {
+pub(crate) fn target_tag_config(config: &Json) -> Option<u64> {
     if class(config) != Some("STU_357DABBB")
         || !native_fields(config, &["m_7D7C86A1", "m_resourceKey"])
         || !child(config, "m_resourceKey").is_null()
