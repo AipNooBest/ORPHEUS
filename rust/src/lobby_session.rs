@@ -3,15 +3,22 @@
 //! This module assembles the currently ported initial messages for verification.
 //! The complete login and post-login handlers still have to be integrated.
 
-use std::{collections::BTreeMap, io, net::TcpStream, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    io,
+    net::{SocketAddr, TcpStream},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::{
     accounts::{Account, Accounts, account_id_for, battle_tag},
     battle_tag_query,
     collection::{Collection, HERO_CATALOG, PROGRESSION},
     jam_codec::{Fields, Schemas, Value},
-    jam_handshake::server_handshake,
+    jam_handshake::handshake_io,
     lobby_arcade::Arcade,
+    lobby_celebrations::Celebrations,
     lobby_clock::server_time,
     lobby_login::{self, INCOMPATIBLE_CLIENT, Identity, LOGIN_MESSAGE, Login, OUT_CONNECT},
     lobby_mode_rules::{self, MODE_RULES, RULES},
@@ -21,6 +28,7 @@ use crate::{
     lobby_ranked::{LeaderboardPlaces, Ranked},
     lobby_transport::{Event, LobbyMessage, LobbyTransport},
     retail_templates::{IN_CONNECT, LOBBY, RetailTemplates},
+    service_tcp::PeerStream,
 };
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -52,6 +60,7 @@ pub struct LoginContent<'a> {
     pub extra_skins: &'a [u64],
     pub wall_time: u64,
     pub arcade: &'a Arcade,
+    pub celebrations: Option<&'a Celebrations>,
     pub leaderboard_places: &'a LeaderboardPlaces,
     /// A confirmed single-member party; the caller sends other party rosters.
     pub solo_party: Option<SoloLoginParty>,
@@ -68,19 +77,42 @@ pub struct SoloLoginParty {
 impl<'a> LobbySession<'a> {
     /// Handle a launcher BattleTag query, or open the encrypted game connection.
     pub fn accept(
-        mut stream: TcpStream,
+        stream: TcpStream,
+        connection_id: u32,
+        signing_key: &[u8; 64],
+        accounts: &Accounts,
+        schemas: &'a Schemas,
+    ) -> io::Result<Option<Self>> {
+        Self::accept_peer(
+            PeerStream::new(stream, Arc::default())?,
+            connection_id,
+            signing_key,
+            accounts,
+            schemas,
+        )
+    }
+
+    pub(crate) fn accept_peer(
+        mut stream: PeerStream,
         connection_id: u32,
         signing_key: &[u8; 64],
         accounts: &Accounts,
         schemas: &'a Schemas,
     ) -> io::Result<Option<Self>> {
         let local = stream.peer_addr()?.ip().is_loopback();
-        stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
-        if battle_tag_query::answer(&mut stream, |name| resolve_battle_tag(accounts, name))? {
+        let SocketAddr::V4(address) = stream.local_addr()? else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the lobby handshake requires IPv4",
+            ));
+        };
+        stream.set_deadline(Some(Instant::now() + HELLO_TIMEOUT));
+        if battle_tag_query::answer_peer(&mut stream, |name| resolve_battle_tag(accounts, name))? {
             return Ok(None);
         }
-        let channel = server_handshake(&mut stream, connection_id, signing_key)?;
-        let transport = LobbyTransport::new(stream, channel)?;
+        let channel = handshake_io(&mut stream, address, connection_id, signing_key)?;
+        stream.set_deadline(Some(Instant::now() + HELLO_TIMEOUT));
+        let transport = LobbyTransport::from_peer(stream, channel);
         Ok(Some(Self {
             transport,
             schemas,
@@ -100,7 +132,7 @@ impl<'a> LobbySession<'a> {
             .fields(OUT_CONNECT, LOGIN_MESSAGE)
             .map_err(invalid)?;
         let Some((_, _, fields)) =
-            self.receive_matching(|crc, id| (crc, id) == (OUT_CONNECT, LOGIN_MESSAGE))?
+            self.receive_matching(|crc, id| (crc, id) == (OUT_CONNECT, LOGIN_MESSAGE), || true)?
         else {
             return Ok(LoginRequest::Disconnected);
         };
@@ -114,6 +146,7 @@ impl<'a> LobbySession<'a> {
             }
         };
         let identity = Identity::create(account.account_lo, self.transport.sequence)?;
+        self.transport.set_deadline(None);
         self.authenticated = true;
         Ok(LoginRequest::Prepared(PreparedLogin {
             account,
@@ -125,20 +158,28 @@ impl<'a> LobbySession<'a> {
     /// Receive the next valid client message after accepting the session login.
     /// Client messages use the single-byte group offset.
     pub fn receive_message(&mut self) -> io::Result<Option<LobbyMessage>> {
+        self.receive_message_until(|| true)
+    }
+
+    pub(crate) fn receive_message_until(
+        &mut self,
+        keep_receiving: impl Fn() -> bool,
+    ) -> io::Result<Option<LobbyMessage>> {
         if !self.authenticated {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "lobby session has not accepted a login",
             ));
         }
-        self.receive_matching(|_, _| true)
+        self.receive_matching(|_, _| true, keep_receiving)
     }
 
     fn receive_matching(
         &mut self,
         accept: impl Fn(u32, u32) -> bool,
+        keep_receiving: impl Fn() -> bool,
     ) -> io::Result<Option<LobbyMessage>> {
-        while let Some(event) = self.transport.receive()? {
+        while let Some(event) = self.transport.receive_until(&keep_receiving)? {
             let Event::Message { crc, offset, body } = event else {
                 continue;
             };
@@ -209,8 +250,15 @@ impl PreparedLogin {
                 20502,
                 Fields::from([(0x78, Value::Struct(record))]),
             ),
-            (IN_CONNECT, 20505, templates.preload(content.extra_skins)?),
         ];
+        let preload = (IN_CONNECT, 20505, templates.preload(content.extra_skins)?);
+        if let Some(celebrations) = content.celebrations {
+            let [keys, records, progress] =
+                celebrations.login_messages(&profile, collection.items(), now)?;
+            messages.extend([keys, preload, records, progress]);
+        } else {
+            messages.push(preload);
+        }
         messages.extend(player::endorsements(&profile, identity, content.wall_time));
         messages.push(presence.own(&profile, identity, content.wall_time)?);
         messages.extend([
@@ -503,6 +551,227 @@ mod tests {
 
     #[test]
     #[ignore = "requires an authorized 104319 runtime in ORPHEUS_RUNTIME_DIR"]
+    fn native_server_logs_in_saved_profile_and_loads_practice_over_udp() {
+        use crate::{
+            bits::BitReader,
+            game_content::PRACTICE_RANGE_MAP,
+            game_link::{ACK, KIND_FRAME, LinkCipher, MAX_DATAGRAM, Packet, SYN},
+            game_messages::read_channel,
+            lobby_practice::CREATE_GAME,
+            match_handoff::{HANDOFF, HANDOFF_MESSAGE},
+            scene_assets::SceneAssets,
+            server::{Server, ServerConfig},
+        };
+        use std::{fs, net::UdpSocket, time::Instant};
+
+        let runtime = PathBuf::from(
+            std::env::var_os("ORPHEUS_RUNTIME_DIR").expect("set ORPHEUS_RUNTIME_DIR"),
+        );
+        let state = tempfile::tempdir().unwrap();
+        let mut config = ServerConfig::new(runtime.clone(), state.path().into());
+        config.lobby_port = 0;
+        config.game_port = 0;
+        config.stall_port = 0;
+        config.rpc_port = 0;
+        if !SceneAssets::load(&runtime)
+            .unwrap()
+            .prepare(crate::game_content::GameMap::practice_range())
+            .unwrap()
+            .movement_ready()
+        {
+            assert!(
+                matches!(Server::start(config), Err(error) if error.kind() == io::ErrorKind::Unsupported)
+            );
+            assert!(!state.path().join("profiles").exists());
+            return;
+        }
+        let accounts = Accounts::new(
+            state.path().join("profiles"),
+            state.path().join("profile.json"),
+        )
+        .unwrap();
+        accounts.get("earlier").unwrap();
+        let rust = accounts.get("rust").unwrap();
+        {
+            let mut profile = rust.profile();
+            profile.level = 3000;
+            profile.endorsement_level = 5;
+            profile.unlock_all = true;
+        }
+        rust.save().unwrap();
+        fs::write(state.path().join("default_account.txt"), "RUST\n").unwrap();
+        let schemas = Schemas::load(runtime.join("data/schemas_174.json")).unwrap();
+        let game_schemas = Schemas::load(runtime.join("data/game_schemas_174.json")).unwrap();
+        let mut server = Server::start(config).unwrap();
+        for address in [server.stall_addr(), server.rpc_addr()] {
+            assert!(address.ip().is_loopback());
+            TcpStream::connect(address).unwrap();
+        }
+        let lobby = server.lobby_addr();
+        let mut stalled = TcpStream::connect(lobby).unwrap();
+        stalled.write_all(b"HELLO").unwrap();
+        assert_eq!(
+            battle_tag_query::ask(lobby, "rust").unwrap(),
+            rust.battle_tag()
+        );
+
+        let mut tcp = TcpStream::connect(lobby).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let (mut tx, rx) = handshake(&mut tcp);
+        let groups = [
+            IN_CONNECT,
+            OUT_CONNECT,
+            GAME_REQUEST,
+            player::ENDORSEMENTS,
+            PROGRESSION,
+            HERO_CATALOG,
+            HANDOFF,
+        ];
+        let mut announcement = vec![0, 0];
+        announcement.extend_from_slice(&(groups.len() as u32).to_le_bytes());
+        for group in groups {
+            announcement.extend_from_slice(&group.to_le_bytes());
+        }
+        jam_framing::send_frame(&mut tcp, &mut tx, &announcement).unwrap();
+        for (crc, wire, id, fields) in [
+            (OUT_CONNECT, 2, LOGIN_MESSAGE, Fields::new()),
+            (
+                GAME_REQUEST,
+                3,
+                CREATE_GAME,
+                Fields::from([
+                    (0x78, Value::Unsigned(2)),
+                    (0x80, Value::String(String::new())),
+                    (0xa8, Value::Unsigned(4)),
+                ]),
+            ),
+        ] {
+            let mut frame = schemas.header(crc, wire, id).unwrap();
+            frame.extend(schemas.encode(crc, id, &fields).unwrap());
+            jam_framing::send_frame(&mut tcp, &mut tx, &frame).unwrap();
+        }
+
+        let wanted = [
+            (IN_CONNECT, 1, 20500),
+            (player::ENDORSEMENTS, 4, 52002),
+            (PROGRESSION, 5, 24300),
+            (HERO_CATALOG, 6, 24900),
+            (HANDOFF, 7, HANDOFF_MESSAGE),
+        ];
+        let mut received = std::collections::HashMap::new();
+        let mut reader = FrameReader::new(rx);
+        let mut buf = [0; 8192];
+        let limit = Instant::now() + Duration::from_secs(5);
+        while received.len() < wanted.len() {
+            let count = tcp.read(&mut buf).unwrap();
+            assert!(
+                count != 0 && Instant::now() < limit,
+                "incomplete native lobby login or handoff"
+            );
+            for frame in reader.feed(&buf[..count]) {
+                for (crc, wire, id) in wanted {
+                    if let Some(body) =
+                        frame.strip_prefix(schemas.header(crc, wire, id).unwrap().as_slice())
+                    {
+                        received.insert(id, schemas.decode(crc, id, body, true).unwrap());
+                    }
+                }
+            }
+        }
+        fn structure(value: &Value) -> &Fields {
+            let Value::Struct(fields) = value else {
+                panic!("expected structured protocol fields")
+            };
+            fields
+        }
+        fn owned_ids(value: &Value) -> impl Iterator<Item = u64> + '_ {
+            let Value::Array(items) = value else {
+                panic!("expected collection ownership array")
+            };
+            items.iter().map(|item| {
+                let fields = structure(item);
+                let Value::Unsigned(guid) = fields[&0] else {
+                    panic!("missing cosmetic ID")
+                };
+                assert_eq!(fields[&8], Value::Bool(true));
+                guid
+            })
+        }
+        assert_eq!(received[&20500][&0xa8], Value::String(rust.battle_tag()));
+        assert_eq!(structure(&received[&52002][&0x88])[&0x18], Value::Signed(5));
+        let progression = structure(&received[&24300][&0x78]);
+        assert_eq!(progression[&0x68], Value::Signed(3000));
+        let Value::Array(heroes) = &received[&24900][&0x80] else {
+            panic!("missing hero collection")
+        };
+        let cosmetics: std::collections::HashSet<_> = owned_ids(&progression[&0x30])
+            .chain(
+                heroes
+                    .iter()
+                    .flat_map(|hero| owned_ids(&structure(hero)[&0])),
+            )
+            .collect();
+        assert_eq!(cosmetics.len(), 7122);
+
+        let ticket = structure(&received[&HANDOFF_MESSAGE][&0x80]);
+        assert_eq!(
+            ticket[&0x2c],
+            Value::Unsigned(u64::from(server.game_addr().port()))
+        );
+        let Value::Unsigned(connection) = ticket[&0x28] else {
+            panic!("missing UDP connection")
+        };
+        let key = |offset| {
+            let Value::Array(values) = &ticket[&offset] else {
+                panic!("missing UDP key")
+            };
+            std::array::from_fn(|index| {
+                let Value::Unsigned(byte) = values[index] else {
+                    panic!("invalid UDP key byte")
+                };
+                u8::try_from(byte).unwrap()
+            })
+        };
+        let cipher = LinkCipher::new(key(0xce), key(0xae));
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let game = server.game_addr();
+        udp.connect(game).unwrap();
+        udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut packet = Packet {
+            conn: u32::try_from(connection).unwrap(),
+            flags: SYN,
+            ..Packet::default()
+        };
+        udp.send(&cipher.seal(&packet).unwrap()).unwrap();
+        let mut buf = [0; MAX_DATAGRAM];
+        let count = udp.recv(&mut buf).unwrap();
+        let syn_ack = cipher.open(&buf[..count]).unwrap();
+        assert_eq!((syn_ack.conn, syn_ack.flags), (packet.conn, SYN | ACK));
+        packet.seq += 1;
+        packet.flags = ACK;
+        packet.ack = syn_ack.seq.wrapping_add(1);
+        udp.send(&cipher.seal(&packet).unwrap()).unwrap();
+        let count = udp.recv(&mut buf).unwrap();
+        let load = cipher.open(&buf[..count]).unwrap();
+        assert_eq!(load.kind, KIND_FRAME);
+        let mut bits = BitReader::new(&load.payload);
+        bits.var_a().unwrap();
+        let channel = read_channel(&mut bits, &game_schemas).unwrap();
+        assert_eq!(channel.reliable[0].message.id, 20300);
+        assert_eq!(
+            channel.reliable[0].message.fields[&0x4a8],
+            Value::Unsigned(PRACTICE_RANGE_MAP)
+        );
+
+        let closing = Instant::now();
+        server.stop().unwrap();
+        assert!(closing.elapsed() < Duration::from_secs(3));
+        TcpListener::bind(lobby).unwrap();
+        UdpSocket::bind(game).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an authorized 104319 runtime in ORPHEUS_RUNTIME_DIR"]
     fn prepared_subset_matches_the_python_login_in_wire_order() {
         let runtime = PathBuf::from(
             std::env::var_os("ORPHEUS_RUNTIME_DIR").expect("set ORPHEUS_RUNTIME_DIR"),
@@ -571,6 +840,7 @@ mod tests {
                 extra_skins: &[],
                 wall_time: 1_700_000_000,
                 arcade: &arcade,
+                celebrations: None,
                 leaderboard_places: &places,
                 solo_party: None,
             };

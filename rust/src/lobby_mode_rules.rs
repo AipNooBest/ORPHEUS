@@ -8,12 +8,13 @@ use std::io;
 use indexmap::IndexMap;
 
 use crate::{
-    accounts::{Profile, parse_guid},
+    accounts::Profile,
     catalog::ItemDb,
     jam_codec::{
         Fields,
         Value::{self, Array, Float64, Struct, Unsigned},
     },
+    lobby_menu::explicit_hero,
     lobby_ranked::{Queue, Season, wins_of},
     retail_templates::RetailTemplates,
 };
@@ -57,7 +58,7 @@ pub fn career_stats(
             "empty career hero catalog",
         ));
     }
-    let main = picked_hero(&profile.lobby_hero, heroes, items).unwrap_or_else(|| {
+    let main = explicit_hero(&profile.lobby_hero, heroes, items).unwrap_or_else(|| {
         heroes[crc32fast::hash(profile.player_name.as_bytes()) as usize % heroes.len()]
     });
     let played: IndexMap<_, _> = std::iter::once(main)
@@ -96,25 +97,6 @@ pub fn career_stats(
         category(seasonal.clone(), key),
         category(seasonal, key | SEASON_FLAG),
     ])
-}
-
-fn picked_hero(choice: &str, heroes: &[u64], items: &ItemDb) -> Option<u64> {
-    let choice = choice.trim();
-    if choice.is_empty()
-        || choice.eq_ignore_ascii_case("random")
-        || choice.eq_ignore_ascii_case("none")
-    {
-        return None;
-    }
-    items
-        .hero_by_name(choice)
-        .or_else(|| {
-            choice
-                .get(..2)
-                .filter(|prefix| prefix.eq_ignore_ascii_case("0x"))?;
-            parse_guid(choice)
-        })
-        .filter(|hero| heroes.contains(hero))
 }
 
 fn stat(guid: u64, value: f64) -> Value {

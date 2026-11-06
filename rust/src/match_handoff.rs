@@ -21,6 +21,31 @@ const QUEUE: u32 = 0xb4f8_bc62;
 const QUEUE_POPPED: u64 = 1;
 const GAME_QUEUE: u64 = 4;
 const GAME_FOUND: i64 = 4;
+const GENERAL_CHANNEL: [u64; 2] = [0x8b0c, 0xcccc_0000_0f99_5be6];
+
+fn chat_channel(id: [u64; 2], kind: u64) -> Fields {
+    Fields::from([
+        (0, Value::Struct(id16(id[0], id[1]))),
+        (0x10, Value::Unsigned(kind)),
+        (0x14, Value::Unsigned(0)),
+    ])
+}
+
+pub fn general_channel() -> Fields {
+    chat_channel(GENERAL_CHANNEL, 7)
+}
+
+pub fn match_channel(id: [u64; 2]) -> Fields {
+    chat_channel(id, 6)
+}
+
+pub fn join_chat_channel(channel: Fields) -> LobbyMessage {
+    (
+        CHAT_IN,
+        20402,
+        Fields::from([(0x78, Value::Struct(channel))]),
+    )
+}
 
 /// The match ID, connection ID and directional keys of a player's UDP seat.
 #[derive(Clone)]
@@ -174,11 +199,7 @@ pub fn enter_game(
             20404,
             Fields::from([(0x78, Value::Struct(general))]),
         ),
-        (
-            CHAT_IN,
-            20402,
-            Fields::from([(0x78, Value::Struct(match_channel))]),
-        ),
+        join_chat_channel(match_channel),
         (HANDOFF, HANDOFF_MESSAGE, handoff.fields(host, port)?),
     ])
 }

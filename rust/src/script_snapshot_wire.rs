@@ -85,6 +85,10 @@ pub enum SnapshotError {
         diagnostics: usize,
         first: String,
     },
+    UnsupportedBindings {
+        entity: u32,
+        variables: usize,
+    },
     MissingGraph {
         instance: u16,
         graph: u32,
@@ -126,6 +130,12 @@ impl fmt::Display for SnapshotError {
                 write!(
                     f,
                     "body {entity:08X} has {diagnostics} initialization diagnostics, first {first}"
+                )
+            }
+            Self::UnsupportedBindings { entity, variables } => {
+                write!(
+                    f,
+                    "body {entity:08X} has {variables} variables with unsupported stack bindings"
                 )
             }
             Self::MissingGraph { instance, graph } => {
@@ -233,6 +243,12 @@ impl<'a> SnapshotEncoder<'a> {
                 entity: snapshot.entity,
                 diagnostics: snapshot.diagnostics.len(),
                 first: format!("{:?}", snapshot.diagnostics.first()),
+            });
+        }
+        if !snapshot.bindings.is_empty() {
+            return Err(SnapshotError::UnsupportedBindings {
+                entity: snapshot.entity,
+                variables: snapshot.bindings.len(),
             });
         }
         let mut entity_exclusions = frozen
@@ -1166,6 +1182,37 @@ mod tests {
             encoder.project(&snapshot, View::Observer),
             Err(SnapshotError::Incomplete { entity: ENTITY, diagnostics: 1, first })
                 if first.contains("fixture")
+        ));
+    }
+
+    #[test]
+    fn stack_bindings_block_initial_and_later_projection_for_both_views() {
+        let (graphs, mut snapshot) = fixture();
+        let codecs = CodecTable::from_json(CODECS).unwrap();
+        let encoder = SnapshotEncoder::new(&graphs, &codecs);
+        let baseline = encoder.project(&snapshot, View::Owner).unwrap();
+        snapshot.bindings.insert(
+            (0, 55),
+            vec![crate::script_init::StackBinding {
+                instance: 1,
+                raw_state: 2,
+            }],
+        );
+        for view in [View::Owner, View::Observer] {
+            assert!(matches!(
+                encoder.project(&snapshot, view),
+                Err(SnapshotError::UnsupportedBindings {
+                    entity: ENTITY,
+                    variables: 1
+                })
+            ));
+        }
+        assert!(matches!(
+            encoder.project_next(&snapshot, &baseline),
+            Err(SnapshotError::UnsupportedBindings {
+                entity: ENTITY,
+                variables: 1
+            })
         ));
     }
 

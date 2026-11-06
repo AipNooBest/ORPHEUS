@@ -3,9 +3,8 @@
 //! Ports the listener roles from `ow174/bnet/service.py` and the connection
 //! handling from `ow174/bnet/rpc_server.py`. RPC content lives in `bnet_rpc`.
 
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::{self, Read};
+use std::net::{SocketAddr, SocketAddrV4, TcpListener};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -17,6 +16,7 @@ use tungstenite::{Error, Message, WebSocket, accept_hdr_with_config};
 
 use crate::bnet_protocol::Protocol;
 use crate::bnet_rpc::{Clock, Player, RpcSession};
+use crate::service_tcp::{PeerStream, PeerWorkers, accept, retryable};
 
 pub const STALL_PORT: u16 = 1119;
 pub const RPC_PORT: u16 = 21119;
@@ -24,7 +24,6 @@ pub const SUBPROTOCOL: &str = "v1.rpc.battle.net";
 const MAX_RPC_SIZE: usize = 8 << 20;
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const IO_POLL: Duration = Duration::from_millis(250);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Background listeners for the original client dial and the relay's RPC pipe.
@@ -122,136 +121,13 @@ fn wall_millis() -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
-struct PeerStream {
-    socket: TcpStream,
-    stopping: Arc<AtomicBool>,
-    handshake_deadline: Option<Instant>,
-}
-
-impl PeerStream {
-    fn transfer<T>(
-        &self,
-        deadline: Option<Instant>,
-        mut operation: impl FnMut(&TcpStream) -> io::Result<T>,
-    ) -> io::Result<T> {
-        loop {
-            if self.stopping.load(Ordering::Acquire) {
-                return Err(io::ErrorKind::ConnectionAborted.into());
-            }
-            if deadline.is_some_and(|end| Instant::now() >= end) {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            match operation(&self.socket) {
-                Err(error) if deadline.is_some() && retryable(&error) => continue,
-                result => return result,
-            }
-        }
-    }
-}
-
-impl Read for PeerStream {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.transfer(self.handshake_deadline, |mut socket| socket.read(buffer))
-    }
-}
-
-impl Write for PeerStream {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let deadline = self
-            .handshake_deadline
-            .unwrap_or_else(|| Instant::now() + HANDSHAKE_TIMEOUT);
-        self.transfer(Some(deadline), |mut socket| socket.write(buffer))
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.socket.flush()
-    }
-}
-
-fn retryable(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-    )
-}
-
-#[derive(Default)]
-struct Peers {
-    stopping: Arc<AtomicBool>,
-    workers: Vec<JoinHandle<()>>,
-}
-
-impl Peers {
-    fn spawn(
-        &mut self,
-        socket: TcpStream,
-        handle: impl FnOnce(PeerStream) + Send + 'static,
-    ) -> io::Result<()> {
-        // The accepted stream must be blocking on every platform.
-        socket.set_nonblocking(false)?;
-        socket.set_read_timeout(Some(IO_POLL))?;
-        socket.set_write_timeout(Some(IO_POLL))?;
-        let stream = PeerStream {
-            socket,
-            stopping: Arc::clone(&self.stopping),
-            handshake_deadline: None,
-        };
-        let worker = thread::Builder::new()
-            .name("bnet-peer".into())
-            .spawn(move || handle(stream))?;
-        self.workers.push(worker);
-        Ok(())
-    }
-
-    fn reap(&mut self) {
-        let mut index = 0;
-        while index < self.workers.len() {
-            if self.workers[index].is_finished() {
-                let _ = self.workers.swap_remove(index).join();
-            } else {
-                index += 1;
-            }
-        }
-    }
-}
-
-impl Drop for Peers {
-    fn drop(&mut self) {
-        // Windows can leave a blocked read pending when another thread shuts
-        // down a duplicated handle. Every worker instead checks this flag
-        // between bounded socket operations.
-        self.stopping.store(true, Ordering::Release);
-        for worker in self.workers.drain(..) {
-            let _ = worker.join();
-        }
-    }
-}
-
-fn accept(listener: &TcpListener) -> io::Result<Option<(TcpStream, SocketAddr)>> {
-    match listener.accept() {
-        Ok(peer) => Ok(Some(peer)),
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock
-                    | io::ErrorKind::Interrupted
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::ConnectionReset
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error),
-    }
-}
-
 fn serve(
     stall: TcpListener,
     rpc: TcpListener,
     endpoint: Arc<RpcEndpoint>,
     shutdown: mpsc::Receiver<()>,
 ) -> io::Result<()> {
-    let mut peers = Peers::default();
+    let mut peers = PeerWorkers::default();
     while matches!(shutdown.try_recv(), Err(mpsc::TryRecvError::Empty)) {
         peers.reap();
         let stall_peer = accept(&stall)?;
@@ -266,11 +142,13 @@ fn serve(
             continue;
         }
         if let Some((socket, _)) = stall_peer {
-            let _ = peers.spawn(socket, hold_open);
+            let _ = peers.spawn("bnet-peer", socket, hold_open);
         }
         if let Some((socket, address)) = rpc_peer {
             let endpoint = Arc::clone(&endpoint);
-            let _ = peers.spawn(socket, move |socket| serve_rpc(socket, address, &endpoint));
+            let _ = peers.spawn("bnet-peer", socket, move |socket| {
+                serve_rpc(socket, address, &endpoint)
+            });
         }
     }
     Ok(())
@@ -323,11 +201,11 @@ fn rpc_config() -> WebSocketConfig {
 }
 
 fn serve_rpc(mut socket: PeerStream, address: SocketAddr, endpoint: &RpcEndpoint) {
-    socket.handshake_deadline = Some(Instant::now() + HANDSHAKE_TIMEOUT);
+    socket.set_deadline(Some(Instant::now() + HANDSHAKE_TIMEOUT));
     let Ok(mut websocket) = accept_hdr_with_config(socket, negotiate, Some(rpc_config())) else {
         return;
     };
-    websocket.get_mut().handshake_deadline = None;
+    websocket.get_mut().set_deadline(None);
     let _ = run_rpc(&mut websocket, address, endpoint);
 }
 
@@ -395,8 +273,8 @@ mod tests {
     use super::*;
     use crate::bnet_protocol::ACCOUNT_HASH;
     use prost_reflect::Value;
-    use std::io::Write;
     use std::net::Ipv4Addr;
+    use std::{io::Write, net::TcpStream};
     use tungstenite::{HandshakeError, client, client::IntoClientRequest};
 
     // Synthetic FileDescriptorSet. It contains only the six Header fields needed

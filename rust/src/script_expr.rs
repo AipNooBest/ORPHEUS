@@ -23,6 +23,59 @@ pub struct Variable {
     pub id: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StackPriority {
+    pub level: i8,
+    pub above_equals: bool,
+}
+
+/// Priority assets documented by the 104319 reference evaluator.
+pub fn stack_priority(config: &Json) -> Result<StackPriority, EvalError> {
+    let asset = child(config, "m_priority");
+    if asset.is_null() {
+        return Ok(StackPriority {
+            level: 0,
+            above_equals: true,
+        });
+    }
+    let guid = resource(asset).ok_or(EvalError::MalformedConfig("stack priority asset"))?;
+    let (level, above_equals) = match guid as u32 {
+        0x0000 | 0x003d => (0, true),
+        0x0001 | 0x008e => (0, false),
+        0x0002 => (-10, false),
+        0x0003 | 0x0066 => (10, false),
+        0x0015 => (20, false),
+        0x003e => (-5, true),
+        0x0051 => (30, false),
+        0x0079 => (-5, false),
+        0x008d => (2, false),
+        0x008f => (1, false),
+        0x0090 => (-1, false),
+        0x0091 => (3, false),
+        0x00a1 => (-20, false),
+        0x00b5 | 0x00f9 => (5, false),
+        0x00c9 => (-2, false),
+        0x00dd => (-10, true),
+        0x00f1 => (25, false),
+        0x00f2 => (16, false),
+        0x00f3 => (99, false),
+        0x00f4 => (4, false),
+        0x00f6 => (14, true),
+        0x00f7 => (9, false),
+        0x00fa => (15, false),
+        0x00fe => (19, false),
+        _ => {
+            return Err(EvalError::UnsupportedConfig(format!(
+                "stack priority {guid:016X}"
+            )));
+        }
+    };
+    Ok(StackPriority {
+        level,
+        above_equals,
+    })
+}
+
 /// External reads may register runtime watchers. An unset variable is null.
 pub trait Context {
     fn variable(&mut self, _variable: Variable) -> Value {
@@ -55,6 +108,14 @@ pub trait Context {
 
     fn ruleset(&mut self, _id: u32) -> Value {
         Value::Null
+    }
+
+    fn would_stack_to_top(
+        &mut self,
+        _variable: Variable,
+        _priority: StackPriority,
+    ) -> Option<bool> {
+        None
     }
 
     /// None means the native is unavailable. Some(Null) is a computed result.
@@ -432,6 +493,16 @@ impl Evaluator {
                 } else {
                     value
                 }
+            }
+            "STU_3ACE35FB" => {
+                let Some(variable) = dynamic(child(config, "m_E50CF556"))? else {
+                    return Ok(Value::Bool(false));
+                };
+                let priority = stack_priority(child(config, "m_012B7AF7"))?;
+                let top = context
+                    .would_stack_to_top(variable, priority)
+                    .ok_or_else(|| EvalError::UnsupportedConfig(class.into()))?;
+                Value::Bool(top)
             }
             "STU_45EDF12D" if child(config, "m_key").is_null() => {
                 let container = self.config(child(config, "m_814F8EC3"), context, nested)?;

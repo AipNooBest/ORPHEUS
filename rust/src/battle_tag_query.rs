@@ -4,6 +4,8 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+use crate::service_tcp::PeerStream;
+
 const QUERY: &[u8] = b"OW174 BATTLETAG ";
 const TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_LINE_BYTES: u64 = 256;
@@ -41,15 +43,43 @@ pub fn answer(
     if stream.peek(&mut prefix)? != prefix.len() || prefix != QUERY {
         return Ok(false);
     }
-    let query = read_line(stream)?;
-    let name = query.strip_prefix("OW174 BATTLETAG").unwrap_or("").trim();
-    let mut tag = battle_tag_of(name);
-    tag.push('\n');
-    stream.write_all(tag.as_bytes())?;
+    respond(stream, battle_tag_of)?;
     Ok(true)
 }
 
-fn read_line(stream: &mut TcpStream) -> io::Result<String> {
+pub(crate) fn answer_peer(
+    stream: &mut PeerStream,
+    battle_tag_of: impl FnOnce(&str) -> String,
+) -> io::Result<bool> {
+    // The only other accepted protocol starts with "HELLO". Classify its
+    // first byte before reading the query, even across TCP fragments.
+    let mut first = [0];
+    if stream.peek(&mut first)? == 0 {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    if first[0] != QUERY[0] {
+        return Ok(false);
+    }
+    respond(stream, battle_tag_of)?;
+    Ok(true)
+}
+
+fn respond(
+    stream: &mut (impl Read + Write),
+    battle_tag_of: impl FnOnce(&str) -> String,
+) -> io::Result<()> {
+    let query = read_line(stream)?;
+    let name = query
+        .strip_prefix("OW174 BATTLETAG")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid BattleTag query"))?
+        .trim();
+    let mut tag = battle_tag_of(name);
+    tag.push('\n');
+    stream.write_all(tag.as_bytes())?;
+    Ok(())
+}
+
+fn read_line(stream: &mut impl Read) -> io::Result<String> {
     let mut bytes = Vec::new();
     BufReader::new(stream)
         .take(MAX_LINE_BYTES)

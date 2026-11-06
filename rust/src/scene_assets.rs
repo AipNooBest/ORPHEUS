@@ -20,8 +20,9 @@ use crate::{
     game_bots::{Bot, BotCatalog, BotWalk},
     game_content::{GameMap, PRACTICE_RANGE_MAP, PRACTICE_RANGE_MODE},
     game_controller::Controller,
-    game_heroes::HeroCatalog,
+    game_heroes::{Hero, HeroCatalog},
     game_pools::PoolCatalog,
+    game_replication::OwnerBodyRuntime,
     game_stats::{PlayerStats, StatsCatalog},
     match_scene::{PlayerAppearance, initial_world, mode_ui},
     mover::Mover,
@@ -32,6 +33,9 @@ use crate::{
 };
 
 const MOVER_CATEGORY: u16 = 0x18;
+
+type OwnerBodyFactory =
+    dyn Fn(&Hero, u32, u32) -> io::Result<Option<Box<dyn OwnerBodyRuntime>>> + Send + Sync;
 
 pub struct SceneAssets {
     collision: PathBuf,
@@ -56,6 +60,7 @@ pub struct PreparedScene {
     movers: Arc<MoverCatalog>,
     heroes: Arc<HeroCatalog>,
     pools: Arc<PoolCatalog>,
+    pub(crate) owner_body_factory: Option<Arc<OwnerBodyFactory>>,
 }
 
 impl SceneAssets {
@@ -136,6 +141,8 @@ impl SceneAssets {
             movers: Arc::clone(&self.movers),
             heroes: Arc::clone(&self.heroes),
             pools: Arc::clone(&self.pools),
+            // No hero body has completed the native runtime path yet.
+            owner_body_factory: None,
         })
     }
 }
@@ -183,6 +190,17 @@ impl PreparedScene {
             category,
         )
         .map_err(invalid)
+    }
+
+    pub(crate) fn owner_body_runtime(
+        &self,
+        hero: &Hero,
+        entity: u32,
+        frame: u32,
+    ) -> io::Result<Option<Box<dyn OwnerBodyRuntime>>> {
+        self.owner_body_factory
+            .as_ref()
+            .map_or(Ok(None), |factory| factory(hero, entity, frame))
     }
 
     pub fn heroes(&self) -> &HeroCatalog {

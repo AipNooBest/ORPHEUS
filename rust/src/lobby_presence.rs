@@ -28,7 +28,7 @@ const RETAIL_APP_ACCOUNT: u64 = 0x3a16_9def;
 const RETAIL_PRO_ACCOUNT: u64 = 0x3a16_9e4c;
 const RETAIL_FULL_NAME: &[u8] = b"ExampleUser";
 const APP_ACCOUNT_BITS: u64 = 0x0a0a_0000;
-const PRO_ACCOUNT_BITS: u64 = 0x0b0b_0000;
+pub(crate) const PRO_ACCOUNT_BITS: u64 = 0x0b0b_0000;
 
 const PRESENCE_PROGRAM: u64 = 16_974;
 const ACCOUNT_GROUP: u64 = 1;

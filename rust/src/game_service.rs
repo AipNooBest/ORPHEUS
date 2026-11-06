@@ -24,7 +24,7 @@ use crate::{
     game_connection::{GameConnections, MAX_CONNECTION_ID, Outgoing},
     game_content::{GameMap, PRACTICE_RANGE_MODE},
     game_controller::ControllerFrame,
-    game_egress::{FrameRecords, GameEgress, RecordSource},
+    game_egress::GameEgress,
     game_ingress::{GameIngress, MapReadiness, MapReadyStep, MessageKind, WorldReadiness, pong},
     game_instance::{Instance, Member, RETAIL_QUANTA, TOURNAMENT_QUANTA, ownership},
     game_link::{ACK, KIND_FRAME, Packet},
@@ -70,6 +70,12 @@ enum Request {
     },
     Cancel {
         connection: u32,
+        reply: mpsc::SyncSender<bool>,
+    },
+    Seat {
+        connection: u32,
+        id: MatchId,
+        release: bool,
         reply: mpsc::SyncSender<bool>,
     },
 }
@@ -193,6 +199,23 @@ impl GameService {
 
     pub fn cancel_handoff(&self, connection: u32) -> io::Result<bool> {
         self.request(|reply| Request::Cancel { connection, reply })
+    }
+
+    pub fn seat_exists(&self, handoff: &Handoff) -> io::Result<bool> {
+        self.seat(handoff, false)
+    }
+
+    pub fn release_seat(&self, handoff: &Handoff) -> io::Result<bool> {
+        self.seat(handoff, true)
+    }
+
+    fn seat(&self, handoff: &Handoff, release: bool) -> io::Result<bool> {
+        self.request(|reply| Request::Seat {
+            connection: handoff.conn,
+            id: handoff.match_id,
+            release,
+            reply,
+        })
     }
 
     fn request<T>(&self, request: impl FnOnce(mpsc::SyncSender<T>) -> Request) -> io::Result<T> {
@@ -499,6 +522,21 @@ impl State {
             Request::Cancel { connection, reply } => {
                 let _ = reply.send(self.links.cancel_handoff(connection));
             }
+            Request::Seat {
+                connection,
+                id,
+                release,
+                reply,
+            } => {
+                let exists = self
+                    .seats
+                    .get(&connection)
+                    .is_some_and(|&(match_id, _)| match_id == id);
+                if release && exists && !self.links.cancel_handoff(connection) {
+                    self.send_home(connection, now);
+                }
+                let _ = reply.send(exists);
+            }
         }
     }
 
@@ -682,42 +720,21 @@ impl State {
                         .as_ref()
                         .map_or_else(Vec::new, |world| peer.world.movement(&world.scene, tick))
                 };
-                let queued = peer.world.ready();
-                let command_ack = peer.world.command_ack(tick);
-                let sent = peer.egress.send_frame(
-                    FrameRecords {
-                        tick,
-                        queued: &queued,
-                        movements: &movements,
-                        owner_correction: false,
-                        reliable_only: drain,
-                    },
-                    |_| command_ack,
-                    |source| match source {
-                        RecordSource::Queued(index) => queued[index].tracked(),
-                        RecordSource::Movement(index) => {
-                            Arc::new(Record::baseline(movements[index].clone()))
-                        }
-                    },
-                    |payload| {
-                        let packet = Packet {
-                            conn: connection,
-                            kind: KIND_FRAME,
-                            flags: ACK,
-                            payload,
-                            ..Packet::default()
-                        };
-                        let outgoing = self
-                            .links
-                            .transmit(packet)
-                            .map_err(|error| io::Error::other(format!("game link: {error:?}")))?;
-                        send(socket, outgoing)
-                    },
-                );
-                if let Ok(sent) = sent {
-                    let indexes = WorldDelivery::sent_indices(&queued, &sent.records);
-                    peer.world.sent(&indexes);
-                }
+                let _ =
+                    peer.world
+                        .send_frame(tick, movements, drain, &mut peer.egress, |payload| {
+                            let packet = Packet {
+                                conn: connection,
+                                kind: KIND_FRAME,
+                                flags: ACK,
+                                payload,
+                                ..Packet::default()
+                            };
+                            let outgoing = self.links.transmit(packet).map_err(|error| {
+                                io::Error::other(format!("game link: {error:?}"))
+                            })?;
+                            send(socket, outgoing)
+                        });
             }
         }
         self.clock.renew_if_idle(!self.seats.is_empty(), false);

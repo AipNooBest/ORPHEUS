@@ -3,14 +3,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
 use std::net::TcpStream;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::jam_cipher::Jam;
 use crate::jam_codec::Fields;
 use crate::jam_framing::{self, FrameReader};
 use crate::jam_handshake::Channel;
+use crate::service_tcp::PeerStream;
 
-const POLL: Duration = Duration::from_secs(2);
 const KEEPALIVE: Duration = Duration::from_secs(10);
 
 /// Protocol CRC, message ID and its decoded fields.
@@ -23,7 +24,7 @@ pub enum Event {
 }
 
 pub struct LobbyTransport {
-    stream: TcpStream,
+    stream: PeerStream,
     reader: FrameReader,
     tx: Jam,
     pending: VecDeque<Vec<u8>>,
@@ -35,8 +36,14 @@ pub struct LobbyTransport {
 
 impl LobbyTransport {
     pub fn new(stream: TcpStream, channel: Channel) -> io::Result<Self> {
-        stream.set_read_timeout(Some(POLL))?;
-        Ok(Self {
+        Ok(Self::from_peer(
+            PeerStream::new(stream, Arc::default())?,
+            channel,
+        ))
+    }
+
+    pub(crate) fn from_peer(stream: PeerStream, channel: Channel) -> Self {
+        Self {
             stream,
             reader: FrameReader::new(channel.rx),
             tx: channel.tx,
@@ -45,7 +52,11 @@ impl LobbyTransport {
             wire_of: HashMap::new(),
             last_keepalive: Instant::now(),
             sequence: channel.seq,
-        })
+        }
+    }
+
+    pub(crate) fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.stream.set_deadline(deadline);
     }
 
     pub fn groups(&self) -> &[u32] {
@@ -62,8 +73,15 @@ impl LobbyTransport {
 
     /// Handle control traffic in frame order and return the next lobby event.
     pub fn receive(&mut self) -> io::Result<Option<Event>> {
+        self.receive_until(|| true)
+    }
+
+    pub(crate) fn receive_until(
+        &mut self,
+        keep_receiving: impl Fn() -> bool,
+    ) -> io::Result<Option<Event>> {
         let mut data = [0; 65_536];
-        loop {
+        while keep_receiving() {
             while let Some(frame) = self.pending.pop_front() {
                 if let Some(event) = self.handle_frame(frame)? {
                     return Ok(Some(event));
@@ -80,6 +98,9 @@ impl LobbyTransport {
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
+                    if self.stream.deadline_expired() {
+                        return Err(error);
+                    }
                     if self.last_keepalive.elapsed() > KEEPALIVE {
                         self.send(&jam_framing::PONG)?;
                         self.last_keepalive = Instant::now();
@@ -88,6 +109,7 @@ impl LobbyTransport {
                 Err(error) => return Err(error),
             }
         }
+        Ok(None)
     }
 
     fn handle_frame(&mut self, frame: Vec<u8>) -> io::Result<Option<Event>> {

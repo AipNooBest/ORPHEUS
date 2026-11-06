@@ -13,6 +13,10 @@ path = "rust/src/lib.rs"
 name = "prepare_server_runtime"
 path = "rust/src/bin/prepare_server_runtime.rs"
 
+[[bin]]
+name = "orpheus_server"
+path = "rust/src/bin/orpheus_server.rs"
+
 [dependencies]
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 crc32fast = "1"

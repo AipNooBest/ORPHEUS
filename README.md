@@ -27,7 +27,7 @@ An automated result covers the fixture or replay named in its evidence. A manual
 
 ## Run locally
 
-The Rust crate includes transport, protocol codecs, account and collection handling, a local Battle.net listener, a UDP match worker and the runtime preparation tool. A headless loopback with the base graph bundle follows solo Practice Range from lobby handoff through world creation, bot movement, hero selection and body replacement. The worker simulates ordinary player movement on prepared collision and bounds input catch-up across peers. Separate reference checks cover Arcade rotation, priority passes, logical button input, timed script events and state frames. Hero-script movement, owner corrections, full bot behavior and combat are still being ported. Run `cargo test --locked --all-targets` with stable Rust to verify the public fixtures. The current game server entry point runs the Python implementation described below.
+The experimental `orpheus_server` binary runs the local Battle.net, lobby and UDP services together. Headless tests cover encrypted login with a saved profile, solo Practice Range loading, world creation, bot movement, hero selection and body replacement with the base graph bundle. The worker simulates ordinary player movement on prepared collision and bounds input catch-up across peers. Separate reference checks cover lobby content, logical button input, timed script events and the isolated Soldier: 76 Sprint graph. Live hero-script movement, owner corrections, full bot behavior and combat are still being ported. Run `cargo test --locked --all-targets` with stable Rust to verify the public fixtures. The regular game server entry point still uses Python.
 
 The documented environment is Windows with Python 3.12. Node.js 24 is used for the dashboard test. The public source checks can run without the game or any prepared runtime.
 
@@ -50,6 +50,8 @@ $env:ORPHEUS_RUNTIME_DIR = 'C:\path\to\orpheus-runtime'
 ```
 
 The preparation command copies files from an already prepared checkout and writes a manifest. Omit `--map` to copy all available prepared caches. The server-only entry uses loopback and requires neither an installed game nor a relay DLL. Its default dashboard is at `127.0.0.1:3725`. For original-client testing, see [the manual procedure](CONTRIBUTING.md#original-client-verification) and [runtime data provenance](data/README.md).
+
+To try the native server with an authorized base Practice Range runtime, use `cargo run --locked --bin orpheus_server -- --data-dir 'C:\path\to\local-state'` with `ORPHEUS_RUNTIME_DIR` set. It uses loopback and reads `profiles/`, `profile.json` and `default_account.txt` from the local state directory. Use the existing server checkout as that directory to reuse its saved profiles. The native entry has headless coverage and awaits original-client acceptance. See [Rust migration](docs/RUST_MIGRATION.md) for its current scope.
 
 ## Project layout
 

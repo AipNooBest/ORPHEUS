@@ -2,7 +2,7 @@
 
 use std::{
     borrow::Borrow,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io,
     sync::Arc,
     time::Duration,
@@ -14,16 +14,20 @@ use crate::{
     game_bots::BOT_RECORD_DELAY,
     game_clock::{MAX_LEASE_FRAME, SEND_EVERY},
     game_controller::ControllerFrame,
-    game_egress::{DeliveryReport, RecordSource},
-    game_heroes::Hero,
+    game_egress::{DeliveryReport, FrameRecords, GameEgress, RecordSource, SendError, SentFrame},
+    game_heroes::{Hero, SOLDIER},
     game_messages::Message,
     game_parameters::{ClientGameMessage, HeroSelectRequest},
     match_scene::{PlayerAppearance, Possession, team_bit},
     mover::Mover,
+    mover_correction::CorrectionHistory,
     mover_kinematics::Poses,
+    mover_modifiers::{Modifier, ModifierKey},
     scene_assets::PreparedScene,
-    script_stream::{ScriptChunk, Stream},
-    world::{EntityUpdate, GAME_MODE_ENTITY, Operation, SkinTheme},
+    script_init::Snapshot,
+    script_snapshot_wire::{ProjectedSnapshot, SnapshotEncoder, View},
+    script_stream::{BodyStream, DeltaKind, ScriptChunk, Stream},
+    world::{EntityUpdate, GAME_MODE_ENTITY, LeaseBlock, MAX_PAYLOAD, Operation, SkinTheme, frame},
 };
 
 const BODY_REUSE_DELAY: Duration = Duration::from_secs(30);
@@ -47,6 +51,152 @@ struct Body {
     skin: SkinTheme,
 }
 
+/// A running owner VM and the authored data used to encode its snapshots.
+/// A supported modifier projection is required before the mover can correct
+/// the owner's prediction, even if the current set of modifiers is empty.
+pub(crate) trait OwnerBodyRuntime: Send {
+    fn snapshot(&self) -> Option<&Snapshot>;
+    fn encoder(&self) -> SnapshotEncoder<'_>;
+    fn advance(&mut self, command: Command, mover: &Mover) -> io::Result<()>;
+    fn frame_ms(&self) -> u32;
+
+    fn leases(&self) -> &[LeaseBlock] {
+        &[]
+    }
+
+    fn movement_modifiers(&self) -> Option<&BTreeMap<ModifierKey, Modifier>> {
+        None
+    }
+}
+
+struct BodyScript {
+    id: BodyId,
+    runtime: Box<dyn OwnerBodyRuntime>,
+    stream: BodyStream<ProjectedSnapshot>,
+    frame: u32,
+    unsent_delta: Option<(u32, DeltaKind)>,
+    corrections: Option<CorrectionHistory>,
+}
+
+impl BodyScript {
+    fn new(body: Body, frame: u32, runtime: Box<dyn OwnerBodyRuntime>) -> io::Result<Self> {
+        let snapshot = runtime
+            .snapshot()
+            .ok_or_else(|| invalid("body VM is unavailable"))?;
+        if snapshot.entity != body.id.entity {
+            return Err(invalid("body VM has the wrong entity"));
+        }
+        runtime
+            .encoder()
+            .project(snapshot, View::Owner)
+            .map_err(invalid)?;
+        let corrections = (body.hero == SOLDIER && runtime.movement_modifiers().is_some())
+            .then(|| CorrectionHistory::new(body.id.entity, body.id.generation));
+        Ok(Self {
+            id: body.id,
+            runtime,
+            stream: BodyStream::new(body.id.entity),
+            frame,
+            unsent_delta: None,
+            corrections,
+        })
+    }
+
+    fn step(&mut self, mover: &mut Mover, command: Command) -> io::Result<()> {
+        if command.frame > self.frame {
+            self.runtime.advance(command, mover)?;
+            self.frame = command.frame;
+        }
+        if !self
+            .runtime
+            .snapshot()
+            .is_some_and(Snapshot::initialization_complete)
+        {
+            return Err(invalid("body VM reached an unsupported state"));
+        }
+        if let Some(modifiers) = self.runtime.movement_modifiers() {
+            mover.track_modifiers(command.frame, modifiers);
+        } else if self.corrections.is_some() {
+            return Err(invalid("body VM lost its movement projection"));
+        }
+        if let Some(history) = &mut self.corrections {
+            history.record(mover.pose());
+        }
+        Ok(())
+    }
+
+    fn next_record(&mut self, created: bool) -> io::Result<Option<(Record, Option<u32>)>> {
+        if !created {
+            return Ok(None);
+        }
+        let encoder = self.runtime.encoder();
+        let snapshot = self
+            .runtime
+            .snapshot()
+            .ok_or_else(|| invalid("body VM is unavailable"))?;
+        let (chunk, kind) = if self.stream.last() == 0 {
+            let snapshot = encoder.project(snapshot, View::Owner).map_err(invalid)?;
+            (
+                encoder
+                    .queue_full(&mut self.stream, &snapshot)
+                    .map_err(invalid)?,
+                None,
+            )
+        } else {
+            let replace_initial =
+                matches!(self.unsent_delta, Some((_, DeltaKind::InitialOwner(_))));
+            let Some(kind) = self
+                .stream
+                .owner_kind(self.frame, false, replace_initial)
+                .map_err(invalid)?
+            else {
+                return Ok(None);
+            };
+            let (_, base) = self
+                .stream
+                .base()
+                .expect("owner delta requires the baseline");
+            let snapshot = encoder.project_next(snapshot, base).map_err(invalid)?;
+            let chunk = encoder
+                .queue_delta(&mut self.stream, &snapshot, kind, self.runtime.frame_ms())
+                .map_err(invalid)?
+                .expect("owner deltas include a command frame");
+            (chunk, Some(kind))
+        };
+        // An individual chunk that cannot fit alone needs fragmentation.
+        // Fail this VM closed so it cannot hold up other entity records.
+        let packet = frame(u32::MAX, u32::MAX, &[], &[], &[&chunk.update]).map_err(invalid)?;
+        if packet.len() > MAX_PAYLOAD {
+            return Err(invalid(
+                "body script chunk exceeds the game datagram budget",
+            ));
+        }
+        let last = chunk.last;
+        let replaced = kind.and_then(|kind| {
+            self.unsent_delta.replace((last, kind)).map(|(last, _)| {
+                self.stream.discard_unsent(last);
+                last
+            })
+        });
+        let record = Record {
+            update: chunk.update,
+            delivery: Delivery::BodyScript {
+                id: self.id,
+                last,
+                delta: kind.is_some(),
+            },
+        };
+        Ok(Some((record, replaced)))
+    }
+
+    fn sent(&mut self, last: u32) {
+        self.stream.sent(last);
+        if self.unsent_delta.is_some_and(|(queued, _)| queued == last) {
+            self.unsent_delta = None;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum Lifetime {
     Live,
@@ -60,6 +210,11 @@ enum Delivery {
     CreateBody(BodyId),
     Possession(BodyId),
     DestroyBody(BodyId),
+    BodyScript {
+        id: BodyId,
+        last: u32,
+        delta: bool,
+    },
     Script {
         last: u32,
         close: bool,
@@ -191,6 +346,7 @@ pub(crate) struct WorldDelivery {
     bodies: HashMap<u32, (u64, Lifetime)>,
     input: InputQueue,
     mover: Option<Mover>,
+    body_script: Option<BodyScript>,
 }
 
 impl WorldDelivery {
@@ -210,6 +366,7 @@ impl WorldDelivery {
             bodies: HashMap::new(),
             input: InputQueue::default(),
             mover: None,
+            body_script: None,
         }
     }
 
@@ -218,6 +375,7 @@ impl WorldDelivery {
         self.started = None;
         self.presentation_due = false;
         self.mover = None;
+        self.cancel_body_script();
         self.input.clear();
     }
 
@@ -238,6 +396,10 @@ impl WorldDelivery {
                 self.bodies.get(&id.entity) == Some(&(id.generation, Lifetime::Retiring))
             }
             Delivery::Possession(id) => self.body.is_some_and(|body| body.id == id),
+            Delivery::BodyScript { id, .. } => self
+                .body_script
+                .as_ref()
+                .is_some_and(|script| script.id == id),
         }
     }
 
@@ -251,20 +413,36 @@ impl WorldDelivery {
                 if !self.current(&record) {
                     continue;
                 }
-                if !packet.arrived {
-                    if !matches!(record.delivery, Delivery::Script { resend: false, .. }) {
-                        retry.push(record);
+                match (packet.arrived, record.delivery) {
+                    (arrived, Delivery::BodyScript { last, .. }) => {
+                        let stream = &mut self
+                            .body_script
+                            .as_mut()
+                            .expect("current body stream")
+                            .stream;
+                        if arrived {
+                            stream.arrived(last);
+                        } else if stream.lost(last).retry {
+                            retry.push(record);
+                        }
                     }
-                    continue;
-                }
-                match record.delivery {
-                    Delivery::Baseline | Delivery::CreateBody(_) => {
+                    (false, Delivery::Script { resend: false, .. }) => {}
+                    (false, _) => retry.push(record),
+                    (true, Delivery::Baseline) => {
                         if matches!(record.update.operation, Some(Operation::Create(_))) {
                             self.created.insert(record.update.entity);
                         }
                     }
-                    Delivery::Possession(id) => self.bound = Some(id),
-                    Delivery::DestroyBody(id) => {
+                    (true, Delivery::CreateBody(id)) => {
+                        self.created.insert(id.entity);
+                        if let Some(script) =
+                            self.body_script.as_mut().filter(|script| script.id == id)
+                        {
+                            script.stream.create_arrived();
+                        }
+                    }
+                    (true, Delivery::Possession(id)) => self.bound = Some(id),
+                    (true, Delivery::DestroyBody(id)) => {
                         self.bodies.insert(
                             id.entity,
                             (
@@ -273,10 +451,10 @@ impl WorldDelivery {
                             ),
                         );
                     }
-                    Delivery::Script { last, .. } if record.update.entity == self.owner => {
+                    (true, Delivery::Script { last, .. }) if record.update.entity == self.owner => {
                         self.controller.arrived(last);
                     }
-                    Delivery::Script { last, .. } => {
+                    (true, Delivery::Script { last, .. }) => {
                         self.mode.arrived(last);
                     }
                 }
@@ -310,6 +488,14 @@ impl WorldDelivery {
                     Delivery::DestroyBody(_) | Delivery::Script { close: true, .. } if !bound => {
                         return None;
                     }
+                    Delivery::BodyScript { id, last, delta }
+                        if (delta && !bound)
+                            || !self.body_script.as_ref().is_some_and(|script| {
+                                script.id == id && script.stream.ready_to_send(last)
+                            }) =>
+                    {
+                        return None;
+                    }
                     _ => {}
                 }
                 Some(Ready { index, record })
@@ -322,6 +508,14 @@ impl WorldDelivery {
     pub(crate) fn sent(&mut self, indexes: &[usize]) {
         if indexes.is_empty() {
             return;
+        }
+        if let Some(script) = &mut self.body_script {
+            for &index in indexes {
+                match self.queued[index].delivery {
+                    Delivery::BodyScript { id, last, .. } if id == script.id => script.sent(last),
+                    _ => {}
+                }
+            }
         }
         let mut selected = indexes.iter().copied().peekable();
         let mut index = 0;
@@ -339,6 +533,119 @@ impl WorldDelivery {
                 RecordSource::Movement(_) => None,
             })
             .collect()
+    }
+
+    pub(crate) fn send_frame<E>(
+        &mut self,
+        tick: u32,
+        mut movements: Vec<EntityUpdate>,
+        reliable_only: bool,
+        egress: &mut GameEgress<Arc<Record>>,
+        send: impl FnOnce(Vec<u8>) -> Result<u32, E>,
+    ) -> Result<SentFrame, SendError<E>> {
+        if !reliable_only {
+            self.prepare_body_script();
+        }
+        let script = self.body_script.as_ref();
+        let history = script.and_then(|script| script.corrections.as_ref());
+        let correction = if reliable_only {
+            None
+        } else {
+            script.and_then(|script| {
+                history?.candidate(tick, self.created.contains(&script.id.entity))
+            })
+        };
+        let owner_index = correction.map(|correction| {
+            let index = movements.len();
+            movements.push(correction.update());
+            index
+        });
+        let queued = self.ready();
+        let newest = self.command_ack(tick);
+        let sent = egress.send_frame(
+            FrameRecords {
+                tick,
+                queued: &queued,
+                movements: &movements,
+                owner_correction: owner_index.is_some(),
+                reliable_only,
+            },
+            |records| {
+                let selected = owner_index
+                    .filter(|&index| {
+                        records
+                            .iter()
+                            .any(|record| std::ptr::eq(*record, &movements[index]))
+                    })
+                    .and(correction.as_ref());
+                history.map_or(newest, |history| {
+                    history.command_ack(tick, Some(newest), selected)
+                })
+            },
+            |source| match source {
+                RecordSource::Queued(index) => queued[index].tracked(),
+                RecordSource::Movement(_) => unreachable!("movement records are not retried"),
+            },
+            send,
+        )?;
+        let indexes = Self::sent_indices(&queued, &sent.records);
+        self.sent(&indexes);
+        let selected = owner_index
+            .zip(correction)
+            .filter(|(index, _)| sent.records.contains(&RecordSource::Movement(*index)));
+        let history = self
+            .body_script
+            .as_mut()
+            .and_then(|script| script.corrections.as_mut());
+        if let (Some((_, correction)), Some(history)) = (selected, history) {
+            history.sent(&correction);
+        }
+        Ok(sent)
+    }
+
+    fn prepare_body_script(&mut self) {
+        let Some(script) = &mut self.body_script else {
+            return;
+        };
+        // A split input gap can update physics history immediately. The owner
+        // VM stream publishes only after the queued command completes.
+        if matches!(
+            self.input.work.front(),
+            Some(InputWork::Command {
+                pending: Some(_),
+                ..
+            })
+        ) {
+            return;
+        }
+        let (record, replaced) = match script.next_record(self.created.contains(&script.id.entity))
+        {
+            Ok(Some(record)) => record,
+            Ok(None) => return,
+            Err(_) => {
+                self.cancel_body_script();
+                return;
+            }
+        };
+        if let Some(replaced) = replaced {
+            let id = script.id;
+            self.queued.retain(|queued| {
+                !matches!(queued.delivery, Delivery::BodyScript { id: queued_id, last, .. }
+                    if queued_id == id && last == replaced)
+            });
+        }
+        self.push(record);
+    }
+
+    fn cancel_body_script(&mut self) {
+        if let Some(mut script) = self.body_script.take() {
+            script.stream.retire();
+            if let Some(mover) = &mut self.mover {
+                let frame = mover.pose().frame.unwrap_or(script.frame);
+                mover.track_modifiers(frame, &BTreeMap::new());
+            }
+            self.remove_stale();
+        }
     }
 
     pub(crate) fn start(
@@ -483,9 +790,28 @@ impl WorldDelivery {
                 } => {
                     if let Some(mover) = &mut self.mover {
                         let poses = pending.get_or_insert_with(|| mover.pending_poses(command));
-                        remaining -= mover
-                            .step_pending(scene.movement_index(), poses, dt, remaining, |_, _| {})
-                            .map_err(invalid)?;
+                        let mut failed = false;
+                        let script = &mut self.body_script;
+                        let stepped = mover.step_pending(
+                            scene.movement_index(),
+                            poses,
+                            dt,
+                            remaining,
+                            |mover, command| {
+                                if !failed
+                                    && script
+                                        .as_mut()
+                                        .is_some_and(|script| script.step(mover, command).is_err())
+                                {
+                                    mover.track_modifiers(command.frame, &BTreeMap::new());
+                                    failed = true;
+                                }
+                            },
+                        );
+                        if failed {
+                            self.cancel_body_script();
+                        }
+                        remaining -= stepped.map_err(invalid)?;
                         if poses.len() != 0 {
                             self.input
                                 .work
@@ -530,6 +856,22 @@ impl WorldDelivery {
         let yaw = (yaw * 65536.0 / 360.0).round_ties_even() as i32;
         let mover = scene.player_mover(hero.body, viewer.team, position, yaw)?;
         let pose = owner_pose(mover.pose());
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid("player body lifetime exhausted"))?;
+        let id = BodyId { entity, generation };
+        let body = Body {
+            id,
+            hero: hero.guid,
+            skin,
+        };
+        let start_frame = self.input.processed.unwrap_or(tick);
+        let script = scene
+            .owner_body_runtime(hero, entity, start_frame)
+            .ok()
+            .flatten()
+            .and_then(|runtime| BodyScript::new(body, start_frame, runtime).ok());
         let create = body_create(
             BodyCreate {
                 entity,
@@ -542,15 +884,12 @@ impl WorldDelivery {
             },
             BodyView::Owner {
                 pose: Some(pose),
-                leases: &[],
+                leases: script
+                    .as_ref()
+                    .map_or(&[], |script| script.runtime.leases()),
             },
             scene.pools(),
         );
-        let generation = self
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| invalid("player body lifetime exhausted"))?;
-        let id = BodyId { entity, generation };
         let possession = Possession {
             body: entity,
             hero: hero.guid,
@@ -561,11 +900,9 @@ impl WorldDelivery {
         self.generation = generation;
         self.bodies.insert(entity, (generation, Lifetime::Live));
         self.created.remove(&entity);
-        let old = self.body.replace(Body {
-            id,
-            hero: hero.guid,
-            skin,
-        });
+        let old = self.body.replace(body);
+        self.cancel_body_script();
+        self.body_script = script;
         self.mover = Some(mover);
         self.bound = None;
         self.select_open = false;
@@ -680,6 +1017,9 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
     use crate::{
+        bits::BitReader,
+        collision_index::TriangleIndex,
+        contact_world::ContactWorld,
         game_clock::FIRST_TICK,
         game_content::GameMap,
         game_heroes::SOLDIER,
@@ -687,8 +1027,15 @@ mod tests {
         game_parameters::{CLIENT_GAME_MESSAGE, PICK_HERO},
         jam_codec::{Fields, Value},
         match_scene::PlayerCard,
+        mover_settings::MoverSettings,
         scene_assets::SceneAssets,
+        script_codecs::CodecTable,
+        script_graph::GraphStore,
+        script_init::{Component, EmptyWorld, MAX_INIT_WORK, Root},
+        script_runtime::FRAME_MS,
+        world::{MAX_ENTITY_RECORDS, Movement},
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn forward(frame: u32) -> Command {
         Command {
@@ -822,6 +1169,7 @@ mod tests {
                 SkinTheme::default(),
             )
             .unwrap();
+        assert!(world.body_script.is_none());
         let initial = world.mover.as_ref().unwrap().pose();
         let actual = Command {
             yaw: initial.yaw,
@@ -961,6 +1309,417 @@ mod tests {
 
     fn eligible(world: &WorldDelivery) -> Vec<usize> {
         world.ready().iter().map(|ready| ready.index).collect()
+    }
+
+    struct SyntheticOwner {
+        component: Component,
+        graphs: Arc<GraphStore>,
+        codecs: CodecTable,
+        modifiers: BTreeMap<ModifierKey, Modifier>,
+        failed: Arc<AtomicBool>,
+    }
+
+    impl OwnerBodyRuntime for SyntheticOwner {
+        fn snapshot(&self) -> Option<&Snapshot> {
+            (!self.failed.load(Ordering::Relaxed))
+                .then(|| self.component.snapshot())
+                .flatten()
+        }
+
+        fn encoder(&self) -> SnapshotEncoder<'_> {
+            SnapshotEncoder::new(&self.graphs, &self.codecs)
+        }
+
+        fn advance(&mut self, command: Command, _mover: &Mover) -> io::Result<()> {
+            self.component
+                .advance_command(command, &mut EmptyWorld)
+                .map_err(invalid)
+        }
+
+        fn frame_ms(&self) -> u32 {
+            FRAME_MS as u32
+        }
+
+        fn movement_modifiers(&self) -> Option<&BTreeMap<ModifierKey, Modifier>> {
+            Some(&self.modifiers)
+        }
+    }
+
+    fn synthetic_owner(
+        entity: u32,
+        frame: u32,
+        failed: Arc<AtomicBool>,
+    ) -> Box<dyn OwnerBodyRuntime> {
+        let graphs = Arc::new(
+            GraphStore::from_json(
+                br#"{"version":1,"bodies":{},"missing":[],"graphs":[{
+            "index":42,"items":0,"nodes":[],"states":[],"entries":[],"remote":[],
+            "sync_vars":[],"containers":{},"unknown_nodes":[],"fields":{},
+            "header":{"m_nodesBitCount":4,"m_statesBitCount":4,
+                "m_remoteSyncNodesBitCount":4,"m_syncVarsBitCount":4}
+        }]}"#,
+            )
+            .unwrap(),
+        );
+        let component = Component::start(
+            Arc::clone(&graphs),
+            entity,
+            Default::default(),
+            vec![Root::new(1, 42)],
+            frame,
+            &mut EmptyWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        Box::new(SyntheticOwner {
+            component,
+            graphs,
+            codecs: CodecTable::from_json(r#"{"classes":{}}"#).unwrap(),
+            modifiers: BTreeMap::new(),
+            failed,
+        })
+    }
+
+    fn activate_script(world: &mut WorldDelivery, id: BodyId, hero: u64, failed: Arc<AtomicBool>) {
+        let body = Body { hero, ..body(id) };
+        world.body = Some(body);
+        world.bound = None;
+        world
+            .bodies
+            .insert(id.entity, (id.generation, Lifetime::Live));
+        world.created.remove(&id.entity);
+        world.body_script =
+            Some(BodyScript::new(body, 100, synthetic_owner(id.entity, 100, failed)).unwrap());
+    }
+
+    fn transmit(
+        world: &mut WorldDelivery,
+        egress: &mut GameEgress<Arc<Record>>,
+        tick: u32,
+        sequence: u32,
+    ) -> (Vec<u8>, SentFrame) {
+        let mut bytes = Vec::new();
+        let sent = world
+            .send_frame(tick, Vec::new(), false, egress, |payload| {
+                bytes = payload;
+                Ok::<_, ()>(sequence)
+            })
+            .unwrap();
+        (bytes, sent)
+    }
+
+    fn transport_outcome(
+        world: &mut WorldDelivery,
+        egress: &mut GameEgress<Arc<Record>>,
+        sequence: u32,
+        arrived: bool,
+    ) {
+        world.acknowledge(
+            egress.acknowledge(sequence + 1, u64::from(arrived)),
+            Duration::ZERO,
+        );
+    }
+
+    #[test]
+    fn body_script_retries_frozen_initial_frames_and_ignores_old_generation_reports() {
+        let mut world = WorldDelivery::new(OWNER);
+        let id = avatar(1, 1);
+        world.started = Some(100);
+        activate_script(&mut world, id, 7, Arc::default());
+        world.push(record(id.entity, Delivery::CreateBody(id)));
+        let mut egress = GameEgress::default();
+        assert_eq!(
+            transmit(&mut world, &mut egress, 100, 0).1.records,
+            [RecordSource::Queued(0)]
+        );
+        assert!(
+            transmit(&mut world, &mut egress, 100, 1)
+                .1
+                .records
+                .is_empty()
+        );
+        transport_outcome(&mut world, &mut egress, 0, true);
+        let (h0, sent) = transmit(&mut world, &mut egress, 101, 2);
+        assert_eq!(sent.records, [RecordSource::Queued(0)]);
+        transport_outcome(&mut world, &mut egress, 2, false);
+        assert_eq!(transmit(&mut world, &mut egress, 101, 3).0, h0);
+        transport_outcome(&mut world, &mut egress, 3, true);
+        assert_eq!(
+            world.body_script.as_ref().unwrap().stream.base().unwrap().0,
+            1
+        );
+
+        let blocked = transmit(&mut world, &mut egress, 101, 4).1;
+        assert!(blocked.records.is_empty());
+        let mut mover = Mover::new(
+            MoverSettings::default(),
+            Arc::new(ContactWorld::new(Vec::new()).unwrap()),
+            [0.0; 3],
+            0,
+            0x18,
+        )
+        .unwrap();
+        let rays = TriangleIndex::new([]).unwrap();
+        let command = forward(101);
+        mover
+            .step(&rays, command, 0.016, |mover, command| {
+                world
+                    .body_script
+                    .as_mut()
+                    .unwrap()
+                    .step(mover, command)
+                    .unwrap();
+            })
+            .unwrap();
+        assert!(
+            transmit(&mut world, &mut egress, 101, 5)
+                .1
+                .records
+                .is_empty()
+        );
+        let stream = &world.body_script.as_ref().unwrap().stream;
+        assert_eq!(
+            stream.pending().map(|(last, ..)| last).collect::<Vec<_>>(),
+            [3]
+        );
+        assert_eq!(stream.command_frame(), 101);
+
+        world.push(record(OWNER, Delivery::Possession(id)));
+        assert_eq!(
+            transmit(&mut world, &mut egress, 101, 6).1.records,
+            [RecordSource::Queued(0)]
+        );
+        transport_outcome(&mut world, &mut egress, 6, true);
+        let (c0, sent) = transmit(&mut world, &mut egress, 102, 7);
+        assert_eq!(sent.records, [RecordSource::Queued(0)]);
+        let command = forward(117);
+        mover
+            .step(&rays, command, 0.016, |mover, command| {
+                world
+                    .body_script
+                    .as_mut()
+                    .unwrap()
+                    .step(mover, command)
+                    .unwrap();
+            })
+            .unwrap();
+        assert!(
+            transmit(&mut world, &mut egress, 102, 8)
+                .1
+                .records
+                .is_empty()
+        );
+        transport_outcome(&mut world, &mut egress, 7, false);
+        assert_eq!(transmit(&mut world, &mut egress, 102, 9).0, c0);
+        transport_outcome(&mut world, &mut egress, 9, true);
+        assert_eq!(
+            transmit(&mut world, &mut egress, 117, 10).1.records,
+            [RecordSource::Queued(0)]
+        );
+        transport_outcome(&mut world, &mut egress, 10, false);
+        assert!(
+            transmit(&mut world, &mut egress, 118, 11)
+                .1
+                .records
+                .is_empty()
+        );
+
+        mover
+            .step(&rays, forward(118), 0.016, |mover, command| {
+                world
+                    .body_script
+                    .as_mut()
+                    .unwrap()
+                    .step(mover, command)
+                    .unwrap();
+            })
+            .unwrap();
+        assert_eq!(
+            transmit(&mut world, &mut egress, 118, 12).1.records,
+            [RecordSource::Queued(0)]
+        );
+        world.cancel_body_script();
+        let reused = avatar(1, 257);
+        activate_script(&mut world, reused, 7, Arc::default());
+        transport_outcome(&mut world, &mut egress, 12, true);
+        assert_eq!(world.body_script.as_ref().unwrap().stream.last(), 0);
+        assert!(world.queued.is_empty());
+    }
+
+    fn read_ack(payload: &[u8]) -> u32 {
+        let mut bits = BitReader::new(payload);
+        bits.var_a().unwrap();
+        assert!(!bits.bit().unwrap());
+        bits.var_a().unwrap()
+    }
+
+    #[test]
+    fn owner_correction_respects_create_budget_and_failed_transport() {
+        let mut world = WorldDelivery::new(OWNER);
+        let id = avatar(1, 1);
+        world.started = Some(100);
+        let failed = Arc::new(AtomicBool::new(false));
+        activate_script(&mut world, id, SOLDIER, Arc::clone(&failed));
+        world.input.processed = Some(125);
+        let history = world
+            .body_script
+            .as_mut()
+            .unwrap()
+            .corrections
+            .as_mut()
+            .unwrap();
+        history.record(Movement {
+            frame: Some(100),
+            ..Movement::default()
+        });
+        let mut egress = GameEgress::default();
+        let (blocked, sent) = transmit(&mut world, &mut egress, 100, 0);
+        assert_eq!(read_ack(&blocked), 102);
+        assert!(sent.records.is_empty());
+        world.acknowledge(
+            outcome(Arc::new(record(id.entity, Delivery::CreateBody(id))), true),
+            Duration::ZERO,
+        );
+        let (first, sent) = transmit(&mut world, &mut egress, 100, 1);
+        assert_eq!(read_ack(&first), 102);
+        assert!(sent.records.contains(&RecordSource::Movement(0)));
+        transport_outcome(&mut world, &mut egress, 1, true);
+        let history = world
+            .body_script
+            .as_mut()
+            .unwrap()
+            .corrections
+            .as_mut()
+            .unwrap();
+        assert_eq!(history.corrected(), Some(100));
+        history.record(Movement {
+            frame: Some(106),
+            ..Movement::default()
+        });
+        history.record(Movement {
+            frame: Some(112),
+            ..Movement::default()
+        });
+        for i in 0..MAX_ENTITY_RECORDS {
+            world.push(Record::baseline(EntityUpdate {
+                entity: 0x8000_0100 + i as u32,
+                operation: Some(Operation::Destroy),
+                ..EntityUpdate::default()
+            }));
+        }
+        let (crowded, sent) = transmit(&mut world, &mut egress, 107, 2);
+        assert_eq!(read_ack(&crowded), 102);
+        assert_eq!(sent.records.len(), MAX_ENTITY_RECORDS);
+        assert!(!sent.records.contains(&RecordSource::Movement(0)));
+        transport_outcome(&mut world, &mut egress, 2, true);
+        let rejected = world.send_frame(107, Vec::new(), false, &mut egress, |payload| {
+            assert_eq!(read_ack(&payload), 108);
+            Err(())
+        });
+        assert!(matches!(rejected, Err(SendError::Transport(()))));
+        assert_eq!(
+            world
+                .body_script
+                .as_ref()
+                .unwrap()
+                .corrections
+                .as_ref()
+                .unwrap()
+                .corrected(),
+            Some(100)
+        );
+        let (selected, sent) = transmit(&mut world, &mut egress, 107, 3);
+        assert_eq!(read_ack(&selected), 108);
+        assert_eq!(sent.records, [RecordSource::Movement(0)]);
+        assert!(egress.acknowledge(4, 0).packets.is_empty());
+        assert!(
+            transmit(&mut world, &mut egress, 107, 4)
+                .1
+                .records
+                .is_empty()
+        );
+
+        failed.store(true, Ordering::Relaxed);
+        let (payload, sent) = transmit(&mut world, &mut egress, 112, 5);
+        assert_eq!(read_ack(&payload), 125);
+        assert!(world.body_script.is_none());
+        assert!(sent.records.is_empty());
+        assert!(world.queued.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires a prepared 104319 Practice Range pack without bot VM graphs"]
+    fn prepared_worker_advances_an_attached_vm_and_cancels_it_on_a_pose_fault() {
+        let runtime = std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap();
+        let assets = SceneAssets::load(runtime).unwrap();
+        let mut scene = assets.prepare(GameMap::practice_range()).unwrap();
+        let failed = Arc::new(AtomicBool::new(false));
+        let runtime_fault = Arc::clone(&failed);
+        scene.owner_body_factory = Some(Arc::new(move |_, entity, frame| {
+            Ok(Some(synthetic_owner(
+                entity,
+                frame,
+                Arc::clone(&runtime_fault),
+            )))
+        }));
+        let viewer = PlayerAppearance {
+            entity: OWNER,
+            slot: 0,
+            team: 0,
+            card: &PlayerCard::default(),
+        };
+        let mut world = WorldDelivery::new(OWNER);
+        world.started = Some(FIRST_TICK);
+        let hero = scene.heroes().get(SOLDIER).unwrap();
+        world
+            .switch(
+                &scene,
+                &viewer,
+                FIRST_TICK,
+                OWNER | 1,
+                hero,
+                SkinTheme::default(),
+            )
+            .unwrap();
+        let tick = FIRST_TICK + 1;
+        world.queue_commands(tick, &[forward(tick)]);
+        assert_eq!(
+            world
+                .advance_input(&scene, &viewer, RETAIL_QUANTA, 16)
+                .unwrap(),
+            (1, false)
+        );
+        assert_eq!(world.body_script.as_ref().unwrap().frame, tick);
+        let mut egress = GameEgress::default();
+        assert!(
+            !transmit(&mut world, &mut egress, tick, 0)
+                .1
+                .records
+                .contains(&RecordSource::Movement(0))
+        );
+        transport_outcome(&mut world, &mut egress, 0, true);
+        assert_eq!(
+            transmit(&mut world, &mut egress, tick, 1).1.records,
+            [RecordSource::Queued(0), RecordSource::Movement(0)]
+        );
+
+        failed.store(true, Ordering::Relaxed);
+        world.queue_commands(tick + 1, &[forward(tick + 1)]);
+        assert_eq!(
+            world
+                .advance_input(&scene, &viewer, RETAIL_QUANTA, 16)
+                .unwrap(),
+            (1, false)
+        );
+        assert_eq!(world.command_ack(tick + 1), tick + 1);
+        assert!(world.body_script.is_none());
+        transport_outcome(&mut world, &mut egress, 1, false);
+        assert!(
+            transmit(&mut world, &mut egress, tick + 1, 2)
+                .1
+                .records
+                .is_empty()
+        );
     }
 
     #[test]

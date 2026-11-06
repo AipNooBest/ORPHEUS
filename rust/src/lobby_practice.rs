@@ -10,9 +10,9 @@ use crate::{
     jam_codec::{Fields, Value},
     lobby_session::PreparedLogin,
     lobby_transport::LobbyMessage,
-    match_handoff::{Handoff, LobbySeat, enter_game},
+    match_handoff::{Handoff, LobbySeat, enter_game, general_channel, match_channel},
     match_scene::PlayerCard,
-    scene_assets::SceneAssets,
+    scene_assets::{PreparedScene, SceneAssets},
 };
 
 pub const GAME_REQUEST: u32 = 0xa6e5_3896;
@@ -25,6 +25,17 @@ pub struct SoloPracticeHandoff<'a> {
     pub host: &'a str,
     pub general: Fields,
     pub match_channel: Fields,
+}
+
+impl<'a> SoloPracticeHandoff<'a> {
+    pub fn new(match_id: [u64; 2], host: &'a str) -> Self {
+        Self {
+            match_id,
+            host,
+            general: general_channel(),
+            match_channel: match_channel(match_id),
+        }
+    }
 }
 
 /// Practice uses a creation kind and flags, separate from a matchmaking card.
@@ -121,6 +132,26 @@ pub fn dispatch_prepared(
     collection: &Collection,
     send: impl FnMut(&LobbyMessage) -> io::Result<bool>,
 ) -> io::Result<Option<LobbySeat>> {
+    dispatch_scene(
+        request,
+        login,
+        game,
+        input,
+        (assets, collection),
+        |map| assets.prepare(map),
+        send,
+    )
+}
+
+pub(crate) fn dispatch_scene(
+    request: &LobbyMessage,
+    login: &PreparedLogin,
+    game: &GameService,
+    input: SoloPracticeHandoff<'_>,
+    (assets, collection): (&SceneAssets, &Collection),
+    prepare: impl FnOnce(GameMap) -> io::Result<PreparedScene>,
+    send: impl FnMut(&LobbyMessage) -> io::Result<bool>,
+) -> io::Result<Option<LobbySeat>> {
     dispatch(
         request,
         login,
@@ -147,7 +178,7 @@ pub fn dispatch_prepared(
                     ..PlayerCard::default()
                 }
             };
-            game.open_prepared_practice(id, assets.prepare(map)?, player, card)
+            game.open_prepared_practice(id, prepare(map)?, player, card)
                 .map(|ticket| vec![ticket])
         },
         send,
@@ -173,7 +204,7 @@ mod tests {
         accounts::Accounts,
         game_content::{PRACTICE_RANGE_MAP, PRACTICE_RANGE_MODE},
         game_link::{ACK, KIND_CONTROL, LinkCipher, MAX_DATAGRAM, Packet, SYN},
-        jam_codec::{Schemas, id16},
+        jam_codec::Schemas,
         lobby_login::Identity,
         match_handoff::{HANDOFF, HANDOFF_MESSAGE},
     };
@@ -213,19 +244,7 @@ mod tests {
     }
 
     fn input(match_id: [u64; 2]) -> SoloPracticeHandoff<'static> {
-        fn channel(id: [u64; 2], kind: u64) -> Fields {
-            Fields::from([
-                (0, Value::Struct(id16(id[0], id[1]))),
-                (0x10, Value::Unsigned(kind)),
-                (0x14, Value::Unsigned(0)),
-            ])
-        }
-        SoloPracticeHandoff {
-            match_id,
-            host: "127.0.0.1",
-            general: channel([0x12, 0x34], 7),
-            match_channel: channel(match_id, 6),
-        }
+        SoloPracticeHandoff::new(match_id, "127.0.0.1")
     }
 
     fn require_unsigned(fields: &Fields, offset: u32) -> u64 {

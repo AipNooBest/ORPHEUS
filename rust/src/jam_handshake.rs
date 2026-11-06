@@ -1,7 +1,7 @@
 //! Retail 104319 lobby handshake. The signing input is supplied by the local runtime.
 
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
@@ -31,7 +31,7 @@ fn mac(key: &[u8], first: &[u8], second: &[u8]) -> HmacSha256 {
     mac
 }
 
-fn client_value(stream: &mut TcpStream) -> io::Result<[u8; 32]> {
+fn client_value(stream: &mut impl Read) -> io::Result<[u8; 32]> {
     let mut message = [0; 40];
     stream.read_exact(&mut message)?;
     Ok(message[8..].try_into().unwrap())
@@ -75,7 +75,15 @@ pub fn server_handshake(
         ));
     };
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    handshake_io(stream, address, conn_id, signing_key)
+}
 
+pub(crate) fn handshake_io(
+    stream: &mut (impl Read + Write),
+    address: SocketAddrV4,
+    conn_id: u32,
+    signing_key: &[u8; 64],
+) -> io::Result<Channel> {
     let mut hello = [0; HELLO_CLIENT.len()];
     stream.read_exact(&mut hello)?;
     if &hello != HELLO_CLIENT {
