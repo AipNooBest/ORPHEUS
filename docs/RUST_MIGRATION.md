@@ -39,6 +39,8 @@ For authored target tags, pass the target build's exported `.003` XML directory 
 
 The owner VM reads the initial on-fire flag through the current possessor and the controller's component 64 baseline. The fire scoring and decay rules remain open. An authenticated human body has an explicitly absent AI control entity. For server-local message tables, the shared interpreter preserves the authored typed keys and values and uses their order for lookup. Network serialization of maps remains unverified.
 
+The operand-free instance exit uses the shared event queue and removes pending work and descendants when it runs. It can complete the still-linked parent SubScript through the normal finish event. Dynamic instance selectors, named exits and teardown order for active descendants still need 104319 verification. The verified direct-owner AI state finishes in the same clock when the body has no AI controller. The fieldless resource query returns a typed zero asset. The tagged Soldier preflight now reaches the remaining movement-record sampler at graph `01C7`, node `7`.
+
 The frozen Python server serves the regular entry points until cutover. The native server currently serves the solo base Practice Range on loopback. Other matchmaking modes, social actions, the dashboard and original-client acceptance are pending.
 
 ```powershell

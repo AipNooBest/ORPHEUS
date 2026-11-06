@@ -75,6 +75,10 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
 - The local build 104319 graphs exported with OWLib provide the single-tag grant and suppression
   paths in `01C7`, `01CF` and `0251`. Locally reviewed build 104319 codec tables from Gamayun and
   Boi-027's research corroborate the inherited empty payload for state `STU_E56BA8D8`.
+- The local build 104319 graph bundles from Gamayun and Boi-027 and the OWLib exports corroborate
+  the operands for the instance exit, absent AI state and zero-resource lookup. Local client
+  155284 inspection provides the queued exit, parent completion and typed zero return evidence.
+  The frozen 104319 state decoder and runtime provide finish-event and teardown comparisons.
 - **The Claudewatch contributors** supplied the Beta 1.0.0.3 research lead for attacker-side hit-confirm effects
   and separate entity and announcer voice messages. ORPHEUS checks these leads against 104319 client data before
   implementing them. The reference is a locally reviewed binary distribution.

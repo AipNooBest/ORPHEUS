@@ -827,6 +827,7 @@ struct AbilityPress {
 
 enum Event {
     Entry(u16),
+    ExitInstance,
     Begin(u16),
     Finish(u16),
     Abort(u16),
@@ -846,7 +847,7 @@ enum Event {
 impl Event {
     fn state(&self) -> Option<u16> {
         match *self {
-            Self::Entry(_) | Self::Message { .. } | Self::Button(_) => None,
+            Self::Entry(_) | Self::ExitInstance | Self::Message { .. } | Self::Button(_) => None,
             Self::Begin(state)
             | Self::Finish(state)
             | Self::Abort(state)
@@ -1768,6 +1769,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                             self.run_node(id, node, None, 0)?;
                         }
                     }
+                    Event::ExitInstance => self.exit_instance(id)?,
                     Event::Begin(raw) => self.begin(key(raw), 0)?,
                     Event::Finish(raw) => self.end(key(raw), true, 0)?,
                     Event::Abort(raw) => self.end(key(raw), false, 0)?,
@@ -2220,6 +2222,14 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 self.follow(id, node, "m_outPlug", None, depth)?;
                 Ok(true)
             }
+            "STU_22926252"
+                if field(&node.fields, "m_67B81D25").is_null()
+                    && field(&node.fields, "m_EB35D2F1").is_null() =>
+            {
+                self.post(id, Event::ExitInstance)?;
+                self.follow(id, node, "m_outPlug", None, depth)?;
+                Ok(true)
+            }
             "STU_12F5D52D" => {
                 let mut complete = true;
                 for item in array_field(&node.fields, "m_143D4C5B") {
@@ -2435,6 +2445,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             "STU_E56BA8D8" if node.is_networked() && node.remote == -1 => {
                 StateKind::TargetTag { effect: None }
             }
+            "STU_066B4605" if self.has_no_ai_control_target(id, node) => StateKind::Plain,
             "STUStatescriptStateBooleanSwitch" => StateKind::BooleanSwitch(false),
             "STU_B591EBFE" => StateKind::DelayedSwitch {
                 current: false,
@@ -2494,6 +2505,10 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         );
         match kind {
             StateKind::GamePadVibration => self.post(id, Event::Finish(key.raw))?,
+            StateKind::Plain if node.class == "STU_066B4605" => {
+                // The absent AI relation finishes through the current clock's event queue.
+                self.post(id, Event::Finish(key.raw))?;
+            }
             StateKind::HealthPool { .. } => self.begin_health_pool(key, node)?,
             StateKind::TargetTag { .. } => self.begin_target_tag(key, node)?,
             StateKind::BooleanSwitch(_) => {
@@ -2562,6 +2577,17 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         self.follow(id, node, "m_onBeginPlug", Some(key), depth)?;
         self.follow(id, node, "m_subgraphPlug", Some(key), depth)?;
         self.try_complete(key, node, depth)
+    }
+
+    fn has_no_ai_control_target(&mut self, id: u16, node: &Node) -> bool {
+        let site = self.site(id, node);
+        node.is_networked()
+            && node.remote == -1
+            && script_expr::native_shape(field(&node.fields, "m_00D49978"), "STU_B5A0CAF0", None)
+            && self
+                .world
+                .related_entity(site, EntityRelation::AiControlEntity, site.entity)
+                == Some(0)
     }
 
     fn begin_target_tag(&mut self, key: StateKey, node: &Node) -> Result<(), InitFault> {
@@ -4160,6 +4186,29 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         });
     }
 
+    fn exit_instance(&mut self, id: u16) -> Result<(), InitFault> {
+        let parent = self.machine.snapshot.instances[&id].parent;
+        self.destroy(id)?;
+        let Some((instance, raw)) = parent else {
+            return Ok(());
+        };
+        let key = StateKey { instance, raw };
+        let Some(state) = self.state_mut(key).filter(|state| {
+            state.active && !state.ending && state.kind == StateKind::SubScript { child: Some(id) }
+        }) else {
+            return Ok(());
+        };
+        state.kind = StateKind::SubScript { child: None };
+        let node = self
+            .graph(instance)
+            .state(usize::from(raw))
+            .expect("active subscript");
+        if !configured(node, "m_24AB04BB") {
+            self.post(instance, Event::Finish(raw))?;
+        }
+        Ok(())
+    }
+
     fn destroy(&mut self, id: u16) -> Result<(), InitFault> {
         let mut pending = vec![(id, false)];
         while let Some((id, children_done)) = pending.pop() {
@@ -4607,7 +4656,8 @@ mod tests {
 
     fn node(position: u16, class: &str, state: Option<u16>, mut fields: Json) -> Json {
         fields["m_2BBEEAB8"] = json!(state.is_some());
-        fields["m_ADEB6E05"] = json!(class.contains("Action") || class == "STU_12F5D52D");
+        fields["m_ADEB6E05"] =
+            json!(class.contains("Action") || matches!(class, "STU_12F5D52D" | "STU_22926252"));
         json!({
             "pos":position, "class":class, "uid":position, "rid":position, "remote":-1,
             "state":state, "client_only":false, "server_only":false, "fields":fields,
@@ -4847,6 +4897,129 @@ mod tests {
             let snapshot = component.snapshot().unwrap();
             let states = &snapshot.instances[&1].states;
             assert!(!states[&0].active && !states[&1].active);
+        }
+    }
+
+    #[test]
+    fn instance_exit_drains_in_order_and_finishes_the_linked_parent() {
+        let entry = |links: &[(u16, &str)]| {
+            node(
+                0,
+                "STUStatescriptEntry",
+                None,
+                json!({"m_outPlug":plug(links, &[])}),
+            )
+        };
+        let mark = |position, identifier| {
+            node(
+                position,
+                "STUStatescriptActionSetVar",
+                None,
+                json!({
+                    "m_out_Var":var(identifier,true), "m_value":true
+                }),
+            )
+        };
+        let subscript = |position, raw, child: u16, keep_parent| {
+            node(
+                position,
+                "STU_37D754C8",
+                Some(raw),
+                json!({
+                    "m_36F7B64C":{"m_36F7B64C":{"m_C974E369":{
+                        "m_graph":format!("0x058000000000{child:04X}")
+                    }}},
+                    "m_24AB04BB":keep_parent
+                }),
+            )
+        };
+        let child = graph(
+            43,
+            vec![
+                entry(&[
+                    (1, "m_beginPlug"),
+                    (2, "m_beginPlug"),
+                    (3, "m_inPlug"),
+                    (4, "m_beginPlug"),
+                ]),
+                node(
+                    1,
+                    "STUStatescriptStateWait",
+                    Some(0),
+                    json!({
+                        "m_timeout":{"$":"STUConfigVarFloat","m_value":1.0},
+                        "m_onBeginPlug":plug(&[(5,"m_inPlug")], &[]),
+                        "m_onAbortPlug":plug(&[(6,"m_inPlug")], &[]),
+                        "m_onEndPlug":plug(&[(6,"m_inPlug")], &[])
+                    }),
+                ),
+                subscript(2, 1, 44, false),
+                node(
+                    3,
+                    "STU_22926252",
+                    None,
+                    json!({"m_outPlug":plug(&[(7,"m_inPlug")], &[])}),
+                ),
+                node(
+                    4,
+                    "STUStatescriptState",
+                    Some(2),
+                    json!({"m_onBeginPlug":plug(&[(8,"m_inPlug")], &[])}),
+                ),
+                mark(5, 100),
+                mark(6, 101),
+                mark(7, 102),
+                mark(8, 103),
+            ],
+            json!([1, 2, 4]),
+            json!([0]),
+        );
+        let grandchild = graph(
+            44,
+            vec![entry(&[(1, "m_inPlug")]), mark(1, 104)],
+            json!([]),
+            json!([0]),
+        );
+        for keep_parent in [false, true] {
+            let mut owner = subscript(1, 0, 43, keep_parent);
+            owner["fields"]["m_onFinishedPlug"] = plug(&[(2, "m_inPlug")], &[]);
+            owner["fields"]["m_onAbortPlug"] = plug(&[(3, "m_inPlug")], &[]);
+            let parent = graph(
+                42,
+                vec![
+                    entry(&[(1, "m_beginPlug")]),
+                    owner,
+                    mark(2, 105),
+                    mark(3, 106),
+                ],
+                json!([1]),
+                json!([0]),
+            );
+            let snapshot = initialize(
+                &store(vec![parent, child.clone(), grandchild.clone()]),
+                42,
+                Variables::new(),
+                vec![Root::new(1, 42)],
+                &mut EmptyWorld,
+                MAX_INIT_WORK,
+            )
+            .unwrap();
+            assert!(
+                snapshot.initialization_complete(),
+                "{:?}",
+                snapshot.diagnostics
+            );
+            assert_eq!(snapshot.instances.keys().copied().collect::<Vec<_>>(), [1]);
+            assert!(snapshot.pending_timers.is_empty());
+            let state = &snapshot.instances[&1].states[&0];
+            assert_eq!(state.active, keep_parent);
+            assert_eq!(state.kind, StateKind::SubScript { child: None });
+            let mut expected =
+                Variables::from([(100, Value::Bool(true)), (102, Value::Bool(true))]);
+            if !keep_parent {
+                expected.insert(105, Value::Bool(true));
+            }
+            assert_eq!(snapshot.variables, expected);
         }
     }
 
@@ -7065,6 +7238,110 @@ mod tests {
             assert_eq!(bot.instances[&2].parent, Some((1, 3)));
             assert_eq!(active(&bot, 2), [56, 76]);
             assert!(!bot.initialization_complete());
+        }
+    }
+
+    #[test]
+    fn ai_control_state_finishes_at_begin_time_only_for_an_absent_owner_relation() {
+        const OWNER: u32 = 0xa000_0101;
+        const FRAME: u32 = 100;
+        struct AiWorld(Option<u32>);
+        impl World for AiWorld {
+            fn related_entity(
+                &mut self,
+                site: Site,
+                relation: EntityRelation,
+                entity: u32,
+            ) -> Option<u32> {
+                assert_eq!(site.node, Some(1));
+                assert_eq!(relation, EntityRelation::AiControlEntity);
+                assert_eq!(entity, OWNER);
+                self.0
+            }
+        }
+
+        let owner = json!({"$":"STU_B5A0CAF0","m_EE729DCB":0});
+        for (target, relation, finishes) in [
+            (owner.clone(), Some(0), true),
+            (owner.clone(), None, false),
+            (owner, Some(OWNER + 1), false),
+            (var(100, true), Some(0), false),
+        ] {
+            let graphs = Arc::new(store(vec![graph(
+                42,
+                vec![
+                    node(
+                        0,
+                        "STUStatescriptEntry",
+                        None,
+                        json!({"m_outPlug":plug(&[(1,"m_beginPlug")], &[])}),
+                    ),
+                    node(
+                        1,
+                        "STU_066B4605",
+                        Some(0),
+                        json!({
+                            "m_00D49978":target,
+                            "m_D66E7D68":{"$":"STUConfigVarInt","m_value":0},
+                            "m_F2810377":{"$":"STUConfigVarIdentifier","m_identifier":"0x0D8000000000023A"},
+                            "m_F8585ABF":{"$":"STUConfigVarBool","m_value":0},
+                            "m_priority":{"$":"STU_8A491388","m_priority":"0x0C40000000000002"},
+                            "m_onBeginPlug":plug(&[(2,"m_inPlug")], &[]),
+                            "m_onFinishedPlug":plug(&[(3,"m_inPlug")], &[]),
+                            "m_onAbortPlug":plug(&[(4,"m_inPlug")], &[]),
+                        }),
+                    ),
+                    node(
+                        2,
+                        "STUStatescriptActionSetVar",
+                        None,
+                        json!({"m_out_Var":var(100,false), "m_value":true}),
+                    ),
+                    node(
+                        3,
+                        "STUStatescriptActionSetVar",
+                        None,
+                        json!({"m_out_Var":var(101,false), "m_value":var(100,false)}),
+                    ),
+                    node(
+                        4,
+                        "STUStatescriptActionSetVar",
+                        None,
+                        json!({"m_out_Var":var(101,false), "m_value":false}),
+                    ),
+                ],
+                json!([1]),
+                json!([0]),
+            )]));
+            let component = Component::start(
+                graphs,
+                OWNER,
+                Variables::new(),
+                vec![Root::new(1, 42)],
+                FRAME,
+                &mut AiWorld(relation),
+                MAX_INIT_WORK,
+            )
+            .unwrap();
+            let snapshot = component.snapshot().unwrap();
+            let instance = &snapshot.instances[&1];
+            assert_eq!(component.now_ms(), frame_start(FRAME));
+            assert!(snapshot.pending_timers.is_empty());
+            if finishes {
+                assert!(snapshot.initialization_complete());
+                let state = &instance.states[&0];
+                assert!(!state.active);
+                assert_eq!(state.activation, 1);
+                assert_eq!(state.start_ms, frame_start(FRAME));
+                assert_eq!(instance.variables[&101], Value::Bool(true));
+            } else {
+                assert!(matches!(
+                    snapshot.diagnostics.as_slice(),
+                    [Diagnostic { issue: Issue::UnsupportedState(class), .. }]
+                        if class == "STU_066B4605"
+                ));
+                assert!(instance.states.is_empty() && instance.variables.is_empty());
+            }
         }
     }
 }

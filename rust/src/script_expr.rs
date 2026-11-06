@@ -711,6 +711,15 @@ impl Evaluator {
             }
             "STU_B70476F3" => literal_asset(config, class, "m_548E5344", 0x0a90)
                 .ok_or_else(|| EvalError::UnsupportedConfig(class.into()))?,
+            "STU_ABB6C23E" => {
+                if !native_shape(config, class, Some("m_resourceKey"))
+                    || fields.get("m_resourceKey") != Some(&Json::Null)
+                {
+                    return Err(EvalError::UnsupportedConfig(class.into()));
+                }
+                // The native evaluator writes zero with the identifier's asset type.
+                Value::Asset(0)
+            }
             "STU_7757D403" => literal_message_map(config)?,
             "STU_B5A0CAF0" => context.owner(),
             "STU_25ECB55F" => {
@@ -1564,6 +1573,26 @@ mod tests {
                 Err(WireError::InvalidValue)
             );
             assert_eq!(bits.bit_len(), 0);
+        }
+    }
+
+    #[test]
+    fn fieldless_native_resource_evaluates_to_a_zero_asset() {
+        let literal = json!({"$":"STU_ABB6C23E", "m_EE729DCB":0, "m_resourceKey":null});
+        let mut context = Vars::default();
+        assert_eq!(evaluate(&literal, &mut context), Ok(Value::Asset(0)));
+
+        for (field, value) in [
+            ("m_resourceKey", json!("0x0D80000000000015")),
+            ("m_EE729DCB", json!(1)),
+            ("m_unknown", json!("0x0D80000000000015")),
+        ] {
+            let mut config = literal.clone();
+            config[field] = value;
+            assert_eq!(
+                evaluate(&config, &mut context),
+                Err(EvalError::UnsupportedConfig("STU_ABB6C23E".into()))
+            );
         }
     }
 

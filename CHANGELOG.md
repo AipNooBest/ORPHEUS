@@ -916,3 +916,10 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Verified the stock Soldier graph grants tag `0422` at `01C7`, node `96` with or without a base tag list. Its state uses the inherited empty payload. The tagged 104319 preflight drops from 5 diagnostics to 4. The first remains `STU_22926252` at `08B6`, node `11`. Stock weapon attachment and original-client acceptance remain pending.
 - Clarified that the Python server stays frozen and is retired when Rust exceeds its verified coverage and passes cutover acceptance.
 - Passed 311 public Rust tests, 59 tagged base-runtime checks and 55 tagged enriched-runtime checks. The untagged bundle also passed the owner startup regression. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.
+
+#### Rust script instance exit and owner startup transitions
+
+- Queued the operand-free instance exit after earlier same-time events. The normal action output still runs, and the instance teardown cancels later work and releases its descendants. A child exit completes the still-linked parent state when the authored flag permits it. Dynamic targets, named exits and active descendant ordering remain unverified in build 104319.
+- Completed the direct-owner AI state through the same-time finish queue when the world confirms no AI control entity. Added the typed zero asset returned by the fieldless resource lookup. The 104319 graph shapes match the local archive references, and later client inspection corroborates the execution paths.
+- The tagged Soldier startup retires instances 9 and 25 while retaining the allocated ID 26. Its preflight goes from 4 diagnostics to 1, the movement-record sampler at `01C7`, node `7`. Stock weapon attachment and original-client acceptance remain pending.
+- Passed 314 public Rust tests, 59 tagged base-runtime checks and 55 tagged enriched-runtime checks. The untagged bundle also passed the owner startup regression. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.

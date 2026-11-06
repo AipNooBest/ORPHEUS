@@ -1139,8 +1139,8 @@ mod tests {
                 diagnostic.site.graph, diagnostic.site.node, diagnostic.issue
             );
         }
-        // Frozen BodyScript startup with the same component 26 mask supplied
-        // to the two owner filters. All five team-only masks select this tree.
+        // The frozen BodyScript replay allocates the same IDs with the team
+        // mask. The exit retires 08B6 (9) and its unstarted child 0BF8 (25).
         let expected = [
             (1, 0x0033, None),
             (2, 0x004b, None),
@@ -1150,7 +1150,6 @@ mod tests {
             (6, 0x0257, None),
             (7, 0x0259, None),
             (8, 0x091b, None),
-            (9, 0x08b6, None),
             (10, 0x0015, None),
             (11, 0x0254, None),
             (12, 0x01c7, Some((2, 0))),
@@ -1166,7 +1165,6 @@ mod tests {
             (22, 0x01d8, Some((2, 4))),
             (23, 0x0f82, Some((2, 21))),
             (24, 0x05ad, Some((2, 7))),
-            (25, 0x0bf8, Some((9, 4))),
             (26, 0x0e8f, Some((13, 32))),
         ];
         let instances: Vec<_> = snapshot
@@ -1243,15 +1241,7 @@ mod tests {
                 .any(|item| item.site.graph == 0x01cf && item.site.node == Some(41))
         );
         assert_eq!(snapshot.instances[&11].variables[&28], Value::Integer(1));
-        for (instance, state) in [
-            (10, 42),
-            (10, 43),
-            (11, 83),
-            (13, 138),
-            (13, 139),
-            (14, 30),
-            (25, 8),
-        ] {
+        for (instance, state) in [(10, 42), (10, 43), (11, 83), (13, 138), (13, 139), (14, 30)] {
             let controller = &snapshot.instances[&instance].states[&state];
             assert!(controller.active);
             assert_eq!(controller.kind, crate::script_init::StateKind::Plain);
@@ -1278,14 +1268,7 @@ mod tests {
                 assert_eq!(codec.payload(&BTreeMap::new(), mode).unwrap().bit_len(), 0);
             }
         }
-        for (instance, raw, position) in [
-            (1, 13, 39),
-            (2, 22, 32),
-            (2, 23, 33),
-            (9, 9, 18),
-            (9, 10, 19),
-            (10, 39, 73),
-        ] {
+        for (instance, raw, position) in [(1, 13, 39), (2, 22, 32), (2, 23, 33), (10, 39, 73)] {
             let instance = &snapshot.instances[&instance];
             let node = world
                 .graphs
@@ -1303,28 +1286,10 @@ mod tests {
             assert!(child.active);
             assert_eq!(child.kind, StateKind::BooleanSwitch(false));
         }
-        let health_switch = &snapshot.instances[&9].states[&1];
-        assert!(health_switch.active);
-        assert_eq!(
-            health_switch.kind,
-            crate::script_init::StateKind::BooleanSwitch(true)
-        );
-        let ai_switch = &snapshot.instances[&9].states[&12];
-        assert!(ai_switch.active);
-        assert_eq!(ai_switch.kind, StateKind::BooleanSwitch(false));
-        let human_state = &snapshot.instances[&9].states[&11];
-        assert!(human_state.active);
-        assert_eq!(human_state.kind, StateKind::Plain);
-        assert_eq!(
-            world
-                .graphs
-                .graph(0x08b6)
-                .unwrap()
-                .state(11)
-                .unwrap()
-                .remote,
-            -1
-        );
+        let selection = &snapshot.instances[&18].states[&0];
+        assert!(selection.active);
+        assert_eq!(selection.kind, StateKind::BooleanSwitch(false));
+        assert!(!snapshot.instances[&18].states.contains_key(&1));
         let on_fire = &snapshot.instances[&13].states[&17];
         assert!(on_fire.active);
         assert_eq!(on_fire.kind, StateKind::BooleanSwitch(false));
@@ -1336,9 +1301,9 @@ mod tests {
             (0x0033, 66),
             (0x004b, 19),
             (0x004b, 20),
-            (0x08b6, 2),
-            (0x08b6, 20),
-            (0x08b6, 21),
+            (0x08b6, 3),
+            (0x08b6, 11),
+            (0x0ba4, 10),
         ] {
             assert!(!snapshot.diagnostics.iter().any(|diagnostic| {
                 diagnostic.site.graph == graph && diagnostic.site.node == Some(node)
@@ -1437,7 +1402,7 @@ mod tests {
             Ok(Value::Bool(false))
         );
         assert_eq!(
-            component.evaluate_state_config(9, 1, &health_present, &mut world),
+            component.evaluate_state_config(12, 48, &health_present, &mut world),
             Ok(Value::Bool(true))
         );
         assert_eq!(
