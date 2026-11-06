@@ -45,12 +45,17 @@ impl From<ContactFrame> for CastFrame {
 }
 
 impl CastFrame {
-    pub fn transform(self, [x, y, z]: Vec3) -> Vec3 {
+    pub(crate) fn columns(self) -> [Vec3; 3] {
+        self.columns
+    }
+
+    pub(crate) fn rotate_only(self, [x, y, z]: Vec3) -> Vec3 {
         let [c0, c1, c2] = self.columns;
-        add(
-            add(add(scale(c0, x), scale(c1, y)), scale(c2, z)),
-            self.translation,
-        )
+        add(add(scale(c0, x), scale(c1, y)), scale(c2, z))
+    }
+
+    pub fn transform(self, point: Vec3) -> Vec3 {
+        add(self.rotate_only(point), self.translation)
     }
 }
 

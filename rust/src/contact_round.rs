@@ -106,6 +106,7 @@ pub enum FeatureKind {
     Face = 0,
     Edge = 1,
     Vertex = 2,
+    Unclassified = 3,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

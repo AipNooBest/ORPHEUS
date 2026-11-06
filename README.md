@@ -27,7 +27,7 @@ An automated result covers the fixture or replay named in its evidence. A manual
 
 ## Run locally
 
-The Rust crate includes transport, protocol codecs, account and collection handling, a local Battle.net listener, a UDP match worker and the runtime preparation tool. A headless loopback with the base graph bundle follows solo Practice Range from lobby handoff through world creation, bot movement, hero selection and body replacement. Player movement, body and bot script execution, and combat are still being ported. Run `cargo test --locked --all-targets` with stable Rust to verify the public fixtures. The current game server entry point runs the Python implementation described below.
+The Rust crate includes transport, protocol codecs, account and collection handling, a local Battle.net listener, a UDP match worker and the runtime preparation tool. A headless loopback with the base graph bundle follows solo Practice Range from lobby handoff through world creation, bot movement, hero selection and body replacement. Separate reference checks cover movement inputs, ground probes, static contacts, script initialization and state payloads. Live player movement, full body and bot scripts, and combat are still being ported. Run `cargo test --locked --all-targets` with stable Rust to verify the public fixtures. The current game server entry point runs the Python implementation described below.
 
 The documented environment is Windows with Python 3.12. Node.js 24 is used for the dashboard test. The public source checks can run without the game or any prepared runtime.
 

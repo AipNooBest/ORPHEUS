@@ -1,4 +1,4 @@
-//! Two-metre XZ columns shared by the ray and movement geometry indexes.
+//! XZ columns shared by triangle indexes and static contact proxies.
 
 use std::collections::HashMap;
 
@@ -9,7 +9,11 @@ const MAX_REFERENCES: usize = 1 << 24;
 type Column = (i32, i32);
 
 pub(crate) fn cell(coordinate: f64) -> Option<i32> {
-    let value = (coordinate / CELL_WIDTH).floor();
+    cell_with_width(coordinate, CELL_WIDTH)
+}
+
+fn cell_with_width(coordinate: f64, width: f64) -> Option<i32> {
+    let value = (coordinate / width).floor();
     (f64::from(i32::MIN)..=f64::from(i32::MAX))
         .contains(&value)
         .then_some(value as i32)
@@ -23,13 +27,40 @@ pub(crate) struct ColumnRange {
 
 impl ColumnRange {
     pub(crate) fn new([low_x, low_z]: [f64; 2], [high_x, high_z]: [f64; 2]) -> Option<Self> {
+        Self::for_width([low_x, low_z], [high_x, high_z], CELL_WIDTH)
+    }
+
+    pub(crate) fn for_width(
+        [low_x, low_z]: [f64; 2],
+        [high_x, high_z]: [f64; 2],
+        width: f64,
+    ) -> Option<Self> {
         if low_x > high_x || low_z > high_z {
             return None;
         }
         Some(Self {
-            first: (cell(low_x)?, cell(low_z)?),
-            last: (cell(high_x)?, cell(high_z)?),
+            first: (
+                cell_with_width(low_x, width)?,
+                cell_with_width(low_z, width)?,
+            ),
+            last: (
+                cell_with_width(high_x, width)?,
+                cell_with_width(high_z, width)?,
+            ),
         })
+    }
+
+    pub(crate) fn expanded(self, cells: i32) -> Self {
+        Self {
+            first: (
+                self.first.0.saturating_sub(cells),
+                self.first.1.saturating_sub(cells),
+            ),
+            last: (
+                self.last.0.saturating_add(cells),
+                self.last.1.saturating_add(cells),
+            ),
+        }
     }
 
     fn contains(self, (x, z): Column) -> bool {
@@ -46,17 +77,33 @@ impl ColumnRange {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GridLimit;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ColumnGrid {
     grid: HashMap<Column, Vec<u32>>,
     large: Vec<u32>,
     references: usize,
+    large_limit: u64,
+}
+
+impl Default for ColumnGrid {
+    fn default() -> Self {
+        Self::with_large_limit(LARGE_COLUMNS)
+    }
 }
 
 impl ColumnGrid {
+    pub(crate) fn with_large_limit(large_limit: u64) -> Self {
+        Self {
+            grid: HashMap::new(),
+            large: Vec::new(),
+            references: 0,
+            large_limit,
+        }
+    }
+
     pub(crate) fn insert(&mut self, number: u32, range: ColumnRange) -> Result<(), GridLimit> {
         let count = range.count();
-        if count > LARGE_COLUMNS {
+        if count > self.large_limit {
             self.large.push(number);
             return Ok(());
         }
@@ -87,7 +134,7 @@ impl ColumnGrid {
     pub(crate) fn visit(&self, range: ColumnRange, mut consider: impl FnMut(u32)) {
         self.column(range.first).for_each(&mut consider);
         let count = range.count();
-        if count > LARGE_COLUMNS && count > self.grid.len() as u64 {
+        if count > self.large_limit && count > self.grid.len() as u64 {
             let mut occupied: Vec<_> = self
                 .grid
                 .keys()

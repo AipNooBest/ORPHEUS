@@ -16,9 +16,9 @@ use crate::contact_round::{
 
 pub const SKIN: f32 = 0.01;
 pub const TOUCH: f32 = 0.005;
-const FACE_COS: f32 = 0.996_194_7;
+pub(crate) const FACE_COS: f32 = 0.996_194_7;
 const FLAT_COS: f32 = 0.999_390_84;
-const EDGE_TOLERANCE: f32 = 0.9;
+pub(crate) const EDGE_TOLERANCE: f32 = 0.9;
 const EDGE_SLOP: f32 = 0.0025;
 const BEND: f32 = 0.034_906_585;
 const ATAN_K: f32 = 0.28;
@@ -182,12 +182,12 @@ pub fn closest_segments(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> (Vec3, Vec3) 
 }
 
 #[derive(Clone, Copy)]
-struct ClipPoint {
-    position: Vec3,
-    feature: FeatureId,
+pub(crate) struct ClipPoint {
+    pub position: Vec3,
+    pub feature: FeatureId,
 }
 
-fn edge_feature(edge: usize) -> FeatureId {
+pub(crate) fn edge_feature(edge: usize) -> FeatureId {
     FeatureId {
         a: Feature::edge(edge as u8),
         b: Feature::edge(0),
@@ -195,7 +195,7 @@ fn edge_feature(edge: usize) -> FeatureId {
     }
 }
 
-fn clip_segment(
+pub(crate) fn clip_segment(
     points: [ClipPoint; 2],
     side: Vec3,
     offset: f32,
