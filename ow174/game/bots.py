@@ -243,15 +243,18 @@ class Bot:
         x, y, z = self.position
         dx, dz = self.direction
         probe = min(stride, distance)
-        rise = self._floor(x + dx * probe, y, z + dz * probe, collision) - y
+        probe_y = self._floor(x + dx * probe, y, z + dz * probe, collision)
+        rise = probe_y - y
         if 0.0 < abs(rise) <= MAX_SLOPE * probe:
             stride *= probe / math.hypot(probe, rise)
+        # Snapping to the authored target can use different coordinates from the probe.
+        reuse_probe = stride == probe and stride < distance
         if stride >= distance:
             stride = distance
             nx, nz = self.target[0], self.target[2]
         else:
             nx, nz = x + dx * stride, z + dz * stride
-        ny = self._floor(nx, y, nz, collision)
+        ny = probe_y if reuse_probe else self._floor(nx, y, nz, collision)
         self.position = (nx, ny, nz)
         self.velocity = ((nx - x) / dt, (ny - y) / dt, (nz - z) / dt)
         return stride

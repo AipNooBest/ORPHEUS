@@ -304,6 +304,29 @@ class StateTests(unittest.TestCase):
 
 
 class FloorTests(unittest.TestCase):
+    def test_advance_reuses_the_floor_only_for_the_same_arithmetic_step(self):
+        for slope, stride, distance in ((0.0, 1.0, 2.0), (0.5, 1.0, 2.0), (0.0, 2.0, 2.0)):
+            with self.subTest(slope=slope, stride=stride, distance=distance):
+                target = (-0.0, slope * distance, distance)
+                bot = make_bot([(0.0, 0.0, 0.0), target], index=0)
+                bot.target = target
+                queries = []
+
+                def ground(x, z, _top, _bottom, *, queries=queries, slope=slope):
+                    queries.append((math.copysign(1.0, x), z))
+                    return SimpleNamespace(y=slope * z)
+
+                moved = bot._advance(stride, distance, TICK, SimpleNamespace(ground=ground))
+                expected = stride / math.hypot(1.0, slope)
+                self.assertAlmostEqual(moved, expected)
+                self.assertEqual(bot.position, (0.0, slope * moved, moved))
+                wanted = [(1.0, stride)]
+                if slope:
+                    wanted.append((1.0, moved))
+                if stride == distance:
+                    wanted.append((-1.0, distance))
+                self.assertEqual(queries, wanted)
+
     def test_without_collision_it_climbs_in_step_with_the_way(self):
         walker = Walker(make_bot([(0.0, 0.0, 0.0), (0.0, 2.0, 10.0)], index=0))
         walker.run(3.0 + 2.0)  # the wait, then 2 s of the walk
