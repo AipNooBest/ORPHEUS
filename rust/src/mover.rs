@@ -6,12 +6,11 @@ use crate::{
     collision_index::TriangleIndex,
     commands::Command,
     contact_body::CharacterBody,
-    contact_cache::CapsulePose,
     contact_gjk::PointSetSize,
     contact_hull::HullContactError,
     contact_solver::clip_velocity,
     contact_world::ContactWorld,
-    mover_ground::{GroundProbe, ProbePose, capsule, pogo},
+    mover_ground::{GroundProbe, ProbePose, pogo, standing_body},
     mover_kinematics::{Ground, MotionInput, Poses, VelocityStep, poses},
     mover_modifiers::{Modifier, ModifierKey, ModifierTimeline},
     mover_posture::{Posture, PostureStep, TOUCHING, snap},
@@ -43,19 +42,11 @@ impl Mover {
         category: u16,
     ) -> Result<Self, PointSetSize> {
         let position = position.map(snap);
-        let (radius, segment) = capsule(&base, false);
-        let [x, y, z] = position;
-        let lift = pogo(&base, false) as f32;
-        let pose = CapsulePose {
-            position: [x as f32, (y + f64::from(lift)) as f32, z as f32],
-            radius,
-            top: segment + radius,
-        };
         Ok(Self {
             base,
             category,
             probe: GroundProbe::new(&base)?,
-            body: CharacterBody::new(world, pose, category),
+            body: standing_body(&base, world, position, category),
             posture: Posture::new(&base),
             modifiers: ModifierTimeline::default(),
             last_command: None,

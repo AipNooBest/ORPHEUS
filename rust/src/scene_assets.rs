@@ -28,6 +28,7 @@ use crate::{
     game_stats::{PlayerStats, StatsCatalog},
     match_scene::{PlayerAppearance, initial_world, mode_ui},
     mover::Mover,
+    mover_ground::NOT_GROUND,
     mover_posture::snap,
     mover_settings::MoverCatalog,
     script_codecs::CodecTable,
@@ -38,6 +39,30 @@ use crate::{
 };
 
 const MOVER_CATEGORY: u16 = 0x18;
+
+fn mover_category(map: &GameMap, team: u8) -> u16 {
+    match (map.free_for_all, team) {
+        (false, 0) => 0x08,
+        (false, 1) => 0x10,
+        _ => MOVER_CATEGORY,
+    }
+}
+
+fn is_practice_range(map: &GameMap) -> bool {
+    map.map_guid == PRACTICE_RANGE_MAP && map.mode_guid == PRACTICE_RANGE_MODE
+}
+
+fn ground_height(
+    ground: &TriangleIndex,
+    category: u16,
+) -> impl Fn(f64, f64, f64, f64) -> Option<f64> + '_ {
+    move |x, z, top, bottom| {
+        ground
+            .ground(x, z, top, bottom, category)
+            .filter(|hit| hit.surface & NOT_GROUND == 0)
+            .map(|hit| hit.y)
+    }
+}
 
 type OwnerBodyFactory =
     dyn Fn(&Hero, OwnerBodySpawn) -> io::Result<Option<Box<dyn OwnerBodyRuntime>>> + Send + Sync;
@@ -120,7 +145,7 @@ impl SceneAssets {
         let empty = BTreeSet::new();
         let identifiers = self.mode_props.get(&map.mode_guid).unwrap_or(&empty);
         let ground = CollisionScene::movement_probe(&cache, identifiers).map_err(invalid)?;
-        let bots = self.bots.make(map.map_guid, |body| {
+        let mut bots = self.bots.make(map.map_guid, |body| {
             let settings = self.movers.for_body(Some(body));
             BotWalk::from_mover(
                 settings.run_forward,
@@ -132,22 +157,34 @@ impl SceneAssets {
             .iter()
             .filter(|bot| self.graphs.entity_body(bot.spawn.body).is_some())
             .count();
-        let contacts = (map.map_guid == PRACTICE_RANGE_MAP
-            && map.mode_guid == PRACTICE_RANGE_MODE
-            && scripted_bots == 0)
-            .then(|| ContactWorld::from_movement_cache(cache, identifiers).map(Arc::new))
-            .transpose()
-            .map_err(invalid)?;
+        let contacts = (is_practice_range(&map)
+            || bots.iter().any(|bot| !bot.spawn.route.is_empty()))
+        .then(|| ContactWorld::from_movement_cache(cache, identifiers).map(Arc::new))
+        .transpose()
+        .map_err(invalid)?;
+        if let Some(world) = &contacts {
+            for bot in bots.iter_mut().filter(|bot| !bot.spawn.route.is_empty()) {
+                let category = mover_category(&map, bot.spawn.team);
+                bot.attach_collision(
+                    self.movers.for_body(Some(bot.spawn.body)),
+                    Arc::clone(world),
+                    category,
+                    ground_height(ground.triangles(), category),
+                );
+            }
+        }
         let controller = Controller::load(&self.graphs, map.mode_guid)?;
         let mode_ui = mode_ui(&self.graphs, &Variables::new())?;
         let initial_board =
             self.stats
                 .component(&PlayerStats::default(), map.mode_guid, None, None);
-        let owner_body_factory = contacts.as_ref().and_then(|_| {
+        let owner_body_factory = if is_practice_range(&map) && scripted_bots == 0 {
             self.practice_owner_body
                 .get_or_init(|| self.prepare_owner_body(&GameMap::practice_range()))
                 .clone()
-        });
+        } else {
+            None
+        };
         Ok(PreparedScene {
             map,
             ground,
@@ -213,7 +250,7 @@ impl PreparedScene {
     }
 
     pub(crate) fn movement_ready(&self) -> bool {
-        self.contacts.is_some()
+        is_practice_range(&self.map) && self.scripted_bots == 0 && self.contacts.is_some()
     }
 
     pub(crate) fn movement_index(&self) -> &TriangleIndex {
@@ -233,17 +270,12 @@ impl PreparedScene {
                 "the scene has no native player collision",
             )
         })?;
-        let category = match (self.map.free_for_all, team) {
-            (false, 0) => 0x08,
-            (false, 1) => 0x10,
-            _ => MOVER_CATEGORY,
-        };
         Mover::new(
             *self.movers.for_body(Some(body)),
             Arc::clone(contacts),
             position,
             yaw,
-            category,
+            mover_category(&self.map, team),
         )
         .map_err(invalid)
     }
@@ -306,11 +338,10 @@ impl PreparedScene {
     pub fn step_bots(&mut self, tick: u32) {
         let floor = self.ground.triangles();
         for bot in &mut self.bots {
-            bot.step(tick, |x, z, top, bottom| {
-                floor
-                    .ground(x, z, top, bottom, MOVER_CATEGORY)
-                    .map(|hit| hit.y)
-            });
+            bot.step(
+                tick,
+                ground_height(floor, mover_category(&self.map, bot.spawn.team)),
+            );
         }
     }
 
@@ -354,8 +385,7 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::movement_record;
-    use sha2::{Digest, Sha256};
+    use crate::game_bots::BOT_ENTITY;
 
     #[test]
     #[ignore = "requires the baseline 104319 Practice Range pack without bot VM graphs"]
@@ -385,7 +415,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a prepared 104319 Practice Range pack"]
-    fn prepared_scene_matches_python_bot_motion_over_the_real_floor() {
+    fn elevated_practice_patrols_reach_their_hints_without_crossing_walls() {
         let runtime = PathBuf::from(std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap());
         let assets = SceneAssets::load(runtime).unwrap();
         let mut scene = assets.prepare(GameMap::practice_range()).unwrap();
@@ -396,20 +426,53 @@ mod tests {
             15
         };
         assert_eq!(scene.scripted_bots(), scripted);
-        let mut digest = Sha256::new();
-        for tick in 1001..=1500 {
+        let bots = [BOT_ENTITY + 4, BOT_ENTITY + 9];
+        let mut previous = bots.map(|entity| {
+            scene
+                .bots()
+                .iter()
+                .find(|bot| bot.entity == entity)
+                .unwrap()
+                .position
+        });
+        let goals = [[3, 4], [0, 1]];
+        let mut visited = [0; 2];
+        for tick in 1001..=2900 {
             scene.step_bots(tick);
-            for bot in scene.bots() {
-                let movement = movement_record(&bot.movement(tick), Some(tick)).unwrap();
-                digest.update(bot.entity.to_le_bytes());
-                digest.update((movement.bit_len() as u32).to_le_bytes());
-                digest.update(movement.as_bytes());
-                digest.update([u8::from(bot.record_due(tick, 3))]);
+            for (slot, entity) in bots.into_iter().enumerate() {
+                let bot = scene
+                    .bots()
+                    .iter()
+                    .find(|bot| bot.entity == entity)
+                    .unwrap();
+                let before = previous[slot];
+                previous[slot] = bot.position;
+                let delta =
+                    std::array::from_fn::<_, 3, _>(|axis| bot.position[axis] - before[axis]);
+                let length = delta[0].hypot(delta[1]).hypot(delta[2]);
+                if length > 0.001 {
+                    let origin = [before[0], before[1] + 1.05, before[2]];
+                    let category = mover_category(scene.map(), bot.spawn.team);
+                    let hit = scene
+                        .ground
+                        .cast_ray(origin, delta.map(|axis| axis / length), length, category)
+                        .unwrap();
+                    assert!(
+                        hit.is_none_or(|hit| hit.normal[1].abs() >= 0.1),
+                        "bot {entity:x} crossed a wall at {tick}: {before:?} -> {:?}, {hit:?}",
+                        bot.position
+                    );
+                }
+                if let Some(&index) = goals[slot].get(visited[slot]) {
+                    let hint = bot.spawn.route[index];
+                    if (bot.position[0] - hint[0]).hypot(bot.position[2] - hint[2]) < 0.06
+                        && (bot.position[1] - hint[1]).abs() < 0.15
+                    {
+                        visited[slot] += 1;
+                    }
+                }
             }
         }
-        assert_eq!(
-            format!("{:x}", digest.finalize()),
-            "30a7004c18a623e62f54b084ae45a8ca67d771e672ce09296eda863e8b68dd9b",
-        );
+        assert_eq!(visited, [2; 2], "last positions {previous:?}");
     }
 }

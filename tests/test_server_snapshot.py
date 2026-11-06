@@ -13,6 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import test_server_journal as journal_tests
+from test_bots import make_bot
 from test_server_journal import MAP, FixedSource, Peer, acknowledge_ownership, pick
 
 from ow174.game import mover as mover_module
@@ -101,8 +102,21 @@ class ServerSnapshotTests(unittest.TestCase):
     def test_cross_mover_mutable_physics_alias_is_rejected(self):
         session, _, players = self.scene(two=True)
         players[1].mover.position = players[0].mover.position
-        with self.assertRaisesRegex(ServerSnapshotError, "shared across Mover"):
+        with self.assertRaisesRegex(ServerSnapshotError, "shared across physics artifacts"):
             self.capture(session)
+
+    def test_patrol_capsule_contact_state_is_registered(self):
+        session, _, players = self.scene()
+        match = players[0].match
+        bot = make_bot(((0.0, 0.0, 0.0), (0.0, 0.0, 4.0)), index=0)
+        match.bots.append(bot)
+        bot.step(1, 0.016, match.collision_world)
+        bot.step(189, 0.016, match.collision_world)
+        self.assertIsNotNone(bot.physics)
+        first = snapshot_digest(self.capture(session))
+        self.assertEqual(snapshot_digest(self.capture(session)), first)
+        bot.physics.budget -= 1
+        self.assertNotEqual(snapshot_digest(self.capture(session)), first)
 
     def test_queue_movement_callback_closure_and_stream_alias_are_stored_without_building(self):
         session, _, players = self.scene()

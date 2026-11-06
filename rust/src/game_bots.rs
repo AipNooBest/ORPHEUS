@@ -2,12 +2,24 @@
 //!
 //! The catalog and patrol behavior follow ow174/game/bots.py.
 
-use std::{collections::HashMap, f64::consts, fs, io, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    f64::consts,
+    fs, io,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
 
 use serde::Deserialize;
 
 use crate::accounts::parse_guid;
+use crate::contact_body::CharacterBody;
+use crate::contact_math::{add, sub};
+use crate::contact_world::ContactWorld;
 use crate::game_clock::TICK_PERIOD;
+use crate::mover_ground::{pogo, standing_body, standing_origin};
+use crate::mover_settings::MoverSettings;
 use crate::world::{Movement, NO_INPUT};
 
 pub const BOT_ENTITY: u32 = 0xc000_1000;
@@ -21,6 +33,7 @@ const FIRING: u64 = 0x0580_0000_0000_0b92;
 const FIRST_WAIT: f64 = 3.0;
 const WALK_GAP: f64 = 1.2;
 const ARRIVED: f64 = 0.05;
+const MAX_DETOUR_SAMPLES: usize = 64;
 const STEP_UP: f64 = 0.6;
 const DROP: f64 = 4.0;
 const MAX_SLOPE: f64 = 1.0;
@@ -223,6 +236,69 @@ fn throttles(yaw: f64, [dx, dz]: [f64; 2]) -> [i8; 2] {
     ]
 }
 
+fn planar_distance(a: [f64; 3], b: [f64; 3]) -> f64 {
+    (a[0] - b[0]).hypot(a[2] - b[2])
+}
+
+type Detour = [Option<[f64; 3]>; 2];
+
+#[derive(Debug)]
+struct PatrolPlans {
+    first_index: usize,
+    first: Detour,
+    legs: Vec<Detour>,
+}
+
+#[derive(Debug)]
+struct PatrolCollision {
+    body: CharacterBody,
+    lift: f32,
+}
+
+impl PatrolCollision {
+    fn clear(&self, from: [f64; 3], to: [f64; 3]) -> bool {
+        self.body
+            .sweep(
+                standing_origin(from, self.lift),
+                standing_origin(to, self.lift),
+            )
+            .is_ok_and(|hit| hit.is_none())
+    }
+
+    fn supported(
+        &self,
+        from: [f64; 3],
+        to: [f64; 3],
+        floor_tolerance: f64,
+        ground: &mut impl FnMut(f64, f64, f64, f64) -> Option<f64>,
+    ) -> bool {
+        let width = 2.0 * f64::from(self.body.radius());
+        let samples = (planar_distance(from, to) / width).ceil() as usize;
+        if samples == 0 || samples > MAX_DETOUR_SAMPLES || !self.clear(from, to) {
+            return false;
+        }
+        (0..=samples).all(|sample| {
+            let t = sample as f64 / samples as f64;
+            let [x, y, z] = std::array::from_fn(|axis| from[axis] + (to[axis] - from[axis]) * t);
+            ground(x, z, y + floor_tolerance, y - floor_tolerance).is_some()
+        })
+    }
+
+    fn advance(&mut self, from: [f64; 3], to: [f64; 3], dt: f64) -> [f64; 3] {
+        let start = standing_origin(from, self.lift);
+        self.body.teleport(start);
+        let delta = sub(standing_origin(to, self.lift), start);
+        match self.body.move_capsule(delta, dt as f32) {
+            Ok(moved) if moved.position == add(start, delta) => to,
+            Ok(moved) => {
+                let [x, y, z] = moved.position.map(f64::from);
+                [x, y - f64::from(self.lift), z]
+            }
+            Err(_) => from,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Bot {
     pub entity: u32,
@@ -237,6 +313,9 @@ pub struct Bot {
     index: usize,
     wait: f64,
     target: Option<[f64; 3]>,
+    waypoints: VecDeque<[f64; 3]>,
+    collision: Option<PatrolCollision>,
+    plans: Option<Arc<PatrolPlans>>,
     start: [f64; 3],
     keys: bool,
     turning: f64,
@@ -267,6 +346,9 @@ impl Bot {
             index,
             wait: FIRST_WAIT,
             target: None,
+            waypoints: VecDeque::new(),
+            collision: None,
+            plans: None,
             start: spawn.position,
             keys: false,
             turning: 0.0,
@@ -277,6 +359,103 @@ impl Bot {
             last_tick: None,
             records_from: None,
             spawn,
+        }
+    }
+
+    pub(crate) fn attach_collision(
+        &mut self,
+        settings: &MoverSettings,
+        world: Arc<ContactWorld>,
+        category: u16,
+        mut ground: impl FnMut(f64, f64, f64, f64) -> Option<f64>,
+    ) {
+        self.collision = Some(PatrolCollision {
+            body: standing_body(settings, world, self.position, category),
+            lift: pogo(settings, false) as f32,
+        });
+        let count = self.spawn.route.len();
+        if count != 0 {
+            let first_index = (self.index + 1) % count;
+            self.plans = Some(Arc::new(PatrolPlans {
+                first_index,
+                first: self.detour(self.position, self.spawn.route[first_index], &mut ground),
+                legs: (0..count)
+                    .map(|index| {
+                        let from = self.spawn.route[(index + count - 1) % count];
+                        self.detour(from, self.spawn.route[index], &mut ground)
+                    })
+                    .collect(),
+            }));
+        }
+    }
+
+    fn detour(
+        &self,
+        from: [f64; 3],
+        target: [f64; 3],
+        ground: &mut impl FnMut(f64, f64, f64, f64) -> Option<f64>,
+    ) -> Detour {
+        let Some(collision) = &self.collision else {
+            return [None; 2];
+        };
+        let same_floor = |point: [f64; 3]| (point[1] - from[1]).abs() <= ARRIVED;
+        let distance = planar_distance(from, target);
+        if distance <= ARRIVED || !same_floor(target) || collision.clear(from, target) {
+            return [None; 2];
+        }
+        let hint = self
+            .spawn
+            .route
+            .iter()
+            .copied()
+            .filter(|&point| {
+                same_floor(point)
+                    && planar_distance(from, point) > ARRIVED
+                    && planar_distance(point, target) > ARRIVED
+                    && collision.supported(from, point, STEP_UP, ground)
+                    && collision.supported(point, target, STEP_UP, ground)
+            })
+            .min_by(|&a, &b| {
+                let length = |point| planar_distance(from, point) + planar_distance(point, target);
+                length(a).total_cmp(&length(b))
+            });
+        if hint.is_some() {
+            return [hint, None];
+        }
+
+        // Try a body-width lane to either side. Each leg must fit the same
+        // capsule and stay supported by the same floor as ordinary movement.
+        let [x, _, z] = from;
+        let [tx, _, tz] = target;
+        let scale = 2.0 * f64::from(collision.body.radius()) / distance;
+        for sign in [1.0, -1.0] {
+            let offset = [(tz - z) * scale * sign, 0.0, (x - tx) * scale * sign];
+            let side = |point: [f64; 3]| std::array::from_fn(|axis| point[axis] + offset[axis]);
+            let [a, b] = [side(from), side(target)];
+            if collision.supported(from, a, ARRIVED, ground)
+                && collision.supported(a, b, ARRIVED, ground)
+                && collision.supported(b, target, ARRIVED, ground)
+            {
+                return [Some(a), Some(b)];
+            }
+        }
+        [None; 2]
+    }
+
+    fn planned_detour(&self, previous: usize) -> Detour {
+        let Some(plans) = &self.plans else {
+            return [None; 2];
+        };
+        if self.index == plans.first_index && self.position == self.spawn.position {
+            return plans.first;
+        }
+        let from = self.spawn.route[previous];
+        if planar_distance(self.position, from) <= ARRIVED
+            && (self.position[1] - from[1]).abs() <= STEP_UP
+        {
+            plans.legs[self.index]
+        } else {
+            [None; 2]
         }
     }
 
@@ -311,8 +490,15 @@ impl Bot {
         if !self.keys {
             self.wait -= dt;
             if self.target.is_none() && self.wait <= EPSILON {
+                let previous = self.index;
                 self.index = (self.index + 1) % self.spawn.route.len();
-                self.target = Some(self.spawn.route[self.index]);
+                let goal = self.spawn.route[self.index];
+                let detour = self.planned_detour(previous);
+                self.waypoints.extend(detour.into_iter().flatten());
+                self.target = Some(self.waypoints.pop_front().unwrap_or(goal));
+                if self.target != Some(goal) {
+                    self.waypoints.push_back(goal);
+                }
                 self.start = self.position;
                 self.keys = true;
                 self.turning = 0.0;
@@ -340,27 +526,37 @@ impl Bot {
         dt: f64,
         ground: &mut impl FnMut(f64, f64, f64, f64) -> Option<f64>,
     ) {
-        let [dx, dz] = self.to_target();
-        let distance = dx.hypot(dz);
+        let mut offset = self.to_target();
+        let mut distance = offset[0].hypot(offset[1]);
+        if distance <= ARRIVED {
+            if let Some(goal) = self.waypoints.pop_front() {
+                self.target = Some(goal);
+                self.start = self.position;
+                offset = self.to_target();
+                distance = offset[0].hypot(offset[1]);
+            }
+        }
         if distance <= ARRIVED {
             self.keys = false;
             self.wait = WALK_GAP;
             self.stand();
             return;
         }
-        self.direction = [dx / distance, dz / distance];
+        self.direction = offset.map(|axis| axis / distance);
         self.turn(dt);
         self.pace = self.walk.speed.min(self.pace + self.walk.acceleration * dt);
         self.held = throttles(self.yaw, self.direction);
         self.last_held = self.held;
         self.input_tick = Some(tick);
         let mut stride = self.pace * dt;
-        let slide = self.slide_length(dt);
-        if distance - stride <= slide {
-            stride = (distance - slide).max(0.0);
-            self.keys = false;
-            self.wait = WALK_GAP;
-            self.turning = TURN_AFTER;
+        if self.waypoints.is_empty() {
+            let slide = self.slide_length(dt);
+            if distance - stride <= slide {
+                stride = (distance - slide).max(0.0);
+                self.keys = false;
+                self.wait = WALK_GAP;
+                self.turning = TURN_AFTER;
+            }
         }
         self.advance(stride, distance, dt, ground);
     }
@@ -382,6 +578,7 @@ impl Bot {
         self.pace = 0.0;
         self.velocity = [0.0; 3];
         self.target = None;
+        self.waypoints.clear();
     }
 
     fn to_target(&self) -> [f64; 2] {
@@ -441,9 +638,17 @@ impl Bot {
         } else {
             self.floor(nx, y, nz, ground)
         };
+        let intended = [nx, ny, nz];
+        let [nx, ny, nz] = self.collision.as_mut().map_or(intended, |collision| {
+            collision.advance(self.position, intended, dt)
+        });
         self.position = [nx, ny, nz];
         self.velocity = [(nx - x) / dt, (ny - y) / dt, (nz - z) / dt];
-        stride
+        if self.position == intended {
+            stride
+        } else {
+            ((nx - x) * dx + (nz - z) * dz).max(0.0)
+        }
     }
 
     fn floor(
@@ -481,6 +686,13 @@ impl Bot {
 
     pub fn respawned(&self, entity: u32, records_from: u32) -> Self {
         let mut fresh = Self::new(entity, Arc::clone(&self.spawn), self.walk);
+        fresh.collision = self.collision.as_ref().map(|collision| PatrolCollision {
+            body: collision
+                .body
+                .fresh_at(standing_origin(fresh.position, collision.lift)),
+            lift: collision.lift,
+        });
+        fresh.plans = self.plans.clone();
         fresh.records_from = Some(records_from);
         fresh
     }
@@ -677,6 +889,54 @@ mod tests {
         assert!((vy.hypot(vz) - 4.5).abs() < 1.0e-8);
         assert!((vz - 4.5 / 1.0_f64.hypot(0.5)).abs() < 1.0e-8);
         assert!((fallback.position[1] - 0.5 * fallback.position[2]).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn patrol_uses_the_shared_capsule_and_team_mask() {
+        use crate::{
+            collision_cache::{Mesh, Triangle},
+            contact_mesh::ContactMesh,
+            contact_world::{StaticGeometry, StaticShape},
+        };
+
+        let wall = Mesh {
+            vertices: vec![
+                [-10.0, 0.0, 2.0],
+                [-10.0, 4.0, 2.0],
+                [10.0, 0.0, 2.0],
+                [10.0, 4.0, 2.0],
+            ],
+            triangles: vec![
+                Triangle {
+                    corners: [0, 1, 2],
+                    wings: [-1, 3, -1],
+                    mask: 0x08,
+                    surface: 0,
+                },
+                Triangle {
+                    corners: [3, 2, 1],
+                    wings: [-1, 0, -1],
+                    mask: 0x08,
+                    surface: 0,
+                },
+            ],
+        };
+        let mesh = ContactMesh::new(wall, [1.0; 3], u16::MAX).unwrap();
+        let wall = StaticShape::new(StaticGeometry::Mesh(Arc::new(mesh)), None).unwrap();
+        let world = Arc::new(ContactWorld::new(vec![wall]).unwrap());
+        let settings = MoverSettings::default();
+        let mut blocked = walker([0.0, 0.0, 4.0]);
+        let mut allowed = walker([0.0, 0.0, 4.0]);
+        blocked.attach_collision(&settings, Arc::clone(&world), 0x08, |_, _, _, _| Some(0.0));
+        allowed.attach_collision(&settings, world, 0x10, |_, _, _, _| Some(0.0));
+        for tick in 1..=295 {
+            for bot in [&mut blocked, &mut allowed] {
+                bot.step(tick, |_, _, _, _| Some(0.0));
+            }
+        }
+        assert!(blocked.position[2] < 2.0);
+        assert!(allowed.position[2] > 3.0);
+        assert!(blocked.velocity[2].abs() < 0.05);
     }
 
     #[test]

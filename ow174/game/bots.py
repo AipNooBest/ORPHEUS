@@ -37,16 +37,22 @@ walking bots walk the far routes of these spawners (MEASURED unless marked):
   (ground acceleration 11), down at 39 m/s^2 (friction base 6.5), the fast targets 1.74 made them. OW2
   put ordinary Training Bots on these routes (4.5 m/s); the server keeps 1.74's. The routes are 1.74's
   (DATA); OW2 changed three of them.
-It stands on the floor under it: each tick on the highest surface of the map's collision from STEP_UP
-above its feet down (ramps and steps), or, while the collision loads or where there is none, at the
-height between its last point and the next one in step with the way it went.
+It follows the floor and sweeps its standing capsule through the same static collision as players.
+For a blocked straight leg, it tries another authored hint, then a short lateral detour along
+the same floor. The original server's navigation is unverified. When no floor can be sampled,
+its requested feet height follows the line between its last point and the next one.
 """
 
 import json
 import math
 from functools import cache
+from threading import Lock
+from types import MappingProxyType
+from weakref import WeakKeyDictionary
 
-from ow174.game.mover import GRAVITY_SCALE, mover_data
+from ow174.game import contacts
+from ow174.game.collision import NOT_GROUND, World, mover_category
+from ow174.game.mover import GRAVITY_SCALE, ROUNDS, capsule_dimensions, mover_data
 from ow174.game.world import NO_INPUT, Movement
 from ow174.paths import DATA_DIR
 
@@ -69,9 +75,12 @@ TURN_AFTER = 0.5  # seconds it turns on after it lets go of the keys (28 to 33 t
 FAR_RUNNER = 0x02E000000000016E  # the far runners' hero (body 14ED)
 CATCH_UP = 625  # ticks a late step walks at most (10 s)
 EPSILON = 1e-9
+MAX_DETOUR_FLOOR_STEPS = 64
 # A walking bot's state goes in every frame, as retail sent them. A standing one changes nothing, so its
 # record goes once a second (staggered by bot), and in every frame for a second after it stopped.
 SETTLE_TICKS = 63  # about a second of 16 ms ticks
+_PATROL_PLANS = WeakKeyDictionary()
+_PATROL_PLANS_LOCK = Lock()
 
 
 @cache
@@ -112,11 +121,17 @@ def throttles(yaw, direction: tuple) -> tuple[int, int]:
     return round(right * FORWARD), round(forward * FORWARD)
 
 
+def planar_distance(a, b) -> float:
+    return math.hypot(a[0] - b[0], a[2] - b[2])
+
+
 DEAD = 0x2000  # the movement state's dead flag (combat.py): the 3P animation's dead pose
 
 
 class Bot:
-    def __init__(self, entity: int, spawner: dict, hero: dict, hints: dict) -> None:
+    def __init__(
+        self, entity: int, spawner: dict, hero: dict, hints: dict, *, free_for_all: bool = False,
+    ) -> None:
         self.entity = entity
         self.spawner, self.hero_data, self.hints = spawner, hero, hints  # for a respawn (respawned)
         self.dead = False  # killed (combat.py): it stands still with the dead flag until it is made again
@@ -126,8 +141,15 @@ class Bot:
         self.name = hero["name"]
         self.body = int(hero["body"], 16)
         self.team = spawner["team"]
+        self.free_for_all = free_for_all
+        self.category = mover_category(self.team, free_for_all)
         self.health = hero["health"]
         values = mover_data(self.body)
+        self.radius, segment = capsule_dimensions(values, False)
+        self.capsule_top = contacts.f32(segment + self.radius)
+        self.pogo = contacts.f32(values.stand_pogo)
+        self.physics: contacts.CharacterBody | None = None
+        self.physics_world: World | None = None
         self.speed = values.run_forward
         self.accel = values.accel_ground * values.run_forward  # m/s^2 up to full speed
         self.brake = values.decel_ground_base * values.run_forward  # m/s^2 down to a stop
@@ -144,6 +166,7 @@ class Bot:
         self.index = variables.get(INDEX, 0)
         self.wait = FIRST_WAIT  # seconds to the next walk
         self.target: tuple | None = None
+        self.waypoints: list[tuple] = []
         self.start = self.position  # where the walk to the target began
         self.keys = False  # it holds its movement keys
         self.turning = 0.0  # seconds it still turns after it let go of the keys
@@ -173,6 +196,11 @@ class Bot:
                 self.index = (self.index + 1) % len(self.route)
                 self.target = self.route[self.index]
                 self.start = self.position
+                if isinstance(collision, World):
+                    detour = self._leg_detour(collision)
+                    if detour:
+                        self.waypoints = [*detour[1:], self.target]
+                        self.target = detour[0]
                 self.keys = True
                 self.turning = 0.0
         if self.keys:
@@ -190,6 +218,11 @@ class Bot:
         x, _, z = self.position
         tx, _, tz = self.target
         distance = math.hypot(tx - x, tz - z)
+        if distance <= ARRIVED and self.waypoints:
+            self.target = self.waypoints.pop(0)
+            self.start = self.position
+            tx, _, tz = self.target
+            distance = math.hypot(tx - x, tz - z)
         if distance <= ARRIVED:
             self.keys = False
             self.wait = WALK_GAP
@@ -201,7 +234,7 @@ class Bot:
         self.held = self.last_held = throttles(self.yaw, self.direction)
         self.input_tick = tick
         stride, slide = self.pace * dt, self._slide_length(dt)
-        if distance - stride <= slide:
+        if not self.waypoints and distance - stride <= slide:
             # its last tick with keys: from here its friction slides it onto the point
             stride = max(0.0, distance - slide)
             self.keys = False
@@ -224,6 +257,7 @@ class Bot:
         self.pace = 0.0
         self.velocity = (0.0, 0.0, 0.0)
         self.target = None
+        self.waypoints.clear()
 
     def _slide_length(self, dt: float) -> float:
         """How far its friction slides it from its speed now, tick by tick."""
@@ -236,6 +270,103 @@ class Bot:
 
     def _turn(self, dt: float) -> None:
         self.yaw = turned(self.yaw, heading(*self.direction), TURN_RATE * dt)
+
+    def _engine_body(self, collision: World) -> contacts.CharacterBody:
+        if self.physics is None or self.physics_world is not collision:
+            self.physics = contacts.CharacterBody(
+                self.radius, self.capsule_top, world=collision.engine, category=self.category,
+            )
+            self.physics_world = collision
+        return self.physics
+
+    def _body_position(self, feet) -> tuple:
+        x, y, z = feet
+        return contacts.v3(x, y + self.pogo, z)
+
+    def _plan_key(self, start, goal) -> tuple:
+        return tuple(self.route), self.category, self.radius, self.capsule_top, self.pogo, start, goal
+
+    def _leg_detour(self, collision: World) -> tuple:
+        start = tuple(self.spawner["position"])
+        first_index = (self.spawner.get("vars", {}).get(INDEX, 0) + 1) % len(self.route)
+        if self.position != start or self.index != first_index:
+            start = self.route[self.index - 1]
+            if planar_distance(self.position, start) > ARRIVED or abs(self.position[1] - start[1]) > STEP_UP:
+                return ()
+        with _PATROL_PLANS_LOCK:
+            plans = _PATROL_PLANS.get(collision)
+        if plans is not None:
+            planned = plans.get(self._plan_key(start, self.target))
+            if planned is not None:
+                return planned
+        return self._detour(collision, start, self.target)
+
+    def _detour(self, collision: World, start, goal) -> tuple:
+        """Check authored waypoints before testing a bounded detour to each side."""
+        length = planar_distance(start, goal)
+
+        def same_floor(point):
+            return abs(point[1] - start[1]) <= ARRIVED
+
+        if length <= ARRIVED or not same_floor(goal):
+            return ()
+        points = contacts.CharacterBody(self.radius, self.capsule_top).local_points()
+        diameter = 2.0 * self.radius
+
+        def clear(a, b):
+            return contacts.scene_sweep(
+                collision.engine, self._body_position(a), self._body_position(b),
+                points, self.radius, self.category,
+            ) is None
+
+        def walkable(a, b, tolerance):
+            return self._floor_path(collision, a, b, diameter, tolerance) and clear(a, b)
+
+        if clear(start, goal):
+            return ()
+        candidates = sorted(
+            (
+                point for point in self.route
+                if same_floor(point) and planar_distance(start, point) > ARRIVED
+                and planar_distance(point, goal) > ARRIVED
+            ),
+            key=lambda point: planar_distance(start, point) + planar_distance(point, goal),
+        )
+        for point in candidates:
+            if walkable(start, point, STEP_UP) and walkable(point, goal, STEP_UP):
+                return (point,)
+
+        sx, sy, sz = start
+        gx, gy, gz = goal
+        dx, dz = gx - sx, gz - sz
+        scale = diameter / length
+        ox, oz = dz * scale, -dx * scale
+        for sign in (1, -1):
+            near = (sx + sign * ox, sy, sz + sign * oz)
+            far = (gx + sign * ox, gy, gz + sign * oz)
+            segments = ((start, near), (near, far), (far, goal))
+            if all(walkable(a, b, ARRIVED) for a, b in segments):
+                return (near, far)
+        return ()
+
+    def _floor_path(self, collision: World, start, end, spacing: float, tolerance: float) -> bool:
+        dx, dy, dz = (b - a for a, b in zip(start, end, strict=True))
+        steps = math.ceil(math.hypot(dx, dz) / spacing)
+        if not 0 < steps <= MAX_DETOUR_FLOOR_STEPS:
+            return False
+        sx, sy, sz = start
+        for i in range(steps + 1):
+            t = i / steps
+            x, y, z = sx + t * dx, sy + t * dy, sz + t * dz
+            if self._walkable_floor(collision, x, z, y + tolerance, y - tolerance) is None:
+                return False
+        return True
+
+    def _walkable_floor(
+        self, collision: World, x: float, z: float, top: float, bottom: float,
+    ) -> float | None:
+        ground = collision.ground(x, z, top, bottom, self.category)
+        return ground.y if ground is not None and not ground.surface & NOT_GROUND else None
 
     def _advance(self, stride: float, distance: float, dt: float, collision) -> float:
         """Move `stride` along the floor the way it walks, not past its point (`distance` away); the
@@ -255,6 +386,17 @@ class Bot:
         else:
             nx, nz = x + dx * stride, z + dz * stride
         ny = probe_y if reuse_probe else self._floor(nx, y, nz, collision)
+        if isinstance(collision, World):
+            body = self._engine_body(collision)
+            body.teleport(self._body_position(self.position))
+            requested = self._body_position((nx, ny, nz))
+            displacement = contacts.sub(requested, body.position)
+            expected = contacts.add(body.position, displacement)
+            moved, _, _ = body.move(displacement, contacts.f32(dt), ROUNDS)
+            if moved != expected:
+                nx, by, nz = moved
+                ny = by - self.pogo
+                stride = max(0.0, (nx - x) * dx + (nz - z) * dz)
         self.position = (nx, ny, nz)
         self.velocity = ((nx - x) / dt, (ny - y) / dt, (nz - z) / dt)
         return stride
@@ -262,10 +404,13 @@ class Bot:
     def _floor(self, x: float, y: float, z: float, collision) -> float:
         """The height its feet take at (x, z): the floor of the collision, else the height between the
         walk's start and its target at the share of the way it has gone."""
-        if collision is not None:
-            ground = collision.ground(x, z, y + STEP_UP, y - DROP)
-            if ground is not None:
-                return ground.y
+        bounds = (x, z, y + STEP_UP, y - DROP)
+        if isinstance(collision, World):
+            floor = self._walkable_floor(collision, *bounds)
+            if floor is not None:
+                return floor
+        elif collision is not None and (ground := collision.ground(*bounds)) is not None:
+            return ground.y
         sx, sy, sz = self.start
         tx, ty, tz = self.target
         whole = math.hypot(tx - sx, tz - sz)
@@ -327,12 +472,12 @@ class Bot:
 
 def respawned(bot: Bot, entity: int, records_from: int) -> Bot:
     """The bot made again at its spawner under a new entity id, its records from `records_from` on."""
-    fresh = Bot(entity, bot.spawner, bot.hero_data, bot.hints)
+    fresh = Bot(entity, bot.spawner, bot.hero_data, bot.hints, free_for_all=bot.free_for_all)
     fresh.records_from = records_from
     return fresh
 
 
-def make(map_guid: int) -> list[Bot]:
+def make(map_guid: int, *, free_for_all: bool = False) -> list[Bot]:
     """The bots of a map: one per AI spawner that needs no mode identifier (the Practice Range's need
     none; the Tutorial's do)."""
     data = table()
@@ -344,5 +489,23 @@ def make(map_guid: int) -> list[Bot]:
         hero = data["heroes"].get(spawner["hero"])
         if hero is None or spawner["identifier"] is not None:
             continue
-        bots.append(Bot(BOT_ENTITY + len(bots), spawner, hero, entry["hints"]))
+        bots.append(Bot(BOT_ENTITY + len(bots), spawner, hero, entry["hints"], free_for_all=free_for_all))
     return bots
+
+
+def prepare_patrols(map_guid: int, collision: World) -> None:
+    """Plan fixed patrol legs on the collision loader before the World becomes available to matches."""
+    plans = {}
+    for free_for_all in (False, True):
+        for bot in make(map_guid, free_for_all=free_for_all):
+            route = bot.route
+            if not route:
+                continue
+            legs = [(bot.position, route[(bot.index + 1) % len(route)])]
+            legs.extend(zip(route, [*route[1:], route[0]], strict=True))
+            for start, goal in legs:
+                key = bot._plan_key(start, goal)
+                if key not in plans:
+                    plans[key] = bot._detour(collision, start, goal)
+    with _PATROL_PLANS_LOCK:
+        _PATROL_PLANS[collision] = MappingProxyType(plans)

@@ -3,8 +3,12 @@
 //! It uses the same triangle index as other ground queries and the contact
 //! world's shape sweep only when the centre ray has no walkable ground.
 
+use std::sync::Arc;
+
 use crate::{
     collision_index::{GroundHit, TriangleIndex},
+    contact_body::CharacterBody,
+    contact_cache::CapsulePose,
     contact_gjk::{PointSetSize, sweep::MeshProbe},
     contact_math::{TINY, Vec3, add, cross, dot, scale, sub, unrotate},
     contact_world::{ContactWorld, StaticGeometry, StaticShape},
@@ -13,7 +17,7 @@ use crate::{
 };
 
 const MOVER: u16 = 0x18;
-const NOT_GROUND: u16 = 1;
+pub(crate) const NOT_GROUND: u16 = 1;
 const DISC_RADIUS: f32 = 0.015;
 const FACE_REACH: f32 = 0.05;
 const FACE_SLACK: f32 = 1.192_092_9e-5;
@@ -265,6 +269,28 @@ pub fn pogo(settings: &MoverSettings, crouched: bool) -> f64 {
     } else {
         settings.stand_pogo
     }
+}
+
+pub(crate) fn standing_body(
+    settings: &MoverSettings,
+    world: Arc<ContactWorld>,
+    position: [f64; 3],
+    category: u16,
+) -> CharacterBody {
+    let (radius, segment) = capsule(settings, false);
+    CharacterBody::new(
+        world,
+        CapsulePose {
+            position: standing_origin(position, pogo(settings, false) as f32),
+            radius,
+            top: segment + radius,
+        },
+        category,
+    )
+}
+
+pub(crate) fn standing_origin([x, y, z]: [f64; 3], lift: f32) -> Vec3 {
+    [x as f32, (y + f64::from(lift)) as f32, z as f32]
 }
 
 /// Radius and distance between the sphere centres at normal body scale.

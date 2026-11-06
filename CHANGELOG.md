@@ -857,3 +857,11 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Compared the same 19-instance stock startup state with the Rust and Python encoders. The owner and observer frames matched byte for byte in this offline comparison.
 - Validated authored mode tables in the external base bundle. Together with the VM changes they reduced the stock preflight from 35 diagnostics to 22. The first remaining query is the entity relation at graph `0033`, node `51`. The stock Soldier body still stops before attaching its weapon. No new original-client session was run.
 - Passed 287 public Rust tests, 58 base-runtime checks and 54 enriched-runtime checks. Cargo formatting, Clippy, documentation links and Git diff checks passed.
+
+#### Practice Range patrol collision
+
+- Reproduced two elevated patrols crossing solid geometry in build 104319. Python and Rust now move patrolling bots through the same standing capsule and static map contact solver used by player movement, with the same map barrier masks.
+- Kept the authored spawns, hint order and destinations. Blocked legs can use a clear authored hint or a short lateral detour that passes capsule clearance and floor support checks. This is a local reconstruction of patrol navigation. The original navigation implementation remains unverified.
+- Prepared the detours outside the live tick loop and retained the bot's contact state in Python stored-state replay. Recorded allied pass-through and opposing-body blocking in the roadmap. Actor-to-actor movement collision remains open.
+- Verified both elevated patrols over the real 104319 map, including the enemy bot's return leg. In an isolated optimized Rust run of 1,900 patrol updates, the patrol step took 47 µs at p95 and 143 µs at maximum. This measurement covers patrol updates only. Client acceptance is pending.
+- Passed 288 public Rust tests, 58 base-runtime checks, 54 enriched-runtime checks and 148 focused Python tests. The Python run skipped one King's Row check because the base pack lacks that map's cache. Cargo formatting, Clippy, Ruff, relative documentation links and Git diff checks passed. The optimized Rust server started and stopped on isolated ports.
