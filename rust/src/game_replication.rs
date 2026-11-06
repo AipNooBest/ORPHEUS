@@ -317,6 +317,11 @@ enum InputWork {
         tick: u32,
         received: Duration,
     },
+    Skin {
+        hero: u64,
+        tick: u32,
+        received: Duration,
+    },
     Command {
         command: Command,
         pending: Option<PendingCommand>,
@@ -955,6 +960,43 @@ impl WorldDelivery {
         }
     }
 
+    pub(crate) fn queue_skin(&mut self, hero: u64, tick: u32, received: Duration) {
+        if self.can_handle_game_message() {
+            self.input.push(InputWork::Skin {
+                hero,
+                tick,
+                received,
+            });
+        }
+    }
+
+    fn apply_skin(
+        &mut self,
+        scene: &PreparedScene,
+        viewer: &PlayerAppearance<'_>,
+        hero: u64,
+        tick: u32,
+        now: Duration,
+        quanta: u32,
+    ) -> io::Result<()> {
+        let Some(body) = self.body.filter(|body| body.hero == hero) else {
+            return Ok(());
+        };
+        let Some(&skin) = viewer
+            .card
+            .skins
+            .get(&hero)
+            .filter(|&&skin| skin != body.skin)
+        else {
+            return Ok(());
+        };
+        if let Some(entity) = self.next_body(now) {
+            let hero = scene.heroes().get(hero).expect("active hero");
+            self.switch(scene, viewer, tick, quanta, entity, (hero, skin))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn queue_commands(&mut self, tick: u32, commands: &[Command]) {
         if self.started.is_some() {
             self.input.commands(tick, commands);
@@ -995,6 +1037,14 @@ impl WorldDelivery {
                     received,
                 } => {
                     let _ = self.game_message(scene, viewer, tick, received, quanta, &message);
+                    remaining -= 1;
+                }
+                InputWork::Skin {
+                    hero,
+                    tick,
+                    received,
+                } => {
+                    let _ = self.apply_skin(scene, viewer, hero, tick, received, quanta);
                     remaining -= 1;
                 }
                 InputWork::Command {

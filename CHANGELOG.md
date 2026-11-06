@@ -843,3 +843,9 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Added shared swept projectile flight with wall and capsule collision, direct damage and capsule-distance splash. The projectile modules still need live-worker integration.
 - Set Doomfist as the next hero after Soldier: 76 and the Practice Range training bots pass their acceptance checks.
 - Passed 284 public Rust tests, 58 base runtime checks, 54 enriched runtime checks and 172 focused Python tests. Cargo formatting, Clippy, documentation links and Git diff checks passed. Stock owner startup still reports unsupported graph queries. Original-client gameplay acceptance remains pending.
+
+#### Rust gallery equip and match appearance
+
+- Processed retail gallery equip requests after login. The native lobby saves the loadout before confirming it and refreshes the local player card when an icon changes.
+- Applied new skin and weapon themes to the reserved match. Equipping a different theme for the active hero uses the existing ordered body replacement. Other heroes retain the change for their next selection.
+- Passed 84 focused Python reference tests and two prepared-base encrypted Rust loopback regressions covering gallery confirmation, persistence, a subsequent map load and the new skin theme on the replacement entity. The preceding original-client Rust session reached Practice Range, where the user reported missing weapons, unusable abilities and failed skin selection. The gallery repair awaits a client retest. The stock Soldier owner script still needs additional graph behavior.

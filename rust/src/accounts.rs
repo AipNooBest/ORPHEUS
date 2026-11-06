@@ -423,6 +423,22 @@ impl Account {
         }
         Ok(())
     }
+
+    pub(crate) fn edit_profile<T>(
+        &self,
+        edit: impl FnOnce(&mut Profile) -> io::Result<Option<T>>,
+    ) -> io::Result<Option<T>> {
+        let mut profile = self.profile();
+        let mut edited = profile.clone();
+        let Some(result) = edit(&mut edited)? else {
+            return Ok(None);
+        };
+        if let Some(path) = &self.path {
+            save_profile(&edited, path)?;
+        }
+        *profile = edited;
+        Ok(Some(result))
+    }
 }
 
 pub struct Accounts {

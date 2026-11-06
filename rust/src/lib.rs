@@ -55,6 +55,7 @@ pub mod jam_handshake;
 pub mod lobby_arcade;
 pub mod lobby_celebrations;
 pub mod lobby_clock;
+mod lobby_gallery;
 pub mod lobby_login;
 pub mod lobby_menu;
 pub mod lobby_mode_rules;

@@ -37,7 +37,7 @@ use crate::{
     match_scene::{PlayerAppearance, PlayerCard},
     scene_assets::PreparedScene,
     script_wire::chunk,
-    world::{EntityUpdate, GAME_MODE_ENTITY, MAX_PAYLOAD, frame},
+    world::{EntityUpdate, GAME_MODE_ENTITY, MAX_PAYLOAD, SkinTheme, frame},
 };
 
 const GAME_SOCKET: Token = Token(0);
@@ -80,6 +80,13 @@ enum Request {
         id: MatchId,
         release: bool,
         reply: mpsc::SyncSender<bool>,
+    },
+    Skin {
+        connection: u32,
+        id: MatchId,
+        hero: u64,
+        skin: SkinTheme,
+        reply: mpsc::SyncSender<()>,
     },
 }
 
@@ -212,6 +219,21 @@ impl GameService {
 
     pub fn release_seat(&self, handoff: &Handoff) -> io::Result<bool> {
         self.seat(handoff, true)
+    }
+
+    pub(crate) fn update_skin(
+        &self,
+        handoff: &Handoff,
+        hero: u64,
+        skin: SkinTheme,
+    ) -> io::Result<()> {
+        self.request(|reply| Request::Skin {
+            connection: handoff.conn,
+            id: handoff.match_id,
+            hero,
+            skin,
+            reply,
+        })
     }
 
     fn seat(&self, handoff: &Handoff, release: bool) -> io::Result<bool> {
@@ -618,6 +640,24 @@ impl State {
                     self.send_home(connection, now);
                 }
                 let _ = reply.send(exists);
+            }
+            Request::Skin {
+                connection,
+                id,
+                hero,
+                skin,
+                reply,
+            } => {
+                if self.seats.get(&connection).is_some_and(|seat| seat.0 == id) {
+                    let room = self.rooms.get_mut(&id).expect("reserved match");
+                    if let Some(world) = &mut room.world {
+                        world.card.skins.insert(hero, skin);
+                        if let Some(peer) = self.peers.get_mut(&connection) {
+                            peer.world.queue_skin(hero, self.clock.frame(), now);
+                        }
+                    }
+                }
+                let _ = reply.send(());
             }
         }
     }
@@ -1228,6 +1268,7 @@ mod tests {
         entity: u32,
         operation: Option<u8>,
         movement: bool,
+        skin: Option<(u32, bool)>,
         script: Option<ReceivedChunk>,
     }
 
@@ -1264,6 +1305,7 @@ mod tests {
                     entity: reader.entity_id().unwrap().unwrap(),
                     operation: None,
                     movement: false,
+                    skin: None,
                     script: None,
                 };
                 assert!(reader.bit().unwrap());
@@ -1298,7 +1340,19 @@ mod tests {
                     record.operation = Some(operation);
                     if operation != 3 {
                         let length = reader.bits(14).unwrap() as usize;
-                        reader.advance(length).unwrap();
+                        let start = reader.position();
+                        if operation == 1 && !reader.bit().unwrap() {
+                            reader.guid_index().unwrap();
+                            let flags = reader.bits(8).unwrap() as u8;
+                            if flags & crate::world::SKIN_THEME != 0 {
+                                assert_ne!(flags & crate::world::WITH_SKIN, 0);
+                                record.skin =
+                                    Some((reader.bits(32).unwrap() as u32, reader.bit().unwrap()));
+                            }
+                        }
+                        reader
+                            .advance(length - (reader.position() - start))
+                            .unwrap();
                     }
                     assert!(!reader.bit().unwrap());
                 }
@@ -1671,7 +1725,9 @@ mod tests {
             PreparedFixture::Combat => {
                 exercise_combat(&mut client, &schemas, BOT_ENTITY + 1, BOT_ENTITY + 15)
             }
-            PreparedFixture::Stock => exercise_hero_selection(&mut client, &schemas, &assets),
+            PreparedFixture::Stock => {
+                exercise_hero_selection(&mut client, &schemas, &assets, &server, &ticket)
+            }
         }
         server.stop().unwrap();
     }
@@ -1900,6 +1956,8 @@ mod tests {
         client: &mut Client,
         schemas: &Schemas,
         assets: &crate::scene_assets::SceneAssets,
+        server: &GameService,
+        ticket: &Handoff,
     ) {
         use crate::{
             game_heroes::SOLDIER,
@@ -2068,6 +2126,29 @@ mod tests {
         );
         assert!(verify_controller(&records, tracer, false) > reopen_cmfd);
         assert!(client.window.accept(swap.seq));
+        client.send(ACK, Vec::new());
+
+        let skin = SkinTheme {
+            guid: 0x0a50_0000_0000_1234,
+            golden: true,
+        };
+        server.update_skin(ticket, tracer, skin).unwrap();
+        let third = OWNER | 3;
+        let (reskin, records) = next_body_frame(client, third);
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.entity == third)
+                .unwrap()
+                .skin,
+            Some((0x1234, true))
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.entity == SECOND && record.operation == Some(3))
+        );
+        assert!(client.window.accept(reskin.seq));
         client.send(ACK, Vec::new());
     }
 }
