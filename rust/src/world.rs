@@ -32,6 +32,7 @@ pub const ANGLE_UNITS: f64 = 65536.0 / std::f64::consts::TAU;
 pub const POSITION_UNITS: f64 = 1024.0;
 pub const MOVEMENT_AXIS_BITS: usize = 24;
 pub const MAX_MOVEMENT_AXIS: f64 = ((1 << (MOVEMENT_AXIS_BITS - 1)) - 1) as f64 / POSITION_UNITS;
+pub(crate) const GMP_STATS_FIELDS: usize = 45;
 
 #[derive(Debug)]
 pub enum WorldError {
@@ -130,6 +131,7 @@ pub enum ComponentValue {
     U8(u8),
     I8(i8),
     I16(i16),
+    U16(u16),
     U32(u32),
     I32(i32),
     U64(u64),
@@ -145,6 +147,7 @@ pub struct Component {
 
 #[derive(Clone, Copy)]
 enum Field {
+    Unsupported,
     Id,
     DbId,
     Entity,
@@ -155,6 +158,7 @@ enum Field {
     U8,
     I8,
     I16,
+    U16,
     U32,
     I32,
     U64,
@@ -172,11 +176,27 @@ fn layout(index: u8) -> Result<&'static [Field], WorldError> {
         fields[52] = U8;
         fields
     };
+    const STATS: [Field; GMP_STATS_FIELDS] = {
+        let mut fields = [U8; GMP_STATS_FIELDS];
+        let mut index = 0;
+        while index < 35 {
+            fields[index] = match index {
+                // These nested fields have no writer in the reference.
+                0..=4 => Unsupported,
+                5..=18 => U64,
+                _ => F32,
+            };
+            index += 1;
+        }
+        fields[35] = U16;
+        fields
+    };
     Ok(match index {
         26 | 123 => &[Id],
         29 => &[DbId, Text, U32, I32, I32, I32, I32, I16, I16, I8, U8],
         44 => &[Entity, Entity, Entity],
         51 => &HEALTH,
+        64 => &STATS,
         74 => &[Id, I16, I8, U8, U8, I8, U8, U8, U8],
         75 => &[Id; 6],
         90 => &[Leases],
@@ -255,6 +275,7 @@ fn write_field(
         (Field::U8, ComponentValue::U8(number)) => out.raw(&[*number]),
         (Field::I8, ComponentValue::I8(number)) => out.raw(&number.to_le_bytes()),
         (Field::I16, ComponentValue::I16(number)) => out.raw(&number.to_le_bytes()),
+        (Field::U16, ComponentValue::U16(number)) => out.raw(&number.to_le_bytes()),
         (Field::I32, ComponentValue::I32(number)) => out.raw(&number.to_le_bytes()),
         (Field::U64, ComponentValue::U64(number)) => out.raw(&number.to_le_bytes()),
         (Field::F32, ComponentValue::F32(number)) => out.f32(*number),

@@ -11,9 +11,12 @@ use crate::{
     collection::{Collection, HERO_CATALOG, PROGRESSION},
     jam_codec::{Fields, Schemas, Value},
     jam_handshake::server_handshake,
+    lobby_clock::server_time,
     lobby_login::{self, INCOMPATIBLE_CLIENT, Identity, LOGIN_MESSAGE, Login, OUT_CONNECT},
+    lobby_party::{self, Membership, PartyMember},
     lobby_player_messages as player,
     lobby_presence::Presence,
+    lobby_ranked::{LeaderboardPlaces, Ranked},
     lobby_transport::{Event, LobbyMessage, LobbyTransport},
     retail_templates::{IN_CONNECT, LOBBY, RetailTemplates},
 };
@@ -47,11 +50,24 @@ pub struct PreparedLogin {
     pub tournament: bool,
 }
 
+#[derive(Clone, Copy)]
 pub struct LoginContent<'a> {
     pub menu_hero: Option<u64>,
     pub extra_skins: &'a [u64],
     pub wall_time: u64,
-    pub server_time: u64,
+    /// None means the caller has no verified Arcade state.
+    pub competitive_event_cards: Option<&'a [u64]>,
+    pub leaderboard_places: &'a LeaderboardPlaces,
+    /// A confirmed single-member party; the caller sends other party rosters.
+    pub solo_party: Option<SoloLoginParty>,
+}
+
+#[derive(Clone, Copy)]
+pub struct SoloLoginParty {
+    pub id: [u64; 2],
+    pub entity: [u64; 2],
+    pub menu_hero: u64,
+    pub members_may_invite: bool,
 }
 
 impl<'a> LobbySession<'a> {
@@ -154,10 +170,12 @@ impl PreparedLogin {
         templates: &RetailTemplates,
         collection: &Collection,
         presence: &Presence,
+        ranked: &Ranked,
         content: LoginContent<'_>,
     ) -> io::Result<Vec<LobbyMessage>> {
         let profile = self.account.profile();
         let identity = self.identity;
+        let now = server_time(&profile.server_date, content.wall_time)?;
         let record = player::record(
             &profile,
             identity,
@@ -183,7 +201,7 @@ impl PreparedLogin {
             &profile,
             identity,
             content.menu_hero,
-            content.server_time,
+            now,
             &BTreeMap::from([((LOBBY, 20812), player::ux_states(&profile)?)]),
         )?;
         messages.extend(
@@ -191,6 +209,14 @@ impl PreparedLogin {
                 .into_iter()
                 .filter(|&(crc, id, _)| !UNPORTED_LOGIN_REPLACEMENTS.contains(&(crc, id))),
         );
+        if let Some(event_cards) = content.competitive_event_cards {
+            messages.extend(ranked.login_messages(
+                &profile,
+                event_cards,
+                content.leaderboard_places,
+                now,
+            )?);
+        }
         messages.push((
             PING,
             35500,
@@ -200,6 +226,24 @@ impl PreparedLogin {
                 (0x80, Value::Array(Vec::new())),
             ]),
         ));
+        if let Some(party) = content.solo_party {
+            let ratings = ranked.party_ratings(&profile, content.leaderboard_places)?;
+            let member = PartyMember {
+                profile: &profile,
+                identity,
+                menu_hero: party.menu_hero,
+                ratings: &ratings,
+                membership: Membership::Leader,
+            };
+            messages.push(lobby_party::state(
+                collection,
+                party.id,
+                party.entity,
+                &[member],
+                party.members_may_invite,
+                content.wall_time,
+            )?);
+        }
         messages.push((LOBBY, 20802, player::settings(schemas, &profile)?));
         Ok(messages)
     }
@@ -228,6 +272,7 @@ mod tests {
     };
 
     use hmac::{Hmac, Mac};
+    use serde_json::json;
     use sha2::{Digest, Sha256};
 
     use crate::{
@@ -235,6 +280,7 @@ mod tests {
         jam_cipher::Jam,
         jam_framing::{self, FrameReader},
         lobby_presence::FRIENDS,
+        lobby_ranked::{COMPETITIVE_CTF, Queue, RANKED},
     };
 
     #[test]
@@ -415,8 +461,10 @@ mod tests {
         let schemas = Schemas::load(runtime.join("schemas_174.json")).unwrap();
         let templates = RetailTemplates::load(runtime.join("retail_templates.json")).unwrap();
         let items = Arc::new(ItemDb::load(&runtime).unwrap());
+        let reaper = items.hero_by_name("Reaper").unwrap();
         let collection = Collection::new(&templates, items).unwrap();
         let presence = Presence::new(&templates).unwrap();
+        let ranked = Ranked::new(&templates).unwrap();
         let temporary = tempfile::tempdir().unwrap();
         let accounts = Accounts::new(
             temporary.path().join("profiles"),
@@ -429,77 +477,125 @@ mod tests {
             account,
             tournament: false,
         };
-        // Python Content.login_messages and PlayerMessages.settings, filtered
-        // to the same subset and encoded with a normalized wire index of one.
-        for (level, unlock_all, frame, expected_digest) in [
+        // Python login ordering replaces the early party from Content with the
+        // session's actual party after PING. Compare both subsets.
+        for (level, frame, date, menu_hero, event_cards, places, base, with_extras) in [
             (
                 100,
-                false,
                 0x0250_0000_0000_0921,
-                "0e1a47287d6a6e592ca1d33746bdfd8fee7580ad22de2cbb0999bba851684a6b",
+                "2024-02-29",
+                None,
+                [].as_slice(),
+                LeaderboardPlaces::new(),
+                "c19b931eacf9c54cd61056f82694453fa93a1e716d0c7f01f1cb273480ac76ef",
+                "092d0b645d812659197dc2f3e4ab5790ae1c7264060c33f2b6d4491d1f6a170b",
             ),
             (
                 3000,
-                true,
                 0x0250_0000_0000_0f97,
-                "98aab1f92b4e45cc16316747910aa6022a20b39682c7627080384f79b53255b8",
+                "2026-09-29",
+                Some(reaper),
+                [COMPETITIVE_CTF].as_slice(),
+                LeaderboardPlaces::from([(Queue::Tank, 7)]),
+                "7d7660da99e8973ce1ca8c0b2d73122f0822bead8a4d2fa7785876025b0251c7",
+                "551492de79257b2112e0cdbcb3e2fc1ceffbc9493f4d55d18bce2863c558ace7",
             ),
         ] {
+            let unlock_all = level == 3000;
             {
                 let mut profile = prepared.account.profile();
                 profile.level = level;
                 profile.unlock_all = unlock_all;
+                profile.server_date = date.into();
+                profile.lobby_hero = if unlock_all { "Reaper" } else { "none" }.into();
+                profile.events = vec![if unlock_all { "lunar" } else { "goodbye" }.into()];
+                if unlock_all {
+                    profile
+                        .settings
+                        .insert("+0x10D".into(), json!({"+0x0": false, "+0x5": 1}));
+                }
             }
-            let messages = prepared
-                .available_messages(
-                    &schemas,
-                    &templates,
-                    &collection,
-                    &presence,
-                    LoginContent {
-                        menu_hero: None,
-                        extra_skins: &[],
-                        wall_time: 1_700_000_000,
-                        server_time: 1_700_010_000,
-                    },
-                )
-                .unwrap();
-            let keys: Vec<_> = messages.iter().map(|&(crc, id, _)| (crc, id)).collect();
-            assert_eq!(
-                keys[..9],
-                [
-                    (IN_CONNECT, 20500),
-                    (IN_CONNECT, 20502),
-                    (IN_CONNECT, 20505),
-                    (player::ENDORSEMENTS, 52002),
-                    (player::ENDORSEMENTS, 52005),
-                    (player::ENDORSEMENTS, 52006),
-                    (FRIENDS, 27113),
-                    (PROGRESSION, 24300),
-                    (HERO_CATALOG, 24900),
-                ]
-            );
-            assert_eq!(keys[keys.len() - 2..], [(PING, 35500), (LOBBY, 20802)]);
-            assert!(keys[9..].contains(&(LOBBY, 20812)));
-            let Value::Struct(card) = &messages[1].2[&0x78] else {
-                panic!("missing player card");
+            let inputs = LoginContent {
+                menu_hero,
+                extra_skins: &[],
+                wall_time: 1_700_000_000,
+                competitive_event_cards: None,
+                leaderboard_places: &places,
+                solo_party: None,
             };
-            let Value::Struct(progression) = &messages[7].2[&0x78] else {
-                panic!("missing progression");
+            let exact_inputs = LoginContent {
+                competitive_event_cards: Some(event_cards),
+                solo_party: Some(SoloLoginParty {
+                    id: [0x1234, 0x2345],
+                    entity: [0x0100_1d00_0000_0033, 0x4444],
+                    menu_hero: menu_hero.unwrap_or_default(),
+                    members_may_invite: !unlock_all,
+                }),
+                ..inputs
             };
-            assert_eq!(card[&0x28], Value::Unsigned(frame));
-            assert_eq!(progression[&0x58], card[&0x28]);
-            assert_eq!(messages.len(), 46);
-            let mut digest = Sha256::new();
-            for (crc, id, fields) in messages {
-                let mut wire = schemas.header(crc, 1, id).unwrap();
-                wire.extend(schemas.encode(crc, id, &fields).unwrap());
-                digest.update(crc.to_le_bytes());
-                digest.update(id.to_le_bytes());
-                digest.update(u32::try_from(wire.len()).unwrap().to_le_bytes());
-                digest.update(wire);
+            for (content, count, expected) in [
+                (inputs, 46, base),
+                (exact_inputs, 50 + event_cards.len(), with_extras),
+            ] {
+                let messages = prepared
+                    .available_messages(
+                        &schemas,
+                        &templates,
+                        &collection,
+                        &presence,
+                        &ranked,
+                        content,
+                    )
+                    .unwrap();
+                let keys: Vec<_> = messages.iter().map(|&(crc, id, _)| (crc, id)).collect();
+                assert_eq!(
+                    keys[..9],
+                    [
+                        (IN_CONNECT, 20500),
+                        (IN_CONNECT, 20502),
+                        (IN_CONNECT, 20505),
+                        (player::ENDORSEMENTS, 52002),
+                        (player::ENDORSEMENTS, 52005),
+                        (player::ENDORSEMENTS, 52006),
+                        (FRIENDS, 27113),
+                        (PROGRESSION, 24300),
+                        (HERO_CATALOG, 24900),
+                    ]
+                );
+                if content.solo_party.is_some() {
+                    assert_eq!(
+                        keys[keys.len() - 4..],
+                        [
+                            (RANKED, 36300),
+                            (PING, 35500),
+                            (lobby_party::PARTY, 20700),
+                            (LOBBY, 20802)
+                        ]
+                    );
+                } else {
+                    assert_eq!(keys[keys.len() - 2..], [(PING, 35500), (LOBBY, 20802)]);
+                }
+                assert!(keys[9..].contains(&(LOBBY, 20812)));
+                let Value::Struct(card) = &messages[1].2[&0x78] else {
+                    panic!("missing player card");
+                };
+                let Value::Struct(progression) = &messages[7].2[&0x78] else {
+                    panic!("missing progression");
+                };
+                assert_eq!(card[&0x28], Value::Unsigned(frame));
+                assert_eq!(progression[&0x58], card[&0x28]);
+                assert_eq!(messages.len(), count);
+                let mut digest = Sha256::new();
+                for (crc, id, fields) in messages {
+                    let mut wire = schemas.header(crc, 1, id).unwrap();
+                    wire.extend(schemas.encode(crc, id, &fields).unwrap());
+                    digest.update(crc.to_le_bytes());
+                    digest.update(id.to_le_bytes());
+                    digest.update(u32::try_from(wire.len()).unwrap().to_le_bytes());
+                    digest.update(wire);
+                }
+                assert_eq!(format!("{:x}", digest.finalize()), expected);
             }
-            assert_eq!(format!("{:x}", digest.finalize()), expected_digest);
         }
     }
 }

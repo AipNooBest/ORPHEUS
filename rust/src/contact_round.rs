@@ -121,14 +121,18 @@ impl Feature {
         } else if parameter == 1.0 {
             Self::vertex(1)
         } else {
-            Self {
-                index: 0,
-                kind: FeatureKind::Edge,
-            }
+            Self::edge(0)
         }
     }
 
-    fn vertex(index: u8) -> Self {
+    pub(crate) fn edge(index: u8) -> Self {
+        Self {
+            index,
+            kind: FeatureKind::Edge,
+        }
+    }
+
+    pub(crate) fn vertex(index: u8) -> Self {
         Self {
             index,
             kind: FeatureKind::Vertex,
@@ -152,8 +156,10 @@ pub struct ContactPoint {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Manifold {
-    /// Points from the moving capsule toward the obstacle.
+    /// Points from shape A toward shape B.
     pub normal: Vec3,
+    /// Lower distance estimate for an empty manifold beyond contact reach.
+    pub gap: Option<f64>,
     points: [ContactPoint; 2],
     len: usize,
 }
@@ -163,21 +169,31 @@ impl Manifold {
         &self.points[..self.len]
     }
 
-    fn one(normal: Vec3, point: ContactPoint) -> Self {
+    pub(crate) fn with_normal(normal: Vec3) -> Self {
         Self {
             normal,
-            points: [point, ContactPoint::default()],
-            len: 1,
+            ..Self::default()
         }
+    }
+
+    pub(crate) fn one(normal: Vec3, point: ContactPoint) -> Self {
+        let mut manifold = Self::with_normal(normal);
+        manifold.push(point);
+        manifold
+    }
+
+    pub(crate) fn push(&mut self, point: ContactPoint) {
+        self.points[self.len] = point;
+        self.len += 1;
     }
 }
 
-fn splat_tiny(value: f32) -> bool {
+pub(crate) fn splat_tiny(value: f32) -> bool {
     let square = value * value;
     (square + square) + square > TINY
 }
 
-fn clamp01(value: f32) -> f32 {
+pub(crate) fn clamp01(value: f32) -> f32 {
     maxps(0.0, minps(value, 1.0))
 }
 
@@ -339,10 +355,7 @@ impl CapsulePair {
                     self.at_b(t),
                     FeatureId {
                         a: Feature::vertex(k as u8),
-                        b: Feature {
-                            index: 0,
-                            kind: FeatureKind::Edge,
-                        },
+                        b: Feature::edge(0),
                         triangle: 0,
                     },
                 )
@@ -364,12 +377,11 @@ impl CapsulePair {
                 let shift = (self.a.radius - self.b.radius) * 0.5;
                 (add([shift, shift * 0.0, shift * 0.0], a), -self.radii)
             };
-            out.points[out.len] = ContactPoint {
+            out.push(ContactPoint {
                 position,
                 separation,
                 feature,
-            };
-            out.len += 1;
+            });
             normal_sum = add(normal_sum, gap);
         }
         out.normal = unit_or_x(normal_sum, dot(normal_sum, normal_sum));

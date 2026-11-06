@@ -8,7 +8,7 @@ use crate::{game_content::GameMap, game_messages::Message};
 
 pub const RETAIL_QUANTA: u32 = 16_000;
 pub const TOURNAMENT_QUANTA: u32 = 7_000;
-const FREE_FOR_ALL_TEAM: u8 = 4;
+pub(crate) const FREE_FOR_ALL_TEAM: u8 = 4;
 
 pub struct Member<'a> {
     pub entity: u32,

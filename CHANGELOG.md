@@ -765,3 +765,12 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Ported float32 sphere and capsule contacts with ordered features and cache placement. A local differential run matched Python bit for bit across 12,288 cases and 7,611 contact points. These primitives await the character solver and do not change the active Python server.
 - Added own presence to the Rust login subset. The 46-message subset matches Python for both the default and level-3000 full-unlock profiles, and seven additional presence packets match the reference.
 - Passed 140 public Rust tests and 16 optional checks with the prepared Practice Range pack, plus the enriched graph bundle check and 21 Python presence reference tests. Cargo formatting, Clippy and Git diff checks passed. Original-client acceptance remains pending.
+
+#### Rust world bootstrap and lobby roster messages
+
+- Ported the initial world records for map placeables, the player controller, the mode entity and training bots. The 21-record Practice Range baseline matches the Python wire payload. The packet budget splits it into ordered datagrams.
+- Added shared statescript value, chunk and full-frame writers. Verified Practice Range and PvP controller frames, team entries and the mode UI frame against Python. The controller and mode frames are ready for the worker's entity delivery path.
+- Ported training bot route state and shared mover settings. Compared the 15-bot Practice Range roster, 19,560 movement records, and all 34 fields for each of 38 prepared mover bodies. Ported scoreboard and on-fire fields and matched 462 scoreboard wire cases. Combat events still need to drive the on-fire values.
+- Ported the float32 GJK distance solver and one-sided capsule contacts against mesh triangles. The Python comparisons matched on 12,000 synthetic distance queries, 2,048 prepared mesh distance queries and 6,144 prepared capsule contact queries. Mesh candidate traversal, sweeps and character integration are pending.
+- Added the lobby clock, party payload and ranked rating projection. Verified the 50- and 51-message login subsets when the required ranked and solo party inputs were available.
+- Passed 169 public Rust tests, 24 optional runtime checks on each of two prepared packs, Cargo formatting, Clippy and Git diff checks. The native UDP worker still serves the loading phase. World delivery, hero selection and original-client acceptance are pending. The normal launch scripts still use Python.
