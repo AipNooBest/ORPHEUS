@@ -358,6 +358,7 @@ class Combat:
         self.match = match
         self.vitals: dict[int, Vitals] = {}  # body or bot entity -> its health
         self.history: dict[int, deque] = {}  # entity -> (tick, feet, height, eye) of the last HISTORY ticks
+        self.replacement_ticks: dict[int, int] = {}  # replacement body -> authoritative world tick
         self.rockets: list[Rocket] = []
         self.respawns: list[tuple[float, object]] = []  # (when, a player or a bot)
         self.next_bot = bots.BOT_ENTITY + len(match.bots)
@@ -390,12 +391,17 @@ class Combat:
         """Discard body-local combat state when the player's current body retires."""
         self.vitals.pop(player.body, None)
         self.history.pop(player.body, None)
+        self.replacement_ticks.pop(player.body, None)
         self.melee_seen.pop(player.body, None)
         # The owner's leased projectiles and their observer copies retire with the old body.
         self.rockets[:] = [
             rocket for rocket in self.rockets if rocket.shooter is not player or rocket.shot is None
         ]
         self.respawns[:] = [(when, who) for when, who in self.respawns if who is not player]
+
+    def record_replacement(self, body: int) -> None:
+        """Keep the creation boundary independent of the rolling pose history."""
+        self.replacement_ticks[body] = self.match.tick
 
     def spawned(self, player) -> None:
         """The player's client has the world: the game mode entity gets its UI graph (mode_frame). While
@@ -453,6 +459,8 @@ class Combat:
             view_tick = command.frame - command.view_delay(player.quanta) * 1e6 / player.quanta
             for target in self._enemies(player):
                 shown = self.seen(target, view_tick)
+                if shown is None:
+                    continue
                 a, b = shown.segment()
                 if segment_distance(centre, a, b) - shown.radius <= radius and amount > 0.0:
                     self._damage(player, target, amount, False, loadout, command.frame)
@@ -493,7 +501,7 @@ class Combat:
                 self._respawn(who)
         self.voice.expire(now)
         current = {target.entity for target in self._targets()}
-        for table in (self.history, self.vitals):
+        for table in (self.history, self.vitals, self.replacement_ticks):
             for entity in [key for key in table if key not in current]:
                 del table[entity]
 
@@ -545,9 +553,11 @@ class Combat:
             found.append(target)
         return found
 
-    def seen(self, target: Target, view_tick: float) -> Target:
-        """The target as the shooter's client drew it at `view_tick` (a fraction between two ticks): between
-        the two kept ticks around it, the oldest or newest one outside them."""
+    def seen(self, target: Target, view_tick: float) -> Target | None:
+        """Interpolate retained poses or use the nearest sample for a body that already existed."""
+        replaced_at = self.replacement_ticks.get(target.entity)
+        if replaced_at is not None and view_tick < replaced_at:
+            return None
         history = self.history.get(target.entity)
         if not history:
             return target
@@ -653,6 +663,8 @@ class Combat:
         best = None
         for target in self._enemies(shooter):
             shown = self.seen(target, view_tick)
+            if shown is None:
+                continue
             a, b = shown.segment()
             t = ray_capsule(origin, direction, a, b, shown.radius)
             if t is not None and t <= reach and (best is None or t < best[0]):
@@ -924,6 +936,7 @@ class Combat:
         match._prepare_bot_script(fresh)
         match.bots[match.bots.index(bot)] = fresh
         self.vitals.pop(bot.entity, None)
+        self.record_replacement(fresh.entity)
         for viewer in match.players:
             if viewer.client is None or match.bots_shown.get(viewer.slot) is None:
                 continue

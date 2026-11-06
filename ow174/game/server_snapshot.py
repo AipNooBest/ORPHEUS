@@ -90,7 +90,7 @@ FIELDS = {
     ShownController: _names("script create_acked pick card_again possession"),
     CommandQueue: _names("last_frame epoch wraps"),
     combat.Combat: _names(
-        "match vitals history rockets respawns next_bot now tick melee_seen "
+        "match vitals history replacement_ticks rockets respawns next_bot now tick melee_seen "
         "projectiles observers voice"
     ),
     combat.Vitals: _names("entity most now ids changed died_at death_tick killer"),

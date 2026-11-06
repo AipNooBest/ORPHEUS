@@ -1183,6 +1183,7 @@ class Match:
                 return False
             self.combat.retire_player_body(player)
             player.new_body(entity)
+            self.combat.record_replacement(entity)
         player.hero = hero
         player.skin = self.skin_of(player.account_lo, hero.guid)
         player.has_body = True

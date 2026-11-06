@@ -223,6 +223,40 @@ class DamageTests(unittest.TestCase):
         self.assertEqual(vitals.now[HEALTH_POOL], 200.0 - (95.0 - 47.5))
         self.assertEqual(vitals.heal(1000.0), 47.5 + 50.0 + 25.0)
 
+    def test_rewind_cannot_hit_a_body_before_its_replacement_tick(self):
+        for view_delay_ms, damage in ((17, 0), (16, 20)):
+            with self.subTest(view_delay_ms=view_delay_ms):
+                run = Run(KANEZAKA_DM, ("Shooter", "Target"))
+                match = run.match
+                match.bots.clear()
+                match._pending_bot_scripts.clear()
+                shooter, victim = run.players
+                x, y, z = shooter.mover.position
+                victim.mover.position = [x + 10.0, y, z]
+                run.step({})
+
+                retired = victim.body
+                birth_tick = match.tick
+                victim.spawn = ((x, y, z + 6.0), victim.spawn[1])
+                self.assertTrue(match.switch_hero(victim, victim.hero))
+                self.assertNotEqual(victim.body, retired)
+                shot_tick = birth_tick + 1
+                match.update(shot_tick * combat.TICK, shot_tick, frames=False)
+                fight = match.combat
+                self.assertEqual(fight.history[victim.body][0][0], shot_tick)
+
+                yaw, pitch = aim(fight._eye(shooter), (x, y + 1.0, z + 6.0))
+                shooter.take_commands([
+                    Command(shot_tick, yaw=yaw, pitch=pitch, buttons=FIRE, extra=view_delay_ms),
+                ])
+                target = next(target for target in fight._targets() if target.owner is victim)
+                hits = [
+                    (hit["+0x78"]["+0x0"]["+0x0"], hit["+0x78"]["+0x4"], hit["+0x84"])
+                    for hit in shooter.client.messages(combat.HIT)
+                ]
+                expected_hits = [(victim.body, damage, shot_tick)] if damage else []
+                self.assertEqual((fight.vitals_of(target).total, hits), (200.0 - damage, expected_hits))
+
     def test_missing_held_fire_uses_each_reconstructed_pose_and_aim(self):
         def fight_after_gap(lost):
             run = Run(KANEZAKA_DM, ("Shooter", "Target"))
