@@ -741,3 +741,11 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Ported retail lobby template loading, personalization and the account's initial settings and endorsement messages. Compared encoded message digests against the Python reference with the prepared schemas.
 - Added a bounded XZ and geometry reader for version 5 movement and expanded-ray collision caches. A local release build decoded all 190 prepared caches across 95 maps. Every decoded field of the two Practice Range caches matched the Python uncompressed byte stream.
 - Passed 86 public Rust tests, eight optional runtime checks, 39 Python matchmaker tests, Cargo formatting, Clippy and Git diff checks. The normal lobby and match entry points still use Python. Collision queries, full lobby and match integration, and original-client acceptance remain pending.
+
+#### Rust login session, game ingress and combat primitives
+
+- Connected the lobby transport to BattleTag lookup and login preparation. Checked a 43-message initial login subset against the Python wire order. Dynamic collections, queue content and other post-login handlers still need integration.
+- Ported reliable message dispatch before input parsing, Pong and the four map-entry milestones. A mixed frame and its Pong match the Python bytes with the 104319 game schema.
+- Added static ray primitives and an indexed core triangle scene. Compared 2,720 ray, ground and ordered nearby queries on both prepared Practice Range caches. Hit results, floating-point fields and ordering matched the Python reference in this comparison. Prop placement and character contacts are separate.
+- Ported the body health pools and their dirty updates, including shield and armour order and lethal attribution. Full and partial pool updates use the same world component encoder. Original-client validation of health presentation and combat behavior remains pending.
+- Passed 107 public Rust tests, ten optional runtime checks, 27 Python combat tests, Cargo formatting, Clippy and Git diff checks. The normal server entry point still runs the Python implementation.

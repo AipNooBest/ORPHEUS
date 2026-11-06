@@ -314,20 +314,32 @@ pub fn pool(id: u32, kind: u32, most: f32, now: f32) -> [u8; 20] {
 }
 
 pub fn health(now: f32, most: f32, armour: f32, shields: f32) -> Component {
+    health_pools(
+        [most, armour, shields].map(f64::from),
+        [now, armour, shields].map(f64::from),
+        [true; 3],
+    )
+}
+
+/// Encode selected pools without changing the IDs assigned to the full body.
+pub(crate) fn health_pools(maximum: [f64; 3], current: [f64; 3], include: [bool; 3]) -> Component {
     let mut fields = vec![None; 3 * POOLS];
     let mut id = 1;
-    for (kind, top) in [(SHIELDS_POOL, shields), (ARMOUR_POOL, armour)] {
-        if top > 0.0 {
-            fields[kind * POOLS] = Some(ComponentValue::Blob20(pool(id, kind as u32, top, top)));
-            id += 1;
+    for kind in [SHIELDS_POOL, ARMOUR_POOL, HEALTH_POOL] {
+        let most = maximum[kind];
+        if kind != HEALTH_POOL && (most <= 0.0 || most.is_nan()) {
+            continue;
         }
+        if include[kind] {
+            fields[kind * POOLS] = Some(ComponentValue::Blob20(pool(
+                id,
+                kind as u32,
+                most as f32,
+                current[kind] as f32,
+            )));
+        }
+        id += 1;
     }
-    fields[0] = Some(ComponentValue::Blob20(pool(
-        id,
-        HEALTH_POOL as u32,
-        most,
-        now,
-    )));
     Component { index: 51, fields }
 }
 

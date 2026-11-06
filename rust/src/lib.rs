@@ -11,9 +11,11 @@ pub mod bnet_service;
 pub mod bnet_session_key;
 pub mod catalog;
 pub mod collision_cache;
+pub mod collision_index;
 pub mod commands;
 pub mod game_clock;
 pub mod game_connection;
+pub mod game_ingress;
 pub mod game_link;
 pub mod game_messages;
 pub mod jam_cipher;
@@ -22,10 +24,13 @@ pub mod jam_framing;
 pub mod jam_handshake;
 pub mod lobby_login;
 pub mod lobby_player_messages;
+pub mod lobby_session;
 pub mod lobby_transport;
 pub mod match_handoff;
 pub mod retail_templates;
 pub mod runtime;
+pub mod static_ray;
+pub mod vitals;
 pub mod world;
 
 #[cfg(test)]
