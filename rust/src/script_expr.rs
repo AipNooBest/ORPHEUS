@@ -32,6 +32,7 @@ pub enum EntityRelation {
     OwningController,
     CurrentPossessor,
     PossessedBody,
+    AiControlEntity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,6 +146,10 @@ pub trait Context {
 
     /// None leaves candidate flags unknown. A known absence can report zero.
     fn entity_filter_flags(&mut self, _entity: u32) -> Option<u64> {
+        None
+    }
+
+    fn body_on_fire(&mut self, _entity: u32) -> Option<bool> {
         None
     }
 
@@ -288,6 +293,7 @@ pub fn truthy(value: &Value) -> bool {
         Some(Value::Entity(id)) => valid_entity(*id),
         Some(Value::Vector(parts)) => parts.iter().any(|&part| part != 0.0),
         Some(Value::Handle { instance, .. }) => *instance != 0,
+        Some(Value::Map(entries)) => !entries.is_empty(),
         _ => false,
     }
 }
@@ -366,6 +372,12 @@ fn contains(container: &Value, value: &Value) -> bool {
 }
 
 fn index(object: Value, index: &Value) -> Value {
+    if let Value::Map(entries) = object {
+        return entries
+            .into_iter()
+            .find_map(|(key, value)| equal(&key, index).then_some(value))
+            .unwrap_or(Value::Null);
+    }
     if matches!(
         index,
         Value::Null | Value::Bool(_) | Value::Integer(_) | Value::Float(_)
@@ -413,6 +425,44 @@ fn is_expression(class: Option<&str>) -> bool {
 
 fn child<'a>(config: &'a Json, field: &str) -> &'a Json {
     config.get(field).unwrap_or(&Json::Null)
+}
+
+fn literal_asset(config: &Json, expected: &str, field: &str, kind: u64) -> Option<Value> {
+    if class(config) != Some(expected)
+        || !native_fields(config, &[field, "m_resourceKey"])
+        || !child(config, "m_resourceKey").is_null()
+    {
+        return None;
+    }
+    let guid = asset_guid(child(config, field))?;
+    (guid >> 48 == kind).then_some(Value::Asset(guid))
+}
+
+fn literal_message_map(config: &Json) -> Result<Value, EvalError> {
+    let unsupported = || EvalError::UnsupportedConfig("STU_7757D403".into());
+    if !native_fields(config, &["m_configVars"]) {
+        return Err(unsupported());
+    }
+    let pairs = array_field(config, "m_configVars")?
+        .iter()
+        .map(|entry| {
+            if class(entry) != Some("STU_98DD1872") || !native_fields(entry, &["m_key", "m_value"])
+            {
+                return Err(unsupported());
+            }
+            let key = literal_asset(child(entry, "m_key"), "STU_B70476F3", "m_548E5344", 0x0a90)
+                .ok_or_else(unsupported)?;
+            let value = literal_asset(
+                child(entry, "m_value"),
+                "STUConfigVarGameMessage",
+                "m_gameMessage",
+                0x0240,
+            )
+            .ok_or_else(unsupported)?;
+            Ok((key, value))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Value::Map(pairs))
 }
 
 fn json_truthy(value: &Json) -> bool {
@@ -659,6 +709,9 @@ impl Evaluator {
             "STU_919FD47C" | "STUConfigVarExpression" => {
                 return self.expression(config, context, nested);
             }
+            "STU_B70476F3" => literal_asset(config, class, "m_548E5344", 0x0a90)
+                .ok_or_else(|| EvalError::UnsupportedConfig(class.into()))?,
+            "STU_7757D403" => literal_message_map(config)?,
             "STU_B5A0CAF0" => context.owner(),
             "STU_25ECB55F" => {
                 let unsupported = || EvalError::UnsupportedConfig(class.into());
@@ -685,14 +738,24 @@ impl Evaluator {
                     result => result,
                 };
             }
+            "STU_1ED4F039" if native_shape(config, class, Some("m_entity")) => {
+                let unsupported = || EvalError::UnsupportedConfig(class.into());
+                let Value::Entity(entity) =
+                    self.config(child(config, "m_entity"), context, nested)?
+                else {
+                    return Err(unsupported());
+                };
+                Value::Bool(context.body_on_fire(entity).ok_or_else(unsupported)?)
+            }
             "STU_4A101787" | "STU_E95A9C77" if native_shape(config, class, None) => {
                 // The retail classes share a native evaluator that writes a typed false.
                 Value::Bool(false)
             }
-            "STU_F76C486C" | "STU_F7262B36" | "STU_0AC15F78" => {
+            "STU_F76C486C" | "STU_F7262B36" | "STU_0AC15F78" | "STU_DB742151" => {
                 let (relation, operand) = match class {
                     "STU_F76C486C" => (EntityRelation::OwningController, "m_D63CBEC2"),
                     "STU_F7262B36" => (EntityRelation::CurrentPossessor, "m_801B298F"),
+                    "STU_DB742151" => (EntityRelation::AiControlEntity, "m_entity"),
                     _ => (EntityRelation::PossessedBody, "m_entity"),
                 };
                 if !native_shape(config, class, Some(operand)) {
@@ -706,6 +769,16 @@ impl Evaluator {
                     .related_entity(relation, entity)
                     .ok_or_else(|| EvalError::UnsupportedConfig(class.into()))?;
                 Value::Entity(related)
+            }
+            "STU_D3EB8D87" if native_shape(config, class, Some("m_00903303")) => {
+                if let Some(value) = context.native(config) {
+                    value
+                } else {
+                    match self.config(child(config, "m_00903303"), context, nested)? {
+                        Value::Entity(entity) if !valid_entity(entity) => Value::Bool(false),
+                        _ => return Err(EvalError::UnsupportedConfig(class.into())),
+                    }
+                }
             }
             "STU_32E6E4D8" | "STU_7D7D2470" => {
                 let target = child(config, "m_entity");
@@ -1427,6 +1500,71 @@ mod tests {
                 "m_D99EF254": floats,
             },
         })
+    }
+
+    #[test]
+    fn authored_message_map_looks_up_the_first_matching_key_without_wire() {
+        use crate::{
+            bits::BitWriter,
+            script_wire::{ValueEncoding, WireError, write_value},
+        };
+
+        let row = |key: &str, message: &str| {
+            json!({
+                "$":"STU_98DD1872", "m_EE729DCB":0,
+                "m_key":{"$":"STU_B70476F3","m_548E5344":key,"m_resourceKey":null},
+                "m_value":{"$":"STUConfigVarGameMessage","m_gameMessage":message,"m_resourceKey":null},
+            })
+        };
+        let mut literal = json!({
+            "$":"STU_7757D403", "m_EE729DCB":0,
+            "m_configVars":[
+                row("0x0A90000000000042", "0x0240000000000003"),
+                row("0x0A90000000000042", "0x0240000000000004"),
+            ],
+        });
+        let mut context = Vars::default();
+        let map = evaluate(&literal, &mut context).unwrap();
+        assert_eq!(
+            evaluate(&literal["m_configVars"][0]["m_key"], &mut context),
+            Ok(Value::Asset(0x0a90_0000_0000_0042))
+        );
+        assert!(truthy(&map));
+        context.instance.insert(1, map.clone());
+        let lookup = expression(
+            json!([8, 0, 8, 1, 17, 0]),
+            &[variable(1, Scope::Instance), variable(2, Scope::Instance)],
+            &[],
+            &[],
+        );
+        for (key, result) in [
+            (0x0a90_0000_0000_0042, Value::Asset(0x0240_0000_0000_0003)),
+            (0x0a90_0000_0000_0043, Value::Null),
+        ] {
+            context.instance.insert(2, Value::Asset(key));
+            assert_eq!(evaluate(&lookup, &mut context), Ok(result));
+        }
+        literal["m_configVars"][0]["m_key"]["m_548E5344"] = json!("0x0240000000000042");
+        assert_eq!(
+            evaluate(&literal["m_configVars"][0]["m_key"], &mut context),
+            Err(EvalError::UnsupportedConfig("STU_B70476F3".into()))
+        );
+        assert_eq!(
+            evaluate(&literal, &mut context),
+            Err(EvalError::UnsupportedConfig("STU_7757D403".into()))
+        );
+        literal["m_configVars"] = Json::Null;
+        let empty = evaluate(&literal, &mut context).unwrap();
+        assert_eq!(empty, Value::Map(Vec::new()));
+        assert!(!truthy(&empty));
+        for encoding in [ValueEncoding::Explicit, ValueEncoding::Compact] {
+            let mut bits = BitWriter::new();
+            assert_eq!(
+                write_value(&mut bits, &map, encoding),
+                Err(WireError::InvalidValue)
+            );
+            assert_eq!(bits.bit_len(), 0);
+        }
     }
 
     const FILTER_OWNER: u32 = 0xa000_0101;

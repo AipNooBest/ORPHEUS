@@ -69,6 +69,9 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
   branch timing and event ordering. Its `internal/world/health.go` provides an independent comparison
   for the component 51 fields and the provisional pool ID order. Gamayun identifies its Go implementation
   as AGPL-3.0-or-later and retains the MIT notice for inherited code.
+- The frozen Python `ow174/game/onfire.py` and Gamayun's `internal/vm/natives.go` document the
+  possessor's component 64 on-fire lookup. Gamayun's `internal/expr/value.go` provides a comparison
+  for ordered map values and first-match lookup.
 - **The Claudewatch contributors** supplied the Beta 1.0.0.3 research lead for attacker-side hit-confirm effects
   and separate entity and announcer voice messages. ORPHEUS checks these leads against 104319 client data before
   implementing them. The reference is a locally reviewed binary distribution.

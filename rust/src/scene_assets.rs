@@ -25,8 +25,8 @@ use crate::{
     game_instance::RETAIL_QUANTA,
     game_pools::PoolCatalog,
     game_replication::OwnerBodyRuntime,
-    game_stats::{PlayerStats, StatsCatalog},
-    match_scene::{PlayerAppearance, initial_world, mode_ui},
+    game_stats::{PlayerStats, StatsCatalog, initial_on_fire},
+    match_scene::{PlayerAppearance, initial_world, mode_ui, team_bit},
     mover::Mover,
     mover_ground::NOT_GROUND,
     mover_posture::snap,
@@ -180,7 +180,7 @@ impl SceneAssets {
                 .component(&PlayerStats::default(), map.mode_guid, None, None);
         let owner_body_factory = if is_practice_range(&map) && scripted_bots == 0 {
             self.practice_owner_body
-                .get_or_init(|| self.prepare_owner_body(&GameMap::practice_range()))
+                .get_or_init(|| self.prepare_owner_body(&GameMap::practice_range(), &initial_board))
                 .clone()
         } else {
             None
@@ -201,7 +201,11 @@ impl SceneAssets {
         })
     }
 
-    fn prepare_owner_body(&self, map: &GameMap) -> Option<Arc<OwnerBodyFactory>> {
+    fn prepare_owner_body(
+        &self,
+        map: &GameMap,
+        initial_board: &Component,
+    ) -> Option<Arc<OwnerBodyFactory>> {
         let hero = self.heroes.get(SOLDIER)?;
         let (position, _) = map.spawn_point(0, 0)?;
         let prepared = self
@@ -209,15 +213,20 @@ impl SceneAssets {
             .as_ref()
             .ok_or_else(|| "the owner statescript codec table is unavailable".to_owned())
             .and_then(|codecs| {
+                let controller_on_fire = initial_on_fire(initial_board).ok_or_else(|| {
+                    "the controller's initial on-fire flag is unavailable".to_owned()
+                })?;
                 PlayerBodyFactory::prepare(
                     Arc::clone(&self.graphs),
                     Arc::clone(codecs),
                     map.mode_guid,
                     hero,
                     self.pools.hero_pools(hero.guid),
+                    controller_on_fire,
                     OwnerBodySpawn {
                         controller: 0xa000_0100,
                         entity: 0xa000_0101,
+                        body_filter: team_bit(0).map_err(|error| error.to_string())?,
                         frame: FIRST_TICK,
                         position: position.map(snap),
                         quanta: RETAIL_QUANTA,
@@ -399,6 +408,7 @@ mod tests {
         let spawn = OwnerBodySpawn {
             controller: 0xa000_0100,
             entity: 0xa000_0101,
+            body_filter: team_bit(0).unwrap(),
             frame: FIRST_TICK,
             position: scene.map().spawn_point(0, 0).unwrap().0.map(snap),
             quanta: RETAIL_QUANTA,

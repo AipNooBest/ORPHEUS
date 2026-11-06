@@ -199,6 +199,18 @@ pub fn on_fire_component(
     }
 }
 
+/// The effective flag on a fresh player controller, before any stats updates.
+pub(crate) fn initial_on_fire(component: &Component) -> Option<bool> {
+    if component.index != GMP_STATS {
+        return None;
+    }
+    match component.fields.get(ON_FIRE).and_then(Option::as_ref) {
+        None => Some(false),
+        Some(ComponentValue::U8(flag)) => Some(*flag != 0),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Default)]
 struct StatLists {
     default: Vec<StatSlot>,
@@ -410,6 +422,14 @@ mod tests {
 
     #[test]
     fn on_fire_updates_match_python_and_leave_other_fields_unwritten() {
+        assert_eq!(
+            initial_on_fire(&on_fire_component(None, None, None)),
+            Some(false)
+        );
+        assert_eq!(
+            initial_on_fire(&on_fire_component(None, None, Some(true))),
+            Some(true)
+        );
         let owner = update(
             0,
             &[on_fire_component(Some(250.0), Some(500.0), Some(false))],

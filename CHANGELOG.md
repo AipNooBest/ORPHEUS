@@ -900,3 +900,12 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Shared the owner's tag facts between direct tag queries and filters. The supported filter form applies any, all and exclusion tag predicates, and can use an exclusion mask when the world provides authoritative flags.
 - Verified the authored tag branches at graph `004B`, node `21` and graph `0043`, node `45` with the tagged Practice Range runtime. Stock Soldier startup reports 8 diagnostics, down from 10. The first remaining condition at `004B`, node `20` needs the entity's runtime exclusion flags. Tag mutations, instance overrides, weapon attachment and original-client acceptance remain open.
 - Passed 307 public Rust tests, 59 tagged base-runtime checks and 55 tagged enriched-runtime checks. The earlier untagged bundle also passed the owner startup regression. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.
+
+#### Rust owner startup facts and message tables
+
+- Shared the body creation mask with the entity filter query. The same 104319 weapon-manager graph now starts seven additional subgraphs. A frozen reference replay with the corresponding mask matches the order and parents of all 26 instances. Runtime changes to the original server's exclusion flags still need verification.
+- Read the initial on-fire flag from the current possessor's component 64 baseline. Resolved the authenticated human body's absent AI relation as an invalid entity ID. The original 104319 graph and reference data establish the operand shapes. Later client disassembly corroborates the typed absence results. Fire score, decay and active AI relations remain open.
+- Added ordered VM maps for authored local message tables and their typed key lookup. The 20-entry table in the Soldier startup graph is local to the VM. Map wire encoding still needs verification.
+- Used the inherited state lifecycle and empty payload for the verified zero-valued state on the human owner branch. Other values remain unverified.
+- Reduced tagged 104319 Soldier startup diagnostics from 8 to 5. The first remaining operation is `STU_22926252` at `08B6`, node `11`. Stock weapon attachment and original-client acceptance remain pending.
+- Passed 308 public Rust tests, 59 tagged base-runtime checks and 55 tagged enriched-runtime checks. The untagged bundle also passed the owner startup regression. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.

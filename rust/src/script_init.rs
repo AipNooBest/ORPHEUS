@@ -200,6 +200,10 @@ pub trait World {
         None
     }
 
+    fn body_on_fire(&mut self, _site: Site, _entity: u32) -> Option<bool> {
+        None
+    }
+
     /// None means this relationship is unsupported for the supplied entity.
     fn related_entity(
         &mut self,
@@ -2374,6 +2378,16 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             | "STUStatescriptStateDataFlowMapping"
             | "STU_E13B30A8"
             | "STUStatescriptStateUXPresenter" => StateKind::Plain,
+            // The authored zero-valued form inherits the base state reader.
+            "STU_D9843704"
+                if node.is_networked() && node.remote == -1 && {
+                    let value = field(&node.fields, "m_0B528B1E");
+                    script_expr::native_shape(value, "STUConfigVarFloat", Some("m_value"))
+                        && field(value, "m_value").as_f64() == Some(0.0)
+                } =>
+            {
+                StateKind::Plain
+            }
             "STU_BD02E168" if is_client_subgraph_controller(self.graph(id), node) => {
                 StateKind::Plain
             }
@@ -4488,6 +4502,11 @@ impl<W: World> Context for InstanceContext<'_, W> {
     fn entity_filter_flags(&mut self, entity: u32) -> Option<u64> {
         self.read_native = true;
         self.world.entity_filter_flags(self.site, entity)
+    }
+
+    fn body_on_fire(&mut self, entity: u32) -> Option<bool> {
+        self.read_native = true;
+        self.world.body_on_fire(self.site, entity)
     }
 
     fn related_entity(&mut self, relation: EntityRelation, entity: u32) -> Option<u32> {

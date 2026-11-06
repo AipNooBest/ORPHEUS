@@ -35,6 +35,7 @@ use crate::{
 pub(crate) struct OwnerBodySpawn {
     pub controller: u32,
     pub entity: u32,
+    pub body_filter: u64,
     pub frame: u32,
     pub position: [f64; 3],
     pub quanta: u32,
@@ -49,6 +50,7 @@ pub(crate) struct PlayerBodyFactory {
     variables: Variables,
     pools: Option<HealthPools>,
     target_tags: Option<BTreeSet<u64>>,
+    controller_on_fire: bool,
 }
 
 impl PlayerBodyFactory {
@@ -58,6 +60,7 @@ impl PlayerBodyFactory {
         mode: u64,
         hero: &Hero,
         pools: Option<HealthPools>,
+        controller_on_fire: bool,
         probe: OwnerBodySpawn,
     ) -> io::Result<Self> {
         let body = graphs
@@ -80,6 +83,7 @@ impl PlayerBodyFactory {
             variables,
             pools,
             target_tags,
+            controller_on_fire,
         };
         let runtime = factory.start(probe)?;
         let encoder = runtime.encoder();
@@ -102,6 +106,7 @@ impl PlayerBodyFactory {
             graphs: Arc::clone(&self.graphs),
             controller: spawn.controller,
             entity: spawn.entity,
+            body_filter: spawn.body_filter,
             position: spawn.position,
             throttles: [0; 2],
             mode: self.mode,
@@ -113,6 +118,7 @@ impl PlayerBodyFactory {
             },
             pool_types_known: self.pools.is_some() || has_authored_pools,
             target_tags: self.target_tags.clone(),
+            controller_on_fire: self.controller_on_fire,
         };
         let mut component = Component::start(
             Arc::clone(&self.graphs),
@@ -253,6 +259,7 @@ struct BodyWorld {
     graphs: Arc<GraphStore>,
     controller: u32,
     entity: u32,
+    body_filter: u64,
     position: [f64; 3],
     throttles: [i8; 2],
     mode: u64,
@@ -260,6 +267,7 @@ struct BodyWorld {
     vitals: Vitals,
     pool_types_known: bool,
     target_tags: Option<BTreeSet<u64>>,
+    controller_on_fire: bool,
 }
 
 impl World for BodyWorld {
@@ -348,6 +356,15 @@ impl World for BodyWorld {
         Some(self.target_tags.as_ref()?.contains(&tag))
     }
 
+    fn entity_filter_flags(&self, site: Site, entity: u32) -> Option<u64> {
+        (self.is_player_site(site) && entity == self.entity).then_some(self.body_filter)
+    }
+
+    fn body_on_fire(&mut self, site: Site, entity: u32) -> Option<bool> {
+        self.related_entity(site, EntityRelation::CurrentPossessor, entity)
+            .map(|_| self.controller_on_fire)
+    }
+
     fn related_entity(&mut self, site: Site, relation: EntityRelation, entity: u32) -> Option<u32> {
         if !self.is_player_site(site)
             || !valid_entity(self.controller)
@@ -363,6 +380,8 @@ impl World for BodyWorld {
                 Some(self.controller)
             }
             EntityRelation::PossessedBody if entity == self.controller => Some(self.entity),
+            // The authenticated human body has no AI control entity in this world.
+            EntityRelation::AiControlEntity if entity == self.entity => Some(0),
             _ => None,
         }
     }
@@ -388,20 +407,6 @@ impl World for BodyWorld {
                 if self.is_player_site(site)
                     && self.mode == PRACTICE_RANGE_MODE
                     && native_shape(config, "STU_A77AC2AC", None) =>
-            {
-                Some(Value::Null)
-            }
-            // The player's own AI path query is falsey in the reference.
-            // Other entity operands still need a world-side resolver.
-            "STU_D3EB8D87"
-                if self.is_player_site(site)
-                    && native_shape(config, "STU_D3EB8D87", Some("m_00903303"))
-                    && config.get("m_00903303").is_some_and(|ai| {
-                        native_shape(ai, "STU_DB742151", Some("m_entity"))
-                            && ai
-                                .get("m_entity")
-                                .is_some_and(|owner| native_shape(owner, "STU_B5A0CAF0", None))
-                    }) =>
             {
                 Some(Value::Null)
             }
@@ -446,13 +451,21 @@ pub(crate) fn fixture_body_factory() -> (PlayerBodyFactory, OwnerBodySpawn) {
     let spawn = OwnerBodySpawn {
         controller: 0xa000_0100,
         entity: 0xa000_0101,
+        body_filter: crate::match_scene::team_bit(0).unwrap(),
         frame: 100,
         position: [1.0, 2.0, 3.0],
         quanta: RETAIL_QUANTA,
     };
-    let factory =
-        PlayerBodyFactory::prepare(graphs, codecs, PRACTICE_RANGE_MODE, &hero, None, spawn)
-            .unwrap();
+    let factory = PlayerBodyFactory::prepare(
+        graphs,
+        codecs,
+        PRACTICE_RANGE_MODE,
+        &hero,
+        None,
+        false,
+        spawn,
+    )
+    .unwrap();
     (factory, spawn)
 }
 
@@ -543,13 +556,14 @@ mod tests {
         }
 
         let ai = json!({"$":"STU_DB742151","m_entity":owner,"m_EE729DCB":0});
+        assert_eq!(evaluate(&mut runtime, &ai), Ok(Value::Entity(0)));
         let path = json!({"$":"STU_D3EB8D87","m_00903303":ai,"m_EE729DCB":0});
-        assert_eq!(evaluate(&mut runtime, &path), Ok(Value::Null));
+        assert_eq!(evaluate(&mut runtime, &path), Ok(Value::Bool(false)));
         let other_path =
             json!({"$":"STU_D3EB8D87","m_00903303":{"$":"STU_DB742151","m_entity":dynamic}});
         assert_eq!(
             evaluate(&mut runtime, &other_path),
-            Err(EvalError::UnsupportedConfig("STU_D3EB8D87".into()))
+            Err(EvalError::UnsupportedConfig("STU_DB742151".into()))
         );
         let branch = json!({"$":"STU_A77AC2AC","m_EE729DCB":0});
         assert_eq!(evaluate(&mut runtime, &branch), Ok(Value::Null));
@@ -953,6 +967,7 @@ mod tests {
             graphs: Arc::clone(&graphs),
             controller: 0xa000_0100,
             entity: 0xa000_0101,
+            body_filter: crate::match_scene::team_bit(0).unwrap(),
             position: GameMap::practice_range().spawn_point(0, 0).unwrap().0,
             throttles: [0; 2],
             mode: PRACTICE_RANGE_MODE,
@@ -960,6 +975,7 @@ mod tests {
             vitals: Vitals::empty(),
             pool_types_known: true,
             target_tags: body.target_tags.clone(),
+            controller_on_fire: false,
         };
         let mut component = Component::start(
             graphs,
@@ -973,7 +989,14 @@ mod tests {
         .unwrap();
         component.advance_frame(FIRST_TICK, &mut world).unwrap();
         let snapshot = component.snapshot().unwrap();
-        // Python BodyScript.snapshot() after the same hero's startup.
+        for diagnostic in &snapshot.diagnostics {
+            eprintln!(
+                "{:04X}:{:?} {:?}",
+                diagnostic.site.graph, diagnostic.site.node, diagnostic.issue
+            );
+        }
+        // Frozen BodyScript startup with the same component 26 mask supplied
+        // to the two owner filters. All five team-only masks select this tree.
         let expected = [
             (1, 0x0033, None),
             (2, 0x004b, None),
@@ -992,8 +1015,15 @@ mod tests {
             (15, 0x0b8b, Some((2, 10))),
             (16, 0x0c7d, Some((2, 18))),
             (17, 0x01ca, Some((2, 1))),
-            (18, 0x0bf8, Some((9, 4))),
-            (19, 0x0e8f, Some((13, 32))),
+            (18, 0x0ba4, Some((2, 11))),
+            (19, 0x05ac, Some((2, 8))),
+            (20, 0x02cf, Some((2, 6))),
+            (21, 0x0b3b, Some((2, 9))),
+            (22, 0x01d8, Some((2, 4))),
+            (23, 0x0f82, Some((2, 21))),
+            (24, 0x05ad, Some((2, 7))),
+            (25, 0x0bf8, Some((9, 4))),
+            (26, 0x0e8f, Some((13, 32))),
         ];
         let instances: Vec<_> = snapshot
             .instances
@@ -1009,6 +1039,17 @@ mod tests {
         );
         assert_eq!(body_pools.variables[&520], Value::Float(200.0));
         assert_eq!(world.vitals.component(), pools.vitals().component());
+        let Value::Map(messages) = &snapshot.instances[&24].variables[&29859] else {
+            panic!("the authored message table must be a map");
+        };
+        assert_eq!(messages.len(), 20);
+        assert_eq!(
+            messages[0],
+            (
+                Value::Asset(0x0a90_0000_0000_0171),
+                Value::Asset(0x0240_0000_0000_05ad)
+            )
+        );
         assert_eq!(
             snapshot.instances[&1].variables[&9737],
             Value::Entity(world.entity)
@@ -1036,7 +1077,7 @@ mod tests {
             (13, 138),
             (13, 139),
             (14, 30),
-            (18, 8),
+            (25, 8),
         ] {
             let controller = &snapshot.instances[&instance].states[&state];
             assert!(controller.active);
@@ -1054,7 +1095,7 @@ mod tests {
                 frame_ms: FRAME_MS as u32,
             },
         ] {
-            for class in ["STU_CD46AF93", "STU_F5A99B2A"] {
+            for class in ["STU_CD46AF93", "STU_F5A99B2A", "STU_D9843704"] {
                 let codec = codecs.codec(class).unwrap();
                 assert_eq!(codec.payload(&BTreeMap::new(), mode).unwrap().bit_len(), 0);
             }
@@ -1090,7 +1131,37 @@ mod tests {
             health_switch.kind,
             crate::script_init::StateKind::BooleanSwitch(true)
         );
-        for (graph, node) in [(0x0033, 1), (0x0033, 66), (0x08b6, 2)] {
+        let ai_switch = &snapshot.instances[&9].states[&12];
+        assert!(ai_switch.active);
+        assert_eq!(ai_switch.kind, StateKind::BooleanSwitch(false));
+        let human_state = &snapshot.instances[&9].states[&11];
+        assert!(human_state.active);
+        assert_eq!(human_state.kind, StateKind::Plain);
+        assert_eq!(
+            world
+                .graphs
+                .graph(0x08b6)
+                .unwrap()
+                .state(11)
+                .unwrap()
+                .remote,
+            -1
+        );
+        let on_fire = &snapshot.instances[&13].states[&17];
+        assert!(on_fire.active);
+        assert_eq!(on_fire.kind, StateKind::BooleanSwitch(false));
+        assert!(!snapshot.diagnostics.iter().any(|diagnostic| {
+            diagnostic.site.graph == 0x01cf && diagnostic.site.node == Some(31)
+        }));
+        for (graph, node) in [
+            (0x0033, 1),
+            (0x0033, 66),
+            (0x004b, 19),
+            (0x004b, 20),
+            (0x08b6, 2),
+            (0x08b6, 20),
+            (0x08b6, 21),
+        ] {
             assert!(!snapshot.diagnostics.iter().any(|diagnostic| {
                 diagnostic.site.graph == graph && diagnostic.site.node == Some(node)
             }));
@@ -1100,6 +1171,11 @@ mod tests {
             .iter()
             .any(|diagnostic| diagnostic.site.graph == 0x004b && diagnostic.site.node == Some(21));
         assert_eq!(filter_diagnostic, world.target_tags.is_none());
+        for raw in [12, 13] {
+            let filter = &snapshot.instances[&2].states[&raw];
+            assert!(filter.active);
+            assert_eq!(filter.kind, StateKind::BooleanSwitch(true));
+        }
         if world.target_tags.is_some() {
             let filter = &snapshot.instances[&2].states[&14];
             assert!(filter.active);
@@ -1121,6 +1197,34 @@ mod tests {
         let watch_possessor = authored_field(0x01cf, 41, "m_B7A3CF78");
         let shield_refill = authored_field(0x0033, 66, "m_BD83C8E6");
         let health_present = authored_field(0x08b6, 2, "m_condition");
+        let filter = authored_field(0x004b, 20, "m_condition");
+        let mask = world.body_filter;
+        for (flags, passes) in [(mask, true), (mask | 2, false)] {
+            world.body_filter = flags;
+            assert_eq!(
+                component.evaluate_state_config(2, 13, &filter, &mut world),
+                Ok(Value::Bool(passes))
+            );
+        }
+        world.body_filter = mask;
+        let on_fire = authored_field(0x01cf, 31, "m_condition");
+        for value in [false, true] {
+            world.controller_on_fire = value;
+            assert_eq!(
+                component.evaluate_state_config(13, 17, &on_fire, &mut world),
+                Ok(Value::Bool(value))
+            );
+        }
+        world.controller_on_fire = false;
+        let entries = authored_field(0x05ad, 240, "m_value");
+        let mut message = authored_field(0x05ad, 183, "m_gameMessage");
+        // Supply one authored key as a literal rather than simulating its UI input.
+        message["m_configVars"] = serde_json::json!([entries["m_configVars"][0]["m_key"].clone()]);
+        message["m_expression"]["m_opcodes"] = serde_json::json!([8, 0, 14, 0, 17, 0]);
+        assert_eq!(
+            component.evaluate_state_config(24, 0, &message, &mut world),
+            Ok(Value::Asset(0x0240_0000_0000_05ad))
+        );
         if let Some(original_tags) = world.target_tags.clone() {
             let filter = authored_field(0x004b, 21, "m_condition");
             let tag_query = authored_field(0x0043, 45, "m_condition");
@@ -1221,6 +1325,7 @@ mod tests {
                 graphs: Arc::clone(&graphs),
                 controller: 0xa000_0100,
                 entity: 0xa000_0101,
+                body_filter: crate::match_scene::team_bit(0).unwrap(),
                 position: [0.0; 3],
                 throttles: [0; 2],
                 mode: PRACTICE_RANGE_MODE,
@@ -1228,6 +1333,7 @@ mod tests {
                 vitals: Vitals::empty(),
                 pool_types_known: true,
                 target_tags: body.target_tags.clone(),
+                controller_on_fire: false,
             };
             let component = Component::start(
                 Arc::clone(&graphs),

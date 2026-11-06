@@ -1191,6 +1191,7 @@ impl WorldDelivery {
             hero: hero.guid,
             skin,
         };
+        let body_filter = team_bit(viewer.team)?;
         let start_frame = self.input.processed.unwrap_or(tick);
         let script = scene
             .owner_body_runtime(
@@ -1198,6 +1199,7 @@ impl WorldDelivery {
                 OwnerBodySpawn {
                     controller: self.owner,
                     entity,
+                    body_filter,
                     frame: start_frame,
                     position: pose.position,
                     quanta,
@@ -1210,7 +1212,7 @@ impl WorldDelivery {
             BodyCreate {
                 entity,
                 hero,
-                team_bit: team_bit(viewer.team)?,
+                team_bit: body_filter,
                 position: pose.position,
                 yaw: pose.yaw,
                 skin,

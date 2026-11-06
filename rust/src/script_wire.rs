@@ -26,6 +26,8 @@ pub enum Value {
     },
     String(String),
     Array(Vec<Value>),
+    /// An ordered script map. Its wire representation has not been verified.
+    Map(Vec<(Value, Value)>),
 }
 
 impl From<ModeValue> for Value {
