@@ -757,3 +757,11 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Added collection, loadout and portrait handling to Rust. The initial login subset now includes progression and hero ownership. Its 45 encoded messages match Python for both the default profile and the level-3000 full-unlock fixture.
 - Added collision scene assembly for placed static triangles and round shapes. Compared 2,079 queries across three prepared Practice Range views, including authenticated root placements. The selected hits, ground and nearby outputs matched Python bit for bit.
 - Passed 124 public Rust tests and 13 optional runtime checks, plus 67 focused Python reference tests covering ownership, shop behavior, frame delivery and UDP match loading. Cargo formatting, Clippy and Git diff checks passed. World creation, character contact and original-client acceptance are pending. The usual launch commands still use Python.
+
+#### Rust map catalog, graph metadata and round contacts
+
+- Added the shared map and mode catalog, ordered placeables and spawn selection. The UDP worker now uses the same map type as catalog lookup. Checked 95 map listings and all 698 candidate map and mode combinations against Python, including the 551 supported results and their placement and spawn order.
+- Loaded the authorized state graph bundle and built the owner, remote and variable-slot indexes from its records. All graph layouts in the 373-graph and enriched 405-graph bundles matched the Python reference. The enriched bundle also loaded eight non-player definitions and 25 mode records.
+- Ported float32 sphere and capsule contacts with ordered features and cache placement. A local differential run matched Python bit for bit across 12,288 cases and 7,611 contact points. These primitives await the character solver and do not change the active Python server.
+- Added own presence to the Rust login subset. The 46-message subset matches Python for both the default and level-3000 full-unlock profiles, and seven additional presence packets match the reference.
+- Passed 140 public Rust tests and 16 optional checks with the prepared Practice Range pack, plus the enriched graph bundle check and 21 Python presence reference tests. Cargo formatting, Clippy and Git diff checks passed. Original-client acceptance remains pending.

@@ -1,10 +1,10 @@
 //! Match entry and roster messages shared by team modes and free-for-all.
 
-use crate::game_messages::Message;
 use crate::jam_codec::{
     Fields,
     Value::{Array, String, Struct, Unsigned},
 };
+use crate::{game_content::GameMap, game_messages::Message};
 
 pub const RETAIL_QUANTA: u32 = 16_000;
 pub const TOURNAMENT_QUANTA: u32 = 7_000;
@@ -19,10 +19,7 @@ pub struct Member<'a> {
 }
 
 pub struct Instance<'a> {
-    pub map: u64,
-    pub mode: u64,
-    pub team_sizes: [u8; 2],
-    pub free_for_all: bool,
+    pub map: &'a GameMap,
     pub members: &'a [Member<'a>],
 }
 
@@ -34,7 +31,7 @@ impl Instance<'_> {
             .collect();
         let team = |number, size| {
             let slots = playing()
-                .filter(|member| self.free_for_all || member.team == number)
+                .filter(|member| self.map.free_for_all || member.team == number)
                 .map(|member| entity(member.entity))
                 .collect();
             Struct(Fields::from([
@@ -43,14 +40,15 @@ impl Instance<'_> {
                 (0x61, Unsigned(u64::from(size))),
             ]))
         };
-        let teams = if self.free_for_all {
-            vec![team(FREE_FOR_ALL_TEAM, self.team_sizes[0])]
+        let capacity = |team| self.map.team_sizes.get(team).copied().unwrap_or(0);
+        let teams = if self.map.free_for_all {
+            vec![team(FREE_FOR_ALL_TEAM, capacity(0))]
         } else {
-            vec![team(0, self.team_sizes[0]), team(1, self.team_sizes[1])]
+            vec![team(0, capacity(0)), team(1, capacity(1))]
         };
         let roster = Fields::from([
             (0, Struct(Fields::from([(0, Array(records))]))),
-            (0xb0, Unsigned(self.mode)),
+            (0xb0, Unsigned(self.map.mode_guid)),
             (0xc0, Array(teams)),
             (0xd8, Array(vec![entity(viewer)])),
         ]);
@@ -68,7 +66,7 @@ impl Instance<'_> {
             fields: Fields::from([
                 (0x78, Unsigned(if ranked { 9 } else { 1 })),
                 (0x80, Struct(self.roster(viewer))),
-                (0x4a8, Unsigned(self.map)),
+                (0x4a8, Unsigned(self.map.map_guid)),
                 (0x500, Unsigned(u64::from(quanta))),
                 (
                     0x508,
@@ -134,11 +132,9 @@ mod tests {
     #[test]
     fn instance_preserves_ranked_type_after_a_member_leaves() {
         let members = members();
+        let map = GameMap::practice_range();
         let instance = Instance {
-            map: 12,
-            mode: 34,
-            team_sizes: [6, 6],
-            free_for_all: false,
+            map: &map,
             members: &members,
         };
         let initial = instance.load(members[0].entity, TOURNAMENT_QUANTA);
@@ -167,13 +163,18 @@ mod tests {
         let root = std::path::PathBuf::from(std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap());
         let schemas = Schemas::load(root.join("data/game_schemas_174.json")).unwrap();
         let members = members();
+        let practice_range = GameMap::practice_range();
+        let free_for_all = GameMap {
+            map_guid: 12,
+            mode_guid: 34,
+            team_sizes: vec![8],
+            free_for_all: true,
+            ..GameMap::practice_range()
+        };
         let cases = [
             (
                 Instance {
-                    map: 0x0800_0000_0000_0688,
-                    mode: 0x0230_0000_0000_0018,
-                    team_sizes: [1, 0],
-                    free_for_all: false,
+                    map: &practice_range,
                     members: &members,
                 },
                 [
@@ -189,10 +190,7 @@ mod tests {
             ),
             (
                 Instance {
-                    map: 12,
-                    mode: 34,
-                    team_sizes: [8, 0],
-                    free_for_all: true,
+                    map: &free_for_all,
                     members: &members,
                 },
                 [

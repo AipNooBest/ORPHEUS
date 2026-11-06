@@ -13,6 +13,7 @@ use crate::{
     jam_handshake::server_handshake,
     lobby_login::{self, INCOMPATIBLE_CLIENT, Identity, LOGIN_MESSAGE, Login, OUT_CONNECT},
     lobby_player_messages as player,
+    lobby_presence::Presence,
     lobby_transport::{Event, LobbyMessage, LobbyTransport},
     retail_templates::{IN_CONNECT, LOBBY, RetailTemplates},
 };
@@ -152,6 +153,7 @@ impl PreparedLogin {
         schemas: &Schemas,
         templates: &RetailTemplates,
         collection: &Collection,
+        presence: &Presence,
         content: LoginContent<'_>,
     ) -> io::Result<Vec<LobbyMessage>> {
         let profile = self.account.profile();
@@ -172,6 +174,7 @@ impl PreparedLogin {
             (IN_CONNECT, 20505, templates.preload(content.extra_skins)?),
         ];
         messages.extend(player::endorsements(&profile, identity, content.wall_time));
+        messages.push(presence.own(&profile, identity, content.wall_time)?);
         messages.extend([
             (PROGRESSION, 24300, collection.progression(&profile)?),
             (HERO_CATALOG, 24900, collection.hero_catalog(&profile)?),
@@ -231,6 +234,7 @@ mod tests {
         catalog::ItemDb,
         jam_cipher::Jam,
         jam_framing::{self, FrameReader},
+        lobby_presence::FRIENDS,
     };
 
     #[test]
@@ -412,6 +416,7 @@ mod tests {
         let templates = RetailTemplates::load(runtime.join("retail_templates.json")).unwrap();
         let items = Arc::new(ItemDb::load(&runtime).unwrap());
         let collection = Collection::new(&templates, items).unwrap();
+        let presence = Presence::new(&templates).unwrap();
         let temporary = tempfile::tempdir().unwrap();
         let accounts = Accounts::new(
             temporary.path().join("profiles"),
@@ -431,13 +436,13 @@ mod tests {
                 100,
                 false,
                 0x0250_0000_0000_0921,
-                "dd3592d1567584386b3edc6229a9db3fc972d9b56727647f2c277751ad7e8b1e",
+                "0e1a47287d6a6e592ca1d33746bdfd8fee7580ad22de2cbb0999bba851684a6b",
             ),
             (
                 3000,
                 true,
                 0x0250_0000_0000_0f97,
-                "64a5bdca92b80b4daf210c82f05c4e665c471c5c41e309de9da769a20511dc66",
+                "98aab1f92b4e45cc16316747910aa6022a20b39682c7627080384f79b53255b8",
             ),
         ] {
             {
@@ -450,6 +455,7 @@ mod tests {
                     &schemas,
                     &templates,
                     &collection,
+                    &presence,
                     LoginContent {
                         menu_hero: None,
                         extra_skins: &[],
@@ -460,7 +466,7 @@ mod tests {
                 .unwrap();
             let keys: Vec<_> = messages.iter().map(|&(crc, id, _)| (crc, id)).collect();
             assert_eq!(
-                keys[..8],
+                keys[..9],
                 [
                     (IN_CONNECT, 20500),
                     (IN_CONNECT, 20502),
@@ -468,21 +474,22 @@ mod tests {
                     (player::ENDORSEMENTS, 52002),
                     (player::ENDORSEMENTS, 52005),
                     (player::ENDORSEMENTS, 52006),
+                    (FRIENDS, 27113),
                     (PROGRESSION, 24300),
                     (HERO_CATALOG, 24900),
                 ]
             );
             assert_eq!(keys[keys.len() - 2..], [(PING, 35500), (LOBBY, 20802)]);
-            assert!(keys[8..].contains(&(LOBBY, 20812)));
+            assert!(keys[9..].contains(&(LOBBY, 20812)));
             let Value::Struct(card) = &messages[1].2[&0x78] else {
                 panic!("missing player card");
             };
-            let Value::Struct(progression) = &messages[6].2[&0x78] else {
+            let Value::Struct(progression) = &messages[7].2[&0x78] else {
                 panic!("missing progression");
             };
             assert_eq!(card[&0x28], Value::Unsigned(frame));
             assert_eq!(progression[&0x58], card[&0x28]);
-            assert_eq!(messages.len(), 45);
+            assert_eq!(messages.len(), 46);
             let mut digest = Sha256::new();
             for (crc, id, fields) in messages {
                 let mut wire = schemas.header(crc, 1, id).unwrap();

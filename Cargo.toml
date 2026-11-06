@@ -16,6 +16,7 @@ path = "rust/src/bin/prepare_server_runtime.rs"
 [dependencies]
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 crc32fast = "1"
+flate2 = "1.1"
 getrandom = "0.3"
 hmac = "0.12"
 indexmap = { version = "2", features = ["serde"] }

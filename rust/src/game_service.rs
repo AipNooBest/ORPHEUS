@@ -22,6 +22,7 @@ use mio::{Events, Interest, Poll, Token, Waker, net::UdpSocket};
 use crate::{
     game_clock::{GameClock, Step, next_tick_after},
     game_connection::{GameConnections, MAX_CONNECTION_ID, Outgoing},
+    game_content::GameMap,
     game_egress::{FrameRecords, GameEgress},
     game_ingress::{GameIngress, MapReadiness, MapReadyStep, MessageKind, WorldReadiness, pong},
     game_instance::{Instance, Member, RETAIL_QUANTA, TOURNAMENT_QUANTA, ownership},
@@ -35,14 +36,6 @@ use crate::{
 const GAME_SOCKET: Token = Token(0);
 const REQUESTS: Token = Token(1);
 const RECEIVE_BATCH: usize = 64;
-
-#[derive(Clone, Copy, Debug)]
-pub struct MatchMap {
-    pub guid: u64,
-    pub mode: u64,
-    pub team_sizes: [u8; 2],
-    pub free_for_all: bool,
-}
 
 #[derive(Debug)]
 pub struct MatchPlayer {
@@ -65,7 +58,7 @@ type MatchId = [u64; 2];
 enum Request {
     Open {
         id: MatchId,
-        map: MatchMap,
+        map: GameMap,
         players: Vec<MatchPlayer>,
         reply: mpsc::SyncSender<io::Result<Vec<Handoff>>>,
     },
@@ -114,7 +107,7 @@ impl GameService {
     pub fn open_match(
         &self,
         id: [u64; 2],
-        map: MatchMap,
+        map: GameMap,
         players: Vec<MatchPlayer>,
     ) -> io::Result<Vec<Handoff>> {
         self.request(|reply| Request::Open {
@@ -183,7 +176,7 @@ impl Player {
 }
 
 struct Room {
-    map: MatchMap,
+    map: GameMap,
     players: Vec<Player>,
     remaining: usize,
 }
@@ -202,10 +195,7 @@ impl Room {
             })
             .collect();
         let instance = Instance {
-            map: self.map.guid,
-            mode: self.map.mode,
-            team_sizes: self.map.team_sizes,
-            free_for_all: self.map.free_for_all,
+            map: &self.map,
             members: &members,
         };
         let player = &self.players[slot];
@@ -259,7 +249,7 @@ impl State {
     fn open_match(
         &mut self,
         id: MatchId,
-        map: MatchMap,
+        map: GameMap,
         players: Vec<MatchPlayer>,
         now: Duration,
     ) -> io::Result<Vec<Handoff>> {
@@ -607,18 +597,13 @@ mod tests {
     use super::*;
     use crate::{
         bits::{BitReader, BitWriter},
+        game_content::PRACTICE_RANGE_MAP,
         game_link::{FIN, KIND_CONTROL, LinkCipher, MAX_DATAGRAM, ReceiveWindow, SYN},
         game_messages::{read_channel, write_channel},
     };
     use std::net::UdpSocket as ClientSocket;
 
     const MATCH: MatchId = [5, 8];
-    const MAP: MatchMap = MatchMap {
-        guid: 0x0800_0000_0000_0688,
-        mode: 0x0230_0000_0000_0018,
-        team_sizes: [1, 0],
-        free_for_all: false,
-    };
 
     fn local() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
@@ -727,7 +712,9 @@ mod tests {
     fn exercise_loading(schemas: Schemas) {
         let schemas = Arc::new(schemas);
         let mut server = GameService::bind(local(), Arc::clone(&schemas)).unwrap();
-        let mut tickets = server.open_match(MATCH, MAP, player()).unwrap();
+        let mut tickets = server
+            .open_match(MATCH, GameMap::practice_range(), player())
+            .unwrap();
         let ticket = tickets.pop().unwrap();
         assert!(server.handoff_pending(ticket.conn).unwrap());
         let mut client = Client::new(server.local_addr(), &ticket);
@@ -737,7 +724,10 @@ mod tests {
         let first = client.receive();
         let initial = messages(&schemas, &first);
         assert_eq!((initial[0].sequence, initial[0].message.id), (0, 20300));
-        assert_eq!(initial[0].message.fields[&0x4a8], Value::Unsigned(MAP.guid));
+        assert_eq!(
+            initial[0].message.fields[&0x4a8],
+            Value::Unsigned(PRACTICE_RANGE_MAP)
+        );
         // Drop the first instance datagram, then ACK the following heartbeat.
         let heartbeat = client.receive();
         assert!(messages(&schemas, &heartbeat).is_empty());
@@ -805,7 +795,7 @@ mod tests {
         assert!(ClientSocket::bind(address).is_ok());
         assert_eq!(
             server
-                .open_match(MATCH, MAP, player())
+                .open_match(MATCH, GameMap::practice_range(), player())
                 .err()
                 .unwrap()
                 .kind(),
@@ -830,7 +820,7 @@ mod tests {
     fn canceled_seat_is_rejected_before_tick_and_released() {
         let mut server = GameService::bind(local(), Arc::new(fixture())).unwrap();
         let ticket = server
-            .open_match(MATCH, MAP, player())
+            .open_match(MATCH, GameMap::practice_range(), player())
             .unwrap()
             .pop()
             .unwrap();
@@ -850,7 +840,7 @@ mod tests {
             io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
         ));
         let retry = server
-            .open_match(MATCH, MAP, player())
+            .open_match(MATCH, GameMap::practice_range(), player())
             .unwrap()
             .pop()
             .unwrap();
