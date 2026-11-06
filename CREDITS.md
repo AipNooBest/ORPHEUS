@@ -52,6 +52,8 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
   supply protobuf framing and reflection over the external Battle.net descriptors.
 - **[Tungstenite](https://github.com/snapview/tungstenite-rs)** supplies WebSocket framing for the local
   Battle.net listener.
+- **[lzma-rust2](https://github.com/hasenbanck/lzma-rust2)** supplies XZ decoding for the movement
+  and expanded-ray collision caches.
 - **TripleFault and Gamayun contributors** supplied a same-build comparison for encrypted combat scenarios and
   tick measurement design. This is a behavior reference. Gamayun identifies its Go implementation as
   AGPL-3.0-or-later and retains the MIT notice for inherited code.

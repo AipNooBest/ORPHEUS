@@ -733,3 +733,11 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Ported the deployment data preparation command. For the authorized Practice Range runtime, all 23 copied files match the Python tool by SHA-256 and both manifests describe the same files and hashes.
 - Ported world-frame encoding and fixed-step scheduling primitives. A mixed 452-byte world payload matches the Python output. The lobby and game entry points still use Python while the Rust modules are integrated.
 - Passed 64 public Rust tests, five optional runtime checks, Cargo formatting, Clippy and Git diff checks. Original-client acceptance remains pending.
+
+#### Rust match admission and map cache loading
+
+- Ported the lobby match ticket, queue-pop and delayed seat delivery messages, and the UDP connection lifecycle. A tampered, stale or expired datagram cannot rebind an existing peer. An expired ticket releases its seat on the timeout sweep.
+- Used the prepared 104319 schema to encode and decode a 20600 ticket, then used its directional keys to complete an authenticated SYN exchange over loopback UDP.
+- Ported retail lobby template loading, personalization and the account's initial settings and endorsement messages. Compared encoded message digests against the Python reference with the prepared schemas.
+- Added a bounded XZ and geometry reader for version 5 movement and expanded-ray collision caches. A local release build decoded all 190 prepared caches across 95 maps. Every decoded field of the two Practice Range caches matched the Python uncompressed byte stream.
+- Passed 86 public Rust tests, eight optional runtime checks, 39 Python matchmaker tests, Cargo formatting, Clippy and Git diff checks. The normal lobby and match entry points still use Python. Collision queries, full lobby and match integration, and original-client acceptance remain pending.

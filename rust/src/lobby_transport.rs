@@ -6,11 +6,15 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use crate::jam_cipher::Jam;
+use crate::jam_codec::Fields;
 use crate::jam_framing::{self, FrameReader};
 use crate::jam_handshake::Channel;
 
 const POLL: Duration = Duration::from_secs(2);
 const KEEPALIVE: Duration = Duration::from_secs(10);
+
+/// Protocol CRC, message ID and its decoded fields.
+pub type LobbyMessage = (u32, u32, Fields);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
