@@ -509,7 +509,6 @@ mod tests {
             game_content::GameMap,
             game_messages::{read_channel, write_channel},
             jam_codec::{Schemas, Value},
-            mover_settings::MoverCatalog,
             scene_assets::SceneAssets,
             vitals::{Death, Vitals},
         };
@@ -520,22 +519,9 @@ mod tests {
             .unwrap()
             .prepare(GameMap::practice_range())
             .unwrap();
-        let movers = MoverCatalog::load(root.join("data/game_movers_174.json")).unwrap();
         let schemas = Schemas::load(root.join("data/game_schemas_174.json")).unwrap();
         let bot = scene.bots().iter().find(|bot| bot.spawn.team == 1).unwrap();
-        let mover = movers.for_body(Some(bot.spawn.body));
-        let target = TargetPose {
-            feet: bot.position,
-            height: mover.stand_height,
-            radius: mover.stand_radius,
-            eye: 1.55,
-        };
-        let wall = |origin, direction, length| {
-            scene
-                .movement_index()
-                .cast_ray(origin, direction, length, MOVER)
-                .map(|hit| hit.map(|hit| hit.distance))
-        };
+        let target = scene.bot_target(bot);
         let trace = |yaw, distance, height, frame| {
             let [x, y, z] = target.feet;
             let origin = if yaw == 0 {
@@ -549,7 +535,9 @@ mod tests {
                 ..Command::default()
             };
             HitscanShot::from_command(origin, &command, 180.0, RIFLE)
-                .resolve([(bot.entity, target)], wall)
+                .resolve([(bot.entity, target)], |origin, direction, length| {
+                    scene.hitscan_wall(origin, direction, length)
+                })
                 .unwrap()
         };
         assert!(trace(0, 8.0, 1.0, 1000).is_none());

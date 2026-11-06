@@ -47,6 +47,11 @@ impl Poses {
     pub(crate) fn newest(&self) -> Command {
         self.newest
     }
+
+    pub(crate) fn next_frame(&self) -> Option<u32> {
+        let behind = self.offsets.len().checked_sub(1)? as u32;
+        Some(self.newest.frame.wrapping_sub(behind))
+    }
 }
 
 impl Iterator for Poses {

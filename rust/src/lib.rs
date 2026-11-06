@@ -30,6 +30,7 @@ pub mod contact_world;
 pub mod game_body;
 pub mod game_bots;
 pub mod game_clock;
+mod game_combat;
 pub mod game_combat_messages;
 pub mod game_connection;
 pub mod game_content;

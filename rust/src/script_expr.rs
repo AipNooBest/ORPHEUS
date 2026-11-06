@@ -7,7 +7,7 @@ use serde_json::Value as Json;
 pub use crate::script_wire::Value;
 use crate::{accounts::parse_guid, script_graph::asset_guid};
 
-const EPSILON: f64 = 1.192_092_895_507_812_5e-5;
+pub(crate) const EPSILON: f64 = 1.192_092_895_507_812_5e-5;
 const MAX_CONFIG_DEPTH: usize = 64;
 pub const MAX_EXPRESSION_STEPS: usize = 4096;
 

@@ -4,7 +4,7 @@
 //! initial world. Maps that need the unported bot VM retain that requirement.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io,
     net::SocketAddr,
     sync::{
@@ -21,7 +21,9 @@ use mio::{Events, Interest, Poll, Token, Waker, net::UdpSocket};
 
 use crate::{
     game_clock::{FIRST_TICK, GameClock, Step, next_tick_after},
-    game_connection::{GameConnections, MAX_CONNECTION_ID, Outgoing},
+    game_combat::{BotHit, BotReplacement, Combat, ShotContext},
+    game_combat_messages::CombatNotice,
+    game_connection::{GameConnections, MAX_CONNECTION_ID, Outgoing, SILENCE_TIME},
     game_content::{GameMap, PRACTICE_RANGE_MODE},
     game_controller::ControllerFrame,
     game_egress::GameEgress,
@@ -43,6 +45,7 @@ const REQUESTS: Token = Token(1);
 const RECEIVE_BATCH: usize = 64;
 const INPUT_PER_PEER: usize = 16;
 const INPUT_PER_TURN: usize = 64;
+const MAX_PENDING_COMBAT_NOTICES: usize = 256;
 
 #[derive(Debug)]
 pub struct MatchPlayer {
@@ -91,6 +94,7 @@ struct OpenRequest {
 struct WorldStart {
     scene: Box<PreparedScene>,
     card: PlayerCard,
+    combat: Option<Combat>,
 }
 
 impl GameService {
@@ -184,6 +188,7 @@ impl GameService {
                 world: Some(WorldStart {
                     scene: Box::new(scene),
                     card,
+                    combat: None,
                 }),
                 reply,
             }))
@@ -317,6 +322,14 @@ struct Peer {
     ownership: Option<u32>,
     open: bool,
     world: WorldDelivery,
+    combat_ui: CombatUi,
+}
+
+#[derive(Default)]
+struct CombatUi {
+    notices: VecDeque<CombatNotice>,
+    last_notice_by_entity: HashMap<u32, u32>,
+    replacements: VecDeque<(Duration, BotReplacement)>,
 }
 
 fn initial_controller(scene: &PreparedScene, tick: u32) -> io::Result<crate::bits::BitWriter> {
@@ -355,6 +368,75 @@ impl Peer {
             ownership: None,
             open: false,
             world: WorldDelivery::new(owner),
+            combat_ui: CombatUi::default(),
+        }
+    }
+
+    fn clear_world(&mut self) {
+        self.world.clear();
+        self.combat_ui = CombatUi::default();
+    }
+
+    fn bot_hit(&mut self, hit: BotHit) {
+        self.world.queue_bot_health(hit.health);
+        for notice in hit.notices.into_iter().flatten() {
+            if self.combat_ui.notices.len() == MAX_PENDING_COMBAT_NOTICES {
+                self.combat_ui.notices.pop_front();
+            }
+            self.combat_ui.notices.push_back(notice);
+        }
+    }
+
+    fn flush_combat(&mut self, schemas: &Schemas, now: Duration) {
+        for _ in 0..self.combat_ui.notices.len() {
+            let notice = self
+                .combat_ui
+                .notices
+                .pop_front()
+                .expect("pending combat notice");
+            let entity = notice.required_identity();
+            if entity.is_some_and(|entity| !self.world.identity_ready(entity))
+                || (notice.needs_mode_ui() && !self.world.mode_ready())
+            {
+                self.combat_ui.notices.push_back(notice);
+                continue;
+            }
+            if let Ok(bytes) = notice.encode(schemas) {
+                if let (Ok(ordinal), Some(entity)) = (self.egress.queue_reliable(bytes), entity) {
+                    self.combat_ui.last_notice_by_entity.insert(entity, ordinal);
+                }
+            }
+        }
+        for _ in 0..self.combat_ui.replacements.len() {
+            let (expires, replacement) = self
+                .combat_ui
+                .replacements
+                .pop_front()
+                .expect("pending bot replacement");
+            let entity = replacement.retired;
+            let has_notice = self
+                .combat_ui
+                .notices
+                .iter()
+                .any(|notice| notice.required_identity() == Some(entity));
+            let waiting_for_reliable = self
+                .combat_ui
+                .last_notice_by_entity
+                .get(&entity)
+                .is_some_and(|&ordinal| !self.egress.delivered_through(ordinal));
+            if now < expires
+                && (has_notice || waiting_for_reliable || self.world.bot_health_pending(entity))
+            {
+                self.combat_ui
+                    .replacements
+                    .push_back((expires, replacement));
+            } else {
+                self.combat_ui
+                    .notices
+                    .retain(|notice| notice.required_identity() != Some(entity));
+                self.combat_ui.last_notice_by_entity.remove(&entity);
+                self.world.replace_bot(replacement);
+            }
         }
     }
 
@@ -628,6 +710,7 @@ impl State {
             return false;
         }
         let start = self.next_input_peer % count;
+        let tick = self.clock.frame();
         let mut remaining = INPUT_PER_TURN;
         for offset in 0..count {
             let index = (start + offset) % count;
@@ -636,18 +719,40 @@ impl State {
                 continue;
             }
             let (id, slot) = self.seats[&connection];
-            let room = &self.rooms[&id];
+            let room = self.rooms.get_mut(&id).expect("prepared room with input");
             let world = room.world.as_ref().expect("prepared world with input");
             let viewer = room.appearance(slot).expect("prepared player");
+            let context = ShotContext {
+                team: viewer.team,
+                quanta: room.players[slot].quanta(),
+                tick,
+                now,
+            };
             let budget = remaining.min(INPUT_PER_PEER);
             let (used, leave) = peer
                 .world
-                .advance_input(&world.scene, &viewer, room.players[slot].quanta(), budget)
+                .advance_input(&world.scene, &viewer, context.quanta, budget)
                 .unwrap_or((budget, true));
             remaining -= used;
             self.next_input_peer = (index + 1) % count;
+            let shots = peer.world.take_hitscan();
+            if (!leave && peer.world.combat_body_active()) || !shots.is_empty() {
+                let world = room.world.as_mut().expect("prepared world with combat");
+                let combat = world
+                    .combat
+                    .get_or_insert_with(|| Combat::new(&world.scene));
+                for shot in shots {
+                    if let Ok(Some(hit)) =
+                        combat.hitscan(&mut world.scene, shot, context, |entity| {
+                            peer.world.identity_ready(entity)
+                        })
+                    {
+                        peer.bot_hit(hit);
+                    }
+                }
+            }
             if leave {
-                peer.world.clear();
+                peer.clear_world();
                 peer.loading = MapReadiness::default();
                 if self.links.begin_leaving(connection, now) {
                     let _ = peer.reliable(&self.schemas, leave_message());
@@ -679,7 +784,7 @@ impl State {
             } => {
                 if entered {
                     for (&connection, peer) in &mut self.peers {
-                        peer.world.clear();
+                        peer.clear_world();
                         if self.links.begin_leaving(connection, now) {
                             let _ = peer.reliable(&self.schemas, leave_message());
                         }
@@ -691,10 +796,19 @@ impl State {
         for expired in self.links.expire(now, force) {
             self.retire(expired.connection);
         }
+        let mut spawned = HashMap::new();
         if !drain {
-            for room in self.rooms.values_mut() {
+            for (&id, room) in &mut self.rooms {
                 if let Some(world) = &mut room.world {
                     world.scene.step_bots(tick);
+                    if let Some(combat) = &mut world.combat {
+                        if let Ok(replacements) = combat.respawn_due(&mut world.scene, tick, now) {
+                            if !replacements.is_empty() {
+                                spawned.insert(id, replacements);
+                            }
+                        }
+                        combat.record_poses(&world.scene, tick);
+                    }
                 }
             }
         }
@@ -706,13 +820,24 @@ impl State {
                     .advance_loading(&self.schemas, room, slot, now, tick)
                     .is_err()
             {
-                peer.world.clear();
+                peer.clear_world();
                 peer.loading = MapReadiness::default();
                 if self.links.begin_leaving(connection, now) {
                     let _ = peer.reliable(&self.schemas, leave_message());
                 }
             }
+            if let Some(replacements) = spawned.get(&id).filter(|_| peer.world.world_started()) {
+                peer.combat_ui.replacements.extend(
+                    replacements
+                        .iter()
+                        .cloned()
+                        .map(|bot| (now.saturating_add(SILENCE_TIME), bot)),
+                );
+            }
             if send_frames && peer.open {
+                if !drain {
+                    peer.flush_combat(&self.schemas, now);
+                }
                 let movements = if drain {
                     Vec::new()
                 } else {
@@ -1183,17 +1308,23 @@ mod tests {
     }
 
     fn input_batch(first: u32, count: u8, yaw: i16) -> Vec<u8> {
+        command_batch(first, count, yaw, 0, true)
+    }
+
+    fn command_batch(first: u32, count: u8, yaw: i16, buttons: u32, forward: bool) -> Vec<u8> {
         let mut input = BitWriter::new();
         input.bits(0, 24).unwrap(); // latency and key flags
         input.bits(u64::from(count), 8).unwrap();
         input.bits(u64::from(first), 32).unwrap();
-        input.bit(true); // new throttles
-        input.bit(true); // compact throttle direction
-        input.bit(true); // moving
-        input.bits(2, 3).unwrap(); // forward
+        input.bit(forward); // new throttles
+        if forward {
+            input.bit(true); // compact throttle direction
+            input.bit(true); // moving
+            input.bits(2, 3).unwrap();
+        }
         input.signed(i64::from(yaw), 16).unwrap();
         input.signed(0, 16).unwrap();
-        input.bits(0, 24).unwrap(); // buttons
+        input.bits(u64::from(buttons), 24).unwrap();
         input.bits(0, 8).unwrap(); // action
         input.bits(0, 16).unwrap(); // extra
         for _ in 1..count {
@@ -1241,6 +1372,7 @@ mod tests {
                 world: Some(WorldStart {
                     scene: Box::new(scene),
                     card: PlayerCard::default(),
+                    combat: None,
                 }),
             },
         );
@@ -1287,16 +1419,29 @@ mod tests {
     #[test]
     #[ignore = "requires a prepared 104319 Practice Range scene"]
     fn prepared_world_waits_for_ownership_and_retries_baselines_before_scripts() {
-        exercise_prepared_world(false);
+        exercise_prepared_world(PreparedFixture::Stock);
     }
 
     #[test]
     #[ignore = "requires a prepared 104319 Practice Range scene without bot VM graphs"]
     fn prepared_worker_retries_a_concrete_owner_vm_on_encrypted_loopback() {
-        exercise_prepared_world(true);
+        exercise_prepared_world(PreparedFixture::Owner);
     }
 
-    fn exercise_prepared_world(owner_fixture: bool) {
+    #[test]
+    #[ignore = "requires a prepared 104319 Practice Range scene without bot VM graphs"]
+    fn prepared_worker_delivers_a_volley_hit_and_replaces_the_bot_over_encrypted_udp() {
+        exercise_prepared_world(PreparedFixture::Combat);
+    }
+
+    #[derive(Clone, Copy)]
+    enum PreparedFixture {
+        Stock,
+        Owner,
+        Combat,
+    }
+
+    fn exercise_prepared_world(fixture: PreparedFixture) {
         use crate::{
             accounts::Accounts,
             catalog::ItemDb,
@@ -1309,7 +1454,7 @@ mod tests {
             match_handoff::{HANDOFF, HANDOFF_MESSAGE},
             retail_templates::RetailTemplates,
             scene_assets::SceneAssets,
-            script_player::fixture_body_factory,
+            script_player::{fixture_body_factory, fixture_hitscan_factory},
         };
 
         const CONTROLLER: u32 = 0xa000_0100;
@@ -1361,9 +1506,21 @@ mod tests {
             (&assets, &collection),
             |map| {
                 let mut scene = assets.prepare(map)?;
-                if owner_fixture {
+                if !matches!(fixture, PreparedFixture::Stock) {
                     assert!(!scripted_bots);
-                    let (factory, _) = fixture_body_factory();
+                    let factory = match fixture {
+                        PreparedFixture::Combat => {
+                            let [x, y, z] = scene.map().spawn_point(0, 0).unwrap().0;
+                            let bot = scene
+                                .bots_mut()
+                                .iter_mut()
+                                .find(|bot| bot.entity == BOT_ENTITY + 1)
+                                .unwrap();
+                            bot.position = [x - 4.0, y, z];
+                            fixture_hitscan_factory(100.0)
+                        }
+                        _ => fixture_body_factory().0,
+                    };
                     scene.owner_body_factory = Some(Arc::new(move |hero, spawn| {
                         if hero.guid != crate::game_heroes::SOLDIER {
                             return Ok(None);
@@ -1509,10 +1666,12 @@ mod tests {
             client.send(ACK, Vec::new());
         }
         assert!(mode && controller && moving_bot);
-        if owner_fixture {
-            exercise_owner_vm(&mut client, &schemas);
-        } else {
-            exercise_hero_selection(&mut client, &schemas, &assets);
+        match fixture {
+            PreparedFixture::Owner => exercise_owner_vm(&mut client, &schemas),
+            PreparedFixture::Combat => {
+                exercise_combat(&mut client, &schemas, BOT_ENTITY + 1, BOT_ENTITY + 15)
+            }
+            PreparedFixture::Stock => exercise_hero_selection(&mut client, &schemas, &assets),
         }
         server.stop().unwrap();
     }
@@ -1545,6 +1704,97 @@ mod tests {
         let mut payload = BitWriter::new();
         write_channel(&mut payload, &[(ordinal, message)], &[]).unwrap();
         client.send(ACK, payload.into_bytes());
+    }
+
+    fn exercise_combat(client: &mut Client, schemas: &Schemas, target: u32, replacement: u32) {
+        use crate::{commands::FIRE, game_heroes::SOLDIER, game_parameters::PICK_HERO};
+
+        let body = player_entity(0) | 1;
+        send_game_message(
+            client,
+            schemas,
+            1,
+            PICK_HERO,
+            SOLDIER.to_le_bytes().to_vec(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let frame = loop {
+            let packet = client.receive();
+            assert!(client.window.accept(packet.seq));
+            client.send(ACK, Vec::new());
+            if world_records(schemas, &packet)
+                .iter()
+                .any(|record| record.entity == body && record.is_create())
+            {
+                break BitReader::new(&packet.payload).var_a().unwrap() + 1;
+            }
+            assert!(Instant::now() < deadline, "waiting for weapon fixture body");
+        };
+        let commands = command_batch(frame, 1, -16384, FIRE, false);
+        client.send(ACK, commands.clone());
+        client.send(ACK, commands);
+
+        let deadline = Instant::now() + Duration::from_secs(7);
+        let mut lost = None;
+        let mut delivered_hit = false;
+        let mut delivered_kill = false;
+        let mut delivered_health = false;
+        let mut destroyed = false;
+        let mut created = false;
+        while !created {
+            let packet = client.receive();
+            let reliable = messages(schemas, &packet);
+            let hit = reliable.iter().find(|item| item.message.id == 25001);
+            if lost.is_none() {
+                if let Some(hit) = hit {
+                    lost = Some((hit.sequence, hit.message.fields.clone()));
+                    continue; // let a following ACK reveal loss of the original hit
+                }
+            }
+            for item in reliable {
+                match item.message.id {
+                    25001 => {
+                        let (ordinal, fields) = lost.as_ref().unwrap();
+                        assert_eq!((&item.sequence, &item.message.fields), (ordinal, fields));
+                        assert_eq!(fields[&0x84], Value::Unsigned(u64::from(frame)));
+                        let Value::Struct(impact) = &fields[&0x78] else {
+                            panic!("hit body")
+                        };
+                        assert_eq!(impact[&4], Value::Unsigned(200));
+                        assert_eq!(impact[&8], Value::Unsigned(3));
+                        delivered_hit = true;
+                    }
+                    25005 => {
+                        let Value::Struct(victim) = &item.message.fields[&0x84] else {
+                            panic!("elimination body")
+                        };
+                        assert_eq!(victim[&0], Value::Unsigned(u64::from(target)));
+                        delivered_kill = true;
+                    }
+                    _ => {}
+                }
+            }
+            for record in world_records(schemas, &packet) {
+                if record.entity == target {
+                    if record.operation == Some(2) {
+                        delivered_health = true;
+                    }
+                    if record.operation == Some(3) {
+                        assert!(delivered_hit && delivered_kill && delivered_health);
+                        destroyed = true;
+                    }
+                } else if record.entity == replacement && record.is_create() {
+                    assert!(destroyed);
+                    created = true;
+                }
+            }
+            assert!(client.window.accept(packet.seq));
+            client.send(ACK, Vec::new());
+            assert!(
+                Instant::now() < deadline,
+                "waiting for combat recovery and bot respawn"
+            );
+        }
     }
 
     fn exercise_owner_vm(client: &mut Client, schemas: &Schemas) {

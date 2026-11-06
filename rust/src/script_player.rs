@@ -7,13 +7,16 @@ use serde_json::Value as Json;
 use crate::{
     accounts::parse_guid,
     commands::Command,
+    game_combat::{PosedHitscan, eye_height},
     game_content::PRACTICE_RANGE_MODE,
     game_heroes::{Hero, SOLDIER},
+    game_hitscan::HitDefinition,
     game_instance::RETAIL_QUANTA,
-    game_replication::OwnerBodyRuntime,
+    game_replication::{BodyStep, OwnerBodyRuntime},
     mover::Mover,
     mover_modifiers::{Modifier, ModifierKey},
     script_codecs::CodecTable,
+    script_expr::to_float,
     script_graph::GraphStore,
     script_init::{Component, MAX_INIT_WORK, Root, Site, Snapshot, World},
     script_runtime::FRAME_MS,
@@ -132,21 +135,29 @@ impl OwnerBodyRuntime for PlayerBodyRuntime {
         SnapshotEncoder::new(&self.world.graphs, &self.codecs)
     }
 
-    fn advance(&mut self, command: Command, mover: &Mover) -> io::Result<()> {
-        // The mover already supplies recoverable poses. A larger unposed gap
-        // still needs the reference's separate script timer catch-up.
-        if command.frame != self.frame.saturating_add(1) {
-            return Err(unsupported("the owner VM has an unposed command gap"));
+    fn advance(&mut self, command: Command, mover: &Mover, step: BodyStep) -> io::Result<()> {
+        if command.frame <= self.frame
+            || (step != BodyStep::UnposedTimer && command.frame != self.frame.saturating_add(1))
+        {
+            return Err(unsupported(
+                "the owner VM frame is outside the command sequence",
+            ));
         }
         self.world.position = mover.pose().position;
-        self.world.throttles = [command.right, command.forward];
-        self.component
-            .advance_command(command, &mut self.world)
-            .map_err(unsupported)?;
-        self.modifiers = self
-            .component
-            .movement_modifiers(&mut self.world)
-            .map_err(unsupported)?;
+        if step == BodyStep::UnposedTimer {
+            self.component
+                .advance_frame(command.frame, &mut self.world)
+                .map_err(unsupported)?;
+        } else {
+            self.world.throttles = [command.right, command.forward];
+            self.component
+                .advance_command(command, &mut self.world)
+                .map_err(unsupported)?;
+            self.modifiers = self
+                .component
+                .movement_modifiers(&mut self.world)
+                .map_err(unsupported)?;
+        }
         self.frame = command.frame;
         Ok(())
     }
@@ -157,6 +168,48 @@ impl OwnerBodyRuntime for PlayerBodyRuntime {
 
     fn movement_modifiers(&self) -> Option<&BTreeMap<ModifierKey, Modifier>> {
         self.modifiers.as_ref()
+    }
+
+    fn take_hitscan(&mut self, command: Option<Command>, mover: &Mover) -> Vec<PosedHitscan> {
+        let shots = self.component.take_shots().unwrap_or_default();
+        let Some(command) = command else {
+            return Vec::new();
+        };
+        let [x, y, z] = mover.pose().position;
+        let origin = [x, y + eye_height(self.world.hero, mover.crouched()), z];
+        shots
+            .into_iter()
+            .filter_map(|shot| {
+                let node = self.component.shot_node(&shot)?;
+                let mut evaluate = |config: &Json| {
+                    self.component
+                        .evaluate_shot_config(&shot, config, &mut self.world)
+                };
+                let speed = node.field("m_projectileSpeed").unwrap_or(&Json::Null);
+                if !speed.is_null() && to_float(&evaluate(speed).ok()?) != 0.0 {
+                    return None;
+                }
+                let hit = HitDefinition::from_authored(node.field("m_6396149F")?, &mut evaluate)
+                    .ok()??;
+                if hit.amount <= 0.0 {
+                    return None;
+                }
+                let reach = node.field("m_FEC435C6").unwrap_or(&Json::Null);
+                let reach = if reach.is_null() {
+                    0.0
+                } else {
+                    to_float(&evaluate(reach).ok()?)
+                };
+                Some(PosedHitscan {
+                    source: shot.entity,
+                    origin,
+                    command,
+                    shot_frame: shot.frame,
+                    reach,
+                    hit,
+                })
+            })
+            .collect()
     }
 }
 
@@ -262,6 +315,37 @@ pub(crate) fn fixture_body_factory() -> (PlayerBodyFactory, OwnerBodySpawn) {
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_hitscan_factory(damage: f64) -> PlayerBodyFactory {
+    use serde_json::json;
+
+    let graph = json!({
+        "index":42,"items":3,"states":[1,2],"entries":[0],"remote":[],
+        "sync_vars":[],"containers":{},"unknown_nodes":[],"fields":{"m_680A2CB2":[0]},
+        "header":{"m_nodesBitCount":4,"m_statesBitCount":4,
+            "m_remoteSyncNodesBitCount":4,"m_syncVarsBitCount":4},
+        "nodes":[
+            {"pos":0,"class":"STUStatescriptEntry","uid":0,"rid":0,"remote":-1,
+                "state":null,"client_only":false,"server_only":false,"fields":{
+                "m_outPlug":{"$":"Plug","links":[[1,"m_beginPlug"]],"m_FF3DAF1E":[]}}},
+            {"pos":1,"class":"STUStatescriptStateLogicalButton","uid":1,"rid":1,"remote":-1,
+                "state":0,"client_only":false,"server_only":true,"fields":{
+                "m_2BBEEAB8":true,"m_logicalButton":20,
+                "m_onGoingDownPlug":{"$":"Plug","links":[[2,"m_beginPlug"]],"m_FF3DAF1E":[]}}},
+            {"pos":2,"class":"STUStatescriptStateWeaponVolley","uid":2,"rid":2,"remote":-1,
+                "state":1,"client_only":false,"server_only":true,"fields":{
+                "m_2BBEEAB8":true,"m_A17BE89B":2,"m_numShotsPerSecond":9,
+                "m_FEC435C6":180,"m_6396149F":{"m_modifyHealth":{"m_amount":damage},"m_A872C70E":2}}}
+        ]
+    });
+    let bundle = json!({"version":1,"missing":[],"graphs":[graph],"bodies":{}});
+    let mut factory = fixture_body_factory().0;
+    factory.graphs =
+        Arc::new(GraphStore::from_json(&serde_json::to_vec(&bundle).unwrap()).unwrap());
+    factory.roots = vec![Root::new(1, 42)];
+    factory
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
@@ -317,7 +401,7 @@ mod tests {
                 &TriangleIndex::new([]).unwrap(),
                 command,
                 0.016,
-                |mover, command| first.advance(command, mover).unwrap(),
+                |mover, command| first.advance(command, mover, BodyStep::Posed).unwrap(),
             )
             .unwrap();
         assert_eq!(first.world.position(spawn.entity), mover.pose().position);
@@ -327,8 +411,97 @@ mod tests {
             frame: 104,
             ..command
         };
-        assert!(first.advance(gap, &mover).is_err());
+        assert!(first.advance(gap, &mover, BodyStep::Posed).is_err());
         assert_eq!(first.component.now_ms(), 102 * FRAME_MS - 1);
+        first
+            .advance(
+                Command {
+                    frame: 102,
+                    ..Command::default()
+                },
+                &mover,
+                BodyStep::UnposedBoundary,
+            )
+            .unwrap();
+        first
+            .advance(
+                Command {
+                    frame: 200,
+                    ..Command::default()
+                },
+                &mover,
+                BodyStep::UnposedTimer,
+            )
+            .unwrap();
+        first
+            .advance(
+                Command {
+                    frame: 201,
+                    ..Command::default()
+                },
+                &mover,
+                BodyStep::UnposedBoundary,
+            )
+            .unwrap();
+        assert_eq!(first.world.throttles, [0, 0]);
+        assert_eq!(first.component.now_ms(), 202 * FRAME_MS - 1);
+    }
+
+    #[test]
+    fn posed_volley_keeps_the_authored_shot_frame_and_drains_unposed_reports() {
+        let factory = fixture_hitscan_factory(20.0);
+        let (_, spawn) = fixture_body_factory();
+        let mut runtime = factory.start(spawn).unwrap();
+        let mover = Mover::new(
+            MoverSettings::default(),
+            Arc::new(ContactWorld::new(Vec::new()).unwrap()),
+            spawn.position,
+            0,
+            0x18,
+        )
+        .unwrap();
+        let fire = Command {
+            frame: 101,
+            buttons: crate::commands::FIRE,
+            ..Command::default()
+        };
+        runtime.advance(fire, &mover, BodyStep::Posed).unwrap();
+        let command = Command {
+            frame: 102,
+            yaw: 12,
+            pitch: 30,
+            ..Command::default()
+        };
+        let shots = runtime.take_hitscan(Some(command), &mover);
+        let [shot] = shots.as_slice() else {
+            panic!("expected the opening shot")
+        };
+        assert_eq!(shot.source, spawn.entity);
+        assert_eq!(shot.origin, [1.0, 3.55, 3.0]);
+        assert_eq!(shot.shot_frame, 101);
+        assert_eq!(shot.command, command);
+        assert_eq!(
+            (shot.reach, shot.hit.amount, shot.hit.critical),
+            (180.0, 20.0, 2.0)
+        );
+        assert!(runtime.take_hitscan(Some(command), &mover).is_empty());
+
+        runtime
+            .advance(command, &mover, BodyStep::UnposedBoundary)
+            .unwrap();
+        assert_eq!(
+            runtime.snapshot().unwrap().instances[&1].states[&0].kind,
+            crate::script_init::StateKind::LogicalButton { down: false }
+        );
+        let timer = Command {
+            frame: 107,
+            ..Command::default()
+        };
+        runtime
+            .advance(timer, &mover, BodyStep::UnposedTimer)
+            .unwrap();
+        assert!(runtime.take_hitscan(None, &mover).is_empty());
+        assert!(runtime.take_hitscan(Some(timer), &mover).is_empty());
     }
 
     #[test]

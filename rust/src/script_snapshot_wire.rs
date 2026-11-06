@@ -11,7 +11,7 @@ use std::{
 
 use crate::bits::{BitError, BitWriter};
 use crate::script_codecs::{Codec, CodecTable, PayloadError, PayloadMode, StatePayload};
-use crate::script_expr::equal;
+use crate::script_expr::{Scope, Variable, equal};
 use crate::script_graph::{Graph, GraphStore, Node, asset_guid};
 use crate::script_init::{Snapshot, StackBinding, State, StateKind};
 use crate::script_stream::{BodyStream, ChangeKey, DeltaKind, ScriptChunk, StreamError};
@@ -63,6 +63,13 @@ struct ProjectedInstance {
 struct ProjectedState {
     active: bool,
     payload: StatePayload,
+    volley: Option<VolleyActivation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VolleyActivation {
+    identity: (u16, u64), // activation counter and start time
+    ammo: Option<(Variable, i64)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -80,6 +87,11 @@ impl ProjectedVariables {
             owner,
             &self.bindings,
         )
+    }
+
+    fn seed_ammo(&mut self, variable: u32, ammo: i64) {
+        self.values.insert(variable, Value::Integer(ammo));
+        self.bindings.remove(&variable);
     }
 }
 
@@ -325,6 +337,15 @@ impl<'a> SnapshotEncoder<'a> {
                     ProjectedState {
                         active: state.active,
                         payload,
+                        volley: match state.kind {
+                            StateKind::WeaponVolley {
+                                ammo_var, ammo0, ..
+                            } => Some(VolleyActivation {
+                                identity: (state.activation, state.start_ms),
+                                ammo: ammo_var.map(|variable| (variable, ammo0)),
+                            }),
+                            _ => None,
+                        },
                     },
                 );
             }
@@ -510,17 +531,14 @@ impl<'a> SnapshotEncoder<'a> {
         } else {
             BTreeSet::new()
         };
-        let delta = self.differences(base, snapshot, &touched, &known)?;
+        let mut delta = self.differences(base, snapshot, &touched, &known)?;
         if view == View::Observer && delta.keys.is_empty() {
             return Ok(None);
         }
+        let mut delivered = snapshot.clone();
+        delta.seed_owner_ammo(&mut delivered);
         let frame = self.delta_frame(snapshot, &delta, kind, frame_ms)?;
-        Ok(Some(stream.delta(
-            &frame,
-            snapshot.clone(),
-            delta.keys,
-            kind,
-        )?))
+        Ok(Some(stream.delta(&frame, delivered, delta.keys, kind)?))
     }
 
     fn differences<'s>(
@@ -596,6 +614,26 @@ impl<'a> SnapshotEncoder<'a> {
                 }
                 states.insert(raw, now);
                 delta.keys.insert(key);
+                let Some((now, volley)) = now
+                    .filter(|_| current.view == View::Owner)
+                    .and_then(|state| state.volley.map(|volley| (state, volley)))
+                else {
+                    continue;
+                };
+                let previous = was.and_then(|state| state.volley);
+                let introduced = previous.is_none_or(|was| was.identity != volley.identity);
+                if introduced {
+                    delta.keys.insert(ChangeKey::VolleyIntroduction(id, raw));
+                }
+                if let Some((variable, ammo)) = volley.ammo.filter(|_| {
+                    now.active && (introduced || !was.is_some_and(|state| state.active))
+                }) {
+                    let owner = match variable.scope {
+                        Scope::Entity => 0,
+                        Scope::Instance => id,
+                    };
+                    delta.ammo_seeds.insert((owner, variable.id), ammo);
+                }
             }
             if descriptor || !variables.values.is_empty() || !states.is_empty() {
                 delta.instances.insert(
@@ -931,6 +969,35 @@ struct SnapshotDelta<'a> {
     variables: ProjectedVariables,
     instances: BTreeMap<u16, InstanceDelta<'a>>,
     keys: BTreeSet<ChangeKey>,
+    ammo_seeds: BTreeMap<(u16, u32), i64>,
+}
+
+impl SnapshotDelta<'_> {
+    fn seed_owner_ammo(&mut self, delivered: &mut ProjectedSnapshot) {
+        // StartFiring reads the unbound, pre-volley count once after applying
+        // the frame. The acknowledged snapshot must match that wire value.
+        for (&(owner, variable), &ammo) in &self.ammo_seeds {
+            let (wire, baseline) = if owner == 0 {
+                (&mut self.variables, &mut delivered.variables)
+            } else {
+                (
+                    &mut self
+                        .instances
+                        .get_mut(&owner)
+                        .expect("introduced volley")
+                        .variables,
+                    &mut delivered
+                        .instances
+                        .get_mut(&owner)
+                        .expect("introduced volley")
+                        .variables,
+                )
+            };
+            wire.seed_ammo(variable, ammo);
+            baseline.seed_ammo(variable, ammo);
+            self.keys.insert(ChangeKey::Variable(owner, variable));
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1057,7 +1124,8 @@ fn state_payload(state: &State, codec: &Codec) -> Option<StatePayload> {
             StateKind::Plain
             | StateKind::Wait
             | StateKind::AiCandidate { .. }
-            | StateKind::MovementMod,
+            | StateKind::MovementMod
+            | StateKind::CosmeticEntity,
             Some("none"),
         ) if codec.empty() => StatePayload::new(),
         (StateKind::BooleanSwitch(current), Some("switch")) => {
@@ -1091,6 +1159,26 @@ fn state_payload(state: &State, codec: &Codec) -> Option<StatePayload> {
             Value::Integer(i64::from(state.activation & 3)),
         )]),
         (StateKind::SendMessage, Some("send")) => StatePayload::new(),
+        (
+            StateKind::WeaponVolley {
+                volleys, offset_ms, ..
+            },
+            Some("volley"),
+        ) => StatePayload::from([
+            (
+                "start".into(),
+                Value::Integer(i64::try_from(state.start_ms).ok()?),
+            ),
+            (
+                "offset".into(),
+                Value::Integer(i64::try_from(offset_ms).ok()?),
+            ),
+            ("volleys".into(), Value::Integer(i64::from(volleys))),
+            (
+                "counter".into(),
+                Value::Integer(i64::from(state.activation)),
+            ),
+        ]),
         _ => return None,
     })
 }
@@ -1121,6 +1209,13 @@ mod tests {
             "layout":[{"op":"if","c":"H","then":[{"op":"bits","f":"counter","n":4}],"else":[]}]},
         "C38B92B4":{"name":"STUStatescriptStateAbility","codec":"ability","stec":false,"status":"VERIFIED",
             "layout":[{"op":"bits","f":"flags","n":8},{"op":"link","f":"link"},{"op":"bits","f":"has_cur","n":1}]},
+        "EED6D952":{"name":"STUStatescriptStateWeaponVolley","codec":"volley","stec":true,"status":"VERIFIED",
+            "layout":[{"op":"if","c":"H","then":[{"op":"signed_var","f":"t1"},
+                      {"op":"bits","f":"has_offset","n":1},{"op":"if","c":"has_offset",
+                       "then":[{"op":"signed_var","f":"offset"},{"op":"w_u16","f":"subindex"}],"else":[]}],
+                       "else":[]},
+                      {"op":"bits","f":"has_volleys","n":1},{"op":"if","c":"has_volleys",
+                       "then":[{"op":"w_u16","f":"volleys"}],"else":[]},{"op":"bits","f":"counter","n":6}]},
         "D74D4F47":{"name":"STU_D74D4F47","codec":"frames","stec":false,"status":"VERIFIED",
             "layout":[{"op":"bits","f":"target","n":32}]}
     }}"#;
@@ -1592,6 +1687,189 @@ mod tests {
             delta.update.chunk.as_ref().unwrap(),
             140,
             "04000080864004ddfc00081913f20f003601",
+        );
+    }
+
+    #[test]
+    fn a_new_volley_reseeds_ammo_after_an_unacknowledged_stop() {
+        const RIFLE: u16 = 11;
+        const VOLLEY: u16 = 10;
+        const AMMO: u32 = 53;
+        let definition = graph(
+            0x0254,
+            vec![node(
+                0,
+                "STUStatescriptStateWeaponVolley",
+                Some(VOLLEY),
+                json!({}),
+            )],
+            json!([
+                null, null, null, null, null, null, null, null, null, null, 0
+            ]),
+            json!([]),
+            json!([0]),
+            json!([[AMMO, 0, 1]]),
+        );
+        let graphs = GraphStore::from_json(
+            &serde_json::to_vec(&json!({
+                "version":1, "graphs":[definition], "bodies":{}, "missing":[]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let codecs = CodecTable::from_json(CODECS).unwrap();
+        let encoder = SnapshotEncoder::new(&graphs, &codecs);
+        let mut root = Root::new(RIFLE, 0x0254);
+        root.variables.insert(AMMO, Value::Integer(30));
+        let mut snapshot = initialize(
+            &graphs,
+            ENTITY,
+            Variables::new(),
+            vec![root],
+            &mut EmptyWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        let idle = encoder.project(&snapshot, View::Owner).unwrap();
+        let observer_idle = encoder.project(&snapshot, View::Observer).unwrap();
+        let (_, fixture) = fixture();
+        let mut state = fixture.instances[&1].states[&0].clone();
+        let mut volley = |active, activation, start_frame, ammo0, ammo| {
+            state.active = active;
+            state.activation = activation;
+            state.start_ms = u64::from(start_frame) * 16;
+            state.kind = StateKind::WeaponVolley {
+                volleys: 1,
+                offset_ms: 0,
+                ammo0,
+                ammo_var: Some(Variable {
+                    scope: Scope::Instance,
+                    id: AMMO,
+                }),
+            };
+            snapshot.instances[&RIFLE]
+                .states
+                .insert(VOLLEY, state.clone());
+            snapshot
+                .resolved_bindings
+                .insert((RIFLE, AMMO), Value::Integer(ammo));
+            encoder.project(&snapshot, View::Owner).unwrap()
+        };
+        let first = volley(true, 1, 1031_u32, 30, 29);
+        let stopped = volley(false, 1, 1031_u32, 30, 29);
+        let ended = volley(false, 3, 1050_u32, 28, 27);
+        let second = volley(true, 2, 1042_u32, 29, 28);
+        let observer_second = encoder.project(&snapshot, View::Observer).unwrap();
+        let mut stream = BodyStream::new(ENTITY);
+        stream.create_arrived();
+        let baseline = encoder.queue_full(&mut stream, &idle).unwrap();
+        stream.arrived(baseline.last);
+        let initial = encoder
+            .queue_delta(&mut stream, &idle, DeltaKind::InitialOwner(1001), 16)
+            .unwrap()
+            .unwrap();
+        stream.sent(initial.last);
+        stream.arrived(initial.last);
+
+        // Python owner_delta and chunk vectors from the same minimal 0254 layout.
+        let intro = ChangeKey::VolleyIntroduction(RIFLE, VOLLEY);
+        let key = ChangeKey::Variable(RIFLE, AMMO);
+        for (frame, state, bits, bytes, ammo, introduced, dropped) in [
+            (
+                1031,
+                &first,
+                137,
+                "06000050e60e08105980e2811c0082ec0000",
+                30,
+                true,
+                false,
+            ),
+            (
+                1032,
+                &stopped,
+                137,
+                "08000050e61008105980d2810c0882ec0000",
+                29,
+                false,
+                true,
+            ),
+            (
+                1042,
+                &second,
+                137,
+                "08000450e62408105980d2811c0084ec0000",
+                29,
+                true,
+                true,
+            ),
+            (
+                1043,
+                &second,
+                137,
+                "08000850e62608105980d2811c0884ec0000",
+                29,
+                true,
+                false,
+            ),
+            (
+                1044,
+                &second,
+                114,
+                "0e0000e0e42808b45880c201d90100",
+                28,
+                false,
+                false,
+            ),
+            (
+                1050,
+                &ended,
+                137,
+                "10000050e63408105980b2810c0086ec0000",
+                27,
+                true,
+                false,
+            ),
+        ] {
+            let chunk = encoder
+                .queue_delta(&mut stream, state, DeltaKind::Correction(frame), 16)
+                .unwrap()
+                .unwrap();
+            check(chunk.update.chunk.as_ref().unwrap(), bits, bytes);
+            let sent = stream.sent(chunk.last).unwrap();
+            assert_eq!(sent.changes.contains(&intro), introduced);
+            assert!(sent.changes.contains(&key));
+            assert_eq!(
+                sent.snapshot.instances[&RIFLE].variables.values[&AMMO],
+                Value::Integer(ammo)
+            );
+            assert!(stream.sent(chunk.last).is_none());
+            if dropped {
+                let lost = stream.lost(chunk.last);
+                assert!(!lost.retry);
+                assert_eq!(lost.owner_report, Some(false));
+            } else {
+                assert!(stream.arrived(chunk.last).advanced);
+            }
+            assert!(!stream.touched().contains(&intro));
+        }
+
+        let mut stream = BodyStream::new(ENTITY);
+        stream.create_arrived();
+        let baseline = encoder.queue_full(&mut stream, &observer_idle).unwrap();
+        stream.arrived(baseline.last);
+        let delta = encoder
+            .queue_delta(
+                &mut stream,
+                &observer_second,
+                DeltaKind::Observer { resend: false },
+                16,
+            )
+            .unwrap()
+            .unwrap();
+        check(
+            delta.update.chunk.as_ref().unwrap(),
+            78,
+            "040000a08205281c9c00",
         );
     }
 

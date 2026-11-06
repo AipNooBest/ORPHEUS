@@ -31,8 +31,13 @@ pub const MAX_INIT_WORK: usize = 100_000;
 const MAX_PLUG_DEPTH: usize = 64;
 const MAX_EVENTS_PER_UPDATE: usize = 1000;
 const MAX_PENDING_EVENTS: usize = 16_384;
+const MAX_PENDING_SHOTS: usize = 256;
 const ABILITY_RUNNING: u8 = 1;
 const ABILITY_HELD: u8 = 4;
+const LINK_PRIORITY: StackPriority = StackPriority {
+    level: 0,
+    above_equals: true,
+};
 const ABORT_PLUG: &str = "m_F198FD3A";
 const SUBGRAPH_STATES: &str = "m_FF3DAF1E";
 
@@ -176,18 +181,40 @@ impl World for EmptyWorld {}
 pub enum StateKind {
     Plain,
     BooleanSwitch(bool),
-    SubScript { child: Option<u16> },
+    SubScript {
+        child: Option<u16>,
+    },
     MessageIdle,
     Wait,
-    WaitFrames { target: u32 },
-    AiCandidate { selected: bool },
-    LogicalButton { down: bool },
-    Stack { top: bool, under: bool },
-    Ability { flags: u8 },
+    WaitFrames {
+        target: u32,
+    },
+    AiCandidate {
+        selected: bool,
+    },
+    LogicalButton {
+        down: bool,
+    },
+    Stack {
+        top: bool,
+        under: bool,
+    },
+    Ability {
+        flags: u8,
+    },
     MovementMod,
     Anim,
     Effect,
     SendMessage,
+    CosmeticEntity,
+    ChaseVar,
+    Watch,
+    WeaponVolley {
+        volleys: u8,
+        offset_ms: u64,
+        ammo0: i64,
+        ammo_var: Option<Variable>,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -202,11 +229,21 @@ pub struct State {
     pub activation: u16,
     pub start_ms: u64,
     pub kind: StateKind,
+    pub chase: Option<ChasePayload>,
+    watch_seen: Option<Value>,
     ending: bool,
     pending_change: bool,
     pending_timer: bool,
     buffered_press: Option<BufferedPress>,
-    stack_output: Option<VarKey>,
+    linked_variable: Option<VarKey>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChasePayload {
+    pub current: Value,
+    pub reached: bool,
+    pub remaining_ms: Option<i64>,
+    pub last_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -245,7 +282,7 @@ pub struct Snapshot {
     pub pending_timers: IndexMap<u16, Vec<PendingTimer>>,
     /// Stack links by (instance or zero for the entity, variable).
     pub bindings: IndexMap<(u16, u32), Vec<StackBinding>>,
-    /// Effective wire values for the bound variables, separate from their stored bases.
+    /// Effective linked values, separate from their stored bases.
     pub resolved_bindings: IndexMap<(u16, u32), Value>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -279,6 +316,7 @@ pub enum InitFault {
     PendingEvents {
         limit: usize,
     },
+    PendingShots,
     FrameOrder {
         frame: u32,
         now_ms: u64,
@@ -321,6 +359,7 @@ impl fmt::Display for InitFault {
             Self::PendingEvents { limit } => {
                 write!(f, "statescript pending event limit {limit} exceeded")
             }
+            Self::PendingShots => f.write_str("statescript shot queue limit exceeded"),
             Self::FrameOrder { frame, now_ms } => {
                 write!(f, "statescript frame {frame} starts before {now_ms} ms")
             }
@@ -351,6 +390,19 @@ pub struct StackBinding {
     pub instance: u16,
     pub raw_state: u16,
     pub priority: StackPriority,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShotEvent {
+    pub entity: u32,
+    pub instance: u16,
+    pub graph: u32,
+    pub raw_state: u16,
+    pub frame: u32,
+    pub time_ms: u64,
+    pub activation: u16,
+    pub activation_ms: u64,
+    pub ordinal: u32,
 }
 
 /// A single body using the same authored graph engine as one-shot initialization.
@@ -388,6 +440,50 @@ impl Component {
         self.machine.now_ms
     }
 
+    /// Consume reports only after the body graph path is ready for authority.
+    pub fn take_shots(&mut self) -> Option<Vec<ShotEvent>> {
+        let shots = std::mem::take(&mut self.machine.shots);
+        self.snapshot()?.initialization_complete().then_some(shots)
+    }
+
+    pub fn shot_node(&self, shot: &ShotEvent) -> Option<&Node> {
+        let snapshot = self.snapshot()?;
+        let instance = snapshot.instances.get(&shot.instance)?;
+        if snapshot.entity != shot.entity || instance.graph != shot.graph {
+            return None;
+        }
+        self.graphs
+            .graph(shot.graph)?
+            .state(usize::from(shot.raw_state))
+            .filter(|node| node.class == "STUStatescriptStateWeaponVolley")
+    }
+
+    pub fn evaluate_shot_config(
+        &self,
+        shot: &ShotEvent,
+        config: &Json,
+        world: &mut impl World,
+    ) -> Result<Value, EvalError> {
+        let node = self
+            .shot_node(shot)
+            .ok_or(EvalError::MalformedConfig("shot source"))?;
+        let mut context = InstanceContext {
+            machine: &self.machine,
+            world,
+            site: Site {
+                entity: shot.entity,
+                instance: shot.instance,
+                graph: shot.graph,
+                node: Some(node.pos),
+            },
+            reads: Vec::new(),
+            parameters: None,
+            watcher: None,
+            read_native: false,
+        };
+        script_expr::evaluate(config, &mut context)
+    }
+
     pub fn resolved_variable(&self, instance: u16, variable: Variable) -> Option<Value> {
         (!self.halted).then(|| self.machine.value(source_key(instance, variable), None))
     }
@@ -398,7 +494,12 @@ impl Component {
         value: Value,
         world: &mut impl World,
     ) -> Result<(), InitFault> {
-        self.run(world, |vm| vm.write(VarKey::Entity(id), value))
+        self.run(world, |vm| {
+            let key = VarKey::Entity(id);
+            let old = vm.machine.value(key, None);
+            vm.set_base(key, value);
+            vm.notify_value(key, &old, None)
+        })
     }
 
     /// Authoritative modifiers require a fully supported runtime path.
@@ -517,10 +618,50 @@ struct StateKey {
     raw: u16,
 }
 
-struct StackEntry {
+enum LinkValue {
+    Fixed(Value),
+    Volley(u8),
+    Chase,
+}
+
+struct VariableLink {
     state: StateKey,
     priority: StackPriority,
-    value: Value,
+    output: LinkValue,
+    stack: bool,
+}
+
+struct Volley {
+    start_ms: u64,
+    ammo0: i64,
+    per_shot: i64,
+    rate: f64,
+    spread: f64,
+    planned: u32,
+    reported: u32,
+    outputs: [Option<VarKey>; 3],
+}
+
+impl Volley {
+    fn ammo_at(&self, now_ms: u64) -> i64 {
+        let Some(elapsed) = now_ms.checked_sub(self.start_ms) else {
+            return self.ammo0;
+        };
+        let seconds = f64::from(elapsed as f32 * 0.001_f32);
+        let shots = ((seconds * self.rate) as f32).floor() as i64;
+        self.ammo0
+            .saturating_sub(self.per_shot.saturating_mul(shots.saturating_add(1)))
+            .max(0)
+    }
+
+    fn output(&self, slot: u8, now_ms: u64) -> Value {
+        match slot {
+            0 => Value::Integer(self.ammo_at(now_ms)),
+            1 => Value::Float(self.rate),
+            2 => Value::Float(self.spread),
+            _ => unreachable!("weapon volley output slot"),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -540,6 +681,8 @@ enum Event {
     Timer(u16, u16),
     Button(ButtonEdge),
     AbilityCheck(u16),
+    ChaseReached(u16),
+    WatchChanged(u16),
     Message {
         position: u16,
         parameters: Arc<Variables>,
@@ -556,6 +699,8 @@ impl Event {
             | Self::Changed(state)
             | Self::Reevaluate(state)
             | Self::AbilityCheck(state)
+            | Self::ChaseReached(state)
+            | Self::WatchChanged(state)
             | Self::Timer(state, _) => Some(state),
         }
     }
@@ -566,7 +711,9 @@ struct Machine {
     queues: Timeline<Event>,
     watchers: BTreeMap<VarKey, Vec<StateKey>>,
     ticking: BTreeMap<u16, IndexMap<u16, u64>>,
-    stacks: BTreeMap<VarKey, Vec<StackEntry>>,
+    links: BTreeMap<VarKey, Vec<VariableLink>>,
+    volleys: BTreeMap<StateKey, Volley>,
+    shots: Vec<ShotEvent>,
     ability_presses: BTreeMap<StateKey, Vec<AbilityPress>>,
     next_id: u32,
     work_left: usize,
@@ -601,7 +748,9 @@ impl Machine {
             queues: Timeline::new(MAX_PENDING_EVENTS),
             watchers: BTreeMap::new(),
             ticking: BTreeMap::new(),
-            stacks: BTreeMap::new(),
+            links: BTreeMap::new(),
+            volleys: BTreeMap::new(),
+            shots: Vec::new(),
             ability_presses: BTreeMap::new(),
             next_id: 1,
             work_left: max_work,
@@ -640,24 +789,26 @@ impl Machine {
         }
         self.snapshot.bindings.clear();
         self.snapshot.resolved_bindings.clear();
-        for (&variable, entries) in &self.stacks {
+        for (&variable, entries) in &self.links {
             let key = match variable {
                 VarKey::Entity(id) => (0, id),
                 VarKey::Instance(instance, id) => (instance, id),
             };
             let Some(top) = entries.last() else { continue };
-            let bindings = entries
+            let bindings: Vec<_> = entries
                 .iter()
+                .filter(|entry| entry.stack)
                 .map(|entry| StackBinding {
                     instance: entry.state.instance,
                     raw_state: entry.state.raw,
                     priority: entry.priority,
                 })
                 .collect();
-            self.snapshot.bindings.insert(key, bindings);
-            self.snapshot
-                .resolved_bindings
-                .insert(key, top.value.clone());
+            if !bindings.is_empty() {
+                self.snapshot.bindings.insert(key, bindings);
+            }
+            let resolved = self.link_value(top);
+            self.snapshot.resolved_bindings.insert(key, resolved);
         }
     }
 
@@ -709,7 +860,7 @@ impl Machine {
     }
 
     fn value(&self, key: VarKey, below: Option<StateKey>) -> Value {
-        self.stacks
+        self.links
             .get(&key)
             .and_then(|entries| {
                 entries
@@ -717,7 +868,24 @@ impl Machine {
                     .take_while(|entry| Some(entry.state) != below)
                     .last()
             })
-            .map_or_else(|| stored(&self.snapshot, key), |entry| entry.value.clone())
+            .map_or_else(
+                || stored(&self.snapshot, key),
+                |entry| self.link_value(entry),
+            )
+    }
+
+    fn link_value(&self, entry: &VariableLink) -> Value {
+        match &entry.output {
+            LinkValue::Fixed(value) => value.clone(),
+            LinkValue::Volley(slot) => self.volleys[&entry.state].output(*slot, self.now_ms),
+            LinkValue::Chase => self.snapshot.instances[&entry.state.instance].states
+                [&entry.state.raw]
+                .chase
+                .as_ref()
+                .expect("linked chase state")
+                .current
+                .clone(),
+        }
     }
 
     fn allows_stack(
@@ -726,7 +894,7 @@ impl Machine {
         priority: StackPriority,
         exclude: Option<StateKey>,
     ) -> bool {
-        self.stacks.get(&key).is_none_or(|entries| {
+        self.links.get(&key).is_none_or(|entries| {
             entries
                 .iter()
                 .filter(|entry| Some(entry.state) != exclude)
@@ -743,6 +911,7 @@ struct Vm<'graph, 'world, 'machine, W> {
     world: &'world mut W,
     machine: &'machine mut Machine,
     parameters: Option<Arc<Variables>>,
+    output_write_depth: usize,
 }
 
 impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
@@ -756,6 +925,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             world,
             machine,
             parameters: None,
+            output_write_depth: 0,
         }
     }
 
@@ -858,7 +1028,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             if self.machine.now_ms == end
                 && self.machine.queues.next_due().is_none_or(|due| due > end)
             {
-                return Ok(());
+                return self.report_active_volleys();
             }
         }
     }
@@ -932,11 +1102,13 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                         activation: 0,
                         start_ms: 0,
                         kind: StateKind::LogicalButton { down: false },
+                        chase: None,
+                        watch_seen: None,
                         ending: false,
                         pending_change: false,
                         pending_timer: false,
                         buffered_press: None,
-                        stack_output: None,
+                        linked_variable: None,
                     });
                 state.buffered_press = Some(BufferedPress {
                     time_ms: self.machine.now_ms,
@@ -1301,6 +1473,13 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                             self.try_complete(key(raw), node, 0)?;
                         }
                     }
+                    Event::ChaseReached(raw) => {
+                        if self.state(key(raw)).is_some_and(|state| state.active) {
+                            let node = self.graph(id).state(usize::from(raw)).expect("chase state");
+                            self.try_complete(key(raw), node, 0)?;
+                        }
+                    }
+                    Event::WatchChanged(raw) => self.deliver_watch(key(raw))?,
                     Event::Message {
                         position,
                         parameters,
@@ -1515,7 +1694,10 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             }
             if let Some(start) = self
                 .state(watcher)
-                .filter(|state| read_native && matches!(state.kind, StateKind::BooleanSwitch(_)))
+                .filter(|state| {
+                    read_native
+                        && matches!(state.kind, StateKind::BooleanSwitch(_) | StateKind::Watch)
+                })
                 .map(|state| state.start_ms)
             {
                 self.register_tick(watcher, start);
@@ -1539,13 +1721,40 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
 
     fn write(&mut self, key: VarKey, value: Value) -> Result<(), InitFault> {
         let old = self.machine.value(key, None);
+        self.set_base(key, value);
+        let chases: Vec<_> = self
+            .machine
+            .links
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter_map(|link| matches!(link.output, LinkValue::Chase).then_some(link.state))
+            .collect();
+        for state in chases {
+            if !self
+                .state(state)
+                .is_some_and(|state| state.active && state.linked_variable == Some(key))
+            {
+                continue;
+            }
+            if self.output_write_depth == MAX_PLUG_DEPTH {
+                return Err(InitFault::PlugDepth);
+            }
+            self.output_write_depth += 1;
+            let result = self.chase_write(state, key);
+            self.output_write_depth -= 1;
+            result?;
+        }
+        self.notify_value(key, &old, None)
+    }
+
+    fn set_base(&mut self, key: VarKey, value: Value) {
         match key {
             VarKey::Entity(id) => self.machine.snapshot.variables.insert(id, value),
             VarKey::Instance(instance, id) => self.machine.snapshot.instances[&instance]
                 .variables
                 .insert(id, value),
         };
-        self.notify_value(key, &old, None)
     }
 
     fn notify_value(
@@ -1563,9 +1772,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             else {
                 continue;
             };
-            if state.stack_output == Some(key) {
+            if matches!(state.kind, StateKind::Stack { .. }) && state.linked_variable == Some(key) {
                 if let Some(source) = source {
-                    let above = self.machine.stacks.get(&key).is_some_and(|entries| {
+                    let above = self.machine.links.get(&key).is_some_and(|entries| {
                         entries
                             .iter()
                             .skip_while(|entry| entry.state != source)
@@ -1828,6 +2037,10 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                     _ => (),
                 }
             }
+            if kind == StateKind::ChaseVar && configured(node, "m_9FF96195") {
+                self.finish_chase(key, depth)?;
+                self.begin_chase(key, node, depth)?;
+            }
             return Ok(());
         }
         let kind = match node.class.as_str() {
@@ -1854,6 +2067,15 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             "STUStatescriptStateAnim" => StateKind::Anim,
             "STU_691BFA55" | "STU_7CA2FBAF" => StateKind::Effect,
             "STU_38EE1100" => StateKind::SendMessage,
+            "STUStatescriptStateCosmeticEntity" => StateKind::CosmeticEntity,
+            "STUStatescriptStateChaseVar" => StateKind::ChaseVar,
+            "STU_2F4E2E3F" => StateKind::Watch,
+            "STUStatescriptStateWeaponVolley" => StateKind::WeaponVolley {
+                volleys: 1,
+                offset_ms: 0,
+                ammo0: 0,
+                ammo_var: None,
+            },
             _ => {
                 self.report(
                     self.site(id, node),
@@ -1876,11 +2098,13 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 activation,
                 start_ms: self.machine.now_ms,
                 kind,
+                chase: None,
+                watch_seen: None,
                 ending: false,
                 pending_change: false,
                 pending_timer: false,
                 buffered_press,
-                stack_output: None,
+                linked_variable: None,
             },
         );
         match kind {
@@ -1924,6 +2148,13 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             StateKind::SendMessage => {
                 self.send_game_message(id, node)?;
             }
+            StateKind::CosmeticEntity => self.begin_cosmetic(key, node, depth)?,
+            StateKind::ChaseVar => self.begin_chase(key, node, depth)?,
+            StateKind::Watch => {
+                let seen = self.evaluate(id, node, field(&node.fields, "m_B7A3CF78"), Some(key));
+                self.state_mut(key).expect("active Watch").watch_seen = seen;
+            }
+            StateKind::WeaponVolley { .. } => self.begin_volley(key, node, depth)?,
             StateKind::Plain | StateKind::MovementMod | StateKind::Effect => (),
         }
         self.follow(id, node, "m_onBeginPlug", Some(key), depth)?;
@@ -1951,6 +2182,454 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 return Ok(());
             }
         };
+        self.state_mut(key).expect("active stack").linked_variable = Some(target);
+        self.insert_link(
+            target,
+            VariableLink {
+                state: key,
+                priority,
+                output: LinkValue::Fixed(value),
+                stack: true,
+            },
+            depth,
+        )
+    }
+
+    fn begin_cosmetic(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        depth: usize,
+    ) -> Result<(), InitFault> {
+        let target = match script_expr::lvalue(field(&node.fields, "m_1DEF59FA")) {
+            Ok(Some(target)) => source_key(key.instance, target),
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                self.report(self.site(key.instance, node), Issue::Expression(error));
+                return Ok(());
+            }
+        };
+        self.state_mut(key)
+            .expect("active cosmetic")
+            .linked_variable = Some(target);
+        self.insert_link(
+            target,
+            VariableLink {
+                state: key,
+                priority: LINK_PRIORITY,
+                stack: false,
+                output: LinkValue::Fixed(Value::Handle {
+                    kind: 1,
+                    instance: u32::from(key.instance),
+                    state: key.raw,
+                    extra: 0,
+                }),
+            },
+            depth,
+        )
+    }
+
+    fn begin_chase(&mut self, key: StateKey, node: &Node, depth: usize) -> Result<(), InitFault> {
+        let id = key.instance;
+        let target = match script_expr::lvalue(field(&node.fields, "m_out_Var")) {
+            Ok(target) => target.map(|target| source_key(id, target)),
+            Err(error) => {
+                self.report(self.site(id, node), Issue::Expression(error));
+                return Ok(());
+            }
+        };
+        let initial = field(&node.fields, "m_EB0FC261");
+        let current = if initial.is_null() {
+            target.map_or(Value::Null, |target| self.machine.value(target, None))
+        } else {
+            let Some(value) = self.evaluate(id, node, initial, None) else {
+                return Ok(());
+            };
+            value
+        };
+        let current = chase_value(&current);
+        let remaining_ms = if configured(node, "m_5BEFF040") {
+            let Some(value) = self.evaluate(id, node, field(&node.fields, "m_5BEFF040"), None)
+            else {
+                return Ok(());
+            };
+            Some((script_expr::to_float(&value) * 1000.0) as i64)
+        } else {
+            None
+        };
+        let now = self.machine.now_ms;
+        let state = self.state_mut(key).expect("active chase");
+        state.chase = Some(ChasePayload {
+            current: current.clone(),
+            reached: false,
+            remaining_ms,
+            last_ms: now,
+        });
+        state.linked_variable = target;
+        if let Some(target) = target {
+            let old = self.machine.value(target, None);
+            self.set_base(target, current);
+            self.insert_link(
+                target,
+                VariableLink {
+                    state: key,
+                    priority: LINK_PRIORITY,
+                    output: LinkValue::Chase,
+                    stack: false,
+                },
+                depth,
+            )?;
+            self.notify_value(target, &old, None)?;
+        }
+        self.register_tick(key, now);
+        Ok(())
+    }
+
+    fn tick_chase(&mut self, key: StateKey) -> Result<(), InitFault> {
+        let id = key.instance;
+        let now = self.machine.now_ms;
+        let Some(state) = self.state_mut(key) else {
+            return Ok(());
+        };
+        let target = state.linked_variable;
+        let Some(chase) = state.chase.as_mut() else {
+            return Ok(());
+        };
+        let elapsed = (now - chase.last_ms) as i64;
+        chase.last_ms = now;
+        if elapsed == 0 || chase.reached {
+            return Ok(());
+        }
+        let mut next = chase.clone();
+        let before = target.map(|target| self.machine.value(target, None));
+        let node = self
+            .graph(id)
+            .state(usize::from(key.raw))
+            .expect("chase state");
+        let Some(destination) =
+            self.evaluate(id, node, field(&node.fields, "m_destination"), Some(key))
+        else {
+            return Ok(());
+        };
+        let destination = chase_value(&destination);
+        if let Some(remaining) = next.remaining_ms {
+            if remaining <= elapsed {
+                next.current = destination;
+                next.reached = true;
+            } else {
+                let share = f64::from((elapsed as f64 / remaining as f64) as f32);
+                next.current = chase_lerp(next.current, destination, share);
+                next.remaining_ms = Some(remaining - elapsed);
+            }
+        } else {
+            let rate = field(&node.fields, "m_9B0385B4");
+            let rate = if rate.is_null() {
+                1.0
+            } else {
+                let Some(value) = self.evaluate(id, node, rate, Some(key)) else {
+                    return Ok(());
+                };
+                script_expr::to_float(&value)
+            };
+            if rate > 0.0 {
+                let per_ms = (rate * f64::from(0.001_f32)) as f32;
+                let distance = (f64::from(per_ms) * elapsed as f64) as f32;
+                let step = f64::from((f64::from(distance) + script_expr::EPSILON) as f32);
+                (next.current, next.reached) = chase_step(next.current, destination, step);
+            }
+        }
+        let reached = next.reached;
+        self.state_mut(key).expect("active chase").chase = Some(next);
+        if let (Some(target), Some(before)) = (target, before) {
+            self.notify_value(target, &before, None)?
+        }
+        if reached {
+            self.post(id, Event::ChaseReached(key.raw))?;
+            if !configured(node, "m_CB671004") {
+                self.post(id, Event::Finish(key.raw))?
+            }
+        }
+        Ok(())
+    }
+
+    fn chase_write(&mut self, key: StateKey, target: VarKey) -> Result<(), InitFault> {
+        let id = key.instance;
+        let node = self
+            .graph(id)
+            .state(usize::from(key.raw))
+            .expect("chase state");
+        match field(&node.fields, "m_1E10B2B1").as_i64().unwrap_or(0) {
+            0 => self.unlink_single_output(key, self.output_write_depth)?,
+            1 => {
+                let value = chase_value(&stored(&self.machine.snapshot, target));
+                if let Some(chase) = self.state_mut(key).and_then(|state| state.chase.as_mut()) {
+                    chase.current = value;
+                }
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+
+    fn finish_chase(&mut self, key: StateKey, depth: usize) -> Result<(), InitFault> {
+        let Some(state) = self.state_mut(key) else {
+            return Ok(());
+        };
+        let Some(target) = state.linked_variable.take() else {
+            return Ok(());
+        };
+        let current = state.chase.as_ref().map(|chase| chase.current.clone());
+        self.remove_link(key, target, current, depth)
+    }
+
+    fn volley_config(&mut self, id: u16, node: &Node, name: &str, default: Value) -> Option<Value> {
+        let config = field(&node.fields, name);
+        if config.is_null() {
+            Some(default)
+        } else {
+            self.evaluate(id, node, config, None)
+        }
+    }
+
+    fn begin_volley(&mut self, key: StateKey, node: &Node, depth: usize) -> Result<(), InitFault> {
+        let id = key.instance;
+        let names = [
+            "m_A17BE89B",
+            "m_A55BC904",
+            "m_5F40D9D3",
+            "m_numShotsPerSecond",
+        ];
+        let mut config = [
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Integer(1),
+            Value::Float(1.0),
+        ];
+        for (value, name) in config.iter_mut().zip(names) {
+            let Some(found) = self.volley_config(id, node, name, value.clone()) else {
+                return Ok(());
+            };
+            *value = found;
+        }
+        let [max, min, per, rate] = config;
+        let (Ok(maximum), Ok(minimum)) = (
+            u32::try_from(script_expr::to_int(&max, 0).max(0)),
+            u32::try_from(script_expr::to_int(&min, 0).max(0)),
+        ) else {
+            self.report(
+                self.site(id, node),
+                Issue::UnsupportedField("weapon volley shot count"),
+            );
+            return Ok(());
+        };
+        let per_shot = script_expr::to_int(&per, 0).max(0);
+        let rate = if rate == Value::Null {
+            1.0
+        } else {
+            script_expr::to_float(&rate).max(1e-5)
+        };
+        if !rate.is_finite() {
+            self.report(
+                self.site(id, node),
+                Issue::UnsupportedField("weapon volley rate"),
+            );
+            return Ok(());
+        }
+        let mut outputs = [None; 3];
+        for (output, name) in outputs
+            .iter_mut()
+            .zip(["m_24E351A4", "m_17770E7E", "m_3FFC9EB9"])
+        {
+            let cfg = field(&node.fields, name);
+            if cfg.is_null() {
+                continue;
+            }
+            *output = match script_expr::lvalue(cfg) {
+                Ok(Some(var)) => Some(var),
+                Ok(None) => {
+                    self.report(
+                        self.site(id, node),
+                        Issue::UnsupportedField("weapon volley output"),
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.report(self.site(id, node), Issue::Expression(error));
+                    return Ok(());
+                }
+            };
+        }
+        let [ammo_var, _, _] = outputs;
+        let outputs = outputs.map(|output| output.map(|var| source_key(id, var)));
+        for (index, output) in outputs.iter().enumerate() {
+            if output.is_some() && outputs[..index].contains(output) {
+                self.report(
+                    self.site(id, node),
+                    Issue::UnsupportedField("duplicate weapon volley output"),
+                );
+                return Ok(());
+            }
+        }
+        let ammo0 = outputs[0].map_or_else(
+            || i64::from(maximum).saturating_mul(per_shot),
+            |var| script_expr::to_int(&self.machine.value(var, None), 0).max(0),
+        );
+        let spread = outputs[2].map_or(0.0, |var| {
+            script_expr::to_float(&self.machine.value(var, None)).clamp(0.0, 1.0)
+        });
+        if !spread.is_finite() {
+            self.report(
+                self.site(id, node),
+                Issue::UnsupportedField("weapon volley spread"),
+            );
+            return Ok(());
+        }
+        let planned = if per_shot == 0 {
+            maximum
+        } else {
+            (ammo0 / per_shot).min(i64::from(maximum)) as u32
+        };
+        let start_ms = self.machine.now_ms;
+        self.state_mut(key).expect("active volley").kind = StateKind::WeaponVolley {
+            volleys: 1,
+            offset_ms: 0,
+            ammo0,
+            ammo_var,
+        };
+        self.machine.volleys.insert(
+            key,
+            Volley {
+                start_ms,
+                ammo0,
+                per_shot,
+                rate,
+                spread,
+                planned,
+                reported: 0,
+                outputs,
+            },
+        );
+        for (slot, (target, base)) in outputs
+            .into_iter()
+            .zip([
+                Value::Integer(ammo0),
+                Value::Float(rate),
+                Value::Float(spread),
+            ])
+            .enumerate()
+        {
+            let Some(target) = target else { continue };
+            let before = self.machine.value(target, None);
+            self.set_base(target, base);
+            self.insert_link(
+                target,
+                VariableLink {
+                    state: key,
+                    priority: LINK_PRIORITY,
+                    stack: false,
+                    output: LinkValue::Volley(slot as u8),
+                },
+                depth,
+            )?;
+            self.notify_value(target, &before, None)?;
+        }
+        if per_shot == 0 || i64::from(minimum) < ammo0 / per_shot {
+            self.post_after(
+                id,
+                shot_delay(minimum.saturating_sub(1), rate),
+                Event::Timer(key.raw, 1),
+            )?;
+        }
+        self.post_after(
+            id,
+            shot_delay(planned.saturating_sub(1), rate),
+            Event::Timer(key.raw, 2),
+        )
+    }
+
+    fn report_active_volleys(&mut self) -> Result<(), InitFault> {
+        let active: Vec<_> = self
+            .machine
+            .snapshot
+            .instances
+            .iter()
+            .flat_map(|(&id, instance)| {
+                instance.states.iter().filter_map(move |(&raw, state)| {
+                    (state.active && matches!(state.kind, StateKind::WeaponVolley { .. }))
+                        .then_some(StateKey { instance: id, raw })
+                })
+            })
+            .collect();
+        for key in active {
+            self.report_volley(key)?
+        }
+        Ok(())
+    }
+
+    fn report_volley(&mut self, key: StateKey) -> Result<(), InitFault> {
+        if self.machine.owner_dead {
+            return Ok(());
+        }
+        let Some(activation) = self.state(key).map(|state| state.activation) else {
+            return Ok(());
+        };
+        let instance = &self.machine.snapshot.instances[&key.instance];
+        let Some(volley) = self.machine.volleys.get_mut(&key) else {
+            return Ok(());
+        };
+        while volley.reported < volley.planned {
+            let time_ms = volley
+                .start_ms
+                .saturating_add(shot_delay(volley.reported, volley.rate));
+            if time_ms > self.machine.now_ms {
+                break;
+            }
+            if self.machine.shots.len() == MAX_PENDING_SHOTS {
+                return Err(InitFault::PendingShots);
+            }
+            self.machine.shots.push(ShotEvent {
+                entity: self.machine.snapshot.entity,
+                instance: key.instance,
+                graph: instance.graph,
+                raw_state: key.raw,
+                frame: (time_ms / FRAME_MS) as u32,
+                time_ms,
+                activation,
+                activation_ms: volley.start_ms,
+                ordinal: volley.reported,
+            });
+            volley.reported += 1;
+        }
+        Ok(())
+    }
+
+    fn finish_volley(&mut self, key: StateKey, depth: usize) -> Result<(), InitFault> {
+        self.report_volley(key)?;
+        let Some(volley) = self.machine.volleys.get(&key) else {
+            return Ok(());
+        };
+        let outputs = volley.outputs;
+        let at = self.machine.now_ms.saturating_add(1);
+        let values = [
+            volley.output(0, at),
+            volley.output(1, at),
+            volley.output(2, at),
+        ];
+        for (target, value) in outputs.into_iter().zip(values) {
+            if let Some(target) = target {
+                self.remove_link(key, target, Some(value), depth)?
+            }
+        }
+        self.machine.volleys.remove(&key);
+        Ok(())
+    }
+
+    fn insert_link(
+        &mut self,
+        target: VarKey,
+        link: VariableLink,
+        depth: usize,
+    ) -> Result<(), InitFault> {
         let old = self.machine.value(target, None);
         match target {
             VarKey::Entity(id) => self
@@ -1964,23 +2643,16 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 .entry(id)
                 .or_insert(Value::Null),
         };
-        self.state_mut(key).expect("active stack").stack_output = Some(target);
-        let entries = self.machine.stacks.entry(target).or_default();
+        let entries = self.machine.links.entry(target).or_default();
+        entries.retain(|entry| entry.state != link.state);
         let at = entries
             .iter()
             .position(|entry| {
-                entry.priority.level > priority.level
-                    || (entry.priority.level == priority.level && !priority.above_equals)
+                entry.priority.level > link.priority.level
+                    || (entry.priority.level == link.priority.level && !link.priority.above_equals)
             })
             .unwrap_or(entries.len());
-        entries.insert(
-            at,
-            StackEntry {
-                state: key,
-                priority,
-                value,
-            },
-        );
+        entries.insert(at, link);
         self.notify_value(target, &old, None)?;
         self.sync_stack(target, depth)
     }
@@ -1989,20 +2661,24 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         if depth >= MAX_PLUG_DEPTH {
             return Err(InitFault::PlugDepth);
         }
-        let Some(entries) = self.machine.stacks.get(&variable) else {
+        let Some(entries) = self.machine.links.get(&variable) else {
             return Ok(());
         };
-        let states: Vec<_> = entries.iter().map(|entry| entry.state).collect();
+        let states: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.stack)
+            .map(|entry| entry.state)
+            .collect();
         for key in states {
             self.spend("stack position change")?;
             let Some(state) = self.state(key).filter(|state| {
-                state.active && !state.ending && state.stack_output == Some(variable)
+                state.active && !state.ending && state.linked_variable == Some(variable)
             }) else {
                 continue;
             };
             let top = self
                 .machine
-                .stacks
+                .links
                 .get(&variable)
                 .and_then(|entries| entries.last())
                 .is_some_and(|entry| entry.state == key);
@@ -2026,18 +2702,31 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         Ok(())
     }
 
-    fn unlink_stack(&mut self, key: StateKey, depth: usize) -> Result<(), InitFault> {
+    fn unlink_single_output(&mut self, key: StateKey, depth: usize) -> Result<(), InitFault> {
         let Some(target) = self
             .state_mut(key)
-            .and_then(|state| state.stack_output.take())
+            .and_then(|state| state.linked_variable.take())
         else {
             return Ok(());
         };
+        self.remove_link(key, target, None, depth)
+    }
+
+    fn remove_link(
+        &mut self,
+        key: StateKey,
+        target: VarKey,
+        bake: Option<Value>,
+        depth: usize,
+    ) -> Result<(), InitFault> {
         let old = self.machine.value(target, None);
-        if let Some(entries) = self.machine.stacks.get_mut(&target) {
+        if let Some(value) = bake {
+            self.set_base(target, value);
+        }
+        if let Some(entries) = self.machine.links.get_mut(&target) {
             entries.retain(|entry| entry.state != key);
             if entries.is_empty() {
-                self.machine.stacks.remove(&target);
+                self.machine.links.remove(&target);
             }
         }
         self.notify_value(target, &old, None)?;
@@ -2045,7 +2734,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
     }
 
     fn update_stack(&mut self, key: StateKey) -> Result<(), InitFault> {
-        let Some(target) = self.state(key).and_then(|state| state.stack_output) else {
+        let Some(target) = self.state(key).and_then(|state| state.linked_variable) else {
             return Ok(());
         };
         let id = key.instance;
@@ -2061,15 +2750,17 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             return Ok(());
         };
         let old = self.machine.value(target, None);
-        if let Some(entry) = self
+        if let Some(LinkValue::Fixed(current)) = self
             .machine
-            .stacks
+            .links
             .get_mut(&target)
             .and_then(|entries| entries.iter_mut().find(|entry| entry.state == key))
-            .filter(|entry| !same(&entry.value, &value))
+            .map(|entry| &mut entry.output)
         {
-            entry.value = value;
-            self.notify_value(target, &old, Some(key))?;
+            if !same(current, &value) {
+                *current = value;
+                self.notify_value(target, &old, Some(key))?;
+            }
         }
         Ok(())
     }
@@ -2207,6 +2898,8 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                         self.check_switch(key, 0)?;
                     }
                     Some(StateKind::Ability { .. }) => self.activate_ability(key, 0)?,
+                    Some(StateKind::ChaseVar) => self.tick_chase(key)?,
+                    Some(StateKind::Watch) => self.check_watch(key)?,
                     Some(StateKind::WaitFrames { target }) if target <= self.machine.frame => {
                         self.post(id, Event::Finish(raw))?;
                     }
@@ -2319,6 +3012,15 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         if kind == StateKind::Anim && parameter == 1 {
             self.follow(key.instance, node, "m_A3B86BB0", Some(key), 0)?;
         }
+        if matches!(kind, StateKind::WeaponVolley { .. }) {
+            match parameter {
+                1 => {
+                    self.follow(key.instance, node, "m_onMinShotsPlug", Some(key), 0)?;
+                }
+                2 => self.post(key.instance, Event::Finish(key.raw))?,
+                _ => (),
+            }
+        }
         self.try_complete(key, node, 0)
     }
 
@@ -2399,9 +3101,62 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 self.post(key.instance, Event::Reevaluate(key.raw))?;
             } else if state.active && matches!(state.kind, StateKind::Stack { .. }) {
                 self.update_stack(key)?;
+            } else if state.active && state.kind == StateKind::Watch {
+                self.check_watch(key)?;
             }
         }
         Ok(())
+    }
+
+    fn check_watch(&mut self, key: StateKey) -> Result<(), InitFault> {
+        let Some(seen) = self
+            .state(key)
+            .filter(|state| state.active)
+            .and_then(|state| state.watch_seen.clone())
+        else {
+            return Ok(());
+        };
+        let id = key.instance;
+        let node = self
+            .graph(id)
+            .state(usize::from(key.raw))
+            .expect("Watch state");
+        if self
+            .evaluate(id, node, field(&node.fields, "m_B7A3CF78"), Some(key))
+            .is_some_and(|value| !equal(&value, &seen))
+        {
+            self.post(id, Event::WatchChanged(key.raw))?;
+        }
+        Ok(())
+    }
+
+    fn deliver_watch(&mut self, key: StateKey) -> Result<(), InitFault> {
+        let Some(seen) = self
+            .state(key)
+            .filter(|state| state.active)
+            .and_then(|state| state.watch_seen.clone())
+        else {
+            return Ok(());
+        };
+        let id = key.instance;
+        let node = self
+            .graph(id)
+            .state(usize::from(key.raw))
+            .expect("Watch state");
+        match script_expr::lvalue(field(&node.fields, "m_48A8CDEC")) {
+            Ok(Some(target)) => self.write(source_key(id, target), seen)?,
+            Ok(None) => (),
+            Err(error) => {
+                self.report(self.site(id, node), Issue::Expression(error));
+                return Ok(());
+            }
+        }
+        self.follow(id, node, "m_A70DB860", Some(key), 0)?;
+        let seen = self.evaluate(id, node, field(&node.fields, "m_B7A3CF78"), Some(key));
+        if let Some(state) = self.state_mut(key) {
+            state.watch_seen = seen
+        }
+        self.try_complete(key, node, 0)
     }
 
     fn reevaluate(&mut self, key: StateKey, depth: usize) -> Result<(), InitFault> {
@@ -2503,8 +3258,11 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             StateKind::Stack { .. } => {
                 self.exit_subgraph(id, node, "m_topSubgraphPlug", depth + 1)?;
                 self.exit_subgraph(id, node, "m_underSubgraphPlug", depth + 1)?;
-                self.unlink_stack(key, depth + 1)?;
+                self.unlink_single_output(key, depth + 1)?;
             }
+            StateKind::CosmeticEntity => self.unlink_single_output(key, depth + 1)?,
+            StateKind::ChaseVar => self.finish_chase(key, depth + 1)?,
+            StateKind::WeaponVolley { .. } => self.finish_volley(key, depth + 1)?,
             StateKind::Ability { flags } => {
                 self.set_ability_flags(key, flags & !ABILITY_HELD);
                 self.stop_ability(key, node, depth + 1)?;
@@ -2585,13 +3343,24 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 ));
                 continue;
             }
-            let linked: Vec<_> = self.machine.snapshot.instances[&id]
+            let outputs: Vec<_> = self.machine.snapshot.instances[&id]
                 .states
                 .iter()
-                .filter_map(|(&raw, state)| state.stack_output.is_some().then_some(raw))
+                .filter_map(|(&raw, state)| {
+                    (state.linked_variable.is_some()
+                        || matches!(state.kind, StateKind::WeaponVolley { .. }))
+                    .then_some((raw, state.kind))
+                })
                 .collect();
-            for raw in linked {
-                self.unlink_stack(StateKey { instance: id, raw }, 0)?;
+            for (raw, kind) in outputs {
+                let key = StateKey { instance: id, raw };
+                if matches!(kind, StateKind::WeaponVolley { .. }) {
+                    self.finish_volley(key, 0)?;
+                } else if kind == StateKind::ChaseVar {
+                    self.finish_chase(key, 0)?;
+                } else {
+                    self.unlink_single_output(key, 0)?;
+                }
             }
             self.machine.snapshot.instances.shift_remove(&id);
             self.machine.queues.remove(id);
@@ -2687,6 +3456,61 @@ fn stored(snapshot: &Snapshot, key: VarKey) -> Value {
     .unwrap_or(Value::Null)
 }
 
+fn shot_delay(ordinal: u32, rate: f64) -> u64 {
+    ((f64::from(ordinal) / rate) as f32 * 1000.0).round() as u64
+}
+
+fn chase_value(value: &Value) -> Value {
+    match value {
+        Value::Vector(_) => value.clone(),
+        _ => Value::Float(script_expr::to_float(value)),
+    }
+}
+
+fn chase_vector(value: Value) -> [f64; 3] {
+    match value {
+        Value::Vector(vector) => vector,
+        _ => [script_expr::to_float(&value), 0.0, 0.0],
+    }
+}
+
+fn chase_lerp(current: Value, destination: Value, share: f64) -> Value {
+    let interpolate = |from: f64, to: f64| f64::from((from + (to - from) * share) as f32);
+    if let (Value::Float(current), Value::Float(destination)) = (&current, &destination) {
+        return Value::Float(interpolate(*current, *destination));
+    }
+    let current = chase_vector(current);
+    let destination = chase_vector(destination);
+    Value::Vector(std::array::from_fn(|axis| {
+        interpolate(current[axis], destination[axis])
+    }))
+}
+
+fn chase_step(current: Value, destination: Value, step: f64) -> (Value, bool) {
+    if let (Value::Float(current), Value::Float(destination)) = (&current, &destination) {
+        let delta = f64::from((*destination - *current) as f32);
+        return if delta.abs() <= step {
+            (Value::Float(*destination), true)
+        } else {
+            let next = *current + if delta > 0.0 { step } else { -step };
+            (Value::Float(f64::from(next as f32)), false)
+        };
+    }
+    let current = chase_vector(current);
+    let destination = chase_vector(destination);
+    let delta: [f64; 3] =
+        std::array::from_fn(|axis| f64::from((destination[axis] - current[axis]) as f32));
+    let length = f64::from((delta.iter().map(|value| value * value).sum::<f64>().sqrt()) as f32);
+    if length <= step {
+        (Value::Vector(destination), true)
+    } else {
+        let next = std::array::from_fn(|axis| {
+            f64::from((current[axis] + delta[axis] * step / length) as f32)
+        });
+        (Value::Vector(next), false)
+    }
+}
+
 struct InstanceContext<'a, W> {
     machine: &'a Machine,
     world: &'a mut W,
@@ -2702,7 +3526,18 @@ impl<W: World> InstanceContext<'_, W> {
         if !self.reads.contains(&key) {
             self.reads.push(key);
         }
-        self.machine.value(key, self.watcher)
+        let below = self.watcher.filter(|watcher| {
+            self.machine
+                .snapshot
+                .instances
+                .get(&watcher.instance)
+                .and_then(|instance| instance.states.get(&watcher.raw))
+                .is_some_and(|state| {
+                    matches!(state.kind, StateKind::Stack { .. })
+                        && state.linked_variable == Some(key)
+                })
+        });
+        self.machine.value(key, below)
     }
 }
 
@@ -3520,6 +4355,253 @@ mod tests {
             .iter()
             .filter_map(|(&raw, state)| state.active.then_some(raw))
             .collect()
+    }
+
+    #[test]
+    fn volley_reports_exact_times_and_bakes_linked_ammo_on_finish() {
+        let weapon = graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntry",
+                    None,
+                    json!({"m_outPlug":plug(&[(1,"m_beginPlug")],&[])}),
+                ),
+                node(
+                    1,
+                    "STUStatescriptStateWeaponVolley",
+                    Some(0),
+                    json!({
+                        "m_A17BE89B":3,
+                        "m_numShotsPerSecond":9,
+                        "m_24E351A4":var(53,false),
+                        "m_3FFC9EB9":var(231,false),
+                        "m_FEC435C6":180
+                    }),
+                ),
+            ],
+            json!([1]),
+            json!([0]),
+        );
+        let mut root = Root::new(1, 42);
+        root.variables.insert(53, Value::Integer(30));
+        root.variables.insert(231, Value::Float(0.25));
+        let mut component = Component::start(
+            Arc::new(store(vec![weapon])),
+            42,
+            Variables::new(),
+            vec![root],
+            0,
+            &mut EmptyWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        let mut shots = Vec::new();
+        for frame in 0..=14 {
+            component.advance_frame(frame, &mut EmptyWorld).unwrap();
+            shots.extend(component.take_shots().unwrap());
+            if frame == 6 {
+                let snapshot = component.snapshot().unwrap();
+                assert!(snapshot.bindings.is_empty());
+                assert_eq!(snapshot.instances[&1].variables[&53], Value::Integer(30));
+                assert_eq!(snapshot.resolved_bindings[&(1, 53)], Value::Integer(29));
+                assert_eq!(snapshot.resolved_bindings[&(1, 231)], Value::Float(0.25));
+            }
+        }
+        assert_eq!(
+            shots
+                .iter()
+                .map(|shot| (shot.frame, shot.time_ms, shot.ordinal))
+                .collect::<Vec<_>>(),
+            [(0, 0, 0), (6, 111, 1), (13, 222, 2)]
+        );
+        assert!(
+            shots
+                .iter()
+                .all(|shot| shot.activation == 1 && shot.activation_ms == 0)
+        );
+        let node = component.shot_node(&shots[2]).unwrap();
+        assert_eq!(
+            component.evaluate_shot_config(
+                &shots[2],
+                node.field("m_FEC435C6").unwrap(),
+                &mut EmptyWorld
+            ),
+            Ok(Value::Integer(180))
+        );
+        let snapshot = component.snapshot().unwrap();
+        assert!(snapshot.pending_timers.is_empty());
+        assert!(snapshot.resolved_bindings.is_empty());
+        assert!(!snapshot.instances[&1].states[&0].active);
+        assert_eq!(snapshot.instances[&1].variables[&53], Value::Integer(27));
+    }
+
+    struct RifleWorld(Arc<GraphStore>);
+
+    impl World for RifleWorld {
+        fn ruleset(&mut self, id: u32) -> Option<Value> {
+            match id {
+                0x2538 | 0x2819 | 0x32e8 => Some(Value::Float(1.0)),
+                0x260f => Some(Value::Bool(true)),
+                0x281a | 0x32e0 | 0x32e9 => Some(Value::Bool(false)),
+                _ => None,
+            }
+        }
+
+        fn entity_variable(&mut self, entity: u32, id: u32) -> Value {
+            if entity != 0xd000_0010 {
+                return Value::Null;
+            }
+            self.0
+                .mode_variables(0x0230_0000_0000_0018)
+                .and_then(|values| values.get(&id).copied())
+                .map_or(Value::Null, Value::from)
+        }
+
+        fn native(&mut self, site: Site, config: &Json) -> Option<Value> {
+            match config.get("$")?.as_str()? {
+                "STU_1FF67CA6" => Some(Value::Entity(site.entity)),
+                "STU_310D6529" => Some(Value::Vector([0.0; 3])),
+                "STU_37F20D24" => Some(Value::Asset(0x0230_0000_0000_0018)),
+                "STU_A3DEF368" if self.0.mode_variables(0x0230_0000_0000_0018).is_some() => {
+                    Some(Value::Entity(0xd000_0010))
+                }
+                "STU_D3EB8D87" | "STU_A77AC2AC" => Some(Value::Null),
+                "STU_4A101787" => Some(Value::Bool(false)),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local 1.74 graph pack"]
+    fn authored_soldier_rifle_holds_releases_and_reloads_on_the_reference_clock() {
+        let runtime = PathBuf::from(
+            std::env::var_os("ORPHEUS_RUNTIME_DIR").expect("set ORPHEUS_RUNTIME_DIR"),
+        );
+        let graphs =
+            Arc::new(GraphStore::load(runtime.join("data/game_graphs_174.json.gz")).unwrap());
+        let body = &graphs.bodies()[&0x0400_0000_0000_03cf];
+        let mut world = RifleWorld(Arc::clone(&graphs));
+        let mut component = Component::start(
+            Arc::clone(&graphs),
+            0xa000_0101,
+            player_entity_variables(body, 200.0, 200.0),
+            player_roots(body, &graphs).unwrap(),
+            999,
+            &mut world,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        component.advance_frame(999, &mut world).unwrap();
+        let mut shots = Vec::new();
+        let ammo = Variable {
+            scope: Scope::Instance,
+            id: 53,
+        };
+        let reload = Variable {
+            scope: Scope::Instance,
+            id: 51,
+        };
+        for frame in 1000..=1201 {
+            let buttons = match frame {
+                1030..=1073 | 1200 => 1,
+                1095 => 0x400,
+                _ => 0,
+            };
+            component
+                .advance_command(
+                    Command {
+                        frame,
+                        buttons,
+                        ..Command::default()
+                    },
+                    &mut world,
+                )
+                .unwrap();
+            shots.extend(std::mem::take(&mut component.machine.shots));
+            let expected = match frame {
+                1029 => Some(30),
+                1030 | 1036 => Some(29),
+                1074 | 1095 | 1141 => Some(23),
+                1142 | 1188 => Some(30),
+                1201 => Some(29),
+                _ => None,
+            };
+            if let Some(expected) = expected {
+                assert_eq!(
+                    component.resolved_variable(11, ammo),
+                    Some(Value::Integer(expected)),
+                    "frame {frame}, rifle states {:?}, diagnostics {:?}",
+                    active(component.snapshot().unwrap(), 11),
+                    component
+                        .snapshot()
+                        .unwrap()
+                        .diagnostics
+                        .iter()
+                        .filter(|d| d.site.graph == 0x0254)
+                        .collect::<Vec<_>>()
+                );
+            }
+            match frame {
+                1095 | 1142 => assert_eq!(
+                    component.resolved_variable(11, reload),
+                    Some(Value::Bool(true))
+                ),
+                1188 => assert_eq!(
+                    component.resolved_variable(11, reload),
+                    Some(Value::Bool(false))
+                ),
+                _ => (),
+            }
+        }
+        assert_eq!(
+            shots
+                .iter()
+                .map(|shot| (shot.time_ms, shot.activation, shot.ordinal))
+                .collect::<Vec<_>>(),
+            [
+                (16480, 1, 0),
+                (16591, 1, 1),
+                (16702, 1, 2),
+                (16813, 1, 3),
+                (16924, 1, 4),
+                (17036, 1, 5),
+                (17147, 1, 6),
+                (19200, 2, 0),
+            ]
+        );
+        assert!(
+            shots
+                .iter()
+                .all(|shot| shot.instance == 11 && shot.raw_state == 10)
+        );
+        let shot = &shots[0];
+        let node = component.shot_node(shot).unwrap();
+        let mut evaluate = |config: &Json| component.evaluate_shot_config(shot, config, &mut world);
+        let hit = crate::game_hitscan::HitDefinition::from_authored(
+            node.field("m_6396149F").unwrap(),
+            &mut evaluate,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(hit.amount, 20.0);
+        assert_eq!(hit.loadout, Some(0x0b90_0000_0000_008d));
+        assert_eq!(hit.critical, 2.0);
+        assert_eq!(
+            hit.falloff,
+            Some(crate::game_hitscan::DamageFalloff {
+                start: 30.0,
+                end: 50.0,
+                floor: f64::from(0.3_f32),
+            })
+        );
+        assert_eq!(
+            evaluate(node.field("m_FEC435C6").unwrap()),
+            Ok(Value::Integer(180))
+        );
+        assert!(component.take_shots().is_none());
     }
 
     #[test]

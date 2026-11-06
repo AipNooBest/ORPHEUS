@@ -275,6 +275,31 @@ impl PreparedScene {
         &self.bots
     }
 
+    pub(crate) fn bots_mut(&mut self) -> &mut [Bot] {
+        &mut self.bots
+    }
+
+    pub(crate) fn bot_target(&self, bot: &Bot) -> crate::game_hitscan::TargetPose {
+        let settings = self.movers.for_body(Some(bot.spawn.body));
+        crate::game_hitscan::TargetPose {
+            feet: bot.position,
+            height: settings.stand_height,
+            radius: settings.stand_radius,
+            eye: crate::game_combat::eye_height(bot.spawn.hero, false),
+        }
+    }
+
+    pub(crate) fn hitscan_wall(
+        &self,
+        origin: [f64; 3],
+        direction: [f64; 3],
+        reach: f64,
+    ) -> Result<Option<f64>, crate::collision_index::IndexError> {
+        self.ground
+            .cast_ray(origin, direction, reach, MOVER_CATEGORY)
+            .map(|hit| hit.map(|hit| hit.distance))
+    }
+
     pub fn step_bots(&mut self, tick: u32) {
         let floor = self.ground.triangles();
         for bot in &mut self.bots {

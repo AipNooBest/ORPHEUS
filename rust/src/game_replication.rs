@@ -4,6 +4,7 @@ use std::{
     borrow::Borrow,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io,
+    ops::Range,
     sync::Arc,
     time::Duration,
 };
@@ -13,6 +14,7 @@ use crate::{
     game_body::{BodyCreate, BodyView, body_create, owner_pose},
     game_bots::BOT_RECORD_DELAY,
     game_clock::{MAX_LEASE_FRAME, SEND_EVERY},
+    game_combat::{BotReplacement, PosedHitscan},
     game_controller::ControllerFrame,
     game_egress::{DeliveryReport, FrameRecords, GameEgress, RecordSource, SendError, SentFrame},
     game_heroes::{Hero, SOLDIER},
@@ -38,6 +40,9 @@ const MAX_INPUT_LEAD: u32 = 96;
 // Several retransmit windows fit before a peer exhausts this queue. One final
 // leave marker may follow the accepted prefix when the cap is reached.
 const MAX_PENDING_INPUT: usize = 256;
+// BodyScript.command retains this many intermediate VM frames before its
+// requested frame. The first neutral release runs even across a larger gap.
+const MAX_SCRIPT_TAIL: u32 = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BodyId {
@@ -58,7 +63,7 @@ struct Body {
 pub(crate) trait OwnerBodyRuntime: Send {
     fn snapshot(&self) -> Option<&Snapshot>;
     fn encoder(&self) -> SnapshotEncoder<'_>;
-    fn advance(&mut self, command: Command, mover: &Mover) -> io::Result<()>;
+    fn advance(&mut self, command: Command, mover: &Mover, step: BodyStep) -> io::Result<()>;
     fn frame_ms(&self) -> u32;
 
     fn leases(&self) -> &[LeaseBlock] {
@@ -68,6 +73,17 @@ pub(crate) trait OwnerBodyRuntime: Send {
     fn movement_modifiers(&self) -> Option<&BTreeMap<ModifierKey, Modifier>> {
         None
     }
+
+    fn take_hitscan(&mut self, _command: Option<Command>, _mover: &Mover) -> Vec<PosedHitscan> {
+        Vec::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BodyStep {
+    Posed,
+    UnposedBoundary,
+    UnposedTimer,
 }
 
 struct BodyScript {
@@ -103,9 +119,14 @@ impl BodyScript {
         })
     }
 
-    fn step(&mut self, mover: &mut Mover, command: Command) -> io::Result<()> {
+    fn advance(
+        &mut self,
+        mover: &mut Mover,
+        command: Command,
+        step: BodyStep,
+    ) -> io::Result<Vec<PosedHitscan>> {
         if command.frame > self.frame {
-            self.runtime.advance(command, mover)?;
+            self.runtime.advance(command, mover, step)?;
             self.frame = command.frame;
         }
         if !self
@@ -115,15 +136,27 @@ impl BodyScript {
         {
             return Err(invalid("body VM reached an unsupported state"));
         }
+        if step == BodyStep::UnposedTimer {
+            // Combat discards the neutral interval's reports at its boundary.
+            // Drain interior reports early so a long gap cannot fill the VM queue.
+            self.runtime.take_hitscan(None, mover);
+            return Ok(Vec::new());
+        }
         if let Some(modifiers) = self.runtime.movement_modifiers() {
             mover.track_modifiers(command.frame, modifiers);
         } else if self.corrections.is_some() {
             return Err(invalid("body VM lost its movement projection"));
         }
-        if let Some(history) = &mut self.corrections {
+        if let Some(history) = self
+            .corrections
+            .as_mut()
+            .filter(|_| step == BodyStep::Posed)
+        {
             history.record(mover.pose());
         }
-        Ok(())
+        Ok(self
+            .runtime
+            .take_hitscan((step == BodyStep::Posed).then_some(command), mover))
     }
 
     fn next_record(&mut self, created: bool) -> io::Result<Option<(Record, Option<u32>)>> {
@@ -208,6 +241,13 @@ enum Lifetime {
 #[derive(Clone, Copy)]
 enum Delivery {
     Baseline,
+    BotCreate {
+        after: Option<u32>,
+    },
+    BotHealth {
+        revision: u64,
+    },
+    BotDestroy,
     CreateBody(BodyId),
     Possession(BodyId),
     DestroyBody(BodyId),
@@ -221,6 +261,12 @@ enum Delivery {
         close: bool,
         resend: bool,
     },
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BotLifetime {
+    Live,
+    Retiring,
 }
 
 pub(crate) struct Record {
@@ -273,9 +319,62 @@ enum InputWork {
     },
     Command {
         command: Command,
-        pending: Option<Poses>,
+        pending: Option<PendingCommand>,
     },
     Leave,
+}
+
+#[derive(Default)]
+struct ScriptGap {
+    release: Option<u32>,
+    tail: Range<u32>,
+}
+
+impl ScriptGap {
+    fn before(script_frame: u32, first_pose: u32) -> Self {
+        let first_missing = script_frame.saturating_add(1);
+        if first_missing >= first_pose {
+            return Self::default();
+        }
+        let last_missing = first_pose - 1;
+        Self {
+            release: Some(first_missing),
+            tail: (first_missing + 1).max(last_missing.saturating_sub(MAX_SCRIPT_TAIL))..first_pose,
+        }
+    }
+}
+
+impl Iterator for ScriptGap {
+    type Item = (u32, BodyStep);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(frame) = self.release.take() {
+            return Some((frame, BodyStep::UnposedBoundary));
+        }
+        let frame = self.tail.next()?;
+        let step = if self.tail.is_empty() {
+            BodyStep::UnposedBoundary
+        } else {
+            BodyStep::UnposedTimer
+        };
+        Some((frame, step))
+    }
+}
+
+struct PendingCommand {
+    poses: Poses,
+    gap: ScriptGap,
+}
+
+impl PendingCommand {
+    fn new(poses: Poses, script: Option<&BodyScript>) -> Self {
+        let gap = script
+            .zip(poses.next_frame())
+            .map_or_else(ScriptGap::default, |(script, first_pose)| {
+                ScriptGap::before(script.frame, first_pose)
+            });
+        Self { poses, gap }
+    }
 }
 
 #[derive(Default)]
@@ -336,6 +435,9 @@ pub(crate) struct WorldDelivery {
     owner: u32,
     queued: Vec<Arc<Record>>,
     created: HashSet<u32>,
+    bots: HashMap<u32, BotLifetime>,
+    bot_health: HashMap<u32, u64>,
+    health_revision: u64,
     started: Option<u32>,
     pub(crate) presentation_due: bool,
     controller: Stream,
@@ -348,6 +450,7 @@ pub(crate) struct WorldDelivery {
     input: InputQueue,
     mover: Option<Mover>,
     body_script: Option<BodyScript>,
+    hitscan: Vec<PosedHitscan>,
 }
 
 impl WorldDelivery {
@@ -356,6 +459,9 @@ impl WorldDelivery {
             owner,
             queued: Vec::new(),
             created: HashSet::new(),
+            bots: HashMap::new(),
+            bot_health: HashMap::new(),
+            health_revision: 0,
             started: None,
             presentation_due: false,
             controller: Stream::new(owner),
@@ -368,25 +474,90 @@ impl WorldDelivery {
             input: InputQueue::default(),
             mover: None,
             body_script: None,
+            hitscan: Vec::new(),
         }
     }
 
     pub(crate) fn clear(&mut self) {
         self.queued.clear();
+        self.created.clear();
+        self.bots.clear();
+        self.bot_health.clear();
         self.started = None;
         self.presentation_due = false;
         self.mover = None;
         self.cancel_body_script();
         self.input.clear();
+        self.hitscan.clear();
     }
 
     fn push(&mut self, record: Record) {
         self.queued.push(Arc::new(record));
     }
 
+    pub(crate) fn world_started(&self) -> bool {
+        self.started.is_some()
+    }
+
+    pub(crate) fn identity_ready(&self, entity: u32) -> bool {
+        self.world_started() && self.created.contains(&entity)
+    }
+
+    pub(crate) fn mode_ready(&self) -> bool {
+        self.mode.delivered() != 0
+    }
+
+    pub(crate) fn bot_health_pending(&self, entity: u32) -> bool {
+        self.bot_health.contains_key(&entity)
+    }
+
+    pub(crate) fn queue_bot_health(&mut self, update: EntityUpdate) {
+        let entity = update.entity;
+        if self.bots.get(&entity) != Some(&BotLifetime::Live) {
+            return;
+        }
+        self.health_revision = self.health_revision.wrapping_add(1);
+        let revision = self.health_revision;
+        self.bot_health.insert(entity, revision);
+        self.remove_stale();
+        self.push(Record {
+            update,
+            delivery: Delivery::BotHealth { revision },
+        });
+    }
+
+    pub(crate) fn replace_bot(&mut self, replacement: BotReplacement) {
+        let old = replacement.retired;
+        let new = replacement.created.entity;
+        if self.bots.get(&old) != Some(&BotLifetime::Live) || self.bots.contains_key(&new) {
+            return;
+        }
+        self.bots.insert(old, BotLifetime::Retiring);
+        self.bots.insert(new, BotLifetime::Live);
+        self.created.remove(&old);
+        self.bot_health.remove(&old);
+        self.remove_stale();
+        self.push(Record {
+            update: EntityUpdate {
+                entity: old,
+                operation: Some(Operation::Destroy),
+                ..EntityUpdate::default()
+            },
+            delivery: Delivery::BotDestroy,
+        });
+        self.push(Record {
+            update: replacement.created,
+            delivery: Delivery::BotCreate { after: Some(old) },
+        });
+    }
+
     fn current(&self, record: &Record) -> bool {
+        let entity = record.update.entity;
         match record.delivery {
             Delivery::Baseline | Delivery::Script { close: false, .. } => true,
+            Delivery::BotCreate { .. } => self.bots.get(&entity) == Some(&BotLifetime::Live),
+            Delivery::BotDestroy => self.bots.get(&entity) == Some(&BotLifetime::Retiring),
+            Delivery::BotHealth { revision } => self.bot_health.get(&entity) == Some(&revision),
             Delivery::Script {
                 last, close: true, ..
             } => last == self.controller.latest_data(),
@@ -434,6 +605,15 @@ impl WorldDelivery {
                             self.created.insert(record.update.entity);
                         }
                     }
+                    (true, Delivery::BotCreate { .. }) => {
+                        self.created.insert(record.update.entity);
+                    }
+                    (true, Delivery::BotDestroy) => {
+                        self.bots.remove(&record.update.entity);
+                    }
+                    (true, Delivery::BotHealth { .. }) => {
+                        self.bot_health.remove(&record.update.entity);
+                    }
                     (true, Delivery::CreateBody(id)) => {
                         self.created.insert(id.entity);
                         if let Some(script) =
@@ -478,11 +658,23 @@ impl WorldDelivery {
         let body = self.body.map(|body| body.id);
         let mut created = body.is_none_or(|id| self.created.contains(&id.entity));
         let mut bound = body == self.bound;
+        let mut destroyed = HashSet::new();
         self.queued
             .iter()
             .enumerate()
             .filter_map(|(index, record)| {
                 match record.delivery {
+                    Delivery::BotDestroy => {
+                        destroyed.insert(record.update.entity);
+                    }
+                    Delivery::BotCreate { after: Some(old) }
+                        if self.bots.contains_key(&old) && !destroyed.contains(&old) =>
+                    {
+                        return None;
+                    }
+                    Delivery::BotHealth { .. } if !self.identity_ready(record.update.entity) => {
+                        return None;
+                    }
                     Delivery::CreateBody(id) if Some(id) == body => created = true,
                     Delivery::Possession(_) if !created => return None,
                     Delivery::Possession(_) => bound = true,
@@ -656,11 +848,22 @@ impl WorldDelivery {
         tick: u32,
     ) -> io::Result<()> {
         let records = scene.initial_world(viewer)?;
-        self.queued.extend(
-            records
-                .into_iter()
-                .map(|update| Arc::new(Record::baseline(update))),
+        self.bots.extend(
+            scene
+                .bots()
+                .iter()
+                .map(|bot| (bot.entity, BotLifetime::Live)),
         );
+        for update in records {
+            if self.bots.contains_key(&update.entity) {
+                self.push(Record {
+                    update,
+                    delivery: Delivery::BotCreate { after: None },
+                });
+            } else {
+                self.push(Record::baseline(update));
+            }
+        }
         self.started = Some(tick);
         Ok(())
     }
@@ -762,7 +965,15 @@ impl WorldDelivery {
         !self.input.work.is_empty()
     }
 
-    /// One unit per physics pose, pre-body command, or queued game message.
+    pub(crate) fn combat_body_active(&self) -> bool {
+        self.body_script.is_some()
+    }
+
+    pub(crate) fn take_hitscan(&mut self) -> Vec<PosedHitscan> {
+        std::mem::take(&mut self.hitscan)
+    }
+
+    /// One unit per physics pose, unposed VM frame, pre-body command, or queued game message.
     /// A fresh frame is committed only after its final pose has completed.
     pub(crate) fn advance_input(
         &mut self,
@@ -790,38 +1001,14 @@ impl WorldDelivery {
                     command,
                     mut pending,
                 } => {
-                    if let Some(mover) = &mut self.mover {
-                        let poses = pending.get_or_insert_with(|| mover.pending_poses(command));
-                        let mut failed = false;
-                        let script = &mut self.body_script;
-                        let stepped = mover.step_pending(
-                            scene.movement_index(),
-                            poses,
-                            dt,
-                            remaining,
-                            |mover, command| {
-                                if !failed
-                                    && script
-                                        .as_mut()
-                                        .is_some_and(|script| script.step(mover, command).is_err())
-                                {
-                                    mover.track_modifiers(command.frame, &BTreeMap::new());
-                                    failed = true;
-                                }
-                            },
-                        );
-                        if failed {
-                            self.cancel_body_script();
-                        }
-                        remaining -= stepped.map_err(invalid)?;
-                        if poses.len() != 0 {
-                            self.input
-                                .work
-                                .push_front(InputWork::Command { command, pending });
-                            break;
-                        }
-                    } else {
-                        remaining -= 1;
+                    let (used, complete) =
+                        self.advance_command(scene, command, &mut pending, dt, remaining)?;
+                    remaining -= used;
+                    if !complete {
+                        self.input
+                            .work
+                            .push_front(InputWork::Command { command, pending });
+                        break;
                     }
                     self.input.processed = Some(command.frame);
                 }
@@ -829,6 +1016,63 @@ impl WorldDelivery {
             }
         }
         Ok((budget - remaining, false))
+    }
+
+    fn advance_command(
+        &mut self,
+        scene: &PreparedScene,
+        command: Command,
+        pending: &mut Option<PendingCommand>,
+        dt: f64,
+        budget: usize,
+    ) -> io::Result<(usize, bool)> {
+        let Some(mover) = &mut self.mover else {
+            return Ok((1, true));
+        };
+        let pending = pending.get_or_insert_with(|| {
+            PendingCommand::new(mover.pending_poses(command), self.body_script.as_ref())
+        });
+        let mut used = 0;
+        let mut failed = false;
+        let script = &mut self.body_script;
+        let hitscan = &mut self.hitscan;
+        if let Some(script) = script {
+            for (frame, step) in pending.gap.by_ref().take(budget) {
+                used += 1;
+                let neutral = Command {
+                    frame,
+                    ..Command::default()
+                };
+                if script.advance(mover, neutral, step).is_err() {
+                    mover.track_modifiers(frame, &BTreeMap::new());
+                    pending.gap = ScriptGap::default();
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        let stepped = mover.step_pending(
+            scene.movement_index(),
+            &mut pending.poses,
+            dt,
+            budget - used,
+            |mover, command| {
+                if let Some(script) = script.as_mut().filter(|_| !failed) {
+                    match script.advance(mover, command, BodyStep::Posed) {
+                        Ok(shots) => hitscan.extend(shots),
+                        Err(_) => {
+                            mover.track_modifiers(command.frame, &BTreeMap::new());
+                            failed = true;
+                        }
+                    }
+                }
+            },
+        );
+        if failed {
+            self.cancel_body_script();
+        }
+        used += stepped.map_err(invalid)?;
+        Ok((used, pending.poses.len() == 0))
     }
 
     fn next_body(&self, now: Duration) -> Option<u32> {
@@ -1054,6 +1298,130 @@ mod tests {
             forward: 127,
             ..Command::default()
         }
+    }
+
+    #[test]
+    fn bot_health_replaces_stale_packets_and_respawn_keeps_creation_order() {
+        use crate::{
+            game_bots::BOT_ENTITY,
+            game_egress::PacketDelivery,
+            world::{Create, health},
+        };
+        let old = BOT_ENTITY;
+        let new = old + 1;
+        let create = |entity| EntityUpdate {
+            entity,
+            operation: Some(Operation::Create(Box::new(Create::new(1, vec![])))),
+            ..EntityUpdate::default()
+        };
+        let health_update = |now| EntityUpdate {
+            entity: old,
+            operation: Some(Operation::Update(vec![health(now, 200.0, 0.0, 0.0)])),
+            ..EntityUpdate::default()
+        };
+        let send = |world: &mut WorldDelivery, index: usize| {
+            let ready = &world.ready()[index];
+            let record = ready.tracked();
+            let queue_index = ready.index;
+            world.sent(&[queue_index]);
+            record
+        };
+        let resolve = |world: &mut WorldDelivery, record, arrived| {
+            world.acknowledge(
+                DeliveryReport {
+                    requeued_reliable: 0,
+                    packets: vec![PacketDelivery {
+                        sequence: 0,
+                        arrived,
+                        records: vec![record],
+                    }],
+                },
+                Duration::ZERO,
+            );
+        };
+        let mut world = WorldDelivery::new(OWNER);
+        world.started = Some(FIRST_TICK);
+        world.bots.insert(old, BotLifetime::Live);
+        world.push(Record {
+            update: create(old),
+            delivery: Delivery::BotCreate { after: None },
+        });
+        world.queue_bot_health(health_update(160.0));
+        assert_eq!(world.ready().len(), 1);
+        assert!(!world.identity_ready(old));
+        let spawn = send(&mut world, 0);
+        assert!(world.ready().is_empty());
+        resolve(&mut world, spawn, true);
+        assert!(world.identity_ready(old));
+
+        let earlier_health = send(&mut world, 0);
+        world.queue_bot_health(health_update(0.0));
+        resolve(&mut world, earlier_health, false);
+        let ready = world.ready();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].record.update, health_update(0.0));
+        let terminal = send(&mut world, 0);
+        resolve(&mut world, Arc::clone(&terminal), false);
+        assert!(world.bot_health_pending(old));
+        let terminal_retry = send(&mut world, 0);
+        assert!(Arc::ptr_eq(&terminal, &terminal_retry));
+        resolve(&mut world, terminal_retry, true);
+        assert!(!world.bot_health_pending(old));
+
+        world.replace_bot(BotReplacement {
+            retired: old,
+            created: create(new),
+        });
+        assert!(!world.identity_ready(old));
+        let ready = world.ready();
+        assert_eq!(
+            ready
+                .iter()
+                .map(|item| item.record.update.entity)
+                .collect::<Vec<_>>(),
+            [old, new]
+        );
+        let destroy = send(&mut world, 0); // the datagram only had room for the destroy
+        assert!(world.ready().is_empty());
+        resolve(&mut world, destroy, false);
+        let retry = send(&mut world, 0);
+        resolve(&mut world, retry, true);
+        let replacement = send(&mut world, 0);
+        assert_eq!(replacement.update.entity, new);
+        resolve(&mut world, replacement, true);
+        resolve(&mut world, terminal, false);
+        world.queue_bot_health(health_update(120.0));
+        assert!(world.ready().is_empty());
+        assert!(!world.identity_ready(old));
+        assert!(world.identity_ready(new));
+    }
+
+    #[test]
+    fn sparse_vm_work_retains_the_reference_release_and_timer_tail() {
+        use BodyStep::{UnposedBoundary, UnposedTimer};
+        assert_eq!(ScriptGap::before(100, 101).count(), 0);
+        assert_eq!(
+            ScriptGap::before(100, 102).collect::<Vec<_>>(),
+            [(101, UnposedBoundary)]
+        );
+        assert_eq!(
+            ScriptGap::before(100, 104).collect::<Vec<_>>(),
+            [
+                (101, UnposedBoundary),
+                (102, UnposedTimer),
+                (103, UnposedBoundary),
+            ]
+        );
+        let frames = ScriptGap::before(100, 500).collect::<Vec<_>>();
+        assert_eq!(frames.len(), 258);
+        assert_eq!(frames[0], (101, UnposedBoundary));
+        assert!(
+            frames[1..257]
+                .iter()
+                .copied()
+                .eq((243..499).map(|frame| (frame, UnposedTimer)))
+        );
+        assert_eq!(frames[257], (499, UnposedBoundary));
     }
 
     #[test]
@@ -1341,7 +1709,7 @@ mod tests {
             SnapshotEncoder::new(&self.graphs, &self.codecs)
         }
 
-        fn advance(&mut self, command: Command, _mover: &Mover) -> io::Result<()> {
+        fn advance(&mut self, command: Command, _mover: &Mover, _step: BodyStep) -> io::Result<()> {
             self.component
                 .advance_command(command, &mut EmptyWorld)
                 .map_err(invalid)
@@ -1478,7 +1846,7 @@ mod tests {
                     .body_script
                     .as_mut()
                     .unwrap()
-                    .step(mover, command)
+                    .advance(mover, command, BodyStep::Posed)
                     .unwrap();
             })
             .unwrap();
@@ -1510,7 +1878,7 @@ mod tests {
                     .body_script
                     .as_mut()
                     .unwrap()
-                    .step(mover, command)
+                    .advance(mover, command, BodyStep::Posed)
                     .unwrap();
             })
             .unwrap();
@@ -1541,7 +1909,7 @@ mod tests {
                     .body_script
                     .as_mut()
                     .unwrap()
-                    .step(mover, command)
+                    .advance(mover, command, BodyStep::Posed)
                     .unwrap();
             })
             .unwrap();
@@ -1660,7 +2028,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a prepared 104319 Practice Range pack without bot VM graphs"]
-    fn prepared_worker_advances_an_attached_vm_and_cancels_it_on_a_pose_fault() {
+    fn prepared_worker_resumes_unposed_vm_frames_before_advancing_physics() {
         let runtime = std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap();
         let assets = SceneAssets::load(runtime).unwrap();
         let mut scene = assets.prepare(GameMap::practice_range()).unwrap();
@@ -1708,23 +2076,49 @@ mod tests {
             transmit(&mut world, &mut egress, tick, 1).1.records,
             [RecordSource::Queued(0), RecordSource::Movement(0)]
         );
+        transport_outcome(&mut world, &mut egress, 1, true);
 
-        let after_unposed_gap = tick + 65;
+        let after_unposed_gap = tick + 400;
         world.queue_commands(after_unposed_gap, &[forward(after_unposed_gap)]);
+        for turn in 1..=16 {
+            assert_eq!(
+                world
+                    .advance_input(&scene, &viewer, RETAIL_QUANTA, 16)
+                    .unwrap(),
+                (16, false)
+            );
+            assert_eq!(
+                world.body_script.as_ref().unwrap().frame,
+                tick + 141 + turn * 16
+            );
+            assert_eq!(world.mover.as_ref().unwrap().pose().frame, Some(tick));
+            assert_eq!(world.command_ack(after_unposed_gap), tick);
+            assert!(
+                transmit(&mut world, &mut egress, after_unposed_gap, turn + 1)
+                    .1
+                    .records
+                    .is_empty()
+            );
+            world.queue_commands(after_unposed_gap, &[forward(after_unposed_gap)]);
+        }
         assert_eq!(
             world
                 .advance_input(&scene, &viewer, RETAIL_QUANTA, 16)
                 .unwrap(),
-            (1, false)
+            (3, false)
         );
+        assert!(!world.has_input_work());
         assert_eq!(world.command_ack(after_unposed_gap), after_unposed_gap);
-        assert!(world.body_script.is_none());
-        transport_outcome(&mut world, &mut egress, 1, false);
-        assert!(
-            transmit(&mut world, &mut egress, after_unposed_gap, 2)
+        assert_eq!(world.body_script.as_ref().unwrap().frame, after_unposed_gap);
+        assert_eq!(
+            world.mover.as_ref().unwrap().pose().frame,
+            Some(after_unposed_gap)
+        );
+        assert_eq!(
+            transmit(&mut world, &mut egress, after_unposed_gap, 18)
                 .1
-                .records
-                .is_empty()
+                .records,
+            [RecordSource::Queued(0), RecordSource::Movement(0)]
         );
     }
 

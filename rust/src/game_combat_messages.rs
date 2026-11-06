@@ -32,6 +32,10 @@ pub enum CombatNotice {
 }
 
 impl CombatNotice {
+    pub(crate) fn needs_mode_ui(self) -> bool {
+        !matches!(self, Self::Hit { .. })
+    }
+
     pub fn required_identity(self) -> Option<u32> {
         match self {
             Self::Hit { target, .. } => Some(target),

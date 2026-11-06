@@ -73,6 +73,10 @@ impl Mover {
         self.pose
     }
 
+    pub(crate) fn crouched(&self) -> bool {
+        self.posture.crouched()
+    }
+
     pub fn track_modifiers(&mut self, frame: u32, active: &BTreeMap<ModifierKey, Modifier>) {
         self.modifiers.track(frame, active);
     }
