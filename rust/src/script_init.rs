@@ -19,6 +19,7 @@ use serde_json::Value as Json;
 
 use crate::{
     commands::Command,
+    game_pools::PoolKind,
     mover_modifiers::{Modifier, ModifierKey, Operation},
     script_expr::{
         self, Context, EmptyContext, EntityRelation, EvalError, Scope, StackPriority, Variable,
@@ -37,6 +38,8 @@ const MAX_PENDING_SHOTS: usize = 256;
 const ABILITY_RUNNING: u8 = 1;
 const ABILITY_PUSHED: u8 = 2;
 const ABILITY_HELD: u8 = 4;
+const SWITCH_TO_TRUE: u16 = 1;
+const SWITCH_TO_FALSE: u16 = 2;
 const LINK_PRIORITY: StackPriority = StackPriority {
     level: 0,
     above_equals: true,
@@ -169,6 +172,17 @@ pub trait World {
         false
     }
 
+    /// A missing current total requests the pool maximum.
+    fn body_pool(
+        &mut self,
+        _site: Site,
+        _kind: PoolKind,
+        _maximum: f64,
+        _current: Option<f64>,
+    ) -> Option<f64> {
+        None
+    }
+
     /// None means this relationship is unsupported for the supplied entity.
     fn related_entity(
         &mut self,
@@ -205,6 +219,10 @@ impl World for EmptyWorld {}
 pub enum StateKind {
     Plain,
     BooleanSwitch(bool),
+    DelayedSwitch {
+        current: bool,
+        undecided: bool,
+    },
     Switch {
         case: Option<usize>,
     },
@@ -264,6 +282,7 @@ pub struct State {
     ending: bool,
     pending_change: bool,
     pending_timer: bool,
+    delayed_timers: [bool; 2],
     buffered_press: Option<BufferedPress>,
     linked_variable: Option<VarKey>,
     ability_stack: Option<VarKey>,
@@ -282,6 +301,7 @@ impl State {
             ending: false,
             pending_change: false,
             pending_timer: false,
+            delayed_timers: [false; 2],
             buffered_press: None,
             linked_variable: None,
             ability_stack: None,
@@ -2340,8 +2360,27 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             // ForCodeSynced publishes to native game-code registration outside
             // the graph. Its VM plugs and empty wire payload use the base state.
             "STU_CD46AF93" if is_networked_for_code_synced(node) => StateKind::Plain,
+            // Tips register their state key with native presentation code.
+            // The graph still runs the base state's plugs and lifecycle.
+            "STU_F5A99B2A"
+                if node.is_networked()
+                    && field(&node.fields, "m_tips")
+                        .as_array()
+                        .is_some_and(|tips| {
+                            !tips.is_empty()
+                                && tips
+                                    .iter()
+                                    .all(|tip| field(tip, "$").as_str() == Some("STUTip"))
+                        }) =>
+            {
+                StateKind::Plain
+            }
             "STU_7B9E8909" => StateKind::Plain,
             "STUStatescriptStateBooleanSwitch" => StateKind::BooleanSwitch(false),
+            "STU_B591EBFE" => StateKind::DelayedSwitch {
+                current: false,
+                undecided: true,
+            },
             "STU_DEBD057B" => StateKind::Switch { case: None },
             "STU_01178155" => StateKind::ActiveQuery,
             "STUStatescriptStateGamePadVibration" => StateKind::GamePadVibration,
@@ -2407,6 +2446,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                     StateKind::BooleanSwitch(current);
                 self.enter_branch(key, node, current, depth)?;
             }
+            StateKind::DelayedSwitch { .. } => self.begin_delayed_switch(key, node, depth)?,
             StateKind::Switch { .. } => {
                 let Some(case) = self.switch_case(key, node) else {
                     return Ok(());
@@ -3229,6 +3269,13 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                     Some(StateKind::BooleanSwitch(_)) => {
                         self.check_switch(key, 0)?;
                     }
+                    Some(StateKind::DelayedSwitch { .. }) => {
+                        let node = self
+                            .graph(id)
+                            .state(usize::from(raw))
+                            .expect("delayed switch");
+                        self.recheck_delayed_switch(key, node, 0)?;
+                    }
                     Some(StateKind::Switch { .. }) => self.post(id, Event::Reevaluate(raw))?,
                     Some(StateKind::Ability { .. }) => self.activate_ability(key, 0)?,
                     Some(StateKind::ChaseVar) => self.tick_chase(key)?,
@@ -3345,6 +3392,21 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         if kind == StateKind::Anim && parameter == 1 {
             self.follow(key.instance, node, "m_A3B86BB0", Some(key), 0)?;
         }
+        if let StateKind::DelayedSwitch { current, undecided } = kind {
+            let branch = match parameter {
+                SWITCH_TO_TRUE => Some(true),
+                SWITCH_TO_FALSE => Some(false),
+                _ => None,
+            };
+            if let Some(branch) = branch {
+                self.state_mut(key)
+                    .expect("active delayed switch")
+                    .delayed_timers[usize::from(branch)] = false;
+                if undecided || current != branch {
+                    self.set_delayed_branch(key, node, branch, 0)?;
+                }
+            }
+        }
         if matches!(kind, StateKind::Ability { .. }) && matches!(parameter, 1 | 2) {
             self.activate_ability(key, 0)?;
         }
@@ -3433,7 +3495,10 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 self.post(key.instance, Event::Reevaluate(key.raw))?;
             } else if state.active
                 && !state.pending_timer
-                && matches!(state.kind, StateKind::BooleanSwitch(_))
+                && matches!(
+                    state.kind,
+                    StateKind::BooleanSwitch(_) | StateKind::DelayedSwitch { .. }
+                )
             {
                 state.pending_timer = true;
                 self.post(key.instance, Event::Reevaluate(key.raw))?;
@@ -3507,7 +3572,10 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             .graph(key.instance)
             .state(usize::from(key.raw))
             .expect("switch state");
-        let evaluated = if let StateKind::Switch { case } = kind {
+        let evaluated = if matches!(kind, StateKind::DelayedSwitch { .. }) {
+            self.recheck_delayed_switch(key, node, depth)?;
+            true
+        } else if let StateKind::Switch { case } = kind {
             let Some(next) = self.switch_case(key, node) else {
                 return Ok(());
             };
@@ -3552,6 +3620,188 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         Ok(false)
     }
 
+    fn begin_delayed_switch(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        depth: usize,
+    ) -> Result<(), InitFault> {
+        let id = key.instance;
+        let Some(undecided) = self.evaluate(id, node, field(&node.fields, "m_308B8A80"), None)
+        else {
+            return Ok(());
+        };
+        let undecided = truthy(&undecided);
+        let current = if undecided {
+            false
+        } else {
+            let initial = field(&node.fields, "m_418D9D9D");
+            let config = if initial.is_null() {
+                field(&node.fields, "m_BD83C8E6")
+            } else {
+                initial
+            };
+            let Some(initial) = self.evaluate(id, node, config, Some(key)) else {
+                return Ok(());
+            };
+            truthy(&initial)
+        };
+        self.state_mut(key).expect("active delayed switch").kind =
+            StateKind::DelayedSwitch { current, undecided };
+        self.register_tick(key, self.machine.now_ms);
+        if !undecided {
+            self.enter_branch(key, node, current, depth)?;
+        }
+        self.recheck_delayed_switch(key, node, depth)
+    }
+
+    fn recheck_delayed_switch(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        depth: usize,
+    ) -> Result<(), InitFault> {
+        let Some(StateKind::DelayedSwitch { current, undecided }) = self
+            .state(key)
+            .filter(|state| state.active)
+            .map(|state| state.kind)
+        else {
+            return Ok(());
+        };
+        let id = key.instance;
+        let condition = field(&node.fields, "m_BD83C8E6");
+        let false_override = field(&node.fields, "m_E8FC060D");
+        let requested = if current {
+            let Some(holds_false) =
+                self.delayed_false_condition(key, node, condition, false_override)
+            else {
+                return Ok(());
+            };
+            holds_false.then_some(false)
+        } else {
+            let Some(holds_true) = self.evaluate(id, node, condition, Some(key)) else {
+                return Ok(());
+            };
+            if truthy(&holds_true) {
+                Some(true)
+            } else if undecided {
+                let Some(holds_false) =
+                    self.delayed_false_condition(key, node, condition, false_override)
+                else {
+                    return Ok(());
+                };
+                holds_false.then_some(false)
+            } else {
+                None
+            }
+        };
+        let Some(branch) = requested else {
+            if !undecided {
+                self.cancel_delayed_timer(key, !current);
+            }
+            return Ok(());
+        };
+        let delay_field = if branch { "m_7130456B" } else { "m_ED60694A" };
+        let Some(delay) = self.evaluate(id, node, field(&node.fields, delay_field), None) else {
+            return Ok(());
+        };
+        let seconds = script_expr::to_float(&delay);
+        let milliseconds = ((seconds as f32) * 1000.0).trunc();
+        if !milliseconds.is_finite() {
+            self.report(
+                self.site(id, node),
+                Issue::UnsupportedField("delayed switch timeout"),
+            );
+            return Ok(());
+        }
+        if seconds > 0.0 {
+            self.arm_delayed_timer(key, branch, milliseconds as u64)?;
+        }
+        if undecided {
+            self.cancel_delayed_timer(key, !branch);
+        }
+        if seconds <= 0.0 {
+            self.set_delayed_branch(key, node, branch, depth)?;
+        }
+        Ok(())
+    }
+
+    fn delayed_false_condition(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        condition: &Json,
+        override_config: &Json,
+    ) -> Option<bool> {
+        let invert = override_config.is_null();
+        let config = if invert { condition } else { override_config };
+        self.evaluate(key.instance, node, config, Some(key))
+            .map(|value| truthy(&value) != invert)
+    }
+
+    fn arm_delayed_timer(
+        &mut self,
+        key: StateKey,
+        branch: bool,
+        delay_ms: u64,
+    ) -> Result<(), InitFault> {
+        let index = usize::from(branch);
+        if !self
+            .state(key)
+            .expect("active delayed switch")
+            .delayed_timers[index]
+        {
+            let parameter = if branch {
+                SWITCH_TO_TRUE
+            } else {
+                SWITCH_TO_FALSE
+            };
+            self.post_after(key.instance, delay_ms, Event::Timer(key.raw, parameter))?;
+            self.state_mut(key)
+                .expect("active delayed switch")
+                .delayed_timers[index] = true;
+        }
+        Ok(())
+    }
+
+    fn cancel_delayed_timer(&mut self, key: StateKey, branch: bool) {
+        let pending = &mut self
+            .state_mut(key)
+            .expect("active delayed switch")
+            .delayed_timers[usize::from(branch)];
+        if std::mem::take(pending) {
+            let parameter = if branch {
+                SWITCH_TO_TRUE
+            } else {
+                SWITCH_TO_FALSE
+            };
+            self.machine.queues.retain(key.instance, |_, event| {
+                !matches!(event, Event::Timer(raw, param) if *raw == key.raw && *param == parameter)
+            });
+        }
+    }
+
+    fn set_delayed_branch(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        next: bool,
+        depth: usize,
+    ) -> Result<(), InitFault> {
+        if let StateKind::DelayedSwitch {
+            current,
+            undecided: false,
+        } = self.state(key).expect("active delayed switch").kind
+        {
+            self.exit_subgraph(key.instance, node, branch_path(current), depth + 1)?;
+        }
+        self.state_mut(key).expect("active delayed switch").kind = StateKind::DelayedSwitch {
+            current: next,
+            undecided: false,
+        };
+        self.enter_branch(key, node, next, depth)
+    }
+
     fn switch_case(&mut self, key: StateKey, node: &Node) -> Option<Option<usize>> {
         let value = self.evaluate(
             key.instance,
@@ -3583,7 +3833,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             "m_onFalsePlug"
         };
         self.follow(key.instance, node, output, Some(key), depth)?;
-        self.follow(key.instance, node, branch_path(branch), Some(key), depth)?;
+        if self.state(key).is_some_and(|state| state.active) {
+            self.follow(key.instance, node, branch_path(branch), Some(key), depth)?;
+        }
         Ok(())
     }
 
@@ -3613,6 +3865,10 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             StateKind::BooleanSwitch(branch) => {
                 self.exit_subgraph(id, node, branch_path(branch), depth + 1)?
             }
+            StateKind::DelayedSwitch {
+                current,
+                undecided: false,
+            } => self.exit_subgraph(id, node, branch_path(current), depth + 1)?,
             StateKind::Switch { case } => {
                 self.exit_subgraph(id, node, &case_path(case), depth + 1)?
             }
@@ -3648,6 +3904,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         state.ending = false;
         state.pending_change = false;
         state.pending_timer = false;
+        state.delayed_timers = [false; 2];
         if matches!(kind, StateKind::SubScript { .. }) {
             state.kind = StateKind::SubScript { child: None };
         }
@@ -4044,6 +4301,17 @@ impl<W: World> Context for InstanceContext<'_, W> {
         }
     }
 
+    fn body_pool(&mut self, entity: u32, kind: PoolKind, maximum: bool) -> Option<f64> {
+        let most = self.body_health(entity, true)?;
+        let current = if maximum {
+            None
+        } else {
+            Some(self.body_health(entity, false)?)
+        };
+        self.read_native = true;
+        self.world.body_pool(self.site, kind, most, current)
+    }
+
     fn native(&mut self, config: &Json) -> Option<Value> {
         self.read_native = true;
         self.world.native(self.site, config)
@@ -4311,6 +4579,224 @@ mod tests {
             let states = &snapshot.instances[&1].states;
             assert!(!states[&0].active && !states[&1].active);
         }
+    }
+
+    fn delayed_switch_fixture(mut fields: Json) -> Arc<GraphStore> {
+        fields["m_onTruePlug"] = plug(&[(6, "m_inPlug")], &[]);
+        fields["m_onFalsePlug"] = plug(&[(7, "m_inPlug")], &[]);
+        fields["m_trueSubgraphPlug"] = plug(&[(2, "m_beginPlug")], &[1]);
+        fields["m_falseSubgraphPlug"] = plug(&[(3, "m_beginPlug")], &[2]);
+        let entry = |position, input| {
+            node(
+                position,
+                "STUStatescriptEntryGameMessage",
+                None,
+                json!({
+                    "m_gameMessage":{"m_gameMessage":format!("0x024000000000{position:04X}")},
+                    "m_outPlug":plug(&[(1,input)], &[]),
+                }),
+            )
+        };
+        let record_branch = |position, branch| {
+            node(
+                position,
+                "STUStatescriptActionSetVar",
+                None,
+                json!({"m_out_Var":var(103,true), "m_value":branch}),
+            )
+        };
+        Arc::new(store(vec![graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntry",
+                    None,
+                    json!({"m_outPlug":plug(&[(1, "m_beginPlug")], &[])}),
+                ),
+                node(1, "STU_B591EBFE", Some(0), fields),
+                node(2, "STUStatescriptState", Some(1), json!({})),
+                node(3, "STUStatescriptState", Some(2), json!({})),
+                entry(4, ABORT_PLUG),
+                entry(5, "m_beginPlug"),
+                record_branch(6, true),
+                record_branch(7, false),
+            ],
+            json!([1, 2, 3]),
+            json!([0, 4, 5]),
+        )]))
+    }
+
+    fn assert_delayed_switch(
+        component: &Component,
+        branch: Option<bool>,
+        timer: Option<(u64, u16)>,
+    ) {
+        let snapshot = component.snapshot().unwrap();
+        assert!(
+            snapshot.initialization_complete(),
+            "{:?}",
+            snapshot.diagnostics
+        );
+        let states = &snapshot.instances[&1].states;
+        assert!(states[&0].active);
+        assert_eq!(
+            states[&0].kind,
+            StateKind::DelayedSwitch {
+                current: branch == Some(true),
+                undecided: branch.is_none(),
+            },
+        );
+        assert_eq!(
+            states.get(&1).is_some_and(|state| state.active),
+            branch == Some(true)
+        );
+        assert_eq!(
+            states.get(&2).is_some_and(|state| state.active),
+            branch == Some(false)
+        );
+        if let Some(branch) = branch {
+            assert_eq!(snapshot.variables[&103], Value::Bool(branch));
+        }
+        let expected: Vec<_> = timer
+            .map(|(due_ms, parameter)| PendingTimer {
+                due_ms,
+                raw_state: 0,
+                finish: false,
+                parameter,
+            })
+            .into_iter()
+            .collect();
+        assert_eq!(
+            snapshot
+                .pending_timers
+                .get(&1)
+                .map_or(&[][..], Vec::as_slice),
+            expected,
+        );
+    }
+
+    #[test]
+    fn delayed_switch_uses_initial_override_and_asymmetric_interruptible_timers() {
+        let mut component = Component::start(
+            delayed_switch_fixture(json!({
+                "m_418D9D9D": true,
+                "m_BD83C8E6": var(100,true),
+                "m_E8FC060D": var(101,true),
+                "m_7130456B": 0.0259,
+                "m_ED60694A": 0.04075,
+            })),
+            42,
+            Variables::from([(100, Value::Bool(false)), (101, Value::Bool(false))]),
+            vec![Root::new(1, 42)],
+            0,
+            &mut EmptyWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        let write = |component: &mut Component, id, value| {
+            component
+                .set_entity_variable(id, Value::Bool(value), &mut EmptyWorld)
+                .unwrap();
+            component.run_now(&mut EmptyWorld).unwrap();
+        };
+
+        assert_delayed_switch(&component, Some(true), None);
+        write(&mut component, 101, true);
+        assert_delayed_switch(&component, Some(true), Some((40, SWITCH_TO_FALSE)));
+        component.advance_frame(1, &mut EmptyWorld).unwrap();
+        assert_delayed_switch(&component, Some(true), Some((40, SWITCH_TO_FALSE)));
+        write(&mut component, 101, false);
+        component.advance_frame(2, &mut EmptyWorld).unwrap();
+        assert_delayed_switch(&component, Some(true), None);
+        write(&mut component, 101, true);
+        assert_delayed_switch(&component, Some(true), Some((87, SWITCH_TO_FALSE)));
+        for frame in 3..=5 {
+            component.advance_frame(frame, &mut EmptyWorld).unwrap();
+        }
+        assert_delayed_switch(&component, Some(false), None);
+        write(&mut component, 101, false);
+        write(&mut component, 100, true);
+        assert_delayed_switch(&component, Some(false), Some((120, SWITCH_TO_TRUE)));
+        for frame in 6..=7 {
+            component.advance_frame(frame, &mut EmptyWorld).unwrap();
+        }
+        assert_delayed_switch(&component, Some(true), None);
+    }
+
+    #[test]
+    fn delayed_switch_polls_undecided_inputs_and_clears_timers_on_abort() {
+        #[derive(Default)]
+        struct Conditions {
+            positive: bool,
+            negative: bool,
+        }
+
+        impl World for Conditions {
+            fn native(&mut self, _site: Site, config: &Json) -> Option<Value> {
+                match config["$"].as_str()? {
+                    "test-delayed-positive" => Some(Value::Bool(self.positive)),
+                    "test-delayed-negative" => Some(Value::Bool(self.negative)),
+                    _ => None,
+                }
+            }
+        }
+
+        let mut world = Conditions::default();
+        let mut component = Component::start(
+            delayed_switch_fixture(json!({
+                "m_308B8A80": true,
+                "m_418D9D9D": true,
+                "m_BD83C8E6": {"$":"test-delayed-positive"},
+                "m_E8FC060D": {"$":"test-delayed-negative"},
+                "m_7130456B": 0.075,
+                "m_ED60694A": 0.001,
+            })),
+            42,
+            Variables::new(),
+            vec![Root::new(1, 42)],
+            0,
+            &mut world,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        assert_delayed_switch(&component, None, None);
+        assert!(!component.snapshot().unwrap().variables.contains_key(&103));
+        world.positive = true;
+        component.advance_frame(0, &mut world).unwrap();
+        assert_delayed_switch(&component, None, Some((90, SWITCH_TO_TRUE)));
+        world.positive = false;
+        component.advance_frame(1, &mut world).unwrap();
+        assert_delayed_switch(&component, None, Some((90, SWITCH_TO_TRUE)));
+        world.negative = true;
+        component.advance_frame(2, &mut world).unwrap();
+        assert_delayed_switch(&component, None, Some((48, SWITCH_TO_FALSE)));
+        component.advance_frame(3, &mut world).unwrap();
+        assert_delayed_switch(&component, Some(false), None);
+
+        world.positive = true;
+        component.advance_frame(4, &mut world).unwrap();
+        assert_delayed_switch(&component, Some(false), Some((154, SWITCH_TO_TRUE)));
+        component
+            .queue_message(1, 0x0240_0000_0000_0004, Variables::new())
+            .unwrap();
+        component.run_now(&mut world).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert!(snapshot.pending_timers.is_empty());
+        assert!(!snapshot.instances[&1].states[&0].active);
+        assert!(!snapshot.instances[&1].states[&2].active);
+
+        world = Conditions::default();
+        component
+            .queue_message(1, 0x0240_0000_0000_0005, Variables::new())
+            .unwrap();
+        component.run_now(&mut world).unwrap();
+        component.advance_frame(10, &mut world).unwrap();
+        assert_delayed_switch(&component, None, None);
+        assert_eq!(
+            component.snapshot().unwrap().instances[&1].states[&0].activation,
+            2
+        );
     }
 
     #[test]

@@ -214,7 +214,7 @@ impl SceneAssets {
                     Arc::clone(codecs),
                     map.mode_guid,
                     hero,
-                    self.pools.body_pools(hero.guid).total(),
+                    self.pools.hero_pools(hero.guid),
                     OwnerBodySpawn {
                         controller: 0xa000_0100,
                         entity: 0xa000_0101,

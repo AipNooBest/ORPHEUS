@@ -22,6 +22,13 @@ pub const FALLBACK_POOLS: HealthPools = HealthPools {
     shields: 0.0,
 };
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PoolKind {
+    Health,
+    Armour,
+    Shields,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HealthPools {
     pub health: f64,
@@ -36,6 +43,38 @@ impl HealthPools {
 
     pub fn vitals(self) -> Vitals {
         Vitals::new(self.health, self.armour, self.shields)
+    }
+
+    pub(crate) fn amount(self, kind: PoolKind, maximum: f64, current: Option<f64>) -> Option<f64> {
+        let pools = [self.health, self.armour, self.shields];
+        if pools.iter().any(|pool| !pool.is_finite() || *pool < 0.0)
+            || !maximum.is_finite()
+            || self.total() != maximum
+        {
+            return None;
+        }
+        let capacity = match kind {
+            PoolKind::Health => self.health,
+            PoolKind::Armour => self.armour,
+            PoolKind::Shields => self.shields,
+        };
+        let Some(current) = current else {
+            return Some(capacity);
+        };
+        if !(0.0..=maximum).contains(&current) {
+            return None;
+        }
+        if current == 0.0 {
+            return Some(0.0);
+        }
+        // An empty kind, full pools, or one nonzero kind has an unambiguous amount.
+        if capacity == 0.0 || current == maximum {
+            Some(capacity)
+        } else if pools.iter().filter(|&&pool| pool > 0.0).count() == 1 {
+            Some(current)
+        } else {
+            None
+        }
     }
 }
 

@@ -29,6 +29,8 @@ The stock Soldier preflight reports its first unsupported operation at startup. 
 
 Rust carries the authenticated controller and newly allocated body into each human owner VM. The controller, current possessor and possessed-body queries resolve that pair, and the tests cover its replacement and the authored Soldier startup and HUD lookups. Foreign and AI relationships still require their own authoritative lifetimes and validation.
 
+The delayed conditional state uses the shared VM clock and can cancel either branch's pending transition. Its branch flags are available to owners and observers, while pending timers are owner-only. The authored Soldier startup also reads health pool types through the body catalog and existing owner totals. Current values are available where those totals determine the pool distribution. The tips state uses the base graph lifecycle and an empty payload. Named and dynamic pools, damaged mixed pools without a per-type record, and the native tips registry and presentation remain open.
+
 The base graph bundle can include authored mode values without adding bot graphs. Supply the target build's `.0C5` XML directory as `--mode-xml` to [the graph extractor](../tools/extract_game_graphs.py), write its output outside the repository, then pass that output to `prepare_server_runtime --game-graphs` when assembling the external bundle. Mode values and graph data stay local.
 
 The frozen Python server serves the regular entry points until cutover. The native server currently serves the solo base Practice Range on loopback. Other matchmaking modes, social actions, the dashboard and original-client acceptance are pending.

@@ -12,6 +12,7 @@ use crate::{
     game_heroes::{Hero, SOLDIER},
     game_hitscan::HitDefinition,
     game_instance::RETAIL_QUANTA,
+    game_pools::{FALLBACK_POOLS, HealthPools, PoolKind},
     game_replication::{BodyStep, OwnerBodyRuntime},
     mover::Mover,
     mover_modifiers::{Modifier, ModifierKey},
@@ -41,6 +42,7 @@ pub(crate) struct PlayerBodyFactory {
     hero: u64,
     roots: Vec<Root>,
     variables: Variables,
+    pools: Option<HealthPools>,
 }
 
 impl PlayerBodyFactory {
@@ -49,7 +51,7 @@ impl PlayerBodyFactory {
         codecs: Arc<CodecTable>,
         mode: u64,
         hero: &Hero,
-        health: f64,
+        pools: Option<HealthPools>,
         probe: OwnerBodySpawn,
     ) -> io::Result<Self> {
         let body = graphs
@@ -60,6 +62,7 @@ impl PlayerBodyFactory {
                 unsupported("the hero body definition is absent from the graph bundle")
             })?;
         let roots = crate::script_init::player_roots(body, &graphs).map_err(unsupported)?;
+        let health = pools.unwrap_or(FALLBACK_POOLS).total();
         let variables = crate::script_init::player_entity_variables(body, health, health);
         let factory = Self {
             graphs,
@@ -68,6 +71,7 @@ impl PlayerBodyFactory {
             hero: hero.guid,
             roots,
             variables,
+            pools,
         };
         let runtime = factory.start(probe)?;
         let encoder = runtime.encoder();
@@ -93,6 +97,7 @@ impl PlayerBodyFactory {
             throttles: [0; 2],
             mode: self.mode,
             hero: self.hero,
+            pools: self.pools,
         };
         let mut component = Component::start(
             Arc::clone(&self.graphs),
@@ -223,6 +228,7 @@ struct BodyWorld {
     throttles: [i8; 2],
     mode: u64,
     hero: u64,
+    pools: Option<HealthPools>,
 }
 
 impl World for BodyWorld {
@@ -271,6 +277,19 @@ impl World for BodyWorld {
 
     fn has_owner_health(&self, site: Site) -> bool {
         self.is_player_site(site)
+    }
+
+    fn body_pool(
+        &mut self,
+        site: Site,
+        kind: PoolKind,
+        maximum: f64,
+        current: Option<f64>,
+    ) -> Option<f64> {
+        if !self.is_player_site(site) {
+            return None;
+        }
+        self.pools?.amount(kind, maximum, current)
     }
 
     fn related_entity(&mut self, site: Site, relation: EntityRelation, entity: u32) -> Option<u32> {
@@ -376,7 +395,7 @@ pub(crate) fn fixture_body_factory() -> (PlayerBodyFactory, OwnerBodySpawn) {
         quanta: RETAIL_QUANTA,
     };
     let factory =
-        PlayerBodyFactory::prepare(graphs, codecs, PRACTICE_RANGE_MODE, &hero, 200.0, spawn)
+        PlayerBodyFactory::prepare(graphs, codecs, PRACTICE_RANGE_MODE, &hero, None, spawn)
             .unwrap();
     (factory, spawn)
 }
@@ -519,6 +538,117 @@ mod tests {
                 evaluate(&mut runtime, &current),
                 Err(EvalError::UnsupportedConfig("STU_32E6E4D8".into()))
             );
+        }
+    }
+
+    #[test]
+    fn typed_health_queries_require_a_known_pool_distribution() {
+        use crate::script_expr::EvalError;
+        use serde_json::json;
+
+        let (_, spawn) = fixture_body_factory();
+        let mut factory = fixture_hitscan_factory(20.0);
+        let mixed = HealthPools {
+            health: 200.0,
+            armour: 50.0,
+            shields: 25.0,
+        };
+        let evaluate = |body: &mut PlayerBodyRuntime, config: &Json| {
+            body.component
+                .evaluate_state_config(1, 0, config, &mut body.world)
+        };
+        let query = |class, kind| {
+            json!({
+                "$":class, "m_entity":{"$":"STU_B5A0CAF0"}, "m_7BE02F89":null,
+                "m_7E8B666C":{"$":"STU_297E1A30","m_7E8B666C":kind,"m_EE729DCB":0}
+            })
+        };
+        let current = "STU_783B4CF0";
+        let maximum = "STU_68883EAC";
+        let unsupported = |class: &str| Err(EvalError::UnsupportedConfig(class.into()));
+
+        let mut unknown = factory.start(spawn).unwrap();
+        assert_eq!(
+            evaluate(&mut unknown, &query(current, 0)),
+            unsupported(current)
+        );
+        factory.pools = Some(FALLBACK_POOLS);
+        let mut single = factory.start(spawn).unwrap();
+        single
+            .component
+            .set_entity_variable(253, Value::Float(125.0), &mut single.world)
+            .unwrap();
+        for (kind, amount) in [(0, 125.0), (1, 0.0), (2, 0.0)] {
+            assert_eq!(
+                evaluate(&mut single, &query(current, kind)),
+                Ok(Value::Float(amount))
+            );
+        }
+
+        factory.pools = Some(mixed);
+        for id in [253, 1732, 1737] {
+            factory.variables.insert(id, Value::Float(mixed.total()));
+        }
+        let mut body = factory.start(spawn).unwrap();
+        for (kind, amount) in [(0, 200.0), (1, 50.0), (2, 25.0)] {
+            for class in [current, maximum] {
+                assert_eq!(
+                    evaluate(&mut body, &query(class, kind)),
+                    Ok(Value::Float(amount))
+                );
+            }
+        }
+        body.component
+            .set_entity_variable(253, Value::Float(250.0), &mut body.world)
+            .unwrap();
+        assert_eq!(
+            evaluate(&mut body, &query(current, 2)),
+            unsupported(current)
+        );
+        assert_eq!(
+            evaluate(&mut body, &query(maximum, 2)),
+            Ok(Value::Float(25.0))
+        );
+        body.component
+            .set_entity_variable(253, Value::Float(0.0), &mut body.world)
+            .unwrap();
+        for kind in [0, 1, 2] {
+            assert_eq!(
+                evaluate(&mut body, &query(current, kind)),
+                Ok(Value::Float(0.0))
+            );
+        }
+        body.component
+            .set_entity_variable(1737, Value::Float(300.0), &mut body.world)
+            .unwrap();
+        assert_eq!(
+            evaluate(&mut body, &query(maximum, 2)),
+            unsupported(maximum)
+        );
+
+        factory.pools = Some(HealthPools {
+            shields: 0.0,
+            ..mixed
+        });
+        factory.variables.insert(253, Value::Float(225.0));
+        factory.variables.insert(1732, Value::Float(225.0));
+        factory.variables.insert(1737, Value::Float(250.0));
+        let mut without_shields = factory.start(spawn).unwrap();
+        assert_eq!(
+            evaluate(&mut without_shields, &query(current, 2)),
+            Ok(Value::Float(0.0))
+        );
+        assert_eq!(
+            evaluate(&mut without_shields, &query(current, 0)),
+            unsupported(current)
+        );
+
+        let mut named = query(current, 0);
+        named["m_7BE02F89"] = json!({"$":"STUConfigVarIdentifier","m_identifier":"0x01"});
+        let mut foreign = query(current, 0);
+        foreign["m_entity"] = json!({"$":"STU_F76C486C","m_D63CBEC2":{"$":"STU_B5A0CAF0"}});
+        for config in [named, query(current, 3), foreign] {
+            assert_eq!(evaluate(&mut single, &config), unsupported(current));
         }
     }
 
@@ -770,9 +900,14 @@ mod tests {
 
         let root = PathBuf::from(std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap());
         let graphs = Arc::new(GraphStore::load(root.join("data/game_graphs_174.json.gz")).unwrap());
+        let pools = crate::game_pools::PoolCatalog::from_graphs(&graphs)
+            .unwrap()
+            .hero_pools(SOLDIER)
+            .unwrap();
         let body = &graphs.bodies()[&0x0400_0000_0000_03cf];
         let roots = crate::script_init::player_roots(body, &graphs).unwrap();
-        let variables = crate::script_init::player_entity_variables(body, 200.0, 200.0);
+        let health = pools.total();
+        let variables = crate::script_init::player_entity_variables(body, health, health);
         let mut world = BodyWorld {
             graphs: Arc::clone(&graphs),
             controller: 0xa000_0100,
@@ -781,6 +916,7 @@ mod tests {
             throttles: [0; 2],
             mode: PRACTICE_RANGE_MODE,
             hero: SOLDIER,
+            pools: Some(pools),
         };
         let mut component = Component::start(
             graphs,
@@ -855,8 +991,10 @@ mod tests {
             assert!(controller.active);
             assert_eq!(controller.kind, crate::script_init::StateKind::Plain);
         }
+        let tips = &snapshot.instances[&4].states[&0];
+        assert!(tips.active);
+        assert_eq!(tips.kind, StateKind::Plain);
         let codecs = CodecTable::load(root.join("data/statescript_codecs_174.json")).unwrap();
-        let codec = codecs.codec("STU_CD46AF93").unwrap();
         for mode in [
             PayloadMode::Remote { full: true },
             PayloadMode::Owner {
@@ -865,7 +1003,10 @@ mod tests {
                 frame_ms: FRAME_MS as u32,
             },
         ] {
-            assert_eq!(codec.payload(&BTreeMap::new(), mode).unwrap().bit_len(), 0);
+            for class in ["STU_CD46AF93", "STU_F5A99B2A"] {
+                let codec = codecs.codec(class).unwrap();
+                assert_eq!(codec.payload(&BTreeMap::new(), mode).unwrap().bit_len(), 0);
+            }
         }
         for (instance, raw, position) in [
             (1, 13, 39),
@@ -892,6 +1033,17 @@ mod tests {
             assert!(child.active);
             assert_eq!(child.kind, StateKind::BooleanSwitch(false));
         }
+        let health_switch = &snapshot.instances[&9].states[&1];
+        assert!(health_switch.active);
+        assert_eq!(
+            health_switch.kind,
+            crate::script_init::StateKind::BooleanSwitch(true)
+        );
+        for (graph, node) in [(0x0033, 66), (0x08b6, 2)] {
+            assert!(!snapshot.diagnostics.iter().any(|diagnostic| {
+                diagnostic.site.graph == graph && diagnostic.site.node == Some(node)
+            }));
+        }
 
         let authored_field = |graph, position, field: &str| {
             world
@@ -906,6 +1058,8 @@ mod tests {
         };
         let sprint_condition = authored_field(0x0255, 6, "m_condition");
         let watch_possessor = authored_field(0x01cf, 41, "m_B7A3CF78");
+        let shield_refill = authored_field(0x0033, 66, "m_BD83C8E6");
+        let health_present = authored_field(0x08b6, 2, "m_condition");
         let rifle_conditions =
             [81, 83].map(|position| authored_field(0x0254, position, "m_condition"));
         // 01C7 st48 reads the same current and maximum health as the
@@ -914,6 +1068,14 @@ mod tests {
         assert_eq!(
             component.evaluate_state_config(13, 21, &watch_possessor, &mut world),
             Ok(Value::Entity(world.controller))
+        );
+        assert_eq!(
+            component.evaluate_state_config(1, 27, &shield_refill, &mut world),
+            Ok(Value::Bool(false))
+        );
+        assert_eq!(
+            component.evaluate_state_config(9, 1, &health_present, &mut world),
+            Ok(Value::Bool(true))
         );
         assert_eq!(
             component.evaluate_state_config(12, 48, &full_health, &mut world),

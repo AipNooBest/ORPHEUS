@@ -5,7 +5,7 @@ use std::{error::Error, fmt};
 use serde_json::Value as Json;
 
 pub use crate::script_wire::Value;
-use crate::{accounts::parse_guid, script_graph::asset_guid};
+use crate::{accounts::parse_guid, game_pools::PoolKind, script_graph::asset_guid};
 
 pub(crate) const EPSILON: f64 = 1.192_092_895_507_812_5e-5;
 const MAX_CONFIG_DEPTH: usize = 64;
@@ -122,6 +122,10 @@ pub trait Context {
     }
 
     fn body_health(&mut self, _entity: u32, _maximum: bool) -> Option<f64> {
+        None
+    }
+
+    fn body_pool(&mut self, _entity: u32, _kind: PoolKind, _maximum: bool) -> Option<f64> {
         None
     }
 
@@ -375,14 +379,17 @@ fn class(config: &Json) -> Option<&str> {
 }
 
 pub(crate) fn native_shape(config: &Json, expected: &str, operand: Option<&str>) -> bool {
-    class(config) == Some(expected)
-        && config.as_object().is_some_and(|fields| {
-            fields.iter().all(|(key, value)| match key.as_str() {
-                "$" => true,
-                "m_EE729DCB" => value.as_u64() == Some(0),
-                key => Some(key) == operand,
-            })
+    class(config) == Some(expected) && native_fields(config, operand.as_slice())
+}
+
+fn native_fields(config: &Json, operands: &[&str]) -> bool {
+    config.as_object().is_some_and(|fields| {
+        fields.iter().all(|(key, value)| match key.as_str() {
+            "$" => true,
+            "m_EE729DCB" => value.as_u64() == Some(0),
+            key => operands.contains(&key),
         })
+    })
 }
 
 fn is_expression(class: Option<&str>) -> bool {
@@ -565,6 +572,37 @@ impl Evaluator {
                     .body_health(entity, class == "STU_7D7D2470")
                     .ok_or_else(|| EvalError::UnsupportedConfig(class.into()))?;
                 Value::Float(health)
+            }
+            "STU_783B4CF0" | "STU_68883EAC" => {
+                let unsupported = || EvalError::UnsupportedConfig(class.into());
+                if !native_fields(config, &["m_entity", "m_7E8B666C", "m_7BE02F89"])
+                    || !child(config, "m_7BE02F89").is_null()
+                {
+                    return Err(unsupported());
+                }
+                let selector = child(config, "m_7E8B666C");
+                let kind = if selector.is_null() {
+                    PoolKind::Health
+                } else {
+                    if !native_shape(selector, "STU_297E1A30", Some("m_7E8B666C")) {
+                        return Err(unsupported());
+                    }
+                    match child(selector, "m_7E8B666C").as_i64() {
+                        Some(0) => PoolKind::Health,
+                        Some(1) => PoolKind::Armour,
+                        Some(2) => PoolKind::Shields,
+                        _ => return Err(unsupported()),
+                    }
+                };
+                let Value::Entity(entity) =
+                    self.config(child(config, "m_entity"), context, nested)?
+                else {
+                    return Err(unsupported());
+                };
+                let health = context
+                    .body_pool(entity, kind, class == "STU_68883EAC")
+                    .ok_or_else(unsupported)?;
+                Value::Float(rounded(health))
             }
             "STU_FDBB0B67" => {
                 let target = child(config, "m_entity");

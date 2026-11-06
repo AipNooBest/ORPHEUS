@@ -1148,6 +1148,12 @@ fn state_payload(state: &State, codec: &Codec) -> Option<StatePayload> {
         (StateKind::BooleanSwitch(current), Some("switch")) => {
             StatePayload::from([("current".into(), Value::Bool(current))])
         }
+        (StateKind::DelayedSwitch { current, undecided }, Some("two_bits")) => {
+            StatePayload::from([
+                ("current".into(), Value::Bool(current)),
+                ("undecided".into(), Value::Bool(undecided)),
+            ])
+        }
         (StateKind::SubScript { child }, Some("subscript")) => StatePayload::from([(
             "child".into(),
             Value::Integer(i64::from(child.unwrap_or_default())),
@@ -1243,6 +1249,9 @@ mod tests {
         "12340001":{"name":"STUStatescriptState","codec":"none","stec":false,"status":"VERIFIED","layout":[]},
         "12340002":{"name":"STUStatescriptStateBooleanSwitch","codec":"switch","stec":false,"status":"VERIFIED",
             "layout":[{"op":"bits","f":"current","n":1}]},
+        "B591EBFE":{"name":"STU_B591EBFE","codec":"two_bits","stec":false,"status":"VERIFIED",
+            "layout":[{"op":"bits","f":"a","n":1},{"op":"if","c":"!a",
+                       "then":[{"op":"bits","f":"b","n":1}],"else":[]}]},
         "12340003":{"name":"STU_37D754C8","codec":"subscript","stec":false,"status":"VERIFIED",
             "layout":[{"op":"if","c":"H","then":[{"op":"w_u16","f":"child"},{"op":"bits","f":"flag","n":1}],"else":[]}]},
         "12340004":{"name":"STUStatescriptStateGameMessageEntry","codec":"message","stec":false,"status":"VERIFIED",
@@ -1786,6 +1795,105 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn delayed_switch_projects_reference_bits_and_owner_timer() {
+        use crate::script_init::PendingTimer;
+
+        let mut delayed = node(
+            1,
+            "STU_B591EBFE",
+            Some(0),
+            json!({"m_BD83C8E6": {"$": "STUConfigVarBool", "m_value": false}}),
+        );
+        delayed["remote"] = json!(0);
+        let graph = graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntry",
+                    None,
+                    json!({"m_outPlug": {"$": "Plug", "links": [[1, "m_beginPlug"]]}}),
+                ),
+                delayed,
+            ],
+            json!([1]),
+            json!([0]),
+            json!([1]),
+            json!([]),
+        );
+        let graphs = GraphStore::from_json(
+            &serde_json::to_vec(&json!({
+                "version": 1, "graphs": [graph], "bodies": {}, "missing": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let codecs = CodecTable::from_json(CODECS).unwrap();
+        let codec = codecs.codec("STU_B591EBFE").unwrap();
+        let encoder = SnapshotEncoder::new(&graphs, &codecs);
+        let mut snapshot = initialize(
+            &graphs,
+            ENTITY,
+            Variables::new(),
+            vec![Root::new(1, 42)],
+            &mut EmptyWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+
+        // The authorized 104319 layout gives identical state bits in owner and
+        // observer records. Only the owner receives the pending branch timer.
+        for (current, undecided, width, byte) in [
+            (false, false, 2, 0),
+            (false, true, 2, 2),
+            (true, false, 1, 1),
+        ] {
+            snapshot.instances[&1].states[&0].kind =
+                StateKind::DelayedSwitch { current, undecided };
+            snapshot.pending_timers.clear();
+            if undecided {
+                snapshot.pending_timers.insert(
+                    1,
+                    vec![PendingTimer {
+                        due_ms: 16_064,
+                        raw_state: 0,
+                        finish: false,
+                        parameter: 1,
+                    }],
+                );
+            }
+            let owner = encoder.project(&snapshot, View::Owner).unwrap();
+            let observer = encoder.project(&snapshot, View::Observer).unwrap();
+            let owner = &owner.instances[&1];
+            let observer = &observer.instances[&1];
+            assert_eq!(owner.events.len(), usize::from(undecided));
+            if undecided {
+                assert_eq!(owner.events[0].parameter, 1);
+                assert_eq!(owner.events[0].due_ms, 16_064);
+            }
+            assert!(observer.events.is_empty());
+            for (state, mode) in [
+                (
+                    &owner.states[&0],
+                    PayloadMode::Owner {
+                        full: false,
+                        frame_time: 16_000,
+                        frame_ms: 16,
+                    },
+                ),
+                (&observer.states[&0], PayloadMode::Remote { full: false }),
+                (&observer.states[&0], PayloadMode::Remote { full: true }),
+            ] {
+                let bits = codec.payload(&state.payload, mode).unwrap();
+                assert_eq!(
+                    (bits.bit_len(), bits.as_bytes()),
+                    (width, [byte].as_slice())
+                );
+            }
+        }
     }
 
     #[test]

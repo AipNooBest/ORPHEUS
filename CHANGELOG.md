@@ -878,3 +878,11 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Verified that two config classes share the retail native evaluator that returns a typed false, and added their exact operand-free forms.
 - Reduced the stock Soldier preflight from 22 diagnostics to 13 in the same prepared base runtime. The first remaining blocker is the delayed conditional state at graph `0033`, node `66`. Stock weapon attachment and original-client acceptance remain pending.
 - Passed 292 public Rust tests, 58 base-runtime checks and 54 enriched-runtime checks. Cargo formatting, Clippy, documentation links and Git diff checks passed.
+
+#### Rust delayed branches and typed health queries
+
+- Added the delayed conditional state's initial override, interruptible per-branch timers, and subgraph teardown to the shared VM. Its branch flags match the build 104319 payload vectors, and only the owner receives pending timers.
+- Resolved authored health, armor and shield queries from the body pool catalog and the existing owner health totals. Current values are returned when the pool distribution is determined by those totals. Named and dynamic pools, and damaged mixed pools without per-type values, still require native state.
+- Enabled the graph lifecycle and verified empty payload for the authored tips state. The native tips registry and original-client presentation remain open.
+- Reduced stock Soldier startup diagnostics from 13 to 11 in the same base runtime. The first blocker is now the dynamic health pool state at graph `0033`, node `1`. Stock weapon attachment and original-client acceptance remain pending.
+- Passed 296 public Rust tests, 58 base-runtime checks and 54 enriched-runtime checks. The codec comparison matched 1,833 owner and observer samples. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.
