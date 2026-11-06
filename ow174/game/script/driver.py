@@ -374,7 +374,15 @@ class BodyScript(ReplicatedBody):
         self.set_ult_charge(max(0.0, min(cost, f32(charge + points))))
 
     def _charge_ult(self) -> None:
-        if self.ult_seconds <= 0 or any(state.flags & nodes.Ability.RUNNING for state in self.ultimates):
+        blocked = self.ult_seconds <= 0 or any(
+            state.flags & nodes.Ability.RUNNING for state in self.ultimates
+        )
+        if blocked != getattr(self, "_ult_passive_blocked", None):
+            log.info(
+                "[game] %X: ultimate passive %s", self.entity, "paused" if blocked else "running"
+            )
+            self._ult_passive_blocked = blocked
+        if blocked:
             return
         cost = expr.to_float(self.component.entity_var(ULT_COST).value())
         charge = expr.to_float(self.component.entity_var(ULT_CHARGE).value())
