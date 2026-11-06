@@ -106,7 +106,15 @@ pub trait Context {
         [0.0; 3]
     }
 
+    fn random_u64(&mut self) -> Option<u64> {
+        None
+    }
+
     fn body_scale(&mut self, _entity: u32) -> Option<f64> {
+        None
+    }
+
+    fn body_health(&mut self, _entity: u32, _maximum: bool) -> Option<f64> {
         None
     }
 
@@ -504,6 +512,16 @@ impl Evaluator {
                 return self.expression(config, context, nested);
             }
             "STU_B5A0CAF0" => context.owner(),
+            "STU_32E6E4D8" | "STU_7D7D2470" => {
+                let target = child(config, "m_entity");
+                let Value::Entity(entity) = self.config(target, context, nested)? else {
+                    return Err(EvalError::UnsupportedConfig(class.into()));
+                };
+                let health = context
+                    .body_health(entity, class == "STU_7D7D2470")
+                    .ok_or_else(|| EvalError::UnsupportedConfig(class.into()))?;
+                Value::Float(health)
+            }
             "STU_FDBB0B67" => {
                 let target = child(config, "m_entity");
                 if !matches!(
@@ -818,6 +836,41 @@ impl Evaluator {
                 66 => Value::Float(rounded(to_float(&pop(&mut stack, pc)?).floor())),
                 67 => Value::Float(rounded(to_float(&pop(&mut stack, pc)?).ceil())),
                 68 => Value::Integer(i64::from(round_half_away(to_float(&pop(&mut stack, pc)?)))),
+                69 | 70 => {
+                    let (a, b) = pair(&mut stack, pc)?;
+                    let mut sample = context
+                        .random_u64()
+                        .ok_or(EvalError::UnsupportedOpcode { opcode, offset: pc })?;
+                    if opcode == 70
+                        || matches!(
+                            (&a, &b),
+                            (Value::Integer(_), Value::Integer(_) | Value::Bool(_))
+                        )
+                    {
+                        let (a, b) = (to_int(&a, 0), to_int(&b, 0));
+                        let low = i128::from(a.min(b));
+                        let count = (i128::from(a.max(b)) - low + 1) as u128;
+                        // Discard the incomplete residue range to keep inclusive integer rolls uniform.
+                        let reject_below = (1_u128 << 64) % count;
+                        while u128::from(sample) < reject_below {
+                            if self.steps >= self.limit {
+                                return Err(EvalError::BudgetExceeded {
+                                    offset: pc,
+                                    limit: self.limit,
+                                });
+                            }
+                            self.steps += 1;
+                            sample = context
+                                .random_u64()
+                                .ok_or(EvalError::UnsupportedOpcode { opcode, offset: pc })?;
+                        }
+                        Value::Integer((low + (u128::from(sample) % count) as i128) as i64)
+                    } else {
+                        let (a, b) = (to_float(&a), to_float(&b));
+                        let unit = (sample >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0);
+                        Value::Float(rounded(a + (b - a) * unit))
+                    }
+                }
                 71 => {
                     let t = to_float(&pop(&mut stack, pc)?);
                     let (a, b) = pair(&mut stack, pc)?;
@@ -1215,6 +1268,41 @@ mod tests {
         assert_eq!(
             evaluate(&json!({"$": "STU_BE0BD267"}), &mut EmptyContext),
             Err(EvalError::UnsupportedConfig("STU_BE0BD267".into())),
+        );
+    }
+
+    #[test]
+    fn authored_random_expression_preserves_operand_types_and_inclusive_bounds() {
+        struct Samples([u64; 3], usize);
+
+        impl Context for Samples {
+            fn random_u64(&mut self) -> Option<u64> {
+                let sample = self.0.get(self.1).copied();
+                self.1 += 1;
+                sample
+            }
+        }
+
+        let delay = expression(json!([6, 0, 6, 1, 69, 0]), &[], &[6.0, 12.0], &[]);
+        let mut samples = Samples([1 << 63, 0, 2], 0);
+        assert_eq!(evaluate(&delay, &mut samples), Ok(Value::Float(9.0)));
+        let high = json!({"$":"STUConfigVarInt","m_value":3});
+        let low = json!({"$":"STUConfigVarInt","m_value":1});
+        let inclusive = expression(json!([14, 0, 14, 1, 69, 0]), &[], &[], &[high, low]);
+        assert_eq!(evaluate(&inclusive, &mut samples), Ok(Value::Integer(3)));
+        assert_eq!(samples.1, 3);
+
+        let integral = expression(json!([6, 0, 6, 1, 70, 0]), &[], &[1.0, 2.0], &[]);
+        assert_eq!(
+            evaluate(&integral, &mut Samples([0; 3], 0)),
+            Ok(Value::Integer(1))
+        );
+        assert_eq!(
+            evaluate_with_budget(&inclusive, &mut Samples([0; 3], 0), 3),
+            Err(EvalError::BudgetExceeded {
+                offset: 4,
+                limit: 3
+            }),
         );
     }
 

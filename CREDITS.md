@@ -59,6 +59,7 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
 - **[Mio](https://github.com/tokio-rs/mio)** supplies portable UDP readiness polling and cross-thread
   wakeups for the Rust game worker.
 - **[flate2](https://docs.rs/flate2/)** supplies gzip decoding for the external state graph bundle.
+- The statescript VM uses a deterministic SplitMix64 stream for local random expressions. The fixed-increment generator follows the public-domain implementation. [Sebastiano Vigna's SplitMix64](https://prng.di.unimi.it/splitmix.c)
 - **TripleFault and Gamayun contributors** supplied a same-build comparison for encrypted combat scenarios and
   tick measurement design. This is a behavior reference. Gamayun identifies its Go implementation as
   AGPL-3.0-or-later and retains the MIT notice for inherited code.

@@ -25,6 +25,10 @@ The authored Soldier rifle regression verifies held fire, release and reload. Ow
 
 The authored Helix graph now matches the reference for activation, six-second cooldown and the next permitted shot. The projectile components derive the three predicted Soldier definitions from the graph, build owner leases and encode confirmation, observer launch and explosion records. Tests exercise release after the confirmed create, lost owner-frame aliases and swept direct and splash damage. The projectile components still need to join the live worker. The stock body also needs more verified graph behavior before it can attach.
 
+The stock Soldier preflight reports its first unsupported operation at startup. An offline comparison passed the same reference startup tree to both encoders and matched the 3,261-bit owner and 3,067-bit observer frames byte for byte. The native VM still needs to generate that tree's full state before it can attach the weapon. The randomized timer uses a deterministic local sequence whose original-client parity is pending.
+
+The base graph bundle can include authored mode values without adding bot graphs. Supply the target build's `.0C5` XML directory as `--mode-xml` to [the graph extractor](../tools/extract_game_graphs.py), write its output outside the repository, then pass that output to `prepare_server_runtime --game-graphs` when assembling the external bundle. Mode values and graph data stay local.
+
 The Python server serves the regular entry points during the migration. The native server currently serves the solo base Practice Range on loopback. Other matchmaking modes, social actions, the dashboard and original-client acceptance are pending.
 
 ```powershell

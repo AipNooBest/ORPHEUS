@@ -7,6 +7,7 @@
 //! their corresponding runtime.
 
 use std::{
+    cell::Cell,
     collections::{BTreeMap, HashSet},
     error::Error,
     fmt,
@@ -112,6 +113,9 @@ pub fn player_roots(body: &Body, graphs: &GraphStore) -> Result<Vec<Root>, InitF
     Ok(roots)
 }
 
+const OWNER_HEALTH: u32 = 253;
+const HUD_MAX_HEALTH: u32 = 1737;
+
 pub fn player_entity_variables(body: &Body, health: f64, maximum_health: f64) -> Variables {
     let slots = body
         .weapons
@@ -122,9 +126,9 @@ pub fn player_entity_variables(body: &Body, health: f64, maximum_health: f64) ->
     Variables::from([
         (29, Value::Array(slots)),
         (16_515, Value::Integer(first as i64)),
-        (253, Value::Float(health)),
+        (OWNER_HEALTH, Value::Float(health)),
         (1732, Value::Float(health)),
-        (1737, Value::Float(maximum_health)),
+        (HUD_MAX_HEALTH, Value::Float(maximum_health)),
         (342, Value::Float(0.0)),
     ])
 }
@@ -158,6 +162,10 @@ pub trait World {
 
     fn body_scale(&mut self, _site: Site, _target: u32, _override_value: &Value) -> Option<f64> {
         None
+    }
+
+    fn has_owner_health(&self, _site: Site) -> bool {
+        false
     }
 
     /// None leaves an encountered AI candidate explicitly unsupported.
@@ -792,6 +800,7 @@ struct Machine {
     max_work: usize,
     frame: u32,
     now_ms: u64,
+    random_state: Cell<u64>,
     command_buttons: u32,
     held_buttons: Vec<u8>,
     owner_dead: bool,
@@ -829,6 +838,7 @@ impl Machine {
             max_work,
             frame,
             now_ms: frame_start(frame),
+            random_state: Cell::new(u64::from(entity) << 32 | u64::from(frame)),
             command_buttons: 0,
             held_buttons: Vec::new(),
             owner_dead: false,
@@ -2295,8 +2305,14 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             // These client presentation states use the base state lifecycle on the server.
             "STUStatescriptState"
             | "STU_9D7BF987"
+            | "STU_B4CD94F4"
+            | "STU_90C3BCEA"
             | "STUStatescriptStateDataFlowMapping"
+            | "STU_E13B30A8"
             | "STUStatescriptStateUXPresenter" => StateKind::Plain,
+            "STU_BD02E168" if is_client_subgraph_controller(self.graph(id), node) => {
+                StateKind::Plain
+            }
             "STUStatescriptStateBooleanSwitch" => StateKind::BooleanSwitch(false),
             "STU_DEBD057B" => StateKind::Switch { case: None },
             "STU_01178155" => StateKind::ActiveQuery,
@@ -3722,6 +3738,20 @@ fn is_message_entry(node: &Node) -> bool {
     node.class == "STUStatescriptEntryGameMessage"
 }
 
+fn is_client_subgraph_controller(graph: &Graph, node: &Node) -> bool {
+    // The controller is replicated, but its specialized branch starts on the client.
+    const BRANCH: &str = "m_5B10D01F";
+    let plug = field(&node.fields, BRANCH);
+    node.is_networked()
+        && field(plug, "$").as_str() == Some("STU_904BFCEC")
+        && array_field(plug, "links").len() == 1
+        && node
+            .links(BRANCH)
+            .next()
+            .and_then(|(position, _)| graph.node(position?))
+            .is_some_and(|target| target.client_only && !target.server_only)
+}
+
 fn ability_is_stacked(node: &Node) -> bool {
     !field(&node.fields, "m_out_StackVar").is_null() && !field(&node.fields, "m_5E561E77").is_null()
 }
@@ -3931,6 +3961,19 @@ impl<W: World> Context for InstanceContext<'_, W> {
         self.world.position(entity)
     }
 
+    fn random_u64(&mut self) -> Option<u64> {
+        // SplitMix64 gives each component a reproducible stream without OS calls in graph execution.
+        let state = self
+            .machine
+            .random_state
+            .get()
+            .wrapping_add(0x9e37_79b9_7f4a_7c15);
+        self.machine.random_state.set(state);
+        let mixed = (state ^ (state >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        Some(mixed ^ (mixed >> 31))
+    }
+
     fn body_scale(&mut self, entity: u32) -> Option<f64> {
         if entity != self.site.entity {
             return None;
@@ -3938,6 +3981,21 @@ impl<W: World> Context for InstanceContext<'_, W> {
         self.read_native = true;
         let scale_override = self.read(VarKey::Entity(31_210));
         self.world.body_scale(self.site, entity, &scale_override)
+    }
+
+    fn body_health(&mut self, entity: u32, maximum: bool) -> Option<f64> {
+        if entity != self.site.entity || !self.world.has_owner_health(self.site) {
+            return None;
+        }
+        let variable = if maximum {
+            HUD_MAX_HEALTH
+        } else {
+            OWNER_HEALTH
+        };
+        match self.read(VarKey::Entity(variable)) {
+            Value::Float(health) if health.is_finite() && health >= 0.0 => Some(health),
+            _ => None,
+        }
     }
 
     fn native(&mut self, config: &Json) -> Option<Value> {
@@ -4002,6 +4060,59 @@ mod tests {
         json!({"$":"STU_919FD47C","m_expression":{
             "m_opcodes":[10,1,0,0], "m_dynamicVars":[var(id, false)]
         }})
+    }
+
+    #[test]
+    fn client_subgraph_controller_keeps_its_branch_off_the_server() {
+        for client_only in [true, false] {
+            let mut target = node(2, "STUStatescriptState", Some(1), json!({}));
+            target["client_only"] = json!(client_only);
+            let graphs = store(vec![graph(
+                42,
+                vec![
+                    node(
+                        0,
+                        "STUStatescriptEntry",
+                        None,
+                        json!({"m_outPlug":plug(&[(1, "m_beginPlug")], &[])}),
+                    ),
+                    node(
+                        1,
+                        "STU_BD02E168",
+                        Some(0),
+                        json!({"m_5B10D01F":{
+                            "$":"STU_904BFCEC","links":[[2, "m_beginPlug"]],"m_FF3DAF1E":[1]
+                        }}),
+                    ),
+                    target,
+                ],
+                json!([1, 2]),
+                json!([0]),
+            )]);
+            let snapshot = initialize(
+                &graphs,
+                0xa000_0100,
+                Variables::new(),
+                vec![Root::new(1, 42)],
+                &mut EmptyWorld,
+                MAX_INIT_WORK,
+            )
+            .unwrap();
+            let states = &snapshot.instances[&1].states;
+            assert!(!states.contains_key(&1));
+            if client_only {
+                assert!(snapshot.initialization_complete());
+                assert!(states[&0].active);
+                assert_eq!(states[&0].kind, StateKind::Plain);
+            } else {
+                assert!(!states.contains_key(&0));
+                assert!(matches!(
+                    snapshot.diagnostics.as_slice(),
+                    [Diagnostic { issue: Issue::UnsupportedState(class), .. }]
+                        if class == "STU_BD02E168"
+                ));
+            }
+        }
     }
 
     #[test]

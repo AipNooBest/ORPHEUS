@@ -187,6 +187,9 @@ impl SceneAssets {
                 )
                 .map_err(|error| error.to_string())
             });
+        if let Err(reason) = &prepared {
+            eprintln!("Practice Range Soldier owner statescript unavailable ({reason})");
+        }
         Some(Arc::new(move |hero, spawn| {
             if hero.guid != SOLDIER {
                 return Ok(None);
@@ -376,7 +379,6 @@ mod tests {
             blocked.to_string().contains("initialization diagnostics"),
             "{blocked}"
         );
-        eprintln!("prepared Soldier owner VM: {blocked}");
         let tracer = scene.heroes().find_hero("Tracer").unwrap();
         assert!(scene.owner_body_runtime(tracer, spawn).unwrap().is_none());
     }

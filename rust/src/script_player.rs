@@ -266,6 +266,10 @@ impl World for BodyWorld {
         }
     }
 
+    fn has_owner_health(&self, site: Site) -> bool {
+        self.is_player_site(site)
+    }
+
     fn native(&mut self, site: Site, config: &Json) -> Option<Value> {
         match config.get("$")?.as_str()? {
             "STU_1FF67CA6" => Some(Value::Entity(self.entity)),
@@ -467,6 +471,43 @@ mod tests {
             evaluate(&mut runtime, &branch),
             Err(EvalError::UnsupportedConfig("STU_A77AC2AC".into()))
         );
+    }
+
+    #[test]
+    fn health_queries_read_the_existing_owner_variables() {
+        use crate::script_expr::EvalError;
+        use serde_json::json;
+
+        let spawn = fixture_body_factory().1;
+        let mut runtime = fixture_hitscan_factory(20.0).start(spawn).unwrap();
+        let evaluate = |body: &mut PlayerBodyRuntime, config: &Json| {
+            body.component
+                .evaluate_state_config(1, 0, config, &mut body.world)
+        };
+        let owner = json!({"$": "STU_B5A0CAF0"});
+        let current = json!({"$": "STU_32E6E4D8", "m_entity": owner});
+        let maximum = json!({"$": "STU_7D7D2470", "m_entity": owner});
+        assert_eq!(evaluate(&mut runtime, &current), Ok(Value::Float(200.0)));
+        assert_eq!(evaluate(&mut runtime, &maximum), Ok(Value::Float(200.0)));
+        runtime
+            .component
+            .set_entity_variable(253, Value::Float(125.0), &mut runtime.world)
+            .unwrap();
+        assert_eq!(evaluate(&mut runtime, &current), Ok(Value::Float(125.0)));
+        assert_eq!(evaluate(&mut runtime, &maximum), Ok(Value::Float(200.0)));
+
+        let target = json!({"$": "STUConfigVarDynamic", "m_identifier": 400, "m_60DB8F99": true});
+        let current = json!({"$": "STU_32E6E4D8", "m_entity": target});
+        for entity in [spawn.entity + 1, 0] {
+            runtime
+                .component
+                .set_entity_variable(400, Value::Entity(entity), &mut runtime.world)
+                .unwrap();
+            assert_eq!(
+                evaluate(&mut runtime, &current),
+                Err(EvalError::UnsupportedConfig("STU_32E6E4D8".into()))
+            );
+        }
     }
 
     #[test]
@@ -680,6 +721,19 @@ mod tests {
             .collect();
         assert_eq!(instances, expected);
         assert_eq!(snapshot.instances[&11].variables[&28], Value::Integer(1));
+        for (instance, state) in [
+            (10, 42),
+            (10, 43),
+            (11, 83),
+            (13, 138),
+            (13, 139),
+            (14, 30),
+            (18, 8),
+        ] {
+            let controller = &snapshot.instances[&instance].states[&state];
+            assert!(controller.active);
+            assert_eq!(controller.kind, crate::script_init::StateKind::Plain);
+        }
 
         let authored_field = |graph, position, field: &str| {
             world
@@ -695,6 +749,13 @@ mod tests {
         let sprint_condition = authored_field(0x0255, 6, "m_condition");
         let rifle_conditions =
             [81, 83].map(|position| authored_field(0x0254, position, "m_condition"));
+        // 01C7 st48 reads the same current and maximum health as the
+        // health-ratio branches in 01CF st7/st9.
+        let full_health = authored_field(0x01c7, 145, "m_condition");
+        assert_eq!(
+            component.evaluate_state_config(12, 48, &full_health, &mut world),
+            Ok(Value::Bool(true))
+        );
         // 0255 st2 follows the throttle comparison for a human player.
         for (forward, enabled) in [(63, false), (64, true)] {
             world.throttles = [0, forward];
@@ -710,5 +771,12 @@ mod tests {
                 Ok(Value::Null)
             );
         }
+        component
+            .set_entity_variable(253, Value::Float(125.0), &mut world)
+            .unwrap();
+        assert_eq!(
+            component.evaluate_state_config(12, 48, &full_health, &mut world),
+            Ok(Value::Bool(false))
+        );
     }
 }

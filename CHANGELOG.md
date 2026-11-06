@@ -849,3 +849,11 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Processed retail gallery equip requests after login. The native lobby saves the loadout before confirming it and refreshes the local player card when an icon changes.
 - Applied new skin and weapon themes to the reserved match. Equipping a different theme for the active hero uses the existing ordered body replacement. Other heroes retain the change for their next selection.
 - Passed 84 focused Python reference tests and two prepared-base encrypted Rust loopback regressions covering gallery confirmation, persistence, a subsequent map load and the new skin theme on the replacement entity. The preceding original-client Rust session reached Practice Range, where the user reported missing weapons, unusable abilities and failed skin selection. The gallery repair awaits a client retest. The stock Soldier owner script still needs additional graph behavior.
+
+#### Rust Soldier owner script startup
+
+- Added current and maximum health queries backed by the existing owner variables, with a regression for the authored Soldier full-health branch. Added bounded random expressions and verified base presentation-state lifecycles. The deterministic random sequence remains a local implementation.
+- Activated seven authored Soldier client-subgraph controllers on the server and left their client-only branches to the client. These include rifle and weapon manager states. Logged the first preflight failure once per prepared asset set.
+- Compared the same 19-instance stock startup state with the Rust and Python encoders. The owner and observer frames matched byte for byte in this offline comparison.
+- Validated authored mode tables in the external base bundle. Together with the VM changes they reduced the stock preflight from 35 diagnostics to 22. The first remaining query is the entity relation at graph `0033`, node `51`. The stock Soldier body still stops before attaching its weapon. No new original-client session was run.
+- Passed 287 public Rust tests, 58 base-runtime checks and 54 enriched-runtime checks. Cargo formatting, Clippy, documentation links and Git diff checks passed.
