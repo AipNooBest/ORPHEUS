@@ -9,12 +9,20 @@ description = "Server reimplementation for Overwatch 1.74"
 [lib]
 path = "rust/src/lib.rs"
 
+[[bin]]
+name = "prepare_server_runtime"
+path = "rust/src/bin/prepare_server_runtime.rs"
+
 [dependencies]
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
+crc32fast = "1"
 getrandom = "0.3"
 hmac = "0.12"
+indexmap = { version = "2", features = ["serde"] }
 prost = "0.14"
 prost-reflect = "0.16"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tempfile = "3"
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }

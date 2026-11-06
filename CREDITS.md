@@ -50,6 +50,8 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
   system randomness for the lobby challenge.
 - **[Prost](https://github.com/tokio-rs/prost)** and **[prost-reflect](https://github.com/andrewhickman/prost-reflect)**
   supply protobuf framing and reflection over the external Battle.net descriptors.
+- **[Tungstenite](https://github.com/snapview/tungstenite-rs)** supplies WebSocket framing for the local
+  Battle.net listener.
 - **TripleFault and Gamayun contributors** supplied a same-build comparison for encrypted combat scenarios and
   tick measurement design. This is a behavior reference. Gamayun identifies its Go implementation as
   AGPL-3.0-or-later and retains the MIT notice for inherited code.

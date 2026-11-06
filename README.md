@@ -27,7 +27,7 @@ An automated result covers the fixture or replay named in its evidence. A manual
 
 ## Run locally
 
-The Rust migration starts with the transport and protocol library. Run `cargo test --locked --all-targets` with stable Rust to check this library. The current game server entry point still runs the Python implementation described below.
+The Rust crate includes transport, protocol codecs, account storage, a local Battle.net listener, world-frame encoding and the runtime preparation tool. Run `cargo test --locked --all-targets` with stable Rust to verify the public fixtures. The current game server entry point runs the Python implementation described below.
 
 The documented environment is Windows with Python 3.12. Node.js 24 is used for the dashboard test. The public source checks can run without the game or any prepared runtime.
 
@@ -44,7 +44,7 @@ See the [full list of public checks](CONTRIBUTING.md#public-source-checks) befor
 To run the local server, set `ORPHEUS_RUNTIME_DIR` to a prepared, authorized runtime for build 104319. The runtime includes protocol data, graphs, lobby signing input and collision caches. A copy of the game client alone cannot supply all inputs to the preparation tool.
 
 ```powershell
-.\.venv\Scripts\python.exe tools\prepare_server_runtime.py --source 'C:\path\to\local-research' --destination 'C:\path\to\orpheus-runtime' --map 0688
+cargo run --locked --bin prepare_server_runtime -- --source 'C:\path\to\local-research' --destination 'C:\path\to\orpheus-runtime' --map 0688
 $env:ORPHEUS_RUNTIME_DIR = 'C:\path\to\orpheus-runtime'
 .\START_SERVER_LOCAL.cmd
 ```
@@ -55,6 +55,7 @@ The preparation command copies files from an already prepared checkout and write
 
 | Path | Role |
 | --- | --- |
+| `rust/src` | Rust ports, automated regression tests and runtime preparation |
 | `ow174/bnet`, `ow174/lobby` | Local login, accounts, social and lobby services, matchmaking and handoff |
 | `ow174/game`, `ow174/game/script` | Encrypted game transport, inputs, simulation, combat and statescript replication |
 | `ow174/dashboard`, `relay` | Local administration and the Windows client relay source |

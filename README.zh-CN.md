@@ -27,7 +27,7 @@ ORPHEUS 是面向 **《守望先锋 1》正式服 1.74.0.0.104319** 的开源服
 
 ## 在本地运行
 
-Rust 迁移从传输和协议库开始。安装稳定版 Rust 后，运行 `cargo test --locked --all-targets` 可验证该库。现有服务端入口仍运行下方说明的 Python 版本。
+Rust 已实现网络传输、协议编解码、账号存储、本地 Battle.net 监听、世界帧编码和运行数据准备工具。安装稳定版 Rust 后，运行 `cargo test --locked --all-targets` 可执行公开测试。当前游戏服务端入口运行下方说明的 Python 版本。
 
 文档以 Windows 和 Python 3.12 为运行环境。管理面板测试使用 Node.js 24。执行公开源码检查无需安装游戏或准备运行数据。
 
@@ -44,7 +44,7 @@ py -3.12 -m venv .venv
 要运行本地服务端，请将 `ORPHEUS_RUNTIME_DIR` 指向已准备好的 104319 版本授权运行数据目录。其中包括协议数据、状态脚本图、大厅签名所需数据和碰撞缓存。准备工具需要游戏客户端之外的输入。
 
 ```powershell
-.\.venv\Scripts\python.exe tools\prepare_server_runtime.py --source 'C:\path\to\local-research' --destination 'C:\path\to\orpheus-runtime' --map 0688
+cargo run --locked --bin prepare_server_runtime -- --source 'C:\path\to\local-research' --destination 'C:\path\to\orpheus-runtime' --map 0688
 $env:ORPHEUS_RUNTIME_DIR = 'C:\path\to\orpheus-runtime'
 .\START_SERVER_LOCAL.cmd
 ```
@@ -55,6 +55,7 @@ $env:ORPHEUS_RUNTIME_DIR = 'C:\path\to\orpheus-runtime'
 
 | 路径 | 职责 |
 | --- | --- |
+| `rust/src` | Rust 移植代码、自动化回归测试及运行数据准备 |
 | `ow174/bnet`、`ow174/lobby` | 本地登录、账号、社交和大厅服务、匹配与对局交接 |
 | `ow174/game`、`ow174/game/script` | 游戏加密通信、输入、模拟、战斗及状态脚本同步 |
 | `ow174/dashboard`、`relay` | 本地管理和 Windows 客户端中继源码 |

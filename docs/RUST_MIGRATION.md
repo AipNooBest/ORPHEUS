@@ -11,7 +11,9 @@ The migration target is a Rust implementation of ORPHEUS for retail build 1.74.0
 | Windows deployment | Launcher, retail relay and server-only distribution | Build the Windows tools and relay, and boot the audited checkout from the separate runtime. Verify supported connection paths with the original client. |
 | Cutover | Change the normal entry points and remove superseded implementations | Pass the prior behavioral suite, confirm original-client acceptance, and complete a server-only smoke test of the audited public checkout. |
 
-The Rust crate has the JAM handshake, lobby transport and schema codec, Battle.net framing, game UDP packet and message codecs, and client command admission. The Python server remains the runnable entry point while service handlers and simulation are ported. Public Rust tests use synthetic protocol vectors and local loopback connections. They need neither a client nor prepared deployment data.
+The Rust crate has the JAM handshake, lobby transport and schema codec, a local Battle.net listener, account and catalog loading, and lobby login identity selection. The game modules cover UDP packet and message codecs, client command admission, world-frame encoding and the fixed-step clock. These modules are being integrated into the lobby and match entry points. The Python server serves both during the migration.
+
+Public Rust tests use synthetic protocol vectors and local loopback connections. They need neither a client nor prepared deployment data. The Rust `prepare_server_runtime` command assembles an external runtime pack from authorized inputs. The Practice Range pack was checked against the Python tool by comparing the manifest and every copied file.
 
 ```powershell
 cargo test --locked --all-targets
@@ -19,6 +21,6 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Keep data formats and existing verification scenarios stable during replacement. Use the same clock, input, collision data and packet-loss schedule for both implementations. Check bytes where the format is fixed, and compare decoded event order and registered state when runs contain nondeterministic values. The target client remains the final check for presentation and feel.
+Keep data formats and existing verification scenarios stable during replacement. Reuse shared codecs and keep each subsystem as small as the observed behavior allows. Use the same clock, input, collision data and packet-loss schedule for both implementations. Check bytes where the format is fixed, and compare decoded event order and registered state when runs contain nondeterministic values. Measure tick latency and snapshot gaps before claiming a performance improvement. The target client remains the final check for presentation and feel.
 
 Record the source and target build of external research in [CREDITS.md](../CREDITS.md) and the relevant change. Treat Beta hit-confirm and voice behavior as leads to verify against the retail graph and message schemas. Keep client executables, prepared data, private archives, logs, and compiled binaries outside published source.
