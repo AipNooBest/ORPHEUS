@@ -731,11 +731,11 @@ class Client:
         controller, body = self.player.entity, self.player.body
         pending = self._pending_possessions.get(controller)
         created = self.bot_create_acked(body)
-        if created and pending is None:
+        bound = pending is None and self.controller_ready
+        if created and bound:
             return self.entities
 
         possession = pending[1] if pending is not None else None
-        bound = possession is None
         script = getattr(self.player, "body_script", None)
         stream = script.stream if script is not None else None
         records = []
@@ -753,8 +753,10 @@ class Client:
             elif item.op == world.OP_CREATE:
                 if item.entity == body:
                     created = True
-                elif item.entity == controller and not created:
-                    continue  # the initial controller create also carries 44/75
+                elif item.entity == controller:
+                    if not created:
+                        continue
+                    bound = possession is None  # initial controller create also carries 44/75
             elif (
                 not bound and item.op == world.OP_DESTROY
                 and item.entity not in (controller, body) and item.entity & ~0xFF == controller

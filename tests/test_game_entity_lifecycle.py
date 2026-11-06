@@ -256,11 +256,11 @@ class PossessionDeliveryTests(unittest.TestCase):
         peer.queue_reliable(20308, card)
 
     def test_preselected_body_must_create_before_initial_controller_with_possession(self):
-        for split in (False, True):
-            with self.subTest(split=split):
-                self.check_initial_possession(split=split)
+        for split, shared_retry in ((False, False), (True, False), (True, True)):
+            with self.subTest(split=split, shared_retry=shared_retry):
+                self.check_initial_possession(split=split, shared_retry=shared_retry)
 
-    def check_initial_possession(self, *, split):
+    def check_initial_possession(self, *, split, shared_retry):
         server, peer, actor, cipher = connection()
         match = actor.match
         match.tick = 100
@@ -317,10 +317,59 @@ class PossessionDeliveryTests(unittest.TestCase):
         self.assertFalse(actor.body_script.create_arrived)
         acknowledge(retry)
         self.assertTrue(actor.body_script.create_arrived)
+        # Drop the controller create, which carries the first 44/75 binding.
         _, records = emit()
         (entity, fields), = creates(records)
         self.assertEqual(entity, actor.entity)
         assert_possessed(fields)
+        self.assertNotIn(actor.entity, peer._pending_possessions)
+
+        model = decode.ClientBody.for_hero(SOLDIER)
+        match._body_frames(actor, peer)
+        tree_packet, records = emit()
+        (tree,) = [item for item, _ in records if item.entity == actor.body and item.chunk]
+        self.assertTrue(model.apply(tree).full)
+        acknowledge(tree_packet)
+        script = actor.body_script
+        self.assertIsNotNone(script.stream.base)
+        self.assertFalse(peer.controller_ready)
+
+        # Send the controller retry alone and leave its outcome unknown while
+        # the owner stream has a complete H0 base and its first H1 is queued.
+        match._body_frames(actor, peer)
+        controller, owner = peer.entities
+        self.assertEqual((controller.entity, controller.op), (actor.entity, OP_CREATE))
+        self.assertIs(owner.stream, script.stream)
+        if not shared_retry:
+            self.queue_split_budget(peer, controller, owner)
+        controller_retry, records = emit()
+        (entity, fields), = creates(records)
+        self.assertEqual(entity, actor.entity)
+        assert_possessed(fields)
+        if shared_retry:
+            controller_position = next(index for index, (item, _) in enumerate(records)
+                                       if item.entity == actor.entity and item.op == OP_CREATE)
+            owner_position = next(index for index, (item, _) in enumerate(records)
+                                  if item.entity == actor.body and item.chunk)
+            self.assertLess(controller_position, owner_position)
+        else:
+            self.assertFalse(any(item.entity == actor.body and item.chunk for item, _ in records))
+            _, records = emit()
+            self.assertFalse(peer.controller_ready)
+            self.assertFalse(any(item.entity == actor.body and item.chunk for item, _ in records))
+            self.assertEqual(script.report_count, 0)
+
+        acknowledge(controller_retry)
+        self.assertTrue(peer.controller_ready)
+        if not shared_retry:
+            _, records = emit()
+        (initial,) = [item for item, _ in records if item.entity == actor.body and item.chunk]
+        frame = model.apply(initial)
+        self.assertTrue(frame.owner)
+        self.assertFalse(frame.correction)
+        self.assertEqual(frame.cmfd, script.frame)
+        self.assertEqual(model.vars[(11, 53)], 30)
+        self.assertIn((11, 70), model.on())
 
     def test_own_possession_shares_body_create_or_waits_for_the_exact_create_ack(self):
         server, peer, actor, cipher = connection()

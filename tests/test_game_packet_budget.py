@@ -96,6 +96,7 @@ def placeable(entity=0x80000077):
 def prepare_corrections(player):
     player.has_body = True
     player.match.tick = 100
+    player.client._ack_entity_create(player.entity)
     player.match.start_body_script(player, EntityUpdate(player.body, OP_CREATE))
     player.body_script.create_arrived = True
     player.take_commands([Command(frame, forward=127) for frame in range(101, 111)])

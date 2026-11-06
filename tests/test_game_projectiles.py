@@ -253,6 +253,7 @@ class OwnerProjectileDeliveryTests(unittest.TestCase):
         self.server.clients[1] = self.client
         self.client.open = True
         self.player.client = self.client
+        self.client._ack_entity_create(self.player.entity)  # the earlier model already bound the controller
         self.cipher = LinkCipher(key_out, key_in)
         self.window = ReceiveWindow()
         self.seq = 0
@@ -511,6 +512,7 @@ class OwnerVolleyDeliveryTests(unittest.TestCase):
         server.clients[client.conn] = client
         client.open = True
         player.client = client
+        client._ack_entity_create(player.entity)  # the earlier model already bound the controller
         cipher = LinkCipher(key_out, key_in)
         window = ReceiveWindow()
         sequence = 0
