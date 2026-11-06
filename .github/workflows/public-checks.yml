@@ -10,6 +10,22 @@ permissions:
   contents: read
 
 jobs:
+  rust-protocol-tests:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install Rust tools
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check Rust formatting and lint
+        run: |
+          cargo +stable fmt --all -- --check
+          cargo +stable clippy --locked --all-targets -- -D warnings
+      - name: Run Rust protocol regressions
+        run: cargo +stable test --locked --all-targets
+
   source-tests:
     runs-on: windows-latest
     timeout-minutes: 10

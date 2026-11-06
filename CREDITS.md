@@ -39,6 +39,22 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
   are not transplanted into the 1.74 server; it remains a separate project with its own license.
 - **The authors of the community TLS relay** — the foundation of the relay used for the local retail connection.
 
+## Rust migration and behavior references
+
+- **Boi-027, Arlecchino and the upstream 1.74 server contributors** supplied the existing lobby handshake,
+  JAM cipher and framing that serve as the Rust port's protocol reference. The original MIT notice is retained.
+- **LizRollin and the original game runtime contributors** supplied the inherited game transport and bit-level
+  implementation used for the Rust parity checks. The pinned runtime source is listed above.
+- **[RustCrypto](https://github.com/RustCrypto)** maintains the AES-GCM, HMAC and SHA-256 crates used by the Rust
+  transport. **[The Rust Random Project](https://github.com/rust-random/getrandom)** supplies access to operating
+  system randomness for the lobby challenge.
+- **TripleFault and Gamayun contributors** supplied a same-build comparison for encrypted combat scenarios and
+  tick measurement design. This is a behavior reference. Gamayun identifies its Go implementation as
+  AGPL-3.0-or-later and retains the MIT notice for inherited code.
+- **The Claudewatch contributors** supplied the Beta 1.0.0.3 research lead for attacker-side hit-confirm effects
+  and separate entity and announcer voice messages. ORPHEUS checks these leads against 104319 client data before
+  implementing them. The reference is a locally reviewed binary distribution.
+
 Thank you as well to everyone who shared captures, tools, notes, testing, corrections and encouragement, including contributors whose names were not recorded in the materials available to us. If a credit is missing or needs correcting, please open an issue so it can be fixed.
 
 Original copyright and attribution notices are retained. References to related projects acknowledge their work; their code and materials retain their respective licenses.

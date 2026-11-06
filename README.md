@@ -4,7 +4,7 @@
 
 ORPHEUS is an open-source server reimplementation for **Overwatch 1 retail 1.74.0.0.104319**. It is an independent, unofficial research and game preservation project. The long-term goal is to reproduce the server behavior and client-facing events for this build across its heroes, maps and modes. The server is still in development, with Soldier: 76 in the Practice Range as the first end-to-end target.
 
-[Contribute](CONTRIBUTING.md) · [Roadmap](docs/ROADMAP.md) · [Verification record](docs/STATE.md) · [Changelog](CHANGELOG.md) · [Open issues](https://github.com/leafall903/ORPHEUS/issues)
+[Contribute](CONTRIBUTING.md) · [Roadmap](docs/ROADMAP.md) · [Rust migration](docs/RUST_MIGRATION.md) · [Verification record](docs/STATE.md) · [Changelog](CHANGELOG.md) · [Open issues](https://github.com/leafall903/ORPHEUS/issues)
 
 ## Current status
 
@@ -26,6 +26,8 @@ An automated result covers the fixture or replay named in its evidence. A manual
 - **New contributors** can look for tasks that use the public checkout and synthetic data. [Good first issues](https://github.com/leafall903/ORPHEUS/labels/good%20first%20issue)
 
 ## Run locally
+
+The Rust migration starts with the transport and protocol library. Run `cargo test --locked --all-targets` with stable Rust to check this library. The current game server entry point still runs the Python implementation described below.
 
 The documented environment is Windows with Python 3.12. Node.js 24 is used for the dashboard test. The public source checks can run without the game or any prepared runtime.
 

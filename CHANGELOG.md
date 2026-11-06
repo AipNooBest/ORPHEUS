@@ -712,3 +712,10 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Route only the Biotic Field entity through healing. Torbjörn and Zarya still get projectile confirmation for their deployables without creating a healing field.
 - On original Practice Range collision, immediate, delayed and withheld acknowledgements all open the field at tick 1142 and produce identical health at each sampled tick. A second replay verifies that two injured friendly bots receive equal healing and a terminal update across a five-tick gap.
 - Passed 193 focused tests with each runtime data pack, a 268-root replay with matching registered state, Ruff and Git diff checks. Original canister flight, deployment timing and client presentation remain pending.
+
+#### Rust transport foundation
+
+- Ported the game bit stream, encrypted UDP datagrams and ACK window, plus the lobby JAM cipher, encrypted TCP framing and address-bound handshake. The handshake takes its signing input from the caller and the tests use synthetic keys.
+- Added Windows Cargo checks and documented the migration and its behavior references in both README entry points and the credits.
+- Passed 16 Rust tests, including exact Python wire vectors and an encrypted loopback lobby handshake. Cargo formatting and Clippy passed. Passed 19 focused Python regressions with the prepared Practice Range runtime, plus Ruff and Git diff checks.
+- The Python entry point continues to serve the lobby and matches while their behavior is ported. Original-client acceptance of the Rust implementation is pending.

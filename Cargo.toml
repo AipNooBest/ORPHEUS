@@ -1,0 +1,16 @@
+[package]
+name = "orpheus"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "Server reimplementation for Overwatch 1.74"
+
+[lib]
+path = "rust/src/lib.rs"
+
+[dependencies]
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
+getrandom = "0.3"
+hmac = "0.12"
+sha2 = "0.10"

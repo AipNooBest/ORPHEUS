@@ -12,6 +12,9 @@ htmlcov/
 build/
 dist/
 
+# Rust build output
+/target/
+
 # Editors
 .vs/
 .vscode/
@@ -71,6 +74,7 @@ data/srv_dec.bin
 # Archives, secrets, temporary files
 *.zip
 *.7z
+*.rar
 *.tmp
 .env
 .env.*

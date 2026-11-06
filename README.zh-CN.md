@@ -4,7 +4,7 @@
 
 ORPHEUS 是面向 **《守望先锋 1》正式服 1.74.0.0.104319** 的开源服务端复刻项目，独立开展非官方研究与游戏保存工作。长期目标是还原该版本各英雄、地图和模式的服务端行为，以及服务端向客户端发送的事件。服务端仍在开发中，首个端到端验证场景是士兵 76 与训练靶场。
 
-[参与贡献](CONTRIBUTING.md) · [路线图](docs/ROADMAP.md) · [验证记录](docs/STATE.md) · [更新日志](CHANGELOG.md) · [待处理问题](https://github.com/leafall903/ORPHEUS/issues)
+[参与贡献](CONTRIBUTING.md) · [路线图](docs/ROADMAP.md) · [Rust 迁移](docs/RUST_MIGRATION.md) · [验证记录](docs/STATE.md) · [更新日志](CHANGELOG.md) · [待处理问题](https://github.com/leafall903/ORPHEUS/issues)
 
 ## 当前进度
 
@@ -26,6 +26,8 @@ ORPHEUS 是面向 **《守望先锋 1》正式服 1.74.0.0.104319** 的开源服
 - **初次参与者**可以查找只需公开源码和合成数据即可完成的任务。[适合入门的问题](https://github.com/leafall903/ORPHEUS/labels/good%20first%20issue)
 
 ## 在本地运行
+
+Rust 迁移从传输和协议库开始。安装稳定版 Rust 后，运行 `cargo test --locked --all-targets` 可验证该库。现有服务端入口仍运行下方说明的 Python 版本。
 
 文档以 Windows 和 Python 3.12 为运行环境。管理面板测试使用 Node.js 24。执行公开源码检查无需安装游戏或准备运行数据。
 
