@@ -48,6 +48,16 @@ impl ProjectedSnapshot {
     pub fn instance_count(&self) -> usize {
         self.instances.len()
     }
+
+    /// The activation counter and absolute start in milliseconds from this frame.
+    pub fn volley_identity(&self, instance: u16, state: u16) -> Option<(u16, u64)> {
+        self.instances
+            .get(&instance)?
+            .states
+            .get(&state)?
+            .volley
+            .map(|volley| volley.identity)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -428,11 +438,13 @@ impl<'a> SnapshotEncoder<'a> {
                 .instances
                 .get(&binding.instance)
                 .ok_or_else(invalid)?;
-            if !source
-                .states
-                .get(&binding.raw_state)
-                .is_some_and(|state| state.active && matches!(state.kind, StateKind::Stack { .. }))
-            {
+            if !source.states.get(&binding.raw_state).is_some_and(|state| {
+                state.active
+                    && matches!(
+                        (state.kind, binding.slot),
+                        (StateKind::Stack { .. }, 0) | (StateKind::Ability { .. }, 1)
+                    )
+            }) {
                 return Err(invalid());
             }
             let graph = self.graph(binding.instance, source.graph)?;
@@ -444,6 +456,7 @@ impl<'a> SnapshotEncoder<'a> {
                     instance: binding.instance,
                     state: binding.raw_state,
                     state_bits: graph.header.states_bits,
+                    slot: binding.slot,
                     priority: binding.priority.level,
                     above: binding.priority.above_equals,
                 });
@@ -1125,7 +1138,11 @@ fn state_payload(state: &State, codec: &Codec) -> Option<StatePayload> {
             | StateKind::Wait
             | StateKind::AiCandidate { .. }
             | StateKind::MovementMod
-            | StateKind::CosmeticEntity,
+            | StateKind::CosmeticEntity
+            | StateKind::Watch
+            | StateKind::Switch { .. }
+            | StateKind::ActiveQuery
+            | StateKind::GamePadVibration,
             Some("none"),
         ) if codec.empty() => StatePayload::new(),
         (StateKind::BooleanSwitch(current), Some("switch")) => {
@@ -1148,7 +1165,19 @@ fn state_payload(state: &State, codec: &Codec) -> Option<StatePayload> {
             ("under".into(), Value::Bool(under)),
         ]),
         (StateKind::Ability { flags }, Some("ability")) => {
-            StatePayload::from([("flags".into(), Value::Integer(i64::from(flags)))])
+            let mut payload =
+                StatePayload::from([("flags".into(), Value::Integer(i64::from(flags)))]);
+            if let Some(cooldown) = &state.ability_cooldown {
+                payload.extend([
+                    ("cur".into(), Value::Float(cooldown.current)),
+                    ("rate".into(), Value::Float(cooldown.rate)),
+                    (
+                        "last".into(),
+                        Value::Integer(i64::try_from(cooldown.last_ms).ok()?),
+                    ),
+                ]);
+            }
+            payload
         }
         (StateKind::Anim, Some("anim")) => StatePayload::from([(
             "counter".into(),
@@ -1159,6 +1188,24 @@ fn state_payload(state: &State, codec: &Codec) -> Option<StatePayload> {
             Value::Integer(i64::from(state.activation & 3)),
         )]),
         (StateKind::SendMessage, Some("send")) => StatePayload::new(),
+        (StateKind::ChaseVar, Some("chase")) => {
+            let chase = state.chase.as_ref()?;
+            if !matches!(chase.current, Value::Float(_) | Value::Vector(_)) {
+                return None;
+            }
+            let mut payload = StatePayload::from([
+                ("cur".into(), chase.current.clone()),
+                ("reached".into(), Value::Bool(chase.reached)),
+                (
+                    "last".into(),
+                    Value::Integer(i64::try_from(chase.last_ms).ok()?),
+                ),
+            ]);
+            if let Some(remaining) = chase.remaining_ms {
+                payload.insert("remaining".into(), Value::Integer(remaining));
+            }
+            payload
+        }
         (
             StateKind::WeaponVolley {
                 volleys, offset_ms, ..
@@ -1208,7 +1255,21 @@ mod tests {
         "B480A974":{"name":"STUStatescriptStateLogicalButton","codec":"button","stec":true,"status":"VERIFIED",
             "layout":[{"op":"if","c":"H","then":[{"op":"bits","f":"counter","n":4}],"else":[]}]},
         "C38B92B4":{"name":"STUStatescriptStateAbility","codec":"ability","stec":false,"status":"VERIFIED",
-            "layout":[{"op":"bits","f":"flags","n":8},{"op":"link","f":"link"},{"op":"bits","f":"has_cur","n":1}]},
+            "layout":[{"op":"bits","f":"flags","n":8},{"op":"link","f":"link"},
+                      {"op":"bits","f":"has_cur","n":1},{"op":"if","c":"has_cur",
+                       "then":[{"op":"f32","f":"cur"},{"op":"bits","f":"has_rate","n":1},
+                               {"op":"if","c":"has_rate","then":[{"op":"f32","f":"rate"}],"else":[]},
+                               {"op":"var_b","f":"t"}],"else":[]}]},
+        "2F4E2E3F":{"name":"STU_2F4E2E3F","codec":"none","stec":false,"status":"VERIFIED","layout":[]},
+        "6AE5D1A1":{"name":"STUStatescriptStateChaseVar","codec":"chase","stec":false,"status":"VERIFIED",
+            "layout":[{"op":"bits","f":"vector","n":1},{"op":"bits","f":"has_remaining","n":1},
+                      {"op":"bits","f":"reached","n":1},{"op":"f32","f":"x"},
+                      {"op":"if","c":"vector","then":[{"op":"f32","f":"y"},{"op":"f32","f":"z"}],"else":[]},
+                      {"op":"if","c":"has_remaining","then":[{"op":"bits","f":"big","n":1},
+                       {"op":"if","c":"big","then":[{"op":"bits","f":"remaining","n":32}],
+                        "else":[{"op":"bits","f":"remaining","n":16}]}],"else":[]},
+                      {"op":"bits","f":"has_last","n":1},{"op":"if","c":"has_last",
+                       "then":[{"op":"var_b","f":"t"}],"else":[]}]},
         "EED6D952":{"name":"STUStatescriptStateWeaponVolley","codec":"volley","stec":true,"status":"VERIFIED",
             "layout":[{"op":"if","c":"H","then":[{"op":"signed_var","f":"t1"},
                       {"op":"bits","f":"has_offset","n":1},{"op":"if","c":"has_offset",
@@ -1441,6 +1502,7 @@ mod tests {
             vec![crate::script_init::StackBinding {
                 instance: 1,
                 raw_state: 2,
+                slot: 0,
                 priority: crate::script_expr::StackPriority {
                     level: 0,
                     above_equals: true,
@@ -1629,6 +1691,104 @@ mod tests {
     }
 
     #[test]
+    fn ability_cooldown_and_push_binding_match_python_bytes() {
+        use crate::script_expr::StackPriority;
+        use crate::script_init::AbilityCooldown;
+
+        let definition = graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntry",
+                    None,
+                    json!({"m_outPlug":{"$":"Plug","links":[[1,"m_beginPlug"]]}}),
+                ),
+                node(
+                    1,
+                    "STUStatescriptStateAbility",
+                    Some(0),
+                    json!({"m_A5F1A77B":{"$":"STUConfigVarLogicalButton","m_logicalButton":35}}),
+                ),
+            ],
+            json!([1]),
+            json!([0]),
+            json!([1]),
+            json!([]),
+        );
+        let graphs = GraphStore::from_json(
+            &serde_json::to_vec(&json!({
+                "version":1,"graphs":[definition],"bodies":{},"missing":[]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut snapshot = initialize(
+            &graphs,
+            ENTITY,
+            Variables::from([(7, Value::Bool(false))]),
+            vec![Root::new(1, 42)],
+            &mut EmptyWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        let state = &mut snapshot.instances[&1].states[&0];
+        state.kind = StateKind::Ability { flags: 3 };
+        state.ability_cooldown = Some(AbilityCooldown {
+            current: 1.25,
+            rate: 0.5,
+            last_ms: 15_990,
+        });
+        snapshot.resolved_bindings.insert((0, 7), Value::Bool(true));
+        snapshot.bindings.insert(
+            (0, 7),
+            vec![StackBinding {
+                instance: 1,
+                raw_state: 0,
+                slot: 1,
+                priority: StackPriority {
+                    level: 20,
+                    above_equals: false,
+                },
+            }],
+        );
+        let codecs = CodecTable::from_json(CODECS).unwrap();
+        let encoder = SnapshotEncoder::new(&graphs, &codecs);
+        let owner = encoder.project(&snapshot, View::Owner).unwrap();
+        let observer = encoder.project(&snapshot, View::Observer).unwrap();
+        let mut stream = BodyStream::new(ENTITY);
+        stream.create_arrived();
+        let full = encoder.queue_full(&mut stream, &owner).unwrap();
+        stream.arrived(full.last);
+        let initial = encoder
+            .queue_delta(&mut stream, &owner, DeltaKind::InitialOwner(1001), 16)
+            .unwrap()
+            .unwrap();
+        // Python owner_delta and remote_full_frame; the observer has neither
+        // a pushed binding nor the owner's cooldown timestamp.
+        check(
+            initial.update.chunk.as_ref().unwrap(),
+            245,
+            "04000010add207c00a4007300928602800e0010100407f020000fc50490c00",
+        );
+        check(
+            &encoder.full(&observer).unwrap(),
+            146,
+            "081500001d40003c200000e84f0000801f0000",
+        );
+
+        snapshot.bindings[&(0, 7)][0].slot = 0;
+        assert!(matches!(
+            encoder.project(&snapshot, View::Owner),
+            Err(SnapshotError::InvalidBinding {
+                owner: 0,
+                variable: 7,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn initial_owner_and_corrections_match_python_bytes_in_both_views() {
         let (graphs, snapshot) = fixture();
         let codecs = CodecTable::from_json(CODECS).unwrap();
@@ -1687,6 +1847,107 @@ mod tests {
             delta.update.chunk.as_ref().unwrap(),
             140,
             "04000080864004ddfc00081913f20f003601",
+        );
+    }
+
+    #[test]
+    fn chased_values_and_watch_match_python_owner_and_observer_frames() {
+        use crate::script_init::Component;
+        use std::sync::Arc;
+
+        let var =
+            |id, entity| json!({"$":"STUConfigVarDynamic","m_identifier":id,"m_60DB8F99":entity});
+        let vector = json!({"$":"STUConfigVarVec3","m_value":{"X":1.0,"Y":2.0,"Z":3.0}});
+        let definition = graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntry",
+                    None,
+                    json!({"m_outPlug":{"$":"Plug","links":[
+                        [1,"m_beginPlug"],[2,"m_beginPlug"],[3,"m_beginPlug"]
+                    ]}}),
+                ),
+                node(
+                    1,
+                    "STUStatescriptStateChaseVar",
+                    Some(0),
+                    json!({"m_out_Var":var(100,false),"m_EB0FC261":0.5,"m_destination":3.0,
+                           "m_5BEFF040":0.125}),
+                ),
+                node(
+                    2,
+                    "STUStatescriptStateChaseVar",
+                    Some(1),
+                    json!({"m_out_Var":var(7,true),"m_EB0FC261":vector,"m_destination":vector,
+                           "m_5BEFF040":70.0}),
+                ),
+                node(
+                    3,
+                    "STU_2F4E2E3F",
+                    Some(2),
+                    json!({"m_B7A3CF78":var(7,true)}),
+                ),
+            ],
+            json!([1, 2, 3]),
+            json!([0]),
+            json!([1, 2, 3]),
+            json!([[100, 0, 1]]),
+        );
+        let graphs = Arc::new(
+            GraphStore::from_json(
+                &serde_json::to_vec(&json!({
+                    "version":1,"graphs":[definition],"bodies":{},"missing":[]
+                }))
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let codecs = CodecTable::from_json(CODECS).unwrap();
+        let encoder = SnapshotEncoder::new(&graphs, &codecs);
+        let mut world = EmptyWorld;
+        let mut component = Component::start(
+            Arc::clone(&graphs),
+            ENTITY,
+            Variables::new(),
+            vec![Root::new(1, 42)],
+            1000,
+            &mut world,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        let owner = encoder
+            .project(component.snapshot().unwrap(), View::Owner)
+            .unwrap();
+        // The same graph run by the Python VM, then written by body_full_frame,
+        // owner_delta and remote_full_frame. The two durations use distinct widths.
+        check(
+            &encoder.full(&owner).unwrap(),
+            199,
+            "081500001df00100007f000000800000808000880000003f00",
+        );
+        let mut stream = BodyStream::new(ENTITY);
+        stream.create_arrived();
+        let baseline = encoder.queue_full(&mut stream, &owner).unwrap();
+        stream.arrived(baseline.last);
+        component.advance_frame(1001, &mut world).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        let owner = encoder.project(snapshot, View::Owner).unwrap();
+        let delta = encoder
+            .queue_delta(&mut stream, &owner, DeltaKind::InitialOwner(1001), 16)
+            .unwrap()
+            .unwrap();
+        check(
+            delta.update.chunk.as_ref().unwrap(),
+            364,
+            "040000e82740a50f54112000620ad7e30faf14aec71f5e00051c0000e00f00000010000010d0a888008002260600",
+        );
+        let observer = encoder.project(snapshot, View::Observer).unwrap();
+        check(
+            &encoder.full(&observer).unwrap(),
+            388,
+            "081500001df00100007f00000080000080800088295c8f3fac14aec71f5e001e0000e00f00000010000010d0a888000003",
         );
     }
 

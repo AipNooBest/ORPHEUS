@@ -106,6 +106,10 @@ pub trait Context {
         [0.0; 3]
     }
 
+    fn body_scale(&mut self, _entity: u32) -> Option<f64> {
+        None
+    }
+
     fn ruleset(&mut self, _id: u32) -> Value {
         Value::Null
     }
@@ -500,6 +504,25 @@ impl Evaluator {
                 return self.expression(config, context, nested);
             }
             "STU_B5A0CAF0" => context.owner(),
+            "STU_FDBB0B67" => {
+                let target = child(config, "m_entity");
+                if !matches!(
+                    self::class(target),
+                    Some("STU_B5A0CAF0" | "STUConfigVarDynamic")
+                ) {
+                    return Err(EvalError::UnsupportedConfig(class.into()));
+                }
+                let Value::Entity(entity) = self.config(target, context, nested)? else {
+                    return Err(EvalError::UnsupportedConfig(class.into()));
+                };
+                if entity == 0 || entity & 0x1fff_ffff == 0x1fff_ffff {
+                    return Err(EvalError::UnsupportedConfig(class.into()));
+                }
+                let scale = context
+                    .body_scale(entity)
+                    .ok_or_else(|| EvalError::UnsupportedConfig(class.into()))?;
+                Value::Float(scale)
+            }
             "STU_3832D36C" => {
                 let key = match dynamic(value)? {
                     Some(variable) => Some(variable.id),

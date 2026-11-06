@@ -44,8 +44,9 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
 - **Boi-027, Arlecchino and the upstream 1.74 server contributors** supplied the existing lobby handshake,
   JAM cipher and framing that serve as the Rust port's protocol reference. The original MIT notice is retained.
 - **LizRollin and the original game runtime contributors** supplied the inherited game transport,
-  float32 collision and character mover, statescript runtime and payload layouts, and the hitscan
-  and combat notice behavior used as Rust references. The pinned runtime source is listed above.
+  float32 collision and character mover, statescript runtime and payload layouts, and the hitscan,
+  predicted projectile and combat notice behavior used as Rust references. The pinned runtime
+  source is listed above.
 - **[RustCrypto](https://github.com/RustCrypto)** maintains the AES-GCM, HMAC and SHA-256 crates used by the Rust
   transport. **[The Rust Random Project](https://github.com/rust-random/getrandom)** supplies access to operating
   system randomness for the lobby challenge.

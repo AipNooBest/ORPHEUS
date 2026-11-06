@@ -835,3 +835,11 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Resumed long unposed command gaps within the worker input budget. A 400-frame gap runs the same 258 retained script frames as Python, with input release, bounded timer work and no synthetic hits during the gap.
 - Routed posed direct shots through the prepared Practice Range worker. The encrypted fixture verifies a dropped hit's retry, terminal pool delivery, elimination notice and a fresh bot after respawn. A newer full pool update supersedes the old packet, and the old bot retires before the new entity becomes visible.
 - Passed 272 public Rust tests, 56 base runtime checks, 52 enriched runtime checks and 172 focused Python tests. Cargo formatting, Clippy, documentation links and Git diff checks passed. The full stock Soldier body remains gated on unsupported graph behavior. Projectiles, bot weapon scripts and original-client acceptance remain pending.
+
+#### Rust Helix cooldown and projectile prediction
+
+- Added the supported ability cooldown, priority push, state query and branch paths. The authored Helix replay matches the reference shot times, six-second cooldown and damage configuration. Guarded human body queries and typed ChaseVar, Watch and Ability payloads match their reference cases.
+- Derived Soldier's three predicted projectile definitions from the authored graph. Added scoped lease allocation, confirmation after an individually delivered owner report, and release after confirmed creation. The observer launch and owner confirmation and explosion records match Python bytes.
+- Added shared swept projectile flight with wall and capsule collision, direct damage and capsule-distance splash. The projectile modules still need live-worker integration.
+- Set Doomfist as the next hero after Soldier: 76 and the Practice Range training bots pass their acceptance checks.
+- Passed 284 public Rust tests, 58 base runtime checks, 54 enriched runtime checks and 172 focused Python tests. Cargo formatting, Clippy, documentation links and Git diff checks passed. Stock owner startup still reports unsupported graph queries. Original-client gameplay acceptance remains pending.

@@ -184,19 +184,27 @@ pub fn capsule_entry_distance(
     {
         return None;
     }
+    let separation = segment_separation(origin, a, b);
+    if dot(separation, separation) <= radius * radius {
+        return Some(0.0);
+    }
+    round_surface(origin, direction, length, [a, b], radius, 0.0).map(|hit| hit.distance)
+}
+
+pub(crate) fn segment_distance(point: Vec3, a: Vec3, b: Vec3) -> f64 {
+    norm(segment_separation(point, a, b))
+}
+
+fn segment_separation(point: Vec3, a: Vec3, b: Vec3) -> Vec3 {
     let axis = sub(b, a);
-    let offset = sub(origin, a);
+    let offset = sub(point, a);
     let squared_length = dot(axis, axis);
     let projection = if squared_length <= 1e-9 {
         0.0
     } else {
         (dot(offset, axis) / squared_length).clamp(0.0, 1.0)
     };
-    let separation = along(offset, axis, -projection);
-    if dot(separation, separation) <= radius * radius {
-        return Some(0.0);
-    }
-    round_surface(origin, direction, length, [a, b], radius, 0.0).map(|hit| hit.distance)
+    along(offset, axis, -projection)
 }
 
 /// Two-sided Möller-Trumbore distance along a ray, before the caller's length bound.

@@ -16,7 +16,7 @@ use crate::{
     mover::Mover,
     mover_modifiers::{Modifier, ModifierKey},
     script_codecs::CodecTable,
-    script_expr::to_float,
+    script_expr::{to_float, valid_entity},
     script_graph::GraphStore,
     script_init::{Component, MAX_INIT_WORK, Root, Site, Snapshot, World},
     script_runtime::FRAME_MS,
@@ -255,7 +255,18 @@ impl World for BodyWorld {
         }
     }
 
-    fn native(&mut self, _site: Site, config: &Json) -> Option<Value> {
+    fn body_scale(&mut self, site: Site, target: u32, override_value: &Value) -> Option<f64> {
+        if target != self.entity || !self.is_player_site(site) {
+            return None;
+        }
+        match override_value {
+            Value::Null | Value::Integer(1) => Some(1.0),
+            Value::Float(scale) if *scale == 1.0 => Some(1.0),
+            _ => None,
+        }
+    }
+
+    fn native(&mut self, site: Site, config: &Json) -> Option<Value> {
         match config.get("$")?.as_str()? {
             "STU_1FF67CA6" => Some(Value::Entity(self.entity)),
             "STU_310D6529" => {
@@ -270,9 +281,49 @@ impl World for BodyWorld {
                 Some(Value::Entity(GAME_MODE_ENTITY))
             }
             "STU_4A101787" => Some(Value::Bool(false)),
+            // The normal human Practice Range reference takes the falsey
+            // branch for this parameterless query. Its native meaning is open.
+            "STU_A77AC2AC"
+                if self.is_player_site(site)
+                    && self.mode == PRACTICE_RANGE_MODE
+                    && native_shape(config, "STU_A77AC2AC", None) =>
+            {
+                Some(Value::Null)
+            }
+            // The player's own AI path query is falsey in the reference.
+            // Other entity operands still need a world-side resolver.
+            "STU_D3EB8D87"
+                if self.is_player_site(site)
+                    && native_shape(config, "STU_D3EB8D87", Some("m_00903303"))
+                    && config.get("m_00903303").is_some_and(|ai| {
+                        native_shape(ai, "STU_DB742151", Some("m_entity"))
+                            && ai
+                                .get("m_entity")
+                                .is_some_and(|owner| native_shape(owner, "STU_B5A0CAF0", None))
+                    }) =>
+            {
+                Some(Value::Null)
+            }
             _ => None,
         }
     }
+}
+
+impl BodyWorld {
+    fn is_player_site(&self, site: Site) -> bool {
+        site.entity == self.entity && valid_entity(self.entity)
+    }
+}
+
+fn native_shape(config: &Json, class: &str, operand: Option<&str>) -> bool {
+    config.get("$").and_then(Json::as_str) == Some(class)
+        && config.as_object().is_some_and(|fields| {
+            fields.iter().all(|(key, value)| match key.as_str() {
+                "$" => true,
+                "m_EE729DCB" => value.as_u64() == Some(0),
+                key => Some(key) == operand,
+            })
+        })
 }
 
 fn unsupported(error: impl std::fmt::Display) -> io::Error {
@@ -352,6 +403,71 @@ mod tests {
         collision_index::TriangleIndex, contact_world::ContactWorld,
         game_instance::TOURNAMENT_QUANTA, mover_settings::MoverSettings,
     };
+
+    #[test]
+    fn player_natives_follow_the_verified_owner_and_override_shapes() {
+        use crate::script_expr::EvalError;
+        use serde_json::json;
+
+        let spawn = fixture_body_factory().1;
+        let mut runtime = fixture_hitscan_factory(20.0).start(spawn).unwrap();
+        let evaluate = |body: &mut PlayerBodyRuntime, config: &Json| {
+            body.component
+                .evaluate_state_config(1, 0, config, &mut body.world)
+        };
+        let owner = json!({"$":"STU_B5A0CAF0","m_EE729DCB":0});
+        let size = json!({"$":"STU_FDBB0B67","m_entity":owner});
+        assert_eq!(evaluate(&mut runtime, &size), Ok(Value::Float(1.0)));
+        for (value, supported) in [
+            (Value::Integer(1), true),
+            (Value::Float(1.0), true),
+            (Value::Bool(true), false),
+            (Value::Float(1.25), false),
+            (Value::Null, true),
+        ] {
+            runtime
+                .component
+                .set_entity_variable(31_210, value, &mut runtime.world)
+                .unwrap();
+            assert_eq!(
+                evaluate(&mut runtime, &size),
+                if supported {
+                    Ok(Value::Float(1.0))
+                } else {
+                    Err(EvalError::UnsupportedConfig("STU_FDBB0B67".into()))
+                }
+            );
+        }
+        let dynamic = json!({"$":"STUConfigVarDynamic","m_identifier":400,"m_60DB8F99":true});
+        let dynamic_size = json!({"$":"STU_FDBB0B67","m_entity":dynamic});
+        for (entity, supported) in [(spawn.entity, true), (spawn.entity + 1, false), (0, false)] {
+            runtime
+                .component
+                .set_entity_variable(400, Value::Entity(entity), &mut runtime.world)
+                .unwrap();
+            assert_eq!(
+                evaluate(&mut runtime, &dynamic_size).ok(),
+                supported.then_some(Value::Float(1.0))
+            );
+        }
+
+        let ai = json!({"$":"STU_DB742151","m_entity":owner,"m_EE729DCB":0});
+        let path = json!({"$":"STU_D3EB8D87","m_00903303":ai,"m_EE729DCB":0});
+        assert_eq!(evaluate(&mut runtime, &path), Ok(Value::Null));
+        let other_path =
+            json!({"$":"STU_D3EB8D87","m_00903303":{"$":"STU_DB742151","m_entity":dynamic}});
+        assert_eq!(
+            evaluate(&mut runtime, &other_path),
+            Err(EvalError::UnsupportedConfig("STU_D3EB8D87".into()))
+        );
+        let branch = json!({"$":"STU_A77AC2AC","m_EE729DCB":0});
+        assert_eq!(evaluate(&mut runtime, &branch), Ok(Value::Null));
+        runtime.world.mode = 0;
+        assert_eq!(
+            evaluate(&mut runtime, &branch),
+            Err(EvalError::UnsupportedConfig("STU_A77AC2AC".into()))
+        );
+    }
 
     #[test]
     fn verified_body_starts_fresh_instances_and_advances_only_its_own_retail_clock() {
@@ -564,5 +680,35 @@ mod tests {
             .collect();
         assert_eq!(instances, expected);
         assert_eq!(snapshot.instances[&11].variables[&28], Value::Integer(1));
+
+        let authored_field = |graph, position, field: &str| {
+            world
+                .graphs
+                .graph(graph)
+                .unwrap()
+                .node(position)
+                .unwrap()
+                .field(field)
+                .unwrap()
+                .clone()
+        };
+        let sprint_condition = authored_field(0x0255, 6, "m_condition");
+        let rifle_conditions =
+            [81, 83].map(|position| authored_field(0x0254, position, "m_condition"));
+        // 0255 st2 follows the throttle comparison for a human player.
+        for (forward, enabled) in [(63, false), (64, true)] {
+            world.throttles = [0, forward];
+            assert_eq!(
+                component.evaluate_state_config(5, 2, &sprint_condition, &mut world),
+                Ok(Value::Bool(enabled))
+            );
+        }
+        // Both 0254 rifle branches have the same parameterless human condition.
+        for condition in rifle_conditions {
+            assert_eq!(
+                component.evaluate_state_config(11, 10, &condition, &mut world),
+                Ok(Value::Null)
+            );
+        }
     }
 }

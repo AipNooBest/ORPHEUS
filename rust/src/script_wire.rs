@@ -202,6 +202,7 @@ pub(crate) struct Binding {
     pub instance: u16,
     pub state: u16,
     pub state_bits: u8,
+    pub slot: u8,
     pub priority: i8,
     pub above: bool,
 }
@@ -256,7 +257,10 @@ pub(crate) fn bound_variable(
             out.w_u16(binding.instance);
         }
         out.bits(u64::from(binding.state), usize::from(binding.state_bits))?;
-        out.bit(false); // stack output slot zero
+        out.bit(binding.slot != 0);
+        if binding.slot != 0 {
+            out.w_var(u32::from(binding.slot));
+        }
         let explicit = binding.priority != 0 || !binding.above;
         out.bit(explicit);
         if explicit {

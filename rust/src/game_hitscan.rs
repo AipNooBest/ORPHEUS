@@ -103,7 +103,7 @@ pub struct TargetPose {
 }
 
 impl TargetPose {
-    fn segment(self) -> [Vec3; 2] {
+    pub(crate) fn segment(self) -> [Vec3; 2] {
         let [x, y, z] = self.feet;
         [
             [x, y + self.radius, z],

@@ -21,6 +21,8 @@ The prepared body factory builds the authored player roots and weapon slots, che
 
 The authored Soldier rifle regression verifies held fire, release and reload. Owner frames introduce each volley with the starting ammo and resume live ammo updates after acknowledgement. The native worker passes posed direct shots through retained target poses and the map and capsule intersections. In a separate encrypted test, an authored fixture weapon damages a bot, retries a dropped hit and updates its health, then retires the old bot and creates a new one. This path currently serves direct fire against Practice Range bots with a verified fixture body. Full player and bot scripts, projectiles and original-client presentation remain pending.
 
+The authored Helix graph now matches the reference for activation, six-second cooldown and the next permitted shot. The projectile components derive the three predicted Soldier definitions from the graph, build owner leases and encode confirmation, observer launch and explosion records. Tests exercise release after the confirmed create, lost owner-frame aliases and swept direct and splash damage. The projectile components still need to join the live worker. The stock body also needs more verified graph behavior before it can attach.
+
 The Python server serves the regular entry points during the migration. The native server currently serves the solo base Practice Range on loopback. Other matchmaking modes, social actions, the dashboard and original-client acceptance are pending.
 
 ```powershell

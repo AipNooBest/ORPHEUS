@@ -33,6 +33,7 @@ const MAX_EVENTS_PER_UPDATE: usize = 1000;
 const MAX_PENDING_EVENTS: usize = 16_384;
 const MAX_PENDING_SHOTS: usize = 256;
 const ABILITY_RUNNING: u8 = 1;
+const ABILITY_PUSHED: u8 = 2;
 const ABILITY_HELD: u8 = 4;
 const LINK_PRIORITY: StackPriority = StackPriority {
     level: 0,
@@ -155,6 +156,10 @@ pub trait World {
         None
     }
 
+    fn body_scale(&mut self, _site: Site, _target: u32, _override_value: &Value) -> Option<f64> {
+        None
+    }
+
     /// None leaves an encountered AI candidate explicitly unsupported.
     fn selects_ai_behavior(&mut self, _site: Site) -> Option<bool> {
         None
@@ -181,6 +186,11 @@ impl World for EmptyWorld {}
 pub enum StateKind {
     Plain,
     BooleanSwitch(bool),
+    Switch {
+        case: Option<usize>,
+    },
+    ActiveQuery,
+    GamePadVibration,
     SubScript {
         child: Option<u16>,
     },
@@ -230,12 +240,49 @@ pub struct State {
     pub start_ms: u64,
     pub kind: StateKind,
     pub chase: Option<ChasePayload>,
+    pub ability_cooldown: Option<AbilityCooldown>,
     watch_seen: Option<Value>,
     ending: bool,
     pending_change: bool,
     pending_timer: bool,
     buffered_press: Option<BufferedPress>,
     linked_variable: Option<VarKey>,
+    ability_stack: Option<VarKey>,
+}
+
+impl State {
+    fn dormant(kind: StateKind) -> Self {
+        Self {
+            active: false,
+            activation: 0,
+            start_ms: 0,
+            kind,
+            chase: None,
+            ability_cooldown: None,
+            watch_seen: None,
+            ending: false,
+            pending_change: false,
+            pending_timer: false,
+            buffered_press: None,
+            linked_variable: None,
+            ability_stack: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AbilityCooldown {
+    pub current: f64,
+    pub rate: f64,
+    pub last_ms: u64,
+}
+
+impl AbilityCooldown {
+    fn remaining(self, now_ms: u64) -> f64 {
+        let elapsed = (now_ms.saturating_sub(self.last_ms) as f64 * -f64::from(0.001_f32)) as f32;
+        let consumed = (f64::from(elapsed) * self.rate) as f32;
+        f64::from(((f64::from(consumed) + self.current) as f32).max(0.0))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -390,6 +437,7 @@ pub struct StackBinding {
     pub instance: u16,
     pub raw_state: u16,
     pub priority: StackPriority,
+    pub slot: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -464,16 +512,38 @@ impl Component {
         config: &Json,
         world: &mut impl World,
     ) -> Result<Value, EvalError> {
-        let node = self
-            .shot_node(shot)
+        self.shot_node(shot)
             .ok_or(EvalError::MalformedConfig("shot source"))?;
+        self.evaluate_state_config(shot.instance, shot.raw_state, config, world)
+    }
+
+    pub fn evaluate_state_config(
+        &self,
+        instance: u16,
+        raw_state: u16,
+        config: &Json,
+        world: &mut impl World,
+    ) -> Result<Value, EvalError> {
+        let snapshot = self
+            .snapshot()
+            .ok_or(EvalError::MalformedConfig("state source"))?;
+        let graph = snapshot
+            .instances
+            .get(&instance)
+            .ok_or(EvalError::MalformedConfig("state source"))?
+            .graph;
+        let node = self
+            .graphs
+            .graph(graph)
+            .and_then(|graph| graph.state(usize::from(raw_state)))
+            .ok_or(EvalError::MalformedConfig("state source"))?;
         let mut context = InstanceContext {
             machine: &self.machine,
             world,
             site: Site {
-                entity: shot.entity,
-                instance: shot.instance,
-                graph: shot.graph,
+                entity: snapshot.entity,
+                instance,
+                graph,
                 node: Some(node.pos),
             },
             reads: Vec::new(),
@@ -622,6 +692,8 @@ enum LinkValue {
     Fixed(Value),
     Volley(u8),
     Chase,
+    Cooldown,
+    AbilityStack,
 }
 
 struct VariableLink {
@@ -802,6 +874,7 @@ impl Machine {
                     instance: entry.state.instance,
                     raw_state: entry.state.raw,
                     priority: entry.priority,
+                    slot: u8::from(matches!(entry.output, LinkValue::AbilityStack)),
                 })
                 .collect();
             if !bindings.is_empty() {
@@ -885,6 +958,13 @@ impl Machine {
                 .expect("linked chase state")
                 .current
                 .clone(),
+            LinkValue::Cooldown => Value::Float(
+                self.snapshot.instances[&entry.state.instance].states[&entry.state.raw]
+                    .ability_cooldown
+                    .expect("linked cooldown state")
+                    .remaining(self.now_ms),
+            ),
+            LinkValue::AbilityStack => Value::Bool(true),
         }
     }
 
@@ -1073,7 +1153,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 continue;
             }
             let key = StateKey { instance: id, raw };
-            if node.class == "STUStatescriptStateAbility" && supported_ability(node) {
+            if node.class == "STUStatescriptStateAbility" {
                 self.spend("ability button edge")?;
                 self.ability_edge(key, node, edge)?;
                 continue;
@@ -1097,19 +1177,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 let state = self.machine.snapshot.instances[&id]
                     .states
                     .entry(raw)
-                    .or_insert(State {
-                        active: false,
-                        activation: 0,
-                        start_ms: 0,
-                        kind: StateKind::LogicalButton { down: false },
-                        chase: None,
-                        watch_seen: None,
-                        ending: false,
-                        pending_change: false,
-                        pending_timer: false,
-                        buffered_press: None,
-                        linked_variable: None,
-                    });
+                    .or_insert_with(|| State::dormant(StateKind::LogicalButton { down: false }));
                 state.buffered_press = Some(BufferedPress {
                     time_ms: self.machine.now_ms,
                     activation: state.activation.wrapping_add(u16::from(!state.active)),
@@ -1321,7 +1389,12 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         let Some(buttons) = self.ability_buttons(key, node) else {
             return Ok(());
         };
-        if flags & ABILITY_RUNNING != 0 {
+        let active_flag = if ability_is_stacked(node) {
+            ABILITY_PUSHED
+        } else {
+            ABILITY_RUNNING
+        };
+        if flags & active_flag != 0 {
             self.keep_ability(key, node, flags, buttons, depth)
         } else {
             self.try_start_ability(key, node, flags, buttons, depth)
@@ -1387,7 +1460,8 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         } else if hold != 0 && !self.machine.held_buttons.contains(&hold) {
             return Ok(());
         }
-        if !self.ability_condition(key, node, "m_150F0D92")
+        if self.cooldown_remaining(key) > 0.0
+            || !self.ability_condition(key, node, "m_150F0D92")
             || !self.ability_condition(key, node, "m_F495731F")
             || !self.ability_stack_allows(key, node, "m_3C0EB4A6")
         {
@@ -1404,17 +1478,69 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             }
             return Ok(());
         }
+        self.set_ability_flags(key, flags | if start != 0 { ABILITY_HELD } else { 0 });
+        if ability_is_stacked(node) {
+            self.push_ability(key, node, depth)
+        } else {
+            self.start_ability(key, node, depth)
+        }
+    }
+
+    fn push_ability(&mut self, key: StateKey, node: &Node, depth: usize) -> Result<(), InitFault> {
         let id = key.instance;
-        self.set_ability_flags(
-            key,
-            flags | ABILITY_RUNNING | if start != 0 { ABILITY_HELD } else { 0 },
-        );
+        let target = match script_expr::lvalue(field(&node.fields, "m_out_StackVar")) {
+            Ok(Some(target)) => source_key(id, target),
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                self.report(self.site(id, node), Issue::Expression(error));
+                return Ok(());
+            }
+        };
+        let priority = match script_expr::stack_priority(field(&node.fields, "m_5E561E77")) {
+            Ok(priority) => priority,
+            Err(error) => {
+                self.report(self.site(id, node), Issue::Expression(error));
+                return Ok(());
+            }
+        };
+        if self.state(key).and_then(|state| state.linked_variable) == Some(target) {
+            self.report(
+                self.site(id, node),
+                Issue::UnsupportedField("overlapping ability outputs"),
+            );
+            return Ok(());
+        }
+        let state = self.state_mut(key).expect("active ability");
+        let StateKind::Ability { flags } = state.kind else {
+            unreachable!("active ability")
+        };
+        state.kind = StateKind::Ability {
+            flags: flags | ABILITY_PUSHED,
+        };
+        state.ability_stack = Some(target);
+        self.insert_link(
+            target,
+            VariableLink {
+                state: key,
+                priority,
+                output: LinkValue::AbilityStack,
+                stack: true,
+            },
+            depth,
+        )
+    }
+
+    fn start_ability(&mut self, key: StateKey, node: &Node, depth: usize) -> Result<(), InitFault> {
+        let id = key.instance;
+        let flags = self.ability_flags(key).expect("active ability");
+        self.set_ability_flags(key, flags | ABILITY_RUNNING);
         self.follow(id, node, "m_B969AFC9", Some(key), depth)?;
         self.follow(id, node, "m_4E22B5C4", Some(key), depth)?;
         self.ability_vars(id, node, "m_EF3C5C73")
     }
 
     fn stop_ability(&mut self, key: StateKey, node: &Node, depth: usize) -> Result<(), InitFault> {
+        self.unlink_ability_stack(key, depth)?;
         let Some(flags) = self
             .ability_flags(key)
             .filter(|flags| flags & ABILITY_RUNNING != 0)
@@ -1426,6 +1552,108 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         self.exit_subgraph(id, node, "m_B969AFC9", depth + 1)?;
         self.follow(id, node, "m_6EEEC0AA", Some(key), depth)?;
         self.ability_vars(id, node, "m_19899EAC")
+    }
+
+    fn unlink_ability_stack(&mut self, key: StateKey, depth: usize) -> Result<(), InitFault> {
+        let Some(flags) = self
+            .ability_flags(key)
+            .filter(|flags| flags & ABILITY_PUSHED != 0)
+        else {
+            return Ok(());
+        };
+        self.set_ability_flags(key, flags & !ABILITY_PUSHED);
+        if let Some(target) = self
+            .state_mut(key)
+            .and_then(|state| state.ability_stack.take())
+        {
+            self.remove_link(key, target, None, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    fn cooldown_remaining(&self, key: StateKey) -> f64 {
+        self.state(key)
+            .and_then(|state| state.ability_cooldown)
+            .map_or(0.0, |cooldown| cooldown.remaining(self.machine.now_ms))
+    }
+
+    fn restart_cooldown(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        depth: usize,
+    ) -> Result<(), InitFault> {
+        let id = key.instance;
+        let target = match script_expr::lvalue(field(&node.fields, "m_out_CooldownVar")) {
+            Ok(Some(target)) => source_key(id, target),
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                self.report(self.site(id, node), Issue::Expression(error));
+                return Ok(());
+            }
+        };
+        let modifier = self.machine.value(VarKey::Entity(3652), None);
+        let mut rate = (script_expr::to_float(&modifier) + 1.0) as f32;
+        let scalar = field(&node.fields, "m_F7CAF887");
+        if !scalar.is_null() {
+            let Some(value) = self.evaluate(id, node, scalar, None) else {
+                return Ok(());
+            };
+            rate = (f64::from(rate) * script_expr::to_float(&value)) as f32;
+        }
+        let current = script_expr::to_float(&stored(&self.machine.snapshot, target)).max(0.0);
+        let delay = ((current * 1000.0) as f32 / rate).round();
+        if !current.is_finite() || !rate.is_finite() || (rate > 0.0 && !delay.is_finite()) {
+            self.report(
+                self.site(id, node),
+                Issue::UnsupportedField("ability cooldown"),
+            );
+            return Ok(());
+        }
+        // The reference removes its previous slot before relinking at the same priority.
+        if let Some(entries) = self.machine.links.get_mut(&target) {
+            entries.retain(|entry| entry.state != key);
+        }
+        let cooldown = AbilityCooldown {
+            current,
+            rate: f64::from(rate),
+            last_ms: self.machine.now_ms,
+        };
+        let state = self.state_mut(key).expect("active ability");
+        state.linked_variable = Some(target);
+        state.ability_cooldown = Some(cooldown);
+        self.insert_link(
+            target,
+            VariableLink {
+                state: key,
+                priority: StackPriority {
+                    level: 0,
+                    above_equals: true,
+                },
+                output: LinkValue::Cooldown,
+                stack: false,
+            },
+            depth,
+        )?;
+        self.machine.queues.retain(
+            id,
+            |_, event| !matches!(event, Event::Timer(raw, 2) if *raw == key.raw),
+        );
+        if current > 0.0 && rate > 0.0 {
+            self.post_after(id, delay.max(1.0) as u64, Event::Timer(key.raw, 2))?;
+        }
+        Ok(())
+    }
+
+    fn finish_cooldown(&mut self, key: StateKey) -> Result<(), InitFault> {
+        let remaining = self.cooldown_remaining(key);
+        if let Some(target) = self
+            .state_mut(key)
+            .and_then(|state| state.linked_variable.take())
+        {
+            self.unlink_output(key, target, Some(Value::Float(remaining)))?;
+        }
+        Ok(())
     }
 
     fn ability_vars(&mut self, id: u16, node: &Node, name: &str) -> Result<(), InitFault> {
@@ -1463,16 +1691,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                     Event::Reevaluate(raw) => self.reevaluate(key(raw), 0)?,
                     Event::Timer(raw, parameter) => self.timer(key(raw), parameter)?,
                     Event::Button(edge) => self.button_edge(id, edge)?,
-                    Event::AbilityCheck(raw) => {
-                        self.activate_ability(key(raw), 0)?;
-                        if self.state(key(raw)).is_some_and(|state| state.active) {
-                            let node = self
-                                .graph(id)
-                                .state(usize::from(raw))
-                                .expect("ability state");
-                            self.try_complete(key(raw), node, 0)?;
-                        }
-                    }
+                    Event::AbilityCheck(raw) => self.timer(key(raw), 1)?,
                     Event::ChaseReached(raw) => {
                         if self.state(key(raw)).is_some_and(|state| state.active) {
                             let node = self.graph(id).state(usize::from(raw)).expect("chase state");
@@ -1696,7 +1915,12 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 .state(watcher)
                 .filter(|state| {
                     read_native
-                        && matches!(state.kind, StateKind::BooleanSwitch(_) | StateKind::Watch)
+                        && matches!(
+                            state.kind,
+                            StateKind::BooleanSwitch(_)
+                                | StateKind::Switch { .. }
+                                | StateKind::Watch
+                        )
                 })
                 .map(|state| state.start_ms)
             {
@@ -1722,15 +1946,19 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
     fn write(&mut self, key: VarKey, value: Value) -> Result<(), InitFault> {
         let old = self.machine.value(key, None);
         self.set_base(key, value);
-        let chases: Vec<_> = self
+        let outputs: Vec<_> = self
             .machine
             .links
             .get(&key)
             .into_iter()
             .flatten()
-            .filter_map(|link| matches!(link.output, LinkValue::Chase).then_some(link.state))
+            .filter_map(|link| match link.output {
+                LinkValue::Chase => Some((link.state, false)),
+                LinkValue::Cooldown => Some((link.state, true)),
+                _ => None,
+            })
             .collect();
-        for state in chases {
+        for (state, cooldown) in outputs {
             if !self
                 .state(state)
                 .is_some_and(|state| state.active && state.linked_variable == Some(key))
@@ -1741,7 +1969,15 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 return Err(InitFault::PlugDepth);
             }
             self.output_write_depth += 1;
-            let result = self.chase_write(state, key);
+            let result = if cooldown {
+                let node = self
+                    .graph(state.instance)
+                    .state(usize::from(state.raw))
+                    .expect("ability state");
+                self.restart_cooldown(state, node, self.output_write_depth)
+            } else {
+                self.chase_write(state, key)
+            };
             self.output_write_depth -= 1;
             result?;
         }
@@ -1827,11 +2063,23 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             }
             if target.is_state() {
                 if let Some(raw) = target.state {
-                    if target.class == "STUStatescriptStateAbility"
-                        && input == "m_3B7BED2E"
-                        && supported_ability(target)
-                    {
-                        self.stop_ability(StateKey { instance: id, raw }, target, depth + 1)?;
+                    let key = StateKey { instance: id, raw };
+                    if target.class == "STU_01178155" && input == "m_inPlug" {
+                        let state = self.machine.snapshot.instances[&id]
+                            .states
+                            .entry(raw)
+                            .or_insert_with(|| State::dormant(StateKind::ActiveQuery));
+                        let output = if state.active {
+                            "m_7273C81B"
+                        } else {
+                            "m_C6F3744E"
+                        };
+                        self.follow(id, target, output, Some(key), depth + 1)?;
+                        taken = true;
+                        continue;
+                    }
+                    if target.class == "STUStatescriptStateAbility" && input == "m_3B7BED2E" {
+                        self.stop_ability(key, target, depth + 1)?;
                         taken = true;
                         continue;
                     }
@@ -2050,6 +2298,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             | "STUStatescriptStateDataFlowMapping"
             | "STUStatescriptStateUXPresenter" => StateKind::Plain,
             "STUStatescriptStateBooleanSwitch" => StateKind::BooleanSwitch(false),
+            "STU_DEBD057B" => StateKind::Switch { case: None },
+            "STU_01178155" => StateKind::ActiveQuery,
+            "STUStatescriptStateGamePadVibration" => StateKind::GamePadVibration,
             "STU_37D754C8" | "STUStatescriptStateSubScript" => StateKind::SubScript { child: None },
             "STUStatescriptStateGameMessageEntry" => StateKind::MessageIdle,
             "STUStatescriptStateWait" if !configured(node, "m_BF1A93B0") => StateKind::Wait,
@@ -2060,9 +2311,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 top: false,
                 under: false,
             },
-            "STUStatescriptStateAbility" if supported_ability(node) => {
-                StateKind::Ability { flags: 0 }
-            }
+            "STUStatescriptStateAbility" => StateKind::Ability { flags: 0 },
             "STU_316CFEF2" => StateKind::MovementMod,
             "STUStatescriptStateAnim" => StateKind::Anim,
             "STU_691BFA55" | "STU_7CA2FBAF" => StateKind::Effect,
@@ -2097,17 +2346,12 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 active: true,
                 activation,
                 start_ms: self.machine.now_ms,
-                kind,
-                chase: None,
-                watch_seen: None,
-                ending: false,
-                pending_change: false,
-                pending_timer: false,
                 buffered_press,
-                linked_variable: None,
+                ..State::dormant(kind)
             },
         );
         match kind {
+            StateKind::GamePadVibration => self.post(id, Event::Finish(key.raw))?,
             StateKind::BooleanSwitch(_) => {
                 let Some(value) =
                     self.evaluate(id, node, field(&node.fields, "m_condition"), Some(key))
@@ -2118,6 +2362,13 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 self.state_mut(key).expect("active switch").kind =
                     StateKind::BooleanSwitch(current);
                 self.enter_branch(key, node, current, depth)?;
+            }
+            StateKind::Switch { .. } => {
+                let Some(case) = self.switch_case(key, node) else {
+                    return Ok(());
+                };
+                self.state_mut(key).expect("active switch").kind = StateKind::Switch { case };
+                self.follow(id, node, &case_path(case), Some(key), depth)?;
             }
             StateKind::SubScript { .. } => {
                 let child = self.spawn_child(key, node)?;
@@ -2143,7 +2394,10 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             }
             StateKind::LogicalButton { .. } => self.enter_button(key, node, depth)?,
             StateKind::Stack { .. } => self.begin_stack(key, node, depth)?,
-            StateKind::Ability { .. } => self.register_tick(key, self.machine.now_ms),
+            StateKind::Ability { .. } => {
+                self.restart_cooldown(key, node, depth)?;
+                self.register_tick(key, self.machine.now_ms);
+            }
             StateKind::Anim => self.arm_animation(key, node)?,
             StateKind::SendMessage => {
                 self.send_game_message(id, node)?;
@@ -2155,7 +2409,10 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 self.state_mut(key).expect("active Watch").watch_seen = seen;
             }
             StateKind::WeaponVolley { .. } => self.begin_volley(key, node, depth)?,
-            StateKind::Plain | StateKind::MovementMod | StateKind::Effect => (),
+            StateKind::Plain
+            | StateKind::MovementMod
+            | StateKind::Effect
+            | StateKind::ActiveQuery => (),
         }
         self.follow(id, node, "m_onBeginPlug", Some(key), depth)?;
         self.follow(id, node, "m_subgraphPlug", Some(key), depth)?;
@@ -2671,17 +2928,39 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             .collect();
         for key in states {
             self.spend("stack position change")?;
-            let Some(state) = self.state(key).filter(|state| {
-                state.active && !state.ending && state.linked_variable == Some(variable)
-            }) else {
+            let Some(state) = self
+                .state(key)
+                .filter(|state| state.active && !state.ending)
+            else {
                 continue;
             };
             let top = self
                 .machine
                 .links
                 .get(&variable)
-                .and_then(|entries| entries.last())
-                .is_some_and(|entry| entry.state == key);
+                .and_then(|entries| entries.last());
+            if let StateKind::Ability { flags } = state.kind {
+                if flags & ABILITY_PUSHED != 0 && state.ability_stack == Some(variable) {
+                    let node = self
+                        .graph(key.instance)
+                        .state(usize::from(key.raw))
+                        .expect("ability state");
+                    if top.is_some_and(|entry| {
+                        entry.state == key && matches!(entry.output, LinkValue::AbilityStack)
+                    }) {
+                        if flags & ABILITY_RUNNING == 0 {
+                            self.start_ability(key, node, depth + 1)?;
+                        }
+                    } else {
+                        self.stop_ability(key, node, depth + 1)?;
+                    }
+                }
+                continue;
+            }
+            if state.linked_variable != Some(variable) {
+                continue;
+            }
+            let top = top.is_some_and(|entry| entry.state == key);
             let kind = StateKind::Stack { top, under: !top };
             if state.kind == kind {
                 continue;
@@ -2719,6 +2998,16 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         bake: Option<Value>,
         depth: usize,
     ) -> Result<(), InitFault> {
+        self.unlink_output(key, target, bake)?;
+        self.sync_stack(target, depth)
+    }
+
+    fn unlink_output(
+        &mut self,
+        key: StateKey,
+        target: VarKey,
+        bake: Option<Value>,
+    ) -> Result<(), InitFault> {
         let old = self.machine.value(target, None);
         if let Some(value) = bake {
             self.set_base(target, value);
@@ -2729,8 +3018,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 self.machine.links.remove(&target);
             }
         }
-        self.notify_value(target, &old, None)?;
-        self.sync_stack(target, depth)
+        self.notify_value(target, &old, None)
     }
 
     fn update_stack(&mut self, key: StateKey) -> Result<(), InitFault> {
@@ -2897,6 +3185,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                     Some(StateKind::BooleanSwitch(_)) => {
                         self.check_switch(key, 0)?;
                     }
+                    Some(StateKind::Switch { .. }) => self.post(id, Event::Reevaluate(raw))?,
                     Some(StateKind::Ability { .. }) => self.activate_ability(key, 0)?,
                     Some(StateKind::ChaseVar) => self.tick_chase(key)?,
                     Some(StateKind::Watch) => self.check_watch(key)?,
@@ -3012,6 +3301,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         if kind == StateKind::Anim && parameter == 1 {
             self.follow(key.instance, node, "m_A3B86BB0", Some(key), 0)?;
         }
+        if matches!(kind, StateKind::Ability { .. }) && matches!(parameter, 1 | 2) {
+            self.activate_ability(key, 0)?;
+        }
         if matches!(kind, StateKind::WeaponVolley { .. }) {
             match parameter {
                 1 => {
@@ -3093,7 +3385,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
     fn changed(&mut self, key: StateKey) -> Result<(), InitFault> {
         if let Some(state) = self.state_mut(key) {
             state.pending_change = false;
-            if state.active
+            if state.active && matches!(state.kind, StateKind::Switch { .. }) {
+                self.post(key.instance, Event::Reevaluate(key.raw))?;
+            } else if state.active
                 && !state.pending_timer
                 && matches!(state.kind, StateKind::BooleanSwitch(_))
             {
@@ -3164,11 +3458,25 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             return Ok(());
         };
         state.pending_timer = false;
-        if self.check_switch(key, depth)? {
-            let node = self
-                .graph(key.instance)
-                .state(usize::from(key.raw))
-                .expect("switch state");
+        let kind = state.kind;
+        let node = self
+            .graph(key.instance)
+            .state(usize::from(key.raw))
+            .expect("switch state");
+        let evaluated = if let StateKind::Switch { case } = kind {
+            let Some(next) = self.switch_case(key, node) else {
+                return Ok(());
+            };
+            if next != case {
+                self.exit_subgraph(key.instance, node, &case_path(case), depth + 1)?;
+                self.state_mut(key).expect("active switch").kind = StateKind::Switch { case: next };
+                self.follow(key.instance, node, &case_path(next), Some(key), depth)?;
+            }
+            true
+        } else {
+            self.check_switch(key, depth)?
+        };
+        if evaluated {
             self.try_complete(key, node, depth)?;
         }
         Ok(())
@@ -3198,6 +3506,24 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn switch_case(&mut self, key: StateKey, node: &Node) -> Option<Option<usize>> {
+        let value = self.evaluate(
+            key.instance,
+            node,
+            field(&node.fields, "m_262AE982"),
+            Some(key),
+        )?;
+        for (index, case) in array_field(&node.fields, "m_05706D1C").iter().enumerate() {
+            if case.is_object() {
+                let candidate = self.evaluate(key.instance, node, field(case, "m_value"), None)?;
+                if equal(&value, &candidate) {
+                    return Some(Some(index));
+                }
+            }
+        }
+        Some(None)
     }
 
     fn enter_branch(
@@ -3243,6 +3569,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             StateKind::BooleanSwitch(branch) => {
                 self.exit_subgraph(id, node, branch_path(branch), depth + 1)?
             }
+            StateKind::Switch { case } => {
+                self.exit_subgraph(id, node, &case_path(case), depth + 1)?
+            }
             StateKind::SubScript { child: Some(child) } => self.destroy(child)?,
             StateKind::MessageIdle => {
                 self.exit_subgraph(id, node, "m_33DA5163", depth + 1)?;
@@ -3266,6 +3595,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             StateKind::Ability { flags } => {
                 self.set_ability_flags(key, flags & !ABILITY_HELD);
                 self.stop_ability(key, node, depth + 1)?;
+                self.finish_cooldown(key)?;
             }
             _ => (),
         }
@@ -3348,6 +3678,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 .iter()
                 .filter_map(|(&raw, state)| {
                     (state.linked_variable.is_some()
+                        || state.ability_stack.is_some()
                         || matches!(state.kind, StateKind::WeaponVolley { .. }))
                     .then_some((raw, state.kind))
                 })
@@ -3358,6 +3689,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                     self.finish_volley(key, 0)?;
                 } else if kind == StateKind::ChaseVar {
                     self.finish_chase(key, 0)?;
+                } else if matches!(kind, StateKind::Ability { .. }) {
+                    self.unlink_ability_stack(key, 0)?;
+                    self.finish_cooldown(key)?;
                 } else {
                     self.unlink_single_output(key, 0)?;
                 }
@@ -3388,9 +3722,8 @@ fn is_message_entry(node: &Node) -> bool {
     node.class == "STUStatescriptEntryGameMessage"
 }
 
-fn supported_ability(node: &Node) -> bool {
-    field(&node.fields, "m_out_CooldownVar").is_null()
-        && field(&node.fields, "m_5E561E77").is_null()
+fn ability_is_stacked(node: &Node) -> bool {
+    !field(&node.fields, "m_out_StackVar").is_null() && !field(&node.fields, "m_5E561E77").is_null()
 }
 
 fn configured(node: &Node, name: &str) -> bool {
@@ -3423,6 +3756,13 @@ fn raw_indices(values: &[Json]) -> impl Iterator<Item = u16> + '_ {
     values
         .iter()
         .filter_map(|value| u16::try_from(value.as_u64()?).ok())
+}
+
+fn case_path(case: Option<usize>) -> String {
+    case.map_or_else(
+        || "m_A5EF385D".into(),
+        |index| format!("m_05706D1C[{index}]"),
+    )
 }
 
 fn branch_path(branch: bool) -> &'static str {
@@ -3589,6 +3929,15 @@ impl<W: World> Context for InstanceContext<'_, W> {
 
     fn position(&mut self, entity: u32) -> [f64; 3] {
         self.world.position(entity)
+    }
+
+    fn body_scale(&mut self, entity: u32) -> Option<f64> {
+        if entity != self.site.entity {
+            return None;
+        }
+        self.read_native = true;
+        let scale_override = self.read(VarKey::Entity(31_210));
+        self.world.body_scale(self.site, entity, &scale_override)
     }
 
     fn native(&mut self, config: &Json) -> Option<Value> {
@@ -4119,6 +4468,7 @@ mod tests {
                 StackBinding {
                     instance: 1,
                     raw_state: 0,
+                    slot: 0,
                     priority: StackPriority {
                         level: 0,
                         above_equals: false
@@ -4127,6 +4477,7 @@ mod tests {
                 StackBinding {
                     instance: 1,
                     raw_state: 1,
+                    slot: 0,
                     priority: StackPriority {
                         level: 0,
                         above_equals: true
@@ -4165,6 +4516,246 @@ mod tests {
             assert_eq!(component.resolved_variable(1, variable), Some(expected));
         }
         assert!(component.snapshot().unwrap().bindings.is_empty());
+    }
+
+    #[test]
+    fn ability_cooldown_restarts_and_stack_displacement_stops_the_running_ability() {
+        let message = |position, message, target, input| {
+            node(
+                position,
+                "STUStatescriptEntryGameMessage",
+                None,
+                json!({
+                    "m_gameMessage":{"m_gameMessage":message},
+                    "m_outPlug":plug(&[(target, input)], &[]),
+                }),
+            )
+        };
+        let mut fixture = graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntry",
+                    None,
+                    json!({"m_outPlug":plug(&[(1,"m_beginPlug")],&[])}),
+                ),
+                node(
+                    1,
+                    "STUStatescriptStateAbility",
+                    Some(0),
+                    json!({
+                        "m_out_CooldownVar":var(60,true),
+                        "m_out_StackVar":var(61,true),
+                        "m_5E561E77":{"m_priority":"0x0C40000000000001"},
+                        "m_A5F1A77B":35,
+                        "m_EF3C5C73":[{"m_out_Var":var(60,true), "m_value":0.1},
+                                      {"m_out_Var":var(62,true), "m_value":true}],
+                        "m_19899EAC":[{"m_out_Var":var(62,true), "m_value":false}]
+                    }),
+                ),
+                node(
+                    2,
+                    "STUStatescriptStateStack",
+                    Some(1),
+                    json!({
+                        "m_out_Var":var(61,true),
+                        "m_value":7,
+                        "m_priority":{"m_priority":"0x0C40000000000003"}
+                    }),
+                ),
+                message(3, "0x0240000000000001", 2, "m_beginPlug"),
+                message(4, "0x0240000000000002", 1, ABORT_PLUG),
+            ],
+            json!([1, 2]),
+            json!([0, 3, 4]),
+        );
+        fixture["fields"]["m_680A2CB2"] = json!([0]);
+        let mut component = Component::start(
+            Arc::new(store(vec![fixture])),
+            42,
+            Variables::from([(3652, Value::Float(1.0)), (60, Value::Float(0.032))]),
+            vec![Root::new(1, 42)],
+            0,
+            &mut EmptyWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        let timer = |component: &Component| {
+            component
+                .snapshot()
+                .unwrap()
+                .pending_timers
+                .get(&1)
+                .and_then(|timers| timers.first().copied())
+        };
+        assert_eq!(
+            timer(&component),
+            Some(PendingTimer {
+                due_ms: 16,
+                raw_state: 0,
+                finish: false,
+                parameter: 2
+            })
+        );
+        for frame in 0..=1 {
+            component
+                .advance_command(
+                    Command {
+                        frame,
+                        buttons: 8,
+                        ..Command::default()
+                    },
+                    &mut EmptyWorld,
+                )
+                .unwrap();
+        }
+        let snapshot = component.snapshot().unwrap();
+        assert_eq!(snapshot.variables[&62], Value::Bool(true));
+        assert_eq!(
+            snapshot.instances[&1].states[&0].kind,
+            StateKind::Ability { flags: 7 }
+        );
+        assert_eq!(snapshot.resolved_bindings[&(0, 61)], Value::Bool(true));
+        assert_eq!(snapshot.bindings[&(0, 61)][0].slot, 1);
+        assert_eq!(timer(&component).map(|timer| timer.due_ms), Some(66));
+        let remaining = snapshot.resolved_bindings[&(0, 60)].clone();
+        for message in [1, 2] {
+            component
+                .queue_message(1, 0x0240_0000_0000_0000 | message, Variables::new())
+                .unwrap();
+            component.run_now(&mut EmptyWorld).unwrap();
+        }
+        let snapshot = component.snapshot().unwrap();
+        assert_eq!(snapshot.variables[&62], Value::Bool(false));
+        assert_eq!(snapshot.variables[&60], remaining);
+        assert_eq!(snapshot.resolved_bindings[&(0, 61)], Value::Integer(7));
+        assert_eq!(snapshot.bindings[&(0, 61)][0].slot, 0);
+        assert!(!snapshot.instances[&1].states[&0].active);
+        assert!(timer(&component).is_none());
+    }
+
+    #[test]
+    fn switch_exits_old_branch_and_active_query_does_not_begin_its_target() {
+        let set = |position, variable, value| {
+            node(
+                position,
+                "STUStatescriptActionSetVar",
+                None,
+                json!({
+                    "m_out_Var":var(variable,true), "m_value":value,
+                }),
+            )
+        };
+        let fixture = graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntry",
+                    None,
+                    json!({
+                        "m_outPlug":plug(&[(1,"m_beginPlug"),(2,"m_inPlug"),(3,"m_beginPlug")],&[])
+                    }),
+                ),
+                node(
+                    1,
+                    "STU_DEBD057B",
+                    Some(0),
+                    json!({
+                        "m_262AE982":var(100,true),
+                        "m_05706D1C":[
+                            {"$":"Plug", "links":[[4,"m_beginPlug"]], "m_FF3DAF1E":[3], "m_value":2},
+                            {"$":"Plug", "links":[[5,"m_beginPlug"]], "m_FF3DAF1E":[4], "m_value":2}
+                        ],
+                        "m_A5EF385D":plug(&[(6,"m_beginPlug")], &[5]),
+                    }),
+                ),
+                node(
+                    2,
+                    "STU_01178155",
+                    Some(1),
+                    json!({
+                        "m_7273C81B":plug(&[(7,"m_inPlug")],&[]),
+                        "m_C6F3744E":plug(&[(8,"m_inPlug")],&[]),
+                    }),
+                ),
+                node(
+                    3,
+                    "STUStatescriptStateGamePadVibration",
+                    Some(2),
+                    json!({
+                        "m_onBeginPlug":plug(&[(9,"m_inPlug")],&[]),
+                        "m_onFinishedPlug":plug(&[(10,"m_inPlug")],&[]),
+                    }),
+                ),
+                node(4, "STUStatescriptState", Some(3), json!({})),
+                node(5, "STUStatescriptState", Some(4), json!({})),
+                node(6, "STUStatescriptState", Some(5), json!({})),
+                set(7, 101, 1),
+                set(8, 101, 0),
+                set(9, 102, 1),
+                set(10, 102, 2),
+                node(
+                    11,
+                    "STUStatescriptEntryGameMessage",
+                    None,
+                    json!({
+                        "m_gameMessage":{"m_gameMessage":"0x0240000000000001"},
+                        "m_outPlug":plug(&[(2,"m_beginPlug")],&[]),
+                    }),
+                ),
+                node(
+                    12,
+                    "STUStatescriptEntryGameMessage",
+                    None,
+                    json!({
+                        "m_gameMessage":{"m_gameMessage":"0x0240000000000002"},
+                        "m_outPlug":plug(&[(2,"m_inPlug")],&[]),
+                    }),
+                ),
+            ],
+            json!([1, 2, 3, 4, 5, 6]),
+            json!([0, 11, 12]),
+        );
+        let mut component = Component::start(
+            Arc::new(store(vec![fixture])),
+            42,
+            Variables::new(),
+            vec![Root::new(1, 42)],
+            0,
+            &mut EmptyWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        let initial = component.snapshot().unwrap();
+        let states = &initial.instances[&1].states;
+        assert_eq!(states[&0].kind, StateKind::Switch { case: None });
+        assert!(!states[&1].active);
+        assert_eq!(states[&1].activation, 0);
+        assert!(!states[&2].active);
+        assert!(states[&5].active);
+        assert_eq!(initial.variables[&101], Value::Integer(0));
+        assert_eq!(initial.variables[&102], Value::Integer(2));
+        component
+            .set_entity_variable(100, Value::Integer(2), &mut EmptyWorld)
+            .unwrap();
+        for message in [1, 2] {
+            component
+                .queue_message(1, 0x0240_0000_0000_0000 | message, Variables::new())
+                .unwrap();
+            component.run_now(&mut EmptyWorld).unwrap();
+        }
+        let updated = component.snapshot().unwrap();
+        let states = &updated.instances[&1].states;
+        assert_eq!(states[&0].kind, StateKind::Switch { case: Some(0) });
+        assert!(states[&1].active);
+        assert_eq!(states[&1].activation, 1);
+        assert!(states[&3].active);
+        assert!(!states.contains_key(&4));
+        assert!(!states[&5].active);
+        assert_eq!(updated.variables[&101], Value::Integer(1));
+        assert!(updated.initialization_complete());
     }
 
     #[derive(Default)]
@@ -4472,6 +5063,123 @@ mod tests {
                 _ => None,
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires a local 1.74 graph pack"]
+    fn authored_helix_uses_its_six_second_cooldown_before_the_next_volley() {
+        let runtime = PathBuf::from(
+            std::env::var_os("ORPHEUS_RUNTIME_DIR").expect("set ORPHEUS_RUNTIME_DIR"),
+        );
+        let graphs =
+            Arc::new(GraphStore::load(runtime.join("data/game_graphs_174.json.gz")).unwrap());
+        let body = &graphs.bodies()[&0x0400_0000_0000_03cf];
+        let mut world = RifleWorld(Arc::clone(&graphs));
+        let mut component = Component::start(
+            Arc::clone(&graphs),
+            0xa000_0101,
+            player_entity_variables(body, 200.0, 200.0),
+            player_roots(body, &graphs).unwrap(),
+            1000,
+            &mut world,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        component.advance_frame(1000, &mut world).unwrap();
+        let mut shots = Vec::new();
+        let cooldown = Variable {
+            scope: Scope::Instance,
+            id: 61,
+        };
+        for frame in 1001..=1411 {
+            let buttons = if matches!(frame, 1030 | 1031 | 1040 | 1041 | 1410 | 1411) {
+                2
+            } else {
+                0
+            };
+            component
+                .advance_command(
+                    Command {
+                        frame,
+                        buttons,
+                        ..Command::default()
+                    },
+                    &mut world,
+                )
+                .unwrap();
+            shots.extend(std::mem::take(&mut component.machine.shots));
+            let (flags, last_ms, remaining, due) = match frame {
+                1029 => (0, 16000, 0.0, None),
+                1030 => (5, 16480, 5.985000133514404, Some(22480)),
+                1040 => (1, 16480, 5.824999809265137, Some(22480)),
+                1404 => (1, 16480, 0.0009999275207519531, Some(22480)),
+                1405 => (1, 16480, 0.0, None),
+                1410 => (1, 22560, 5.985000133514404, Some(28560)),
+                _ => continue,
+            };
+            let snapshot = component.snapshot().unwrap();
+            let ability = &snapshot.instances[&11].states[&31];
+            assert_eq!(ability.kind, StateKind::Ability { flags }, "frame {frame}");
+            assert_eq!(
+                ability.ability_cooldown,
+                Some(AbilityCooldown {
+                    current: if frame == 1029 { 0.0 } else { 6.0 },
+                    rate: 1.0,
+                    last_ms,
+                }),
+                "frame {frame}"
+            );
+            assert_eq!(
+                component.resolved_variable(11, cooldown),
+                Some(Value::Float(remaining)),
+                "frame {frame}"
+            );
+            assert_eq!(
+                snapshot
+                    .pending_timers
+                    .get(&11)
+                    .into_iter()
+                    .flatten()
+                    .find(|timer| timer.raw_state == 31 && timer.parameter == 2)
+                    .map(|timer| timer.due_ms),
+                due,
+                "frame {frame}"
+            );
+        }
+        assert_eq!(
+            shots
+                .iter()
+                .map(|shot| (
+                    shot.instance,
+                    shot.raw_state,
+                    shot.time_ms,
+                    shot.activation,
+                    shot.ordinal
+                ))
+                .collect::<Vec<_>>(),
+            [(11, 16, 16480, 1, 0), (11, 16, 22560, 2, 0)]
+        );
+        let shot = &shots[0];
+        let node = component.shot_node(shot).unwrap();
+        let rocket =
+            crate::projectile_flight::ProjectileBallistics::from_authored(node, |config| {
+                component.evaluate_shot_config(shot, config, &mut world)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(rocket.definition, Some(0x0400_0000_0000_072c));
+        assert_eq!((rocket.speed, rocket.lifetime), (50.0, 2.0));
+        let direct = rocket.direct.unwrap();
+        assert_eq!(
+            (direct.amount, direct.loadout),
+            (40.0, Some(0x0b90_0000_0000_008e))
+        );
+        let blast = rocket.blast.unwrap();
+        assert_eq!(
+            (blast.hit.amount, blast.hit.loadout),
+            (80.0, Some(0x0b90_0000_0000_008e))
+        );
+        assert_eq!(blast.rings, [(1.0, 1.0), (3.0, 0.5)]);
     }
 
     #[test]
