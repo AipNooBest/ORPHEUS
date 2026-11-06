@@ -1168,6 +1168,7 @@ impl WorldDelivery {
             .owner_body_runtime(
                 hero,
                 OwnerBodySpawn {
+                    controller: self.owner,
                     entity,
                     frame: start_frame,
                     position: pose.position,

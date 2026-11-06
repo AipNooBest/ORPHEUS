@@ -869,3 +869,12 @@ This log records tested changes and their acceptance status. Entries are grouped
 #### Rust development policy
 
 - Moved new implementation and fixes to Rust. Froze the Python server as the transition entry point and behavioral reference. The cutover criteria now require broader verified Rust coverage, original-client checks for the replacement workflows, and a server-only deployment smoke test.
+
+#### Rust owner relationships and startup states
+
+- Bound the stock human owner VM to the authenticated controller and the fresh body allocated at each switch. Added distinct queries for the owning controller, current possessor and possessed body. Regressions verify typed operands, body replacement, and the authored Soldier startup and HUD lookups.
+- Ported the input bridge's explicit activation and abort behavior. It forwards repeated inputs while active and consumes inactive inputs without starting the bridge.
+- Enabled the normal graph lifecycle and variable synchronization for the verified networked ForCode state. The Soldier regression covers all six active states, their empty state payloads, and the linked body and weapon-manager states. Native game-code consumers and the server-only form remain open.
+- Verified that two config classes share the retail native evaluator that returns a typed false, and added their exact operand-free forms.
+- Reduced the stock Soldier preflight from 22 diagnostics to 13 in the same prepared base runtime. The first remaining blocker is the delayed conditional state at graph `0033`, node `66`. Stock weapon attachment and original-client acceptance remain pending.
+- Passed 292 public Rust tests, 58 base-runtime checks and 54 enriched-runtime checks. Cargo formatting, Clippy, documentation links and Git diff checks passed.

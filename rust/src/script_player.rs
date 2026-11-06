@@ -16,7 +16,7 @@ use crate::{
     mover::Mover,
     mover_modifiers::{Modifier, ModifierKey},
     script_codecs::CodecTable,
-    script_expr::{to_float, valid_entity},
+    script_expr::{EntityRelation, native_shape, to_float, valid_entity},
     script_graph::GraphStore,
     script_init::{Component, MAX_INIT_WORK, Root, Site, Snapshot, World},
     script_runtime::FRAME_MS,
@@ -27,6 +27,7 @@ use crate::{
 
 #[derive(Clone, Copy)]
 pub(crate) struct OwnerBodySpawn {
+    pub controller: u32,
     pub entity: u32,
     pub frame: u32,
     pub position: [f64; 3],
@@ -86,6 +87,7 @@ impl PlayerBodyFactory {
         }
         let mut world = BodyWorld {
             graphs: Arc::clone(&self.graphs),
+            controller: spawn.controller,
             entity: spawn.entity,
             position: spawn.position,
             throttles: [0; 2],
@@ -215,6 +217,7 @@ impl OwnerBodyRuntime for PlayerBodyRuntime {
 
 struct BodyWorld {
     graphs: Arc<GraphStore>,
+    controller: u32,
     entity: u32,
     position: [f64; 3],
     throttles: [i8; 2],
@@ -270,6 +273,25 @@ impl World for BodyWorld {
         self.is_player_site(site)
     }
 
+    fn related_entity(&mut self, site: Site, relation: EntityRelation, entity: u32) -> Option<u32> {
+        if !self.is_player_site(site)
+            || !valid_entity(self.controller)
+            || self.controller == self.entity
+        {
+            return None;
+        }
+        // Both relations point to the same controller for this human body.
+        match relation {
+            EntityRelation::OwningController | EntityRelation::CurrentPossessor
+                if entity == self.entity =>
+            {
+                Some(self.controller)
+            }
+            EntityRelation::PossessedBody if entity == self.controller => Some(self.entity),
+            _ => None,
+        }
+    }
+
     fn native(&mut self, site: Site, config: &Json) -> Option<Value> {
         match config.get("$")?.as_str()? {
             "STU_1FF67CA6" => Some(Value::Entity(self.entity)),
@@ -319,17 +341,6 @@ impl BodyWorld {
     }
 }
 
-fn native_shape(config: &Json, class: &str, operand: Option<&str>) -> bool {
-    config.get("$").and_then(Json::as_str) == Some(class)
-        && config.as_object().is_some_and(|fields| {
-            fields.iter().all(|(key, value)| match key.as_str() {
-                "$" => true,
-                "m_EE729DCB" => value.as_u64() == Some(0),
-                key => Some(key) == operand,
-            })
-        })
-}
-
 fn unsupported(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, error.to_string())
 }
@@ -358,6 +369,7 @@ pub(crate) fn fixture_body_factory() -> (PlayerBodyFactory, OwnerBodySpawn) {
     let graphs = Arc::new(GraphStore::from_json(&serde_json::to_vec(&bundle).unwrap()).unwrap());
     let codecs = Arc::new(CodecTable::from_json(r#"{"classes":{}}"#).unwrap());
     let spawn = OwnerBodySpawn {
+        controller: 0xa000_0100,
         entity: 0xa000_0101,
         frame: 100,
         position: [1.0, 2.0, 3.0],
@@ -508,6 +520,92 @@ mod tests {
                 Err(EvalError::UnsupportedConfig("STU_32E6E4D8".into()))
             );
         }
+    }
+
+    #[test]
+    fn entity_relations_resolve_only_the_active_player_pair() {
+        use crate::script_expr::EvalError;
+        use serde_json::json;
+
+        let (_, mut spawn) = fixture_body_factory();
+        let factory = fixture_hitscan_factory(20.0);
+        spawn.controller = 0xa012_3400;
+        let replacement = OwnerBodySpawn {
+            entity: 0xa012_7856,
+            ..spawn
+        };
+        let mut first = factory.start(spawn).unwrap();
+        let mut second = factory.start(replacement).unwrap();
+        let target = json!({"$":"STUConfigVarDynamic","m_identifier":400,"m_60DB8F99":true});
+        let owner = json!({"$":"STU_F76C486C","m_D63CBEC2":target,"m_EE729DCB":0});
+        let possessor = json!({"$":"STU_F7262B36","m_801B298F":target});
+        let body = json!({"$":"STU_0AC15F78","m_entity":target});
+        let invalid_owner = json!({"$":"STU_F76C486C","m_D63CBEC2":target,"m_EE729DCB":1});
+        let evaluate = |runtime: &mut PlayerBodyRuntime, config: &Json, target: Value| {
+            runtime
+                .component
+                .set_entity_variable(400, target, &mut runtime.world)
+                .unwrap();
+            runtime
+                .component
+                .evaluate_state_config(1, 0, config, &mut runtime.world)
+        };
+        let unsupported_owner = || Err(EvalError::UnsupportedConfig("STU_F76C486C".into()));
+        let unsupported_body = || Err(EvalError::UnsupportedConfig("STU_0AC15F78".into()));
+        assert_eq!(
+            evaluate(&mut first, &owner, Value::Entity(spawn.entity)),
+            Ok(Value::Entity(spawn.controller))
+        );
+        assert_eq!(
+            evaluate(&mut first, &possessor, Value::Entity(spawn.entity)),
+            Ok(Value::Entity(spawn.controller))
+        );
+        assert_eq!(
+            evaluate(&mut first, &body, Value::Entity(spawn.controller)),
+            Ok(Value::Entity(spawn.entity))
+        );
+        assert_eq!(
+            evaluate(&mut second, &body, Value::Entity(spawn.controller)),
+            Ok(Value::Entity(replacement.entity))
+        );
+        assert_eq!(
+            evaluate(&mut second, &owner, Value::Entity(replacement.entity)),
+            Ok(Value::Entity(spawn.controller))
+        );
+        assert_eq!(
+            evaluate(&mut second, &possessor, Value::Entity(replacement.entity)),
+            Ok(Value::Entity(spawn.controller))
+        );
+        for entity in [spawn.entity, spawn.controller, 0] {
+            assert_eq!(
+                evaluate(&mut second, &owner, Value::Entity(entity)),
+                unsupported_owner()
+            );
+        }
+        assert_eq!(
+            evaluate(&mut second, &body, Value::Entity(replacement.entity)),
+            unsupported_body()
+        );
+        assert_eq!(
+            evaluate(&mut second, &possessor, Value::Entity(spawn.entity)),
+            Err(EvalError::UnsupportedConfig("STU_F7262B36".into()))
+        );
+        assert_eq!(
+            evaluate(
+                &mut second,
+                &body,
+                Value::Integer(i64::from(spawn.controller))
+            ),
+            unsupported_body()
+        );
+        assert_eq!(
+            evaluate(
+                &mut second,
+                &invalid_owner,
+                Value::Entity(replacement.entity)
+            ),
+            unsupported_owner()
+        );
     }
 
     #[test]
@@ -664,7 +762,10 @@ mod tests {
     #[test]
     #[ignore = "requires the separately prepared 104319 statescript catalog"]
     fn prepared_soldier_starts_the_reference_body_and_weapon_tree() {
-        use crate::{game_clock::FIRST_TICK, game_content::GameMap};
+        use crate::{
+            game_clock::FIRST_TICK, game_content::GameMap, script_codecs::PayloadMode,
+            script_init::StateKind,
+        };
         use std::path::PathBuf;
 
         let root = PathBuf::from(std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap());
@@ -674,6 +775,7 @@ mod tests {
         let variables = crate::script_init::player_entity_variables(body, 200.0, 200.0);
         let mut world = BodyWorld {
             graphs: Arc::clone(&graphs),
+            controller: 0xa000_0100,
             entity: 0xa000_0101,
             position: GameMap::practice_range().spawn_point(0, 0).unwrap().0,
             throttles: [0; 2],
@@ -720,6 +822,25 @@ mod tests {
             .map(|(&id, instance)| (id, instance.graph, instance.parent))
             .collect();
         assert_eq!(instances, expected);
+        assert_eq!(
+            snapshot.instances[&1].variables[&9737],
+            Value::Entity(world.entity)
+        );
+        assert!(
+            !snapshot
+                .diagnostics
+                .iter()
+                .any(|item| item.site.graph == 0x0033 && item.site.node == Some(51))
+        );
+        let watch = &snapshot.instances[&13].states[&21];
+        assert!(watch.active);
+        assert_eq!(watch.kind, crate::script_init::StateKind::Watch);
+        assert!(
+            !snapshot
+                .diagnostics
+                .iter()
+                .any(|item| item.site.graph == 0x01cf && item.site.node == Some(41))
+        );
         assert_eq!(snapshot.instances[&11].variables[&28], Value::Integer(1));
         for (instance, state) in [
             (10, 42),
@@ -734,6 +855,43 @@ mod tests {
             assert!(controller.active);
             assert_eq!(controller.kind, crate::script_init::StateKind::Plain);
         }
+        let codecs = CodecTable::load(root.join("data/statescript_codecs_174.json")).unwrap();
+        let codec = codecs.codec("STU_CD46AF93").unwrap();
+        for mode in [
+            PayloadMode::Remote { full: true },
+            PayloadMode::Owner {
+                full: true,
+                frame_time: i64::from(FIRST_TICK) * FRAME_MS as i64,
+                frame_ms: FRAME_MS as u32,
+            },
+        ] {
+            assert_eq!(codec.payload(&BTreeMap::new(), mode).unwrap().bit_len(), 0);
+        }
+        for (instance, raw, position) in [
+            (1, 13, 39),
+            (2, 22, 32),
+            (2, 23, 33),
+            (9, 9, 18),
+            (9, 10, 19),
+            (10, 39, 73),
+        ] {
+            let instance = &snapshot.instances[&instance];
+            let node = world
+                .graphs
+                .graph(instance.graph)
+                .unwrap()
+                .state(usize::from(raw))
+                .unwrap();
+            assert_eq!((node.pos, node.class.as_str()), (position, "STU_CD46AF93"));
+            let state = &instance.states[&raw];
+            assert!(state.active);
+            assert_eq!(state.kind, StateKind::Plain);
+        }
+        for (instance, raw) in [(1, 4), (10, 41)] {
+            let child = &snapshot.instances[&instance].states[&raw];
+            assert!(child.active);
+            assert_eq!(child.kind, StateKind::BooleanSwitch(false));
+        }
 
         let authored_field = |graph, position, field: &str| {
             world
@@ -747,11 +905,16 @@ mod tests {
                 .clone()
         };
         let sprint_condition = authored_field(0x0255, 6, "m_condition");
+        let watch_possessor = authored_field(0x01cf, 41, "m_B7A3CF78");
         let rifle_conditions =
             [81, 83].map(|position| authored_field(0x0254, position, "m_condition"));
         // 01C7 st48 reads the same current and maximum health as the
         // health-ratio branches in 01CF st7/st9.
         let full_health = authored_field(0x01c7, 145, "m_condition");
+        assert_eq!(
+            component.evaluate_state_config(13, 21, &watch_possessor, &mut world),
+            Ok(Value::Entity(world.controller))
+        );
         assert_eq!(
             component.evaluate_state_config(12, 48, &full_health, &mut world),
             Ok(Value::Bool(true))

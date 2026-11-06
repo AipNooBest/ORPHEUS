@@ -216,6 +216,7 @@ impl SceneAssets {
                     hero,
                     self.pools.body_pools(hero.guid).total(),
                     OwnerBodySpawn {
+                        controller: 0xa000_0100,
                         entity: 0xa000_0101,
                         frame: FIRST_TICK,
                         position: position.map(snap),
@@ -396,6 +397,7 @@ mod tests {
         assert!(scene.movement_ready());
         let hero = scene.heroes().get(SOLDIER).unwrap();
         let spawn = OwnerBodySpawn {
+            controller: 0xa000_0100,
             entity: 0xa000_0101,
             frame: FIRST_TICK,
             position: scene.map().spawn_point(0, 0).unwrap().0.map(snap),

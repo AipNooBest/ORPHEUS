@@ -21,7 +21,8 @@ use crate::{
     commands::Command,
     mover_modifiers::{Modifier, ModifierKey, Operation},
     script_expr::{
-        self, Context, EmptyContext, EvalError, Scope, StackPriority, Variable, equal, truthy,
+        self, Context, EmptyContext, EntityRelation, EvalError, Scope, StackPriority, Variable,
+        equal, truthy,
     },
     script_graph::{Body, Graph, GraphStore, Node, asset_guid},
     script_runtime::{ButtonEdge, FRAME_MS, QueueFull, Timeline, button_edges, frame_start},
@@ -166,6 +167,16 @@ pub trait World {
 
     fn has_owner_health(&self, _site: Site) -> bool {
         false
+    }
+
+    /// None means this relationship is unsupported for the supplied entity.
+    fn related_entity(
+        &mut self,
+        _site: Site,
+        _relation: EntityRelation,
+        _entity: u32,
+    ) -> Option<u32> {
+        None
     }
 
     /// None leaves an encountered AI candidate explicitly unsupported.
@@ -2088,6 +2099,19 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                         taken = true;
                         continue;
                     }
+                    if target.class == "STU_7B9E8909" && input == "m_inPlug" {
+                        // The bridge consumes its input even when inactive. Only an
+                        // explicit begin request can open it.
+                        let state = self.machine.snapshot.instances[&id]
+                            .states
+                            .entry(raw)
+                            .or_insert_with(|| State::dormant(StateKind::Plain));
+                        if state.active {
+                            self.follow(id, target, "m_outPlug", Some(key), depth + 1)?;
+                        }
+                        taken = true;
+                        continue;
+                    }
                     if target.class == "STUStatescriptStateAbility" && input == "m_3B7BED2E" {
                         self.stop_ability(key, target, depth + 1)?;
                         taken = true;
@@ -2313,6 +2337,10 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             "STU_BD02E168" if is_client_subgraph_controller(self.graph(id), node) => {
                 StateKind::Plain
             }
+            // ForCodeSynced publishes to native game-code registration outside
+            // the graph. Its VM plugs and empty wire payload use the base state.
+            "STU_CD46AF93" if is_networked_for_code_synced(node) => StateKind::Plain,
+            "STU_7B9E8909" => StateKind::Plain,
             "STUStatescriptStateBooleanSwitch" => StateKind::BooleanSwitch(false),
             "STU_DEBD057B" => StateKind::Switch { case: None },
             "STU_01178155" => StateKind::ActiveQuery,
@@ -3752,6 +3780,24 @@ fn is_client_subgraph_controller(graph: &Graph, node: &Node) -> bool {
             .is_some_and(|target| target.client_only && !target.server_only)
 }
 
+fn is_networked_for_code_synced(node: &Node) -> bool {
+    node.is_networked()
+        && node.remote >= 0
+        && field(&node.fields, "m_DC897C87").as_u64() == Some(1)
+        && field(&node.fields, "m_598E32D5").as_u64() == Some(0)
+        && field(&node.fields, "m_0582B0E4").as_u64() == Some(0)
+        && field(&node.fields, "m_0B1AA8CA").is_null()
+        && field(&node.fields, "m_values")
+            .as_array()
+            .is_some_and(|values| {
+                !values.is_empty()
+                    && values.iter().all(|value| {
+                        field(value, "$").as_str() == Some("STUStatescriptForCodeValue")
+                            && field(field(value, "m_value"), "$").as_str().is_some()
+                    })
+            })
+}
+
 fn ability_is_stacked(node: &Node) -> bool {
     !field(&node.fields, "m_out_StackVar").is_null() && !field(&node.fields, "m_5E561E77").is_null()
 }
@@ -4003,6 +4049,11 @@ impl<W: World> Context for InstanceContext<'_, W> {
         self.world.native(self.site, config)
     }
 
+    fn related_entity(&mut self, relation: EntityRelation, entity: u32) -> Option<u32> {
+        self.read_native = true;
+        self.world.related_entity(self.site, relation, entity)
+    }
+
     fn would_stack_to_top(&mut self, variable: Variable, priority: StackPriority) -> Option<bool> {
         let key = source_key(self.site.instance, variable);
         self.read(key);
@@ -4063,6 +4114,74 @@ mod tests {
     }
 
     #[test]
+    fn bridge_forwards_input_only_between_begin_and_abort() {
+        let message = |position, input| {
+            node(
+                position,
+                "STUStatescriptEntryGameMessage",
+                None,
+                json!({
+                    "m_gameMessage":{"m_gameMessage":format!("0x024000000000{position:04X}")},
+                    "m_outPlug":plug(&[(0,input)], &[]),
+                }),
+            )
+        };
+        let fixture = graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STU_7B9E8909",
+                    Some(0),
+                    json!({"m_outPlug":plug(&[(1,"m_inPlug")], &[])}),
+                ),
+                node(
+                    1,
+                    "STUStatescriptActionSetVar",
+                    None,
+                    json!({"m_out_Var":var(100,true), "m_value":true}),
+                ),
+                message(2, "m_inPlug"),
+                message(3, "m_beginPlug"),
+                message(4, ABORT_PLUG),
+            ],
+            json!([0]),
+            json!([2, 3, 4]),
+        );
+        let mut component = Component::start(
+            Arc::new(store(vec![fixture])),
+            42,
+            Variables::new(),
+            vec![Root::new(1, 42)],
+            0,
+            &mut EmptyWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        for (message, active, activation, forwarded) in [
+            (2, false, 0, false),
+            (3, true, 1, false),
+            (2, true, 1, true),
+            (2, true, 1, true),
+            (4, false, 1, false),
+            (2, false, 1, false),
+        ] {
+            component
+                .set_entity_variable(100, Value::Bool(false), &mut EmptyWorld)
+                .unwrap();
+            component
+                .queue_message(1, 0x0240_0000_0000_0000 | message, Variables::new())
+                .unwrap();
+            component.run_now(&mut EmptyWorld).unwrap();
+            let snapshot = component.snapshot().unwrap();
+            let state = &snapshot.instances[&1].states[&0];
+            assert_eq!((state.active, state.activation), (active, activation));
+            assert_eq!(snapshot.variables[&100], Value::Bool(forwarded));
+            assert!(snapshot.initialization_complete());
+        }
+    }
+
+    #[test]
     fn client_subgraph_controller_keeps_its_branch_off_the_server() {
         for client_only in [true, false] {
             let mut target = node(2, "STUStatescriptState", Some(1), json!({}));
@@ -4112,6 +4231,85 @@ mod tests {
                         if class == "STU_BD02E168"
                 ));
             }
+        }
+    }
+
+    #[test]
+    fn networked_for_code_state_keeps_its_subgraph_lifetime() {
+        for (server_only, flags) in [(false, 0), (true, 0), (false, 1)] {
+            let mut for_code = node(
+                1,
+                "STU_CD46AF93",
+                Some(0),
+                json!({
+                    "m_DC897C87":1, "m_598E32D5":flags, "m_0582B0E4":0,
+                    "m_values":[{
+                        "$":"STUStatescriptForCodeValue",
+                        "m_identifier":"0x0D80000000000042",
+                        "m_value":var(100,true),
+                    }],
+                    "m_subgraphPlug":plug(&[(2,"m_beginPlug")], &[1]),
+                }),
+            );
+            for_code["remote"] = json!(0);
+            for_code["server_only"] = json!(server_only);
+            let mut fixture = graph(
+                42,
+                vec![
+                    node(
+                        0,
+                        "STUStatescriptEntry",
+                        None,
+                        json!({"m_outPlug":plug(&[(1,"m_beginPlug")], &[])}),
+                    ),
+                    for_code,
+                    node(2, "STUStatescriptState", Some(1), json!({})),
+                    node(
+                        3,
+                        "STUStatescriptEntryGameMessage",
+                        None,
+                        json!({
+                            "m_gameMessage":{"m_gameMessage":"0x0240000000000003"},
+                            "m_outPlug":plug(&[(1,ABORT_PLUG)], &[]),
+                        }),
+                    ),
+                ],
+                json!([1, 2]),
+                json!([0, 3]),
+            );
+            fixture["remote"] = json!([1]);
+            let mut component = Component::start(
+                Arc::new(store(vec![fixture])),
+                42,
+                Variables::from([(100, Value::Integer(5))]),
+                vec![Root::new(1, 42)],
+                0,
+                &mut EmptyWorld,
+                MAX_INIT_WORK,
+            )
+            .unwrap();
+            let snapshot = component.snapshot().unwrap();
+            let states = &snapshot.instances[&1].states;
+            if server_only || flags != 0 {
+                assert!(states.is_empty());
+                assert!(matches!(
+                    snapshot.diagnostics.as_slice(),
+                    [Diagnostic { issue: Issue::UnsupportedState(class), .. }]
+                        if class == "STU_CD46AF93"
+                ));
+                continue;
+            }
+            assert!(snapshot.initialization_complete());
+            assert!(states[&0].active && states[&1].active);
+            assert_eq!(states[&0].kind, StateKind::Plain);
+            assert!(!snapshot.variables.contains_key(&0x42));
+            component
+                .queue_message(1, 0x0240_0000_0000_0003, Variables::new())
+                .unwrap();
+            component.run_now(&mut EmptyWorld).unwrap();
+            let snapshot = component.snapshot().unwrap();
+            let states = &snapshot.instances[&1].states;
+            assert!(!states[&0].active && !states[&1].active);
         }
     }
 

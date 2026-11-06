@@ -61,8 +61,10 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
 - **[flate2](https://docs.rs/flate2/)** supplies gzip decoding for the external state graph bundle.
 - The statescript VM uses a deterministic SplitMix64 stream for local random expressions. The fixed-increment generator follows the public-domain implementation. [Sebastiano Vigna's SplitMix64](https://prng.di.unimi.it/splitmix.c)
 - **TripleFault and Gamayun contributors** supplied a same-build comparison for encrypted combat scenarios and
-  tick measurement design. This is a behavior reference. Gamayun identifies its Go implementation as
-  AGPL-3.0-or-later and retains the MIT notice for inherited code.
+  tick measurement design. The locally reviewed 104319 VM code in `internal/vm/natives.go` also corroborates
+  the separate possessed-body and current-possessor queries. Its `registry.go` and `states.go` provide
+  behavior references for the synced game-code state and the input bridge. Gamayun identifies its Go
+  implementation as AGPL-3.0-or-later and retains the MIT notice for inherited code.
 - **The Claudewatch contributors** supplied the Beta 1.0.0.3 research lead for attacker-side hit-confirm effects
   and separate entity and announcer voice messages. ORPHEUS checks these leads against 104319 client data before
   implementing them. The reference is a locally reviewed binary distribution.

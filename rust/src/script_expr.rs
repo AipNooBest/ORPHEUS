@@ -24,6 +24,13 @@ pub struct Variable {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntityRelation {
+    OwningController,
+    CurrentPossessor,
+    PossessedBody,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StackPriority {
     pub level: i8,
     pub above_equals: bool,
@@ -115,6 +122,10 @@ pub trait Context {
     }
 
     fn body_health(&mut self, _entity: u32, _maximum: bool) -> Option<f64> {
+        None
+    }
+
+    fn related_entity(&mut self, _relation: EntityRelation, _entity: u32) -> Option<u32> {
         None
     }
 
@@ -363,6 +374,17 @@ fn class(config: &Json) -> Option<&str> {
     config.get("$")?.as_str()
 }
 
+pub(crate) fn native_shape(config: &Json, expected: &str, operand: Option<&str>) -> bool {
+    class(config) == Some(expected)
+        && config.as_object().is_some_and(|fields| {
+            fields.iter().all(|(key, value)| match key.as_str() {
+                "$" => true,
+                "m_EE729DCB" => value.as_u64() == Some(0),
+                key => Some(key) == operand,
+            })
+        })
+}
+
 fn is_expression(class: Option<&str>) -> bool {
     matches!(class, Some("STU_919FD47C" | "STUConfigVarExpression"))
 }
@@ -512,6 +534,28 @@ impl Evaluator {
                 return self.expression(config, context, nested);
             }
             "STU_B5A0CAF0" => context.owner(),
+            "STU_4A101787" | "STU_E95A9C77" if native_shape(config, class, None) => {
+                // The retail classes share a native evaluator that writes a typed false.
+                Value::Bool(false)
+            }
+            "STU_F76C486C" | "STU_F7262B36" | "STU_0AC15F78" => {
+                let (relation, operand) = match class {
+                    "STU_F76C486C" => (EntityRelation::OwningController, "m_D63CBEC2"),
+                    "STU_F7262B36" => (EntityRelation::CurrentPossessor, "m_801B298F"),
+                    _ => (EntityRelation::PossessedBody, "m_entity"),
+                };
+                if !native_shape(config, class, Some(operand)) {
+                    return Err(EvalError::UnsupportedConfig(class.into()));
+                }
+                let Value::Entity(entity) = self.config(child(config, operand), context, nested)?
+                else {
+                    return Err(EvalError::UnsupportedConfig(class.into()));
+                };
+                let related = context
+                    .related_entity(relation, entity)
+                    .ok_or_else(|| EvalError::UnsupportedConfig(class.into()))?;
+                Value::Entity(related)
+            }
             "STU_32E6E4D8" | "STU_7D7D2470" => {
                 let target = child(config, "m_entity");
                 let Value::Entity(entity) = self.config(target, context, nested)? else {
@@ -1269,6 +1313,25 @@ mod tests {
             evaluate(&json!({"$": "STU_BE0BD267"}), &mut EmptyContext),
             Err(EvalError::UnsupportedConfig("STU_BE0BD267".into())),
         );
+    }
+
+    #[test]
+    fn retail_constant_boolean_queries_reject_unrecognized_forms() {
+        for class in ["STU_4A101787", "STU_E95A9C77"] {
+            assert_eq!(
+                evaluate(&json!({"$":class, "m_EE729DCB":0}), &mut EmptyContext),
+                Ok(Value::Bool(false))
+            );
+            for invalid in [
+                json!({"$":class, "m_EE729DCB":1}),
+                json!({"$":class, "m_entity":{"$":"STU_B5A0CAF0"}}),
+            ] {
+                assert_eq!(
+                    evaluate(&invalid, &mut EmptyContext),
+                    Err(EvalError::UnsupportedConfig(class.into()))
+                );
+            }
+        }
     }
 
     #[test]
