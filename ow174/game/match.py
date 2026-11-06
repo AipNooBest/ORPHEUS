@@ -1104,7 +1104,9 @@ class Match:
             kill_feed = None
             if self.combat.is_dead(player):
                 kill_feed = self.combat.kill_feed_allowed(player, player.body)
-            client.queue_entities(script.frames(kill_feed=kill_feed, replace_initial=replace_initial))
+            client.queue_entities(script.frames(
+                kill_feed=kill_feed, replace_initial=replace_initial, queued=client.entities,
+            ))
         except Exception:
             log.exception("[game] %s: %s's body statescript failed", self.label(), player.name)
             self.stop_body_script(player, failed=True)

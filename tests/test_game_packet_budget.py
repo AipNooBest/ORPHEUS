@@ -18,7 +18,7 @@ from ow174.game.content import PRACTICE_RANGE, SOLDIER
 from ow174.game.link import ACK, KIND_CONTROL, KIND_FRAME, MAX_DATAGRAM, LinkCipher, Packet, ReceiveWindow
 from ow174.game.match import SEND_EVERY, Match, card_message
 from ow174.game.script import decode
-from ow174.game.script.driver import SETTLE_FRAMES
+from ow174.game.script.driver import HUD_HEALTH, SETTLE_FRAMES
 from ow174.game.server import MAX_PAYLOAD, Client, GameServer
 from ow174.game.world import OP_CREATE, OP_DESTROY, OP_UPDATE, EntityUpdate, Movement
 
@@ -205,10 +205,16 @@ class PacketBudgetTests(unittest.TestCase):
         self.assertEqual(tuple(stream.pending), (latest.chunk_last,))
         self.assertEqual(script.report_count, 0)
 
+        script.set_health(155.0, 200.0)
+        player.match._body_frames(player, client)
+        refreshed, = client.entities
+        self.assertIsNot(refreshed, latest)
+        self.assertEqual(tuple(stream.pending), (refreshed.chunk_last,))
         initial, = send(after_first)
         self.assertTrue(initial.owner)
         self.assertFalse(initial.correction)
-        self.assertEqual((initial.cmfd, initial.last), (after_first, latest.chunk_last))
+        self.assertEqual((initial.cmfd, initial.last), (after_first, refreshed.chunk_last))
+        self.assertEqual(model.vars[(0, HUD_HEALTH)], 155.0)
         player.take_commands([Command(after_first + SETTLE_FRAMES - 1)])
         player.match._body_frames(player, client)
         self.assertEqual(client.entities, [])
@@ -245,14 +251,14 @@ class PacketBudgetTests(unittest.TestCase):
         from test_game_repeated_lifecycles import wire_frame
         from test_server_journal import ServerJournalTests
 
-        def terminal_order(backlog):
+        def terminal_order(backlog, next_command):
             fixture = ServerJournalTests()
             session, sent = fixture.make()
             (peer,), (player,) = fixture.connected(session, sent, two=False)
             match, client, script = player.match, player.client, player.body_script
             now = 101.0
 
-            def send(*, defer_entities=False):
+            def send(*, defer_entities=False, acknowledge=True):
                 nonlocal now
                 before = len(sent)
                 budget = MAX_PAYLOAD
@@ -271,22 +277,33 @@ class PacketBudgetTests(unittest.TestCase):
                 self.assertEqual(len(sent), before + 1)
                 packet = decoded(self, peer.cipher, sent[-1][0])[0]
                 peer.drain()
-                peer.send(now=now)
+                if acknowledge:
+                    peer.send(now=now)
                 return wire_frame(packet)[1]
 
             for count in (1, 24):
                 peer.commands(script.frame + 1, count, 0, now=now)
                 send()
             self.assertGreater(player.mode_script.delivered, 0)
-            if backlog:
-                peer.commands(script.frame + 1, 1, 0, now=now)
-                self.assertEqual(send(defer_entities=True), [])
-                deferred, = [item for item in client.entities if item.stream is script.stream]
-                self.assertEqual(deferred.entity, player.body)
-
             target = next(target for target in match.combat._targets() if target.owner is player)
+            if backlog:
+                match.combat._damage(player, target, 45.0, False, None, match.tick)
+                peer.commands(script.frame + 1, 1, 0, now=now)
+                if backlog == "queued":
+                    self.assertEqual(send(defer_entities=True), [])
+                    deferred, = [item for item in client.entities if item.stream is script.stream]
+                    self.assertEqual(deferred.entity, player.body)
+                    self.assertEqual(deferred.chunk_last, script.stream.last)
+                else:
+                    send(acknowledge=False)
+                    self.assertIn(script.stream.last, script.stream.sent_reports)
+                snapshot, _ = script.stream.pending[script.stream.last]
+                self.assertEqual(snapshot.vars[(0, HUD_HEALTH)][0], 155.0)
+
+            cmfd = script.frame
             match.combat._damage(player, target, 200.0, False, None, match.tick)
-            peer.commands(script.frame + 1, 1, 0, now=now)
+            if next_command:
+                peer.commands(cmfd + 1, 1, 0, now=now)
             known = {index: entry[0] for index, entry in script.stream.base.instances.items()}
             feed = next(index for index, graph_index in known.items() if graph_index == 0x01CF)
             terminal = []
@@ -299,14 +316,20 @@ class PacketBudgetTests(unittest.TestCase):
                 if item.chunk is not None:
                     frame = decode.read_chunk(item.chunk.getvalue(), item.chunk.count, known)
                     self.assertTrue(frame.owner)
-                    self.assertEqual(frame.cmfd, script.frame)
-                    terminal.append(("death", frame.instances[feed].states[108]))
+                    self.assertTrue(frame.correction)
+                    self.assertEqual(frame.cmfd, cmfd + next_command)
+                    terminal.append(("HUD", frame.entity_vars[HUD_HEALTH][0]))
+                    presenter = frame.instances.get(feed)
+                    terminal.append(("death", presenter.states.get(108) if presenter else None))
             return terminal
 
-        for backlog in (False, True):
-            with self.subTest(backlog=backlog):
+        for backlog, next_command in ((None, True), ("queued", True), ("queued", False), ("sent", False)):
+            with self.subTest(backlog=backlog, next_command=next_command):
                 pulse = (True, {"fresh": True, "count": 1})
-                self.assertEqual(terminal_order(backlog), [("health", [0.0]), ("death", pulse)])
+                expected = [("health", [0.0])]
+                if backlog != "sent":
+                    expected.extend([("HUD", 0.0), ("death", pulse)])
+                self.assertEqual(terminal_order(backlog, next_command), expected)
 
     def test_legal_messages_defer_create_then_ack_original_record_once(self):
         server, client, player, peer = connection()

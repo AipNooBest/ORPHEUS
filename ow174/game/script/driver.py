@@ -46,6 +46,7 @@ from ow174.game.world import UNIT_ENTITY_SCALE
 
 if TYPE_CHECKING:
     from ow174.game.match import Match
+    from ow174.game.world import EntityUpdate
 
 log = logging.getLogger("ow174.script")
 
@@ -549,20 +550,40 @@ class BodyScript(ReplicatedBody):
         frame, base = self.tree_frame()
         return [self.stream.full(frame, base)]
 
-    def frames(self, *, kill_feed: bool | None = None, replace_initial: bool = False) -> list:
+    def _unsent_health_changed(self, queued: "Iterable[EntityUpdate]") -> bool:
+        stream = self.stream
+        pending = stream.pending.get(stream.last)
+        if pending is None or stream.last in stream.sent_reports:
+            return False
+        snapshot, _ = pending
+        changed = any(
+            not expr.same(snapshot.vars.get((0, var), (None, ()))[0], self.component.vars[var].value())
+            for var in (HUD_HEALTH, HUD_MAX_HEALTH)
+        )
+        return changed and any(
+            item.stream is stream and item.chunk_last == stream.last and not item.resend for item in queued
+        )
+
+    def frames(
+        self, *, kill_feed: bool | None = None, replace_initial: bool = False,
+        queued: "Iterable[EntityUpdate]" = (),
+    ) -> list:
         """This tick's body frames: the full frame once the body's create arrived (see `created`), the first
         owner frame (C = 0) once the full frame arrived, then, after SETTLE_FRAMES, a C = 1 frame whenever the
-        client's command frame moved on. An unsent first frame can be replaced without starting correction."""
+        client's command frame moved on. Health can also refresh a queued owner frame at the same
+        command frame before its first send."""
         self.component.ensure_valid()
         stream = self.stream
         if self.retired:
             return []
         if not stream.last:
             return self.spawn_frames() if self.create_arrived else []
-        if stream.base is None or self.frame <= stream.cmfd:
+        if stream.base is None or self.frame < stream.cmfd:
             return []
         if stream.initial_owner is not None and stream.initial_owner.resend:
             return []  # transport is delivering the exact first owner frame
+        if self.frame == stream.cmfd and not self._unsent_health_changed(queued):
+            return []
         if self.first_owner_frame is None or replace_initial:
             self.first_owner_frame = self.frame
             correction = False
