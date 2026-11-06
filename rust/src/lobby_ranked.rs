@@ -8,7 +8,7 @@ use std::{
 use serde_json::{Map, Value as Json};
 
 use crate::{
-    accounts::Profile,
+    accounts::{Profile, saved_integer},
     jam_codec::{
         Fields,
         Value::{self, Array, Bool, Float64, Signed, Struct, Unsigned},
@@ -174,15 +174,7 @@ fn profile_integer(values: &Map<String, Json>, queue: Queue, default: i64) -> io
     let Some(value) = values.get(queue.name()) else {
         return Ok(default);
     };
-    let integer = match value {
-        Json::Number(number) => number
-            .as_i64()
-            .or_else(|| number.as_f64().map(|value| value as i64)),
-        Json::Bool(value) => Some(i64::from(*value)),
-        Json::String(value) => value.trim().parse().ok(),
-        _ => None,
-    };
-    integer.ok_or_else(|| {
+    saved_integer(value).ok_or_else(|| {
         invalid(format!(
             "invalid saved rating or match count for {}",
             queue.name()

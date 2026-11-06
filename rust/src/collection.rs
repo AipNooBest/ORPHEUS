@@ -144,6 +144,10 @@ impl Collection {
         &self.hero_order
     }
 
+    pub(crate) fn items(&self) -> &ItemDb {
+        &self.items
+    }
+
     pub fn hero_for(&self, guid: u64) -> Option<u64> {
         self.hero_of.get(&guid).copied()
     }

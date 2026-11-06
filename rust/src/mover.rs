@@ -12,7 +12,7 @@ use crate::{
     contact_solver::clip_velocity,
     contact_world::ContactWorld,
     mover_ground::{GroundProbe, ProbePose, capsule, pogo},
-    mover_kinematics::{Ground, MotionInput, VelocityStep, poses},
+    mover_kinematics::{Ground, MotionInput, Poses, VelocityStep, poses},
     mover_modifiers::{Modifier, ModifierKey, ModifierTimeline},
     mover_posture::{Posture, PostureStep, TOUCHING, snap},
     mover_settings::MoverSettings,
@@ -84,14 +84,35 @@ impl Mover {
         rays: &TriangleIndex,
         newest: Command,
         dt: f64,
-        mut after_pose: impl FnMut(&mut Self, Command),
+        after_pose: impl FnMut(&mut Self, Command),
     ) -> Result<(), HullContactError> {
-        for command in poses(self.last_command, newest) {
+        let mut pending = self.pending_poses(newest);
+        self.step_pending(rays, &mut pending, dt, usize::MAX, after_pose)?;
+        Ok(())
+    }
+
+    pub(crate) fn pending_poses(&self, newest: Command) -> Poses {
+        poses(self.last_command, newest)
+    }
+
+    pub(crate) fn step_pending(
+        &mut self,
+        rays: &TriangleIndex,
+        pending: &mut Poses,
+        dt: f64,
+        limit: usize,
+        mut after_pose: impl FnMut(&mut Self, Command),
+    ) -> Result<usize, HullContactError> {
+        let mut stepped = 0;
+        for command in pending.by_ref().take(limit) {
             self.step_pose(rays, command, dt)?;
             after_pose(self, command);
+            stepped += 1;
         }
-        self.last_command = Some(newest);
-        Ok(())
+        if stepped != 0 && pending.len() == 0 {
+            self.last_command = Some(pending.newest());
+        }
+        Ok(stepped)
     }
 
     fn step_pose(

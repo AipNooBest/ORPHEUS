@@ -24,33 +24,64 @@ const HOLD_INPUT_FRAMES: u32 = 32;
 
 /// Reconstruct short gaps before the newest command. Long gaps start at
 /// the newest command. One-shot actions and subframe aim never repeat.
-pub fn poses(previous: Option<Command>, newest: Command) -> impl Iterator<Item = Command> {
+pub fn poses(previous: Option<Command>, newest: Command) -> Poses {
     let (previous, distance) = previous
         .map(|command| (command, frame_distance(newest.frame, command.frame)))
         .filter(|&(_, distance)| (2..=2 * HOLD_INPUT_FRAMES).contains(&distance))
         .unwrap_or((newest, 1));
-    (1..distance)
-        .map(move |offset| {
-            let neutral = Command {
+    Poses {
+        previous,
+        newest,
+        offsets: 1..distance + 1,
+    }
+}
+
+/// Resumable sequence of reconstructed poses followed by the actual command.
+pub struct Poses {
+    previous: Command,
+    newest: Command,
+    offsets: std::ops::Range<u32>,
+}
+
+impl Poses {
+    pub(crate) fn newest(&self) -> Command {
+        self.newest
+    }
+}
+
+impl Iterator for Poses {
+    type Item = Command;
+
+    fn next(&mut self) -> Option<Command> {
+        let offset = self.offsets.next()?;
+        if self.offsets.is_empty() {
+            return Some(self.newest);
+        }
+        let previous = self.previous;
+        let source = if offset <= HOLD_INPUT_FRAMES {
+            previous
+        } else {
+            Command {
                 yaw: previous.yaw,
                 pitch: previous.pitch,
                 ..Command::default()
-            };
-            let source = if offset <= HOLD_INPUT_FRAMES {
-                previous
-            } else {
-                neutral
-            };
-            Command {
-                frame: previous.frame.wrapping_add(offset),
-                buttons: source.buttons & !SUBFRAME,
-                action: 0,
-                click: None,
-                ..source
             }
+        };
+        Some(Command {
+            frame: previous.frame.wrapping_add(offset),
+            buttons: source.buttons & !SUBFRAME,
+            action: 0,
+            click: None,
+            ..source
         })
-        .chain(std::iter::once(newest))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.offsets.size_hint()
+    }
 }
+
+impl ExactSizeIterator for Poses {}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MotionInput {

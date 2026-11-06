@@ -17,7 +17,9 @@ use crate::{
     accounts::{Profile, battle_tag},
     catalog::localize_fields,
     jam_codec::{Fields, Value},
+    lobby_arcade::ARCADE,
     lobby_login::Identity,
+    lobby_passes::PASSES,
     lobby_transport::LobbyMessage,
 };
 
@@ -31,11 +33,9 @@ const TEMPLATE_FORMAT: u32 = 1;
 pub const CONFIG: u32 = 0x1732_ebf2;
 pub const IN_CONNECT: u32 = 0xf5ff_548a;
 pub const LOBBY: u32 = 0x1a98_79a4;
-const ARCADE: u32 = 0x00a8_654e;
 const CUSTOM_GAMES: u32 = 0x2128_6b49;
 const FRIENDS: u32 = 0xf470_e2ab;
 const OWL_LIVE: u32 = 0x713d_7589;
-const PASSES: u32 = 0xad1c_34ba;
 const REPLAYS: u32 = 0x5894_d085;
 const STORE: u32 = 0x4bad_7a7e;
 

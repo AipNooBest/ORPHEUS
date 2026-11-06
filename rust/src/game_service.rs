@@ -41,6 +41,8 @@ use crate::{
 const GAME_SOCKET: Token = Token(0);
 const REQUESTS: Token = Token(1);
 const RECEIVE_BATCH: usize = 64;
+const INPUT_PER_PEER: usize = 16;
+const INPUT_PER_TURN: usize = 64;
 
 #[derive(Debug)]
 pub struct MatchPlayer {
@@ -389,6 +391,7 @@ struct State {
     seats: HashMap<u32, (MatchId, usize)>,
     peers: IndexMap<u32, Peer>,
     next_connection: u32,
+    next_input_peer: usize,
 }
 
 impl State {
@@ -401,6 +404,7 @@ impl State {
             seats: HashMap::new(),
             peers: IndexMap::new(),
             next_connection: 1,
+            next_input_peer: 0,
         }
     }
 
@@ -566,32 +570,56 @@ impl State {
                     MessageKind::MapLoaded => {
                         loading.mark_loaded(now);
                     }
-                    MessageKind::GameMessage => {
-                        if let Some(prepared) = &room.world {
-                            let viewer = room.appearance(slot).expect("prepared player");
-                            let _ = world.game_message(
-                                &prepared.scene,
-                                &viewer,
-                                self.clock.frame(),
-                                now,
-                                &message,
-                            );
-                        }
+                    MessageKind::GameMessage if room.world.is_some() => {
+                        world.queue_game_message(self.clock.frame(), now, message);
                     }
                     _ => {}
                 }
             });
-            if let (Ok(commands), Some(prepared)) = (commands, &room.world) {
-                let quanta = room.players[slot].quanta();
-                let result =
-                    world.take_commands(&prepared.scene, self.clock.frame(), quanta, &commands);
-                if !matches!(result, Ok(None)) {
-                    world.clear();
-                    *loading = MapReadiness::default();
-                    self.send_home(connection, now);
-                }
+            if let (Ok(commands), Some(_)) = (commands, &room.world) {
+                world.queue_commands(self.clock.frame(), &commands);
             }
         }
+    }
+
+    /// Bounded round-robin input work between receive batches and tick checks.
+    /// A busy peer cannot consume the next peer's whole turn.
+    fn advance_input(&mut self, now: Duration) -> bool {
+        let count = self.peers.len();
+        if count == 0 || self.clock.draining() {
+            return false;
+        }
+        let start = self.next_input_peer % count;
+        let mut remaining = INPUT_PER_TURN;
+        for offset in 0..count {
+            let index = (start + offset) % count;
+            let (&connection, peer) = self.peers.get_index_mut(index).expect("active peer index");
+            if !peer.world.has_input_work() {
+                continue;
+            }
+            let (id, slot) = self.seats[&connection];
+            let room = &self.rooms[&id];
+            let world = room.world.as_ref().expect("prepared world with input");
+            let viewer = room.appearance(slot).expect("prepared player");
+            let budget = remaining.min(INPUT_PER_PEER);
+            let (used, leave) = peer
+                .world
+                .advance_input(&world.scene, &viewer, room.players[slot].quanta(), budget)
+                .unwrap_or((budget, true));
+            remaining -= used;
+            self.next_input_peer = (index + 1) % count;
+            if leave {
+                peer.world.clear();
+                peer.loading = MapReadiness::default();
+                if self.links.begin_leaving(connection, now) {
+                    let _ = peer.reliable(&self.schemas, leave_message());
+                }
+            }
+            if remaining == 0 {
+                break;
+            }
+        }
+        self.peers.values().any(|peer| peer.world.has_input_work())
     }
 
     fn send_home(&mut self, connection: u32, now: Duration) {
@@ -773,6 +801,7 @@ fn run(
                 }
             }
         }
+        let input_ready = state.advance_input(start.elapsed());
         let now = start.elapsed();
         if now >= due {
             let (next, missed) = next_tick_after(due, now)
@@ -780,7 +809,7 @@ fn run(
             due = next;
             state.tick(&socket, now, missed);
         }
-        let timeout = if socket_ready || handled == RECEIVE_BATCH {
+        let timeout = if socket_ready || input_ready || handled == RECEIVE_BATCH {
             Duration::ZERO
         } else {
             due.saturating_sub(start.elapsed())
@@ -1152,6 +1181,75 @@ mod tests {
 
     #[test]
     #[ignore = "requires a prepared 104319 Practice Range scene"]
+    fn busy_peers_resume_in_round_robin_order_after_the_global_input_budget() {
+        use crate::{commands::Command, scene_assets::SceneAssets};
+
+        let assets = SceneAssets::load(std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap()).unwrap();
+        let scene = assets.prepare(GameMap::practice_range()).unwrap();
+        let mut state = State::new(Arc::new(fixture()));
+        // Five synthetic peers share a prepared fixture solely to test the
+        // worker scheduler. The actual admission route remains solo.
+        let players: Vec<_> = (0..5)
+            .map(|slot| Player {
+                info: player().pop().unwrap(),
+                entity: player_entity(slot),
+                gone: false,
+            })
+            .collect();
+        state.rooms.insert(
+            MATCH,
+            Room {
+                map: scene.map().clone(),
+                remaining: players.len(),
+                players,
+                world: Some(WorldStart {
+                    scene: Box::new(scene),
+                    card: PlayerCard::default(),
+                }),
+            },
+        );
+        let first = FIRST_TICK + 1;
+        let commands: Vec<_> = (first..first + 32)
+            .map(|frame| Command {
+                frame,
+                ..Command::default()
+            })
+            .collect();
+        let room = &state.rooms[&MATCH];
+        for slot in 0..room.players.len() {
+            let connection = slot as u32 + 1;
+            let viewer = room.appearance(slot).unwrap();
+            let mut peer = Peer::new(viewer.entity);
+            peer.world
+                .start(&room.world.as_ref().unwrap().scene, &viewer, FIRST_TICK)
+                .unwrap();
+            peer.world.queue_commands(FIRST_TICK, &commands);
+            state.seats.insert(connection, (MATCH, slot));
+            state.peers.insert(connection, peer);
+        }
+        let acks = |state: &State| {
+            state
+                .peers
+                .values()
+                .map(|peer| peer.world.command_ack(FIRST_TICK))
+                .collect::<Vec<_>>()
+        };
+        assert!(state.advance_input(Duration::ZERO));
+        assert_eq!(
+            acks(&state),
+            [first + 15, first + 15, first + 15, first + 15, FIRST_TICK]
+        );
+        assert!(state.advance_input(Duration::ZERO));
+        assert_eq!(
+            acks(&state),
+            [first + 31, first + 31, first + 31, first + 15, first + 15]
+        );
+        assert!(!state.advance_input(Duration::ZERO));
+        assert_eq!(acks(&state), [first + 31; 5]);
+    }
+
+    #[test]
+    #[ignore = "requires a prepared 104319 Practice Range scene"]
     fn prepared_world_waits_for_ownership_and_retries_baselines_before_scripts() {
         use crate::{
             accounts::Accounts,
@@ -1496,8 +1594,11 @@ mod tests {
             assert_eq!(input_ack(schemas, &packet), newest);
             client.send(ACK, Vec::new());
         }
-        newest += 1;
-        client.send(ACK, input_batch(newest, 1, -31010));
+        newest += 48;
+        let recoverable = input_batch(newest, 1, -31010);
+        for _ in 0..=RECEIVE_BATCH {
+            client.send(ACK, recoverable.clone());
+        }
         await_input(client, newest);
 
         let mut open = vec![1, 1];

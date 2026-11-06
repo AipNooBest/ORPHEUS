@@ -233,6 +233,17 @@ mod guid {
     }
 }
 
+pub(crate) fn saved_integer(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_f64().map(|value| value as i64)),
+        Value::Bool(value) => Some(i64::from(*value)),
+        Value::String(value) => value.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_guid(text: &str) -> Option<u64> {
     let text = trim_name(text);
     let text = text.strip_prefix('+').unwrap_or(text);

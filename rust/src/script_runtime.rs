@@ -4,6 +4,65 @@ use std::collections::{BTreeMap, VecDeque};
 
 pub const FRAME_MS: u64 = crate::game_clock::TICK_PERIOD.as_millis() as u64;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ButtonEdge {
+    pub button: u8,
+    pub pressed: bool,
+}
+
+/// Logical edges in the client dispatcher order. Action bytes are pulses.
+pub fn button_edges(previous: u32, current: u32, action: u8) -> impl Iterator<Item = ButtonEdge> {
+    const INPUTS: [(u32, u8); 17] = [
+        (0x040, 11),
+        (0x080, 12),
+        (0x001, 20),
+        (0x002, 29),
+        (0x008, 35),
+        (0x010, 36),
+        (0x020, 37),
+        (0x004, 30),
+        (0x800, 31),
+        (0x400, 14),
+        (0x001, 111),
+        (0x002, 112),
+        (0x004, 113),
+        (0x008, 114),
+        (0x010, 110),
+        (0x020, 116),
+        (0x040, 115),
+    ];
+    let pulse = match action {
+        1..=5 => Some(14 + action),
+        6..=7 => Some(15 + action),
+        8 => Some(56),
+        9 => Some(71),
+        10..=15 => Some(81 + action),
+        16 => Some(120),
+        17..=19 => Some(80 + action),
+        _ => None,
+    };
+    INPUTS
+        .into_iter()
+        .filter_map(move |(mask, button)| {
+            ((previous ^ current) & mask != 0).then_some(ButtonEdge {
+                button,
+                pressed: current & mask != 0,
+            })
+        })
+        .chain(pulse.into_iter().flat_map(|button| {
+            [
+                ButtonEdge {
+                    button,
+                    pressed: true,
+                },
+                ButtonEdge {
+                    button,
+                    pressed: false,
+                },
+            ]
+        }))
+}
+
 pub(crate) fn frame_start(frame: u32) -> u64 {
     u64::from(frame) * FRAME_MS
 }
@@ -106,6 +165,32 @@ impl<E> Timeline<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_edges_preserve_aliases_release_order_and_action_pulses() {
+        let collect = |previous, current, action| {
+            button_edges(previous, current, action)
+                .map(|edge| (edge.button, edge.pressed))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            collect(0x88, 0x841, 2),
+            [
+                (11, true),
+                (12, false),
+                (20, true),
+                (35, false),
+                (31, true),
+                (111, true),
+                (114, false),
+                (115, true),
+                (16, true),
+                (16, false)
+            ]
+        );
+        assert_eq!(collect(8, 8, 19), [(99, true), (99, false)]);
+        assert!(collect(0x004000, 0, 20).is_empty());
+    }
 
     #[test]
     fn preserves_due_time_fifo_and_instance_turns() {

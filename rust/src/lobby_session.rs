@@ -11,10 +11,12 @@ use crate::{
     collection::{Collection, HERO_CATALOG, PROGRESSION},
     jam_codec::{Fields, Schemas, Value},
     jam_handshake::server_handshake,
+    lobby_arcade::Arcade,
     lobby_clock::server_time,
     lobby_login::{self, INCOMPATIBLE_CLIENT, Identity, LOGIN_MESSAGE, Login, OUT_CONNECT},
+    lobby_mode_rules::{self, MODE_RULES, RULES},
     lobby_party::{self, Membership, PartyMember},
-    lobby_player_messages as player,
+    lobby_passes, lobby_player_messages as player,
     lobby_presence::Presence,
     lobby_ranked::{LeaderboardPlaces, Ranked},
     lobby_transport::{Event, LobbyMessage, LobbyTransport},
@@ -24,13 +26,6 @@ use crate::{
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 const DISCONNECT: u32 = 20503;
 const PING: u32 = 0xdda5_83ef;
-// Python builds these four messages per account instead of replaying the capture.
-const UNPORTED_LOGIN_REPLACEMENTS: [(u32, u32); 4] = [
-    (0xad1c_34ba, 58501), // Priority passes.
-    (0x00a8_654e, 39802), // Arcade cards.
-    (0x00a8_654e, 39810), // Arcade dates.
-    (0x00a8_654e, 39804), // Arcade availability.
-];
 
 pub struct LobbySession<'a> {
     transport: LobbyTransport,
@@ -56,8 +51,7 @@ pub struct LoginContent<'a> {
     pub menu_hero: Option<u64>,
     pub extra_skins: &'a [u64],
     pub wall_time: u64,
-    /// None means the caller has no verified Arcade state.
-    pub competitive_event_cards: Option<&'a [u64]>,
+    pub arcade: &'a Arcade,
     pub leaderboard_places: &'a LeaderboardPlaces,
     /// A confirmed single-member party; the caller sends other party rosters.
     pub solo_party: Option<SoloLoginParty>,
@@ -223,26 +217,34 @@ impl PreparedLogin {
             (PROGRESSION, 24300, collection.progression(&profile)?),
             (HERO_CATALOG, 24900, collection.hero_catalog(&profile)?),
         ]);
-        let replay = templates.at_login(
-            &profile,
-            identity,
-            content.menu_hero,
-            now,
-            &BTreeMap::from([((LOBBY, 20812), player::ux_states(&profile)?)]),
-        )?;
-        messages.extend(
-            replay
-                .into_iter()
-                .filter(|&(crc, id, _)| !UNPORTED_LOGIN_REPLACEMENTS.contains(&(crc, id))),
-        );
-        if let Some(event_cards) = content.competitive_event_cards {
-            messages.extend(ranked.login_messages(
+        let season = ranked.season(&profile);
+        messages.push((
+            MODE_RULES,
+            RULES,
+            lobby_mode_rules::mode_rules(
+                templates,
                 &profile,
-                event_cards,
-                content.leaderboard_places,
-                now,
-            )?);
+                collection.heroes(),
+                collection.items(),
+                season,
+            )?,
+        ));
+        let arcade = content.arcade.state(&profile, season, now)?;
+        let mut built = BTreeMap::from([((LOBBY, 20812), player::ux_states(&profile)?)]);
+        for (crc, id, fields) in arcade
+            .messages
+            .into_iter()
+            .chain([lobby_passes::counts(&profile)?])
+        {
+            built.insert((crc, id), fields);
         }
+        messages.extend(templates.at_login(&profile, identity, content.menu_hero, now, &built)?);
+        messages.extend(ranked.login_messages(
+            &profile,
+            &arcade.competitive_cards,
+            content.leaderboard_places,
+            now,
+        )?);
         messages.push((
             PING,
             35500,
@@ -513,6 +515,7 @@ mod tests {
         let collection = Collection::new(&templates, items).unwrap();
         let presence = Presence::new(&templates).unwrap();
         let ranked = Ranked::new(&templates).unwrap();
+        let arcade = Arcade::load(runtime.join("arcade_cards_174.json"), &templates).unwrap();
         let temporary = tempfile::tempdir().unwrap();
         let accounts = Accounts::new(
             temporary.path().join("profiles"),
@@ -567,12 +570,11 @@ mod tests {
                 menu_hero,
                 extra_skins: &[],
                 wall_time: 1_700_000_000,
-                competitive_event_cards: None,
+                arcade: &arcade,
                 leaderboard_places: &places,
                 solo_party: None,
             };
             let exact_inputs = LoginContent {
-                competitive_event_cards: Some(event_cards),
                 solo_party: Some(SoloLoginParty {
                     id: [0x1234, 0x2345],
                     entity: [0x0100_1d00_0000_0033, 0x4444],
@@ -585,7 +587,7 @@ mod tests {
                 (inputs, 46, base),
                 (exact_inputs, 50 + event_cards.len(), with_extras),
             ] {
-                let messages = prepared
+                let mut messages = prepared
                     .available_messages(
                         &schemas,
                         &templates,
@@ -595,6 +597,36 @@ mod tests {
                         content,
                     )
                     .unwrap();
+                let arcade_and_passes = [
+                    (lobby_passes::PASSES, 58501),
+                    (crate::lobby_arcade::ARCADE, 39802),
+                    (crate::lobby_arcade::ARCADE, 39810),
+                    (crate::lobby_arcade::ARCADE, 39804),
+                ];
+                let actual: Vec<_> = messages
+                    .iter()
+                    .map(|&(crc, id, _)| (crc, id))
+                    .filter(|key| arcade_and_passes.contains(key))
+                    .collect();
+                assert_eq!(actual, arcade_and_passes);
+                let ranks = messages
+                    .iter()
+                    .filter(|message| message.0 == RANKED)
+                    .count();
+                assert_eq!(ranks, 3 + event_cards.len());
+                assert_eq!(messages[9].0, MODE_RULES);
+                assert_eq!(messages[9].1, RULES);
+                assert_eq!(
+                    messages.len(),
+                    54 + event_cards.len() + usize::from(content.solo_party.is_some())
+                );
+                // Keep the earlier reference corpus for the original subset.
+                // The new dynamic rows have their own complete wire comparison.
+                messages.retain(|&(crc, id, _)| {
+                    (crc, id) != (MODE_RULES, RULES)
+                        && !arcade_and_passes.contains(&(crc, id))
+                        && (content.solo_party.is_some() || crc != RANKED)
+                });
                 let keys: Vec<_> = messages.iter().map(|&(crc, id, _)| (crc, id)).collect();
                 assert_eq!(
                     keys[..9],

@@ -2,7 +2,7 @@
 
 use std::{
     borrow::Borrow,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     sync::Arc,
     time::Duration,
@@ -20,6 +20,7 @@ use crate::{
     game_parameters::{ClientGameMessage, HeroSelectRequest},
     match_scene::{PlayerAppearance, Possession, team_bit},
     mover::Mover,
+    mover_kinematics::Poses,
     scene_assets::PreparedScene,
     script_stream::{ScriptChunk, Stream},
     world::{EntityUpdate, GAME_MODE_ENTITY, Operation, SkinTheme},
@@ -29,6 +30,9 @@ const BODY_REUSE_DELAY: Duration = Duration::from_secs(30);
 // Resource bound for this worker. The reference keeps 64 predicted states and
 // 32 commands. A farther-ahead command can be retried once the clock catches up.
 const MAX_INPUT_LEAD: u32 = 96;
+// Several retransmit windows fit before a peer exhausts this queue. One final
+// leave marker may follow the accepted prefix when the cap is reached.
+const MAX_PENDING_INPUT: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BodyId {
@@ -105,6 +109,73 @@ impl Borrow<EntityUpdate> for Ready<'_> {
     }
 }
 
+enum InputWork {
+    Message {
+        message: Message,
+        tick: u32,
+        received: Duration,
+    },
+    Command {
+        command: Command,
+        pending: Option<Poses>,
+    },
+    Leave,
+}
+
+#[derive(Default)]
+struct InputQueue {
+    work: VecDeque<InputWork>,
+    first_admitted: Option<u32>,
+    admitted: Option<u32>,
+    processed: Option<u32>,
+    closing: bool,
+}
+
+impl InputQueue {
+    fn push(&mut self, work: InputWork) -> bool {
+        if self.closing {
+            return false;
+        }
+        if self.work.len() == MAX_PENDING_INPUT {
+            self.close_after_prefix();
+            return false;
+        }
+        self.work.push_back(work);
+        true
+    }
+
+    fn commands(&mut self, tick: u32, commands: &[Command]) {
+        if self.closing || commands.is_empty() {
+            return;
+        }
+        let (fresh, boundary) = command_prefix(self.admitted, tick, commands);
+        for command in fresh {
+            if !self.push(InputWork::Command {
+                command,
+                pending: None,
+            }) {
+                return;
+            }
+            self.first_admitted.get_or_insert(command.frame);
+            self.admitted = Some(command.frame);
+        }
+        if boundary.is_some() {
+            self.close_after_prefix();
+        }
+    }
+
+    fn close_after_prefix(&mut self) {
+        self.work.push_back(InputWork::Leave);
+        self.closing = true;
+    }
+
+    fn clear(&mut self) {
+        self.work.clear();
+        self.admitted = self.processed;
+        self.closing = false;
+    }
+}
+
 pub(crate) struct WorldDelivery {
     owner: u32,
     queued: Vec<Arc<Record>>,
@@ -118,7 +189,7 @@ pub(crate) struct WorldDelivery {
     bound: Option<BodyId>,
     generation: u64,
     bodies: HashMap<u32, (u64, Lifetime)>,
-    commands: CommandQueue,
+    input: InputQueue,
     mover: Option<Mover>,
 }
 
@@ -137,7 +208,7 @@ impl WorldDelivery {
             bound: None,
             generation: 0,
             bodies: HashMap::new(),
-            commands: CommandQueue::new(),
+            input: InputQueue::default(),
             mover: None,
         }
     }
@@ -147,6 +218,7 @@ impl WorldDelivery {
         self.started = None;
         self.presentation_due = false;
         self.mover = None;
+        self.input.clear();
     }
 
     fn push(&mut self, record: Record) {
@@ -297,7 +369,13 @@ impl WorldDelivery {
         Ok(())
     }
 
-    pub(crate) fn game_message(
+    fn can_handle_game_message(&self) -> bool {
+        self.started.is_some()
+            && self.controller.latest_data() != 0
+            && self.created.contains(&self.owner)
+    }
+
+    fn game_message(
         &mut self,
         scene: &PreparedScene,
         viewer: &PlayerAppearance<'_>,
@@ -305,10 +383,7 @@ impl WorldDelivery {
         now: Duration,
         message: &Message,
     ) -> io::Result<()> {
-        if self.started.is_none()
-            || self.controller.latest_data() == 0
-            || !self.created.contains(&self.owner)
-        {
+        if !self.can_handle_game_message() {
             return Ok(());
         }
         let Some(message) = ClientGameMessage::read(message) else {
@@ -351,31 +426,81 @@ impl WorldDelivery {
     }
 
     pub(crate) fn command_ack(&self, tick: u32) -> u32 {
-        self.commands.last_frame().unwrap_or(tick)
+        self.input.processed.unwrap_or_else(|| {
+            self.input
+                .first_admitted
+                .map_or(tick, |frame| tick.min(frame.saturating_sub(1)))
+        })
     }
 
-    pub(crate) fn take_commands(
+    pub(crate) fn queue_game_message(&mut self, tick: u32, received: Duration, message: Message) {
+        if self.can_handle_game_message() {
+            self.input.push(InputWork::Message {
+                message,
+                tick,
+                received,
+            });
+        }
+    }
+
+    pub(crate) fn queue_commands(&mut self, tick: u32, commands: &[Command]) {
+        if self.started.is_some() {
+            self.input.commands(tick, commands);
+        }
+    }
+
+    pub(crate) fn has_input_work(&self) -> bool {
+        !self.input.work.is_empty()
+    }
+
+    /// One unit per physics pose, pre-body command, or queued game message.
+    /// A fresh frame is committed only after its final pose has completed.
+    pub(crate) fn advance_input(
         &mut self,
         scene: &PreparedScene,
-        tick: u32,
+        viewer: &PlayerAppearance<'_>,
         quanta: u32,
-        commands: &[Command],
-    ) -> io::Result<Option<u32>> {
-        if self.started.is_none() || commands.is_empty() {
-            return Ok(None);
-        }
-        let (accepted, fresh, boundary) = command_prefix(&self.commands, tick, commands);
+        budget: usize,
+    ) -> io::Result<(usize, bool)> {
         let dt = f64::from(quanta) / 1_000_000.0;
-        if let Some(mover) = &mut self.mover {
-            for (index, &command) in fresh.iter().enumerate() {
-                if let Err(error) = mover.step(scene.movement_index(), command, dt, |_, _| {}) {
-                    self.commands.consume(&fresh[..index]);
-                    return Err(invalid(error));
+        let mut remaining = budget;
+        while remaining != 0 {
+            let Some(work) = self.input.work.pop_front() else {
+                break;
+            };
+            match work {
+                InputWork::Message {
+                    message,
+                    tick,
+                    received,
+                } => {
+                    let _ = self.game_message(scene, viewer, tick, received, &message);
+                    remaining -= 1;
                 }
+                InputWork::Command {
+                    command,
+                    mut pending,
+                } => {
+                    if let Some(mover) = &mut self.mover {
+                        let poses = pending.get_or_insert_with(|| mover.pending_poses(command));
+                        remaining -= mover
+                            .step_pending(scene.movement_index(), poses, dt, remaining, |_, _| {})
+                            .map_err(invalid)?;
+                        if poses.len() != 0 {
+                            self.input
+                                .work
+                                .push_front(InputWork::Command { command, pending });
+                            break;
+                        }
+                    } else {
+                        remaining -= 1;
+                    }
+                    self.input.processed = Some(command.frame);
+                }
+                InputWork::Leave => return Ok((budget - remaining + 1, true)),
             }
         }
-        self.commands = accepted;
-        Ok(boundary)
+        Ok((budget - remaining, false))
     }
 
     fn next_body(&self, now: Duration) -> Option<u32> {
@@ -535,22 +660,16 @@ impl WorldDelivery {
 }
 
 fn command_prefix(
-    queue: &CommandQueue,
+    anchor: Option<u32>,
     tick: u32,
     commands: &[Command],
-) -> (CommandQueue, Vec<Command>, Option<u32>) {
+) -> (Vec<Command>, Option<u32>) {
     // Classify the lease boundary independently of the resource window so a
     // fresh unencodable frame still closes its old link.
-    let mut accepted = queue.clone();
-    let (mut fresh, boundary) = accepted.before_limit(commands, MAX_LEASE_FRAME, None);
+    let (mut fresh, boundary) = CommandQueue::new().before_limit(commands, MAX_LEASE_FRAME, anchor);
     let limit = tick.saturating_add(MAX_INPUT_LEAD);
-    let count = fresh.partition_point(|command| command.frame <= limit);
-    if count < fresh.len() {
-        fresh.truncate(count);
-        accepted = queue.clone();
-        accepted.consume(&fresh);
-    }
-    (accepted, fresh, boundary)
+    fresh.truncate(fresh.partition_point(|command| command.frame <= limit));
+    (fresh, boundary)
 }
 
 fn invalid(error: impl std::fmt::Display) -> io::Error {
@@ -561,8 +680,14 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
 mod tests {
     use super::*;
     use crate::{
-        game_clock::FIRST_TICK, game_content::GameMap, game_heroes::SOLDIER,
-        game_instance::RETAIL_QUANTA, match_scene::PlayerCard, scene_assets::SceneAssets,
+        game_clock::FIRST_TICK,
+        game_content::GameMap,
+        game_heroes::SOLDIER,
+        game_instance::RETAIL_QUANTA,
+        game_parameters::{CLIENT_GAME_MESSAGE, PICK_HERO},
+        jam_codec::{Fields, Value},
+        match_scene::PlayerCard,
+        scene_assets::SceneAssets,
     };
 
     fn forward(frame: u32) -> Command {
@@ -575,10 +700,8 @@ mod tests {
 
     #[test]
     fn native_command_window_keeps_duplicates_and_future_input_unacknowledged() {
-        let mut queue = CommandQueue::new();
-        queue.consume(&[forward(1000)]);
-        let (accepted, fresh, boundary) = command_prefix(
-            &queue,
+        let (fresh, boundary) = command_prefix(
+            Some(1000),
             1000,
             &[
                 forward(1000),
@@ -590,28 +713,78 @@ mod tests {
         );
         assert_eq!(fresh, [forward(1001), forward(1096)]);
         assert_eq!(boundary, None);
-        assert_eq!(queue.last_frame(), Some(1000));
-        assert_eq!(accepted.last_frame(), Some(1096));
 
-        let empty = CommandQueue::new();
-        let (accepted, fresh, boundary) =
-            command_prefix(&empty, 1000, &[forward(MAX_LEASE_FRAME + 1)]);
+        let (fresh, boundary) = command_prefix(None, 1000, &[forward(MAX_LEASE_FRAME + 1)]);
         assert!(fresh.is_empty());
         assert_eq!(boundary, Some(MAX_LEASE_FRAME + 1));
-        assert_eq!(accepted.last_frame(), None);
-        let (accepted, fresh, boundary) = command_prefix(
-            &empty,
+        let (fresh, boundary) = command_prefix(
+            None,
             MAX_LEASE_FRAME - 2,
             &[forward(MAX_LEASE_FRAME - 1), forward(MAX_LEASE_FRAME + 1)],
         );
         assert_eq!(fresh, [forward(MAX_LEASE_FRAME - 1)]);
         assert_eq!(boundary, Some(MAX_LEASE_FRAME + 1));
-        assert_eq!(accepted.last_frame(), Some(MAX_LEASE_FRAME - 1));
+    }
+
+    #[test]
+    fn overlapping_bursts_enqueue_each_frame_once_and_do_not_ack_pending_work() {
+        let mut world = WorldDelivery::new(0xa000_0100);
+        world.started = Some(1000);
+        let first: Vec<_> = (980..1012).map(forward).collect();
+        let next: Vec<_> = (1000..1032).map(forward).collect();
+        world.queue_commands(1000, &first);
+        world.queue_commands(1000, &next);
+        world.queue_commands(1000, &first);
+        let frames: Vec<_> = world
+            .input
+            .work
+            .iter()
+            .map(|work| {
+                let InputWork::Command {
+                    command,
+                    pending: None,
+                } = work
+                else {
+                    panic!("fresh command");
+                };
+                command.frame
+            })
+            .collect();
+        assert_eq!(frames, (980..1032).collect::<Vec<_>>());
+        assert_eq!(world.command_ack(1000), 979);
+        world.clear();
+        assert!(!world.has_input_work());
+        assert_eq!(world.command_ack(1001), 979);
+    }
+
+    #[test]
+    fn pending_queue_closes_after_the_prefix_at_a_boundary_or_capacity() {
+        let mut input = InputQueue::default();
+        input.commands(
+            MAX_LEASE_FRAME - 2,
+            &[forward(MAX_LEASE_FRAME - 1), forward(MAX_LEASE_FRAME + 1)],
+        );
+        assert!(input.closing);
+        assert_eq!(input.admitted, Some(MAX_LEASE_FRAME - 1));
+        assert!(matches!(
+            input.work.pop_front(),
+            Some(InputWork::Command { .. })
+        ));
+        assert!(matches!(input.work.pop_front(), Some(InputWork::Leave)));
+
+        let mut input = InputQueue::default();
+        for frame in 1..=MAX_PENDING_INPUT as u32 + 2 {
+            input.commands(frame, &[forward(frame)]);
+        }
+        assert_eq!(input.work.len(), MAX_PENDING_INPUT + 1);
+        assert_eq!(input.admitted, Some(MAX_PENDING_INPUT as u32));
+        assert!(matches!(input.work.back(), Some(InputWork::Leave)));
+        assert_eq!(input.processed, None);
     }
 
     #[test]
     #[ignore = "requires a prepared 104319 Practice Range pack without bot VM graphs"]
-    fn native_world_moves_the_player_once_per_fresh_command_and_keeps_the_clock_on_switch() {
+    fn native_world_resumes_a_gap_before_switching_the_body_and_acknowledging_input() {
         let runtime = std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap();
         let assets = SceneAssets::load(runtime).unwrap();
         let scene = assets.prepare(GameMap::practice_range()).unwrap();
@@ -624,19 +797,20 @@ mod tests {
         };
         let mut world = WorldDelivery::new(owner);
         let first = FIRST_TICK + 1;
-        assert_eq!(
-            world
-                .take_commands(&scene, FIRST_TICK, RETAIL_QUANTA, &[forward(first)])
-                .unwrap(),
-            None
-        );
+        world.queue_commands(FIRST_TICK, &[forward(first)]);
+        assert!(!world.has_input_work());
         assert_eq!(world.command_ack(FIRST_TICK), FIRST_TICK);
         world.start(&scene, &viewer, FIRST_TICK).unwrap();
-        // The reference accepts commands while the hero selector is open.
-        world
-            .take_commands(&scene, FIRST_TICK, RETAIL_QUANTA, &[forward(first)])
-            .unwrap();
+        world.queue_commands(FIRST_TICK, &[forward(first)]);
+        assert_eq!(
+            world
+                .advance_input(&scene, &viewer, RETAIL_QUANTA, 16)
+                .unwrap(),
+            (1, false)
+        );
         assert_eq!(world.command_ack(FIRST_TICK + 2), first);
+        world.created.insert(owner);
+        world.present(&scene, FIRST_TICK).unwrap();
         let hero = scene.heroes().get(SOLDIER).unwrap();
         world
             .switch(
@@ -649,36 +823,93 @@ mod tests {
             )
             .unwrap();
         let initial = world.mover.as_ref().unwrap().pose();
-        let commands: Vec<_> = (first + 1..=first + 24)
-            .map(|frame| Command {
-                yaw: initial.yaw,
-                ..forward(frame)
-            })
-            .collect();
-        world
-            .take_commands(&scene, FIRST_TICK + 3, RETAIL_QUANTA, &commands)
-            .unwrap();
-        let moved = world.mover.as_ref().unwrap().pose();
-        assert_eq!(moved.frame, Some(first + 24));
-        assert_ne!(moved.position, initial.position);
-        assert_eq!(world.command_ack(FIRST_TICK + 90), first + 24);
-        world
-            .take_commands(&scene, FIRST_TICK + 30, RETAIL_QUANTA, &commands)
-            .unwrap();
-        assert_eq!(world.mover.as_ref().unwrap().pose(), moved);
+        let actual = Command {
+            yaw: initial.yaw,
+            ..forward(first + 1)
+        };
+        let gap = Command {
+            frame: actual.frame + 64,
+            ..actual
+        };
+        let later = Command {
+            frame: gap.frame + 1,
+            ..actual
+        };
+        world.queue_commands(FIRST_TICK + 2, &[actual]);
+        assert_eq!(
+            world
+                .advance_input(&scene, &viewer, RETAIL_QUANTA, 16)
+                .unwrap(),
+            (1, false)
+        );
+        world.queue_commands(FIRST_TICK + 2, &[actual, gap]);
 
-        world
-            .switch(
-                &scene,
-                &viewer,
-                FIRST_TICK + 30,
-                owner | 2,
-                hero,
-                SkinTheme::default(),
-            )
+        let tracer = scene.heroes().find_hero("Tracer").unwrap();
+        let switch = Message {
+            id: CLIENT_GAME_MESSAGE,
+            fields: Fields::from([
+                (
+                    0x78,
+                    Value::Struct(Fields::from([(0, Value::Unsigned(u64::from(owner)))])),
+                ),
+                (0x80, Value::Blob(tracer.guid.to_le_bytes().to_vec())),
+                (0xa8, Value::Unsigned(PICK_HERO)),
+                (0xb0, Value::Signed(3)),
+            ]),
+        };
+        world.queue_game_message(FIRST_TICK + 3, Duration::ZERO, switch);
+        world.queue_commands(FIRST_TICK + 3, &[gap, later]);
+
+        for turn in 1..=4 {
+            assert_eq!(
+                world
+                    .advance_input(&scene, &viewer, RETAIL_QUANTA, 16)
+                    .unwrap(),
+                (16, false)
+            );
+            assert_eq!(world.body.unwrap().id.entity, owner | 1);
+            assert_eq!(
+                world.mover.as_ref().unwrap().pose().frame,
+                Some(actual.frame + turn * 16)
+            );
+            assert_eq!(
+                world.command_ack(FIRST_TICK + 90),
+                if turn == 4 { gap.frame } else { actual.frame }
+            );
+        }
+        let (position, yaw) = scene.map().spawn_point(viewer.team, 0).unwrap();
+        let yaw = (yaw * 65536.0 / 360.0).round_ties_even() as i32;
+        let mut synchronous = scene
+            .player_mover(hero.body, viewer.team, position, yaw)
             .unwrap();
-        assert_eq!(world.mover.as_ref().unwrap().pose(), initial);
-        assert_eq!(world.command_ack(FIRST_TICK + 30), first + 24);
+        for command in [actual, gap] {
+            synchronous
+                .step(scene.movement_index(), command, 0.016, |_, _| {})
+                .unwrap();
+        }
+        assert_eq!(world.mover.as_ref().unwrap().pose(), synchronous.pose());
+        assert_ne!(synchronous.pose().position, initial.position);
+
+        assert_eq!(
+            world
+                .advance_input(&scene, &viewer, RETAIL_QUANTA, 16)
+                .unwrap(),
+            (2, false)
+        );
+        assert_eq!(world.body.unwrap().id.entity, owner | 2);
+        assert_eq!(world.command_ack(FIRST_TICK + 90), later.frame);
+        let mut synchronous = scene
+            .player_mover(tracer.body, viewer.team, position, yaw)
+            .unwrap();
+        synchronous
+            .step(scene.movement_index(), later, 0.016, |_, _| {})
+            .unwrap();
+        assert_eq!(world.mover.as_ref().unwrap().pose(), synchronous.pose());
+
+        world.queue_commands(FIRST_TICK + 3, &[forward(later.frame + 1)]);
+        world.clear();
+        assert!(!world.has_input_work());
+        assert_eq!(world.command_ack(FIRST_TICK + 90), later.frame);
     }
     use crate::game_egress::PacketDelivery;
 

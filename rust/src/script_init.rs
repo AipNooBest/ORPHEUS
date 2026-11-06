@@ -17,9 +17,10 @@ use indexmap::IndexMap;
 use serde_json::Value as Json;
 
 use crate::{
+    commands::Command,
     script_expr::{self, Context, EmptyContext, EvalError, Scope, Variable, equal, truthy},
     script_graph::{Body, Graph, GraphStore, Node, asset_guid},
-    script_runtime::{FRAME_MS, QueueFull, Timeline, frame_start},
+    script_runtime::{ButtonEdge, FRAME_MS, QueueFull, Timeline, button_edges, frame_start},
     script_wire::{Value, Variables},
 };
 
@@ -120,6 +121,13 @@ pub enum StateKind {
     Wait,
     WaitFrames { target: u32 },
     AiCandidate { selected: bool },
+    LogicalButton { down: bool },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BufferedPress {
+    time_ms: u64,
+    activation: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +139,7 @@ pub struct State {
     ending: bool,
     pending_change: bool,
     pending_timer: bool,
+    buffered_press: Option<BufferedPress>,
 }
 
 #[derive(Clone, Debug)]
@@ -348,13 +357,34 @@ impl Component {
     }
 
     pub fn advance_frame(&mut self, frame: u32, world: &mut impl World) -> Result<(), InitFault> {
+        self.advance(frame, None, world)
+    }
+
+    pub fn advance_command(
+        &mut self,
+        command: Command,
+        world: &mut impl World,
+    ) -> Result<(), InitFault> {
+        self.advance(command.frame, Some(command), world)
+    }
+
+    pub fn set_owner_dead(&mut self, dead: bool) {
+        self.machine.owner_dead = dead;
+    }
+
+    fn advance(
+        &mut self,
+        frame: u32,
+        command: Option<Command>,
+        world: &mut impl World,
+    ) -> Result<(), InitFault> {
         if frame_start(frame) < self.machine.now_ms {
             return Err(InitFault::FrameOrder {
                 frame,
                 now_ms: self.machine.now_ms,
             });
         }
-        self.run(world, |vm| vm.advance_frame(frame))
+        self.run(world, |vm| vm.advance_frame(frame, command))
     }
 
     fn run<W: World>(
@@ -409,6 +439,7 @@ enum Event {
     Changed(u16),
     Reevaluate(u16),
     Timer(u16, u16),
+    Button(ButtonEdge),
     Message {
         position: u16,
         parameters: Arc<Variables>,
@@ -418,7 +449,7 @@ enum Event {
 impl Event {
     fn state(&self) -> Option<u16> {
         match *self {
-            Self::Entry(_) | Self::Message { .. } => None,
+            Self::Entry(_) | Self::Message { .. } | Self::Button(_) => None,
             Self::Begin(state)
             | Self::Finish(state)
             | Self::Abort(state)
@@ -439,6 +470,9 @@ struct Machine {
     max_work: usize,
     frame: u32,
     now_ms: u64,
+    command_buttons: u32,
+    held_buttons: Vec<u8>,
+    owner_dead: bool,
 }
 
 impl Machine {
@@ -467,6 +501,9 @@ impl Machine {
             max_work,
             frame,
             now_ms: frame_start(frame),
+            command_buttons: 0,
+            held_buttons: Vec::new(),
+            owner_dead: false,
         })
     }
 
@@ -598,9 +635,12 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         }
     }
 
-    fn advance_frame(&mut self, frame: u32) -> Result<(), InitFault> {
+    fn advance_frame(&mut self, frame: u32, command: Option<Command>) -> Result<(), InitFault> {
         self.machine.frame = frame;
         self.machine.now_ms = frame_start(frame);
+        if let Some(command) = command {
+            self.queue_buttons(command)?;
+        }
         let end = self.machine.now_ms + FRAME_MS - 1;
         loop {
             let due = self
@@ -617,6 +657,152 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 return Ok(());
             }
         }
+    }
+
+    fn queue_buttons(&mut self, command: Command) -> Result<(), InitFault> {
+        let edges: Vec<_> = button_edges(
+            self.machine.command_buttons,
+            command.buttons,
+            command.action,
+        )
+        .collect();
+        self.machine
+            .queues
+            .reserve(edges.len() * self.machine.snapshot.instances.len())?;
+        for &id in self.machine.snapshot.instances.keys() {
+            for &edge in &edges {
+                self.machine
+                    .queues
+                    .push(id, self.machine.now_ms, Event::Button(edge))?;
+            }
+        }
+        self.machine.command_buttons = command.buttons;
+        Ok(())
+    }
+
+    fn button_edge(&mut self, id: u16, edge: ButtonEdge) -> Result<(), InitFault> {
+        if edge.pressed {
+            if !self.machine.held_buttons.contains(&edge.button) {
+                self.machine.held_buttons.push(edge.button);
+            }
+        } else {
+            self.machine
+                .held_buttons
+                .retain(|&button| button != edge.button);
+        }
+        let graph = self.graph(id);
+        for raw in raw_indices(array_field(&graph.fields, "m_680A2CB2")) {
+            let Some(node) = graph.state(usize::from(raw)) else {
+                continue;
+            };
+            if node.client_only || node.class != "STUStatescriptStateLogicalButton" {
+                continue;
+            }
+            self.spend("logical button edge")?;
+            let key = StateKey { instance: id, raw };
+            if self.logical_button_id(key, node) != Some(edge.button) {
+                continue;
+            }
+            if edge.pressed
+                && self.machine.owner_dead
+                && !self
+                    .evaluate(id, node, field(&node.fields, "m_5AE05408"), None)
+                    .is_some_and(|value| truthy(&value))
+            {
+                continue;
+            }
+            if edge.pressed {
+                let state = self.machine.snapshot.instances[&id]
+                    .states
+                    .entry(raw)
+                    .or_insert(State {
+                        active: false,
+                        activation: 0,
+                        start_ms: 0,
+                        kind: StateKind::LogicalButton { down: false },
+                        ending: false,
+                        pending_change: false,
+                        pending_timer: false,
+                        buffered_press: None,
+                    });
+                state.buffered_press = Some(BufferedPress {
+                    time_ms: self.machine.now_ms,
+                    activation: state.activation.wrapping_add(u16::from(!state.active)),
+                });
+            }
+            if self.state(key).is_some_and(|state| state.active) {
+                self.set_button_down(key, node, edge.pressed, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn logical_button_id(&mut self, key: StateKey, node: &Node) -> Option<u8> {
+        let value = self.evaluate(
+            key.instance,
+            node,
+            field(&node.fields, "m_logicalButton"),
+            None,
+        )?;
+        u8::try_from(script_expr::to_int(&value, 0)).ok()
+    }
+
+    fn button_held(&mut self, key: StateKey, node: &Node) -> bool {
+        self.logical_button_id(key, node)
+            .is_some_and(|button| self.machine.held_buttons.contains(&button))
+    }
+
+    fn enter_button(&mut self, key: StateKey, node: &Node, depth: usize) -> Result<(), InitFault> {
+        let state = self.state(key).expect("active logical button");
+        let buffer = state
+            .buffered_press
+            .filter(|press| press.activation == state.activation);
+        let duration = field(&node.fields, "m_246438AD");
+        let early = if let Some(press) = buffer.filter(|_| !duration.is_null()) {
+            let waited = ((self.machine.now_ms - press.time_ms) as f64 / 1000.0) as f32;
+            self.evaluate(key.instance, node, duration, None)
+                .is_some_and(|value| f64::from(waited) <= script_expr::to_float(&value))
+        } else {
+            false
+        };
+        if early {
+            self.follow(key.instance, node, "m_onGoingDownPlug", Some(key), depth)?;
+        }
+        if !self.state(key).is_some_and(|state| state.active) {
+            return Ok(());
+        }
+        let held = self.button_held(key, node);
+        let down = held || early;
+        self.state_mut(key).expect("active logical button").kind =
+            StateKind::LogicalButton { down };
+        let path = if down { "m_80AF45FB" } else { "m_1C9EF058" };
+        self.follow(key.instance, node, path, Some(key), depth)?;
+        if early && !held {
+            self.post_after(key.instance, 1, Event::Timer(key.raw, 1))?;
+        }
+        Ok(())
+    }
+
+    fn set_button_down(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        down: bool,
+        depth: usize,
+    ) -> Result<(), InitFault> {
+        self.state_mut(key).expect("active logical button").kind =
+            StateKind::LogicalButton { down };
+        let (previous, edge, next) = if down {
+            ("m_1C9EF058", "m_onGoingDownPlug", "m_80AF45FB")
+        } else {
+            ("m_80AF45FB", "m_onComingUpPlug", "m_1C9EF058")
+        };
+        self.exit_subgraph(key.instance, node, previous, depth + 1)?;
+        self.follow(key.instance, node, edge, Some(key), depth)?;
+        if self.state(key).is_some_and(|state| state.active) {
+            self.follow(key.instance, node, next, Some(key), depth)?;
+        }
+        Ok(())
     }
 
     fn update(&mut self) -> Result<(), InitFault> {
@@ -643,6 +829,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                     Event::Changed(raw) => self.changed(key(raw))?,
                     Event::Reevaluate(raw) => self.reevaluate(key(raw), 0)?,
                     Event::Timer(raw, parameter) => self.timer(key(raw), parameter)?,
+                    Event::Button(edge) => self.button_edge(id, edge)?,
                     Event::Message {
                         position,
                         parameters,
@@ -1060,6 +1247,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             "STUStatescriptStateWait" if !configured(node, "m_BF1A93B0") => StateKind::Wait,
             "STU_D74D4F47" => StateKind::WaitFrames { target: 0 },
             "STU_91EF24A9" => StateKind::AiCandidate { selected: false },
+            "STUStatescriptStateLogicalButton" => StateKind::LogicalButton { down: false },
             _ => {
                 self.report(
                     self.site(id, node),
@@ -1068,9 +1256,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 return Ok(());
             }
         };
-        let activation = self
-            .state(key)
-            .map_or(1, |state| state.activation.wrapping_add(1));
+        let previous = self.state(key);
+        let activation = previous.map_or(1, |state| state.activation.wrapping_add(1));
+        let buffered_press = previous.and_then(|state| state.buffered_press);
         for raw in raw_indices(array_field(&node.fields, "m_exclusiveStateIndices")) {
             self.end(StateKey { instance: id, raw }, false, depth + 1)?;
             self.drop_begin(id, raw);
@@ -1085,6 +1273,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 ending: false,
                 pending_change: false,
                 pending_timer: false,
+                buffered_press,
             },
         );
         match kind {
@@ -1121,6 +1310,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                     self.report(site, Issue::UnsupportedField("AI behavior selection"));
                 }
             }
+            StateKind::LogicalButton { .. } => self.enter_button(key, node, depth)?,
             StateKind::Plain => (),
         }
         self.follow(id, node, "m_onBeginPlug", Some(key), depth)?;
@@ -1196,13 +1386,20 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         let Some(state) = self.state(key).filter(|state| state.active) else {
             return Ok(());
         };
-        if state.kind == StateKind::Wait && parameter == 1 {
+        let kind = state.kind;
+        if kind == StateKind::Wait && parameter == 1 {
             self.post(key.instance, Event::Finish(key.raw))?;
         }
         let node = self
             .graph(key.instance)
             .state(usize::from(key.raw))
             .expect("active timer state");
+        if matches!(kind, StateKind::LogicalButton { .. })
+            && parameter == 1
+            && !self.button_held(key, node)
+        {
+            self.set_button_down(key, node, false, 0)?;
+        }
         self.try_complete(key, node, 0)
     }
 
@@ -1363,6 +1560,10 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             StateKind::AiCandidate { selected: true } => {
                 self.exit_subgraph(id, node, "m_6F92F4BD", depth + 1)?;
             }
+            StateKind::LogicalButton { .. } => {
+                self.exit_subgraph(id, node, "m_80AF45FB", depth + 1)?;
+                self.exit_subgraph(id, node, "m_1C9EF058", depth + 1)?;
+            }
             _ => (),
         }
         let state = self.state_mut(key).expect("ending state");
@@ -1372,6 +1573,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         state.pending_timer = false;
         if matches!(kind, StateKind::SubScript { .. }) {
             state.kind = StateKind::SubScript { child: None };
+        }
+        if matches!(kind, StateKind::LogicalButton { .. }) {
+            state.kind = StateKind::LogicalButton { down: false };
         }
         self.machine.watchers.retain(|_, watchers| {
             watchers.retain(|watcher| *watcher != key);
@@ -2021,6 +2225,176 @@ mod tests {
             .iter()
             .filter_map(|(&raw, state)| state.active.then_some(raw))
             .collect()
+    }
+
+    #[test]
+    fn buffered_action_press_uses_the_shared_clock_and_releases_after_one_millisecond() {
+        let mut fixture = graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntryGameMessage",
+                    None,
+                    json!({
+                        "m_gameMessage":{"m_gameMessage":"0x0240000000000001"},
+                        "m_outPlug":plug(&[(1,"m_beginPlug")],&[]),
+                    }),
+                ),
+                node(
+                    1,
+                    "STUStatescriptStateLogicalButton",
+                    Some(0),
+                    json!({
+                        "m_logicalButton":{"$":"STUConfigVarLogicalButton","m_logicalButton":15},
+                        "m_246438AD":{"$":"STUConfigVarFloat","m_value":0.03},
+                        "m_onGoingDownPlug":plug(&[(2,"m_inPlug")],&[]),
+                        "m_onComingUpPlug":plug(&[(3,"m_inPlug")],&[]),
+                    }),
+                ),
+                node(
+                    2,
+                    "STUStatescriptActionSetVar",
+                    None,
+                    json!({
+                        "m_out_Var":var(10,false), "m_value": true,
+                    }),
+                ),
+                node(
+                    3,
+                    "STUStatescriptActionSetVar",
+                    None,
+                    json!({
+                        "m_out_Var":var(10,false), "m_value": false,
+                    }),
+                ),
+            ],
+            json!([1]),
+            json!([0]),
+        );
+        fixture["fields"]["m_680A2CB2"] = json!([0]);
+        let graphs = Arc::new(store(vec![fixture]));
+        for (dead, delay) in [(false, 0), (false, 2), (true, 0)] {
+            let mut component = Component::start(
+                Arc::clone(&graphs),
+                42,
+                Variables::new(),
+                vec![Root::new(1, 42)],
+                100,
+                &mut EmptyWorld,
+                MAX_INIT_WORK,
+            )
+            .unwrap();
+            component.set_owner_dead(dead);
+            component
+                .advance_command(
+                    Command {
+                        frame: 100,
+                        action: 1,
+                        ..Command::default()
+                    },
+                    &mut EmptyWorld,
+                )
+                .unwrap();
+            if delay != 0 {
+                component
+                    .advance_frame(100 + delay, &mut EmptyWorld)
+                    .unwrap();
+            }
+            let buffered = !dead && delay == 0;
+            assert_eq!(
+                component
+                    .queue_message(1, 0x0240_0000_0000_0001, Variables::new())
+                    .unwrap(),
+                1
+            );
+            component.run_now(&mut EmptyWorld).unwrap();
+            let snapshot = component.snapshot().unwrap();
+            let instance = &snapshot.instances[&1];
+            assert_eq!(instance.states[&0].activation, 1);
+            assert_eq!(
+                instance.states[&0].kind,
+                StateKind::LogicalButton { down: buffered }
+            );
+            if buffered {
+                assert_eq!(instance.variables[&10], Value::Bool(true));
+                assert_eq!(
+                    snapshot.pending_timers[&1],
+                    [PendingTimer {
+                        due_ms: 1616,
+                        raw_state: 0,
+                        finish: false,
+                        parameter: 1
+                    }]
+                );
+                component.advance_frame(101, &mut EmptyWorld).unwrap();
+                let snapshot = component.snapshot().unwrap();
+                assert_eq!(
+                    snapshot.instances[&1].states[&0].kind,
+                    StateKind::LogicalButton { down: false }
+                );
+                assert_eq!(snapshot.instances[&1].variables[&10], Value::Bool(false));
+                assert!(snapshot.pending_timers.is_empty());
+            } else {
+                assert!(instance.variables.get(&10).is_none());
+                assert!(snapshot.pending_timers.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a local 1.74 graph pack"]
+    fn soldier_sprint_graph_reads_primary_crouch_and_melee_edges_as_in_python() {
+        let runtime = PathBuf::from(
+            std::env::var_os("ORPHEUS_RUNTIME_DIR").expect("set ORPHEUS_RUNTIME_DIR"),
+        );
+        let graphs =
+            Arc::new(GraphStore::load(runtime.join("data/game_graphs_174.json.gz")).unwrap());
+        let mut component = Component::start(
+            graphs,
+            0xa000_0101,
+            Variables::new(),
+            vec![Root::new(5, 0x0255)],
+            1029,
+            &mut ReferenceWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        let sprint = |snapshot: &Snapshot| {
+            [4, 7, 16].map(|raw| {
+                (
+                    snapshot.instances[&5].states[&raw].kind,
+                    snapshot.instances[&5].states[&raw].activation,
+                )
+            })
+        };
+        let up = StateKind::LogicalButton { down: false };
+        let down = StateKind::LogicalButton { down: true };
+        assert_eq!(sprint(component.snapshot().unwrap()), [(up, 1); 3]);
+        component
+            .advance_command(
+                Command {
+                    frame: 1030,
+                    buttons: 0x881,
+                    ..Command::default()
+                },
+                &mut ReferenceWorld,
+            )
+            .unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert_eq!(sprint(snapshot), [(down, 1); 3]);
+        assert_eq!(snapshot.instances[&5].variables[&1919], Value::Bool(true));
+        assert!(!snapshot.initialization_complete());
+        component
+            .advance_command(
+                Command {
+                    frame: 1031,
+                    ..Command::default()
+                },
+                &mut ReferenceWorld,
+            )
+            .unwrap();
+        assert_eq!(sprint(component.snapshot().unwrap()), [(up, 1); 3]);
     }
 
     #[test]
