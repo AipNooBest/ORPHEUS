@@ -782,3 +782,11 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Shared the collision grid between the float64 ray view and the float32 mesh candidate index. Matched 5,000 triangle-box checks and 4,400 ordered mesh queries against Python. All 4,799 earlier ray and scene query comparisons still matched.
 - Ported the hero catalog, graph-derived health pools and owner and observer body creates. The 64 body create vectors cover all 32 heroes. Decoded the original hero pick and open, close and toggle messages. Live hero selection, movement sweeps and original-client acceptance remain pending.
 - Passed 183 public Rust tests, 31 optional runtime checks on each prepared pack, Cargo formatting, Clippy and Git diff checks. The usual launch scripts still use Python.
+
+#### Rust hero selection and body delivery
+
+- Connected original hero-pick and screen messages to body creation, controller possession, old-body retirement and the owner hero-select frame in the solo Practice Range worker. Creation uses the shared hero and health data and the account's equipped skin and golden weapon at handoff.
+- Kept create, possession and retirement in dependency order. A frame can carry adjacent steps when they fit. A split waits for the required ACK. Lost records retry with the same generation and an old body's ID stays reserved for 30 seconds after destroy acknowledgement. Tested the loss of a complete hero selection batch, reopening the screen, and switching heroes on the encrypted worker.
+- Ported controller and body statescript stream sequencing and retry state, plus the scoped expression evaluator. Exact checks cover owner full and cumulative delta frames and 11 expression results from target graphs. Live body and bot script execution still need the VM.
+- Ported float32 shape casts and mesh sweeps. The local differential comparisons match Python on 9,108 shape casts and 3,530 mesh sweeps, including scaled props and tightened hit limits. Static-world dispatch and character movement are pending.
+- Passed 201 public Rust tests, 32 optional runtime checks on each of two prepared packs, seven Python repeated-lifecycle tests, Cargo formatting, Clippy and Git diff checks. Original-client acceptance remains pending. The usual launch scripts still use Python.

@@ -5,6 +5,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use serde::Deserialize;
@@ -17,6 +18,8 @@ use crate::{
     game_bots::{Bot, BotCatalog, BotWalk},
     game_content::GameMap,
     game_controller::Controller,
+    game_heroes::HeroCatalog,
+    game_pools::PoolCatalog,
     game_stats::{PlayerStats, StatsCatalog},
     match_scene::{PlayerAppearance, initial_world, mode_ui},
     mover_settings::MoverCatalog,
@@ -34,6 +37,8 @@ pub struct SceneAssets {
     bots: BotCatalog,
     movers: MoverCatalog,
     stats: StatsCatalog,
+    heroes: Arc<HeroCatalog>,
+    pools: Arc<PoolCatalog>,
 }
 
 pub struct PreparedScene {
@@ -44,24 +49,34 @@ pub struct PreparedScene {
     initial_board: Component,
     bots: Vec<Bot>,
     scripted_bots: usize,
+    heroes: Arc<HeroCatalog>,
+    pools: Arc<PoolCatalog>,
 }
 
 impl SceneAssets {
     pub fn load(runtime: impl AsRef<Path>) -> io::Result<Self> {
         let runtime = runtime.as_ref();
         let data = runtime.join("data");
+        let graphs = GraphStore::load(data.join("game_graphs_174.json.gz"))?;
+        let pools = Arc::new(PoolCatalog::from_graphs(&graphs)?);
         Ok(Self {
             collision: runtime.join("collision"),
             mode_props: read_mode_props(&data.join("collision_props_174.json"))?,
-            graphs: GraphStore::load(data.join("game_graphs_174.json.gz"))?,
+            graphs,
             bots: BotCatalog::load(data.join("ai_spawners_174.json"))?,
             movers: MoverCatalog::load(data.join("game_movers_174.json"))?,
             stats: StatsCatalog::load(data.join("game_stats_174.json"))?,
+            heroes: Arc::new(HeroCatalog::load(data.join("game_heroes_174.json"))?),
+            pools,
         })
     }
 
     pub fn graphs(&self) -> &GraphStore {
         &self.graphs
+    }
+
+    pub fn heroes(&self) -> &HeroCatalog {
+        &self.heroes
     }
 
     /// Load the map before handing it to the worker. The render layouts and
@@ -106,6 +121,8 @@ impl SceneAssets {
             initial_board,
             bots,
             scripted_bots,
+            heroes: Arc::clone(&self.heroes),
+            pools: Arc::clone(&self.pools),
         })
     }
 }
@@ -117,6 +134,14 @@ impl PreparedScene {
 
     pub fn scripted_bots(&self) -> usize {
         self.scripted_bots
+    }
+
+    pub fn heroes(&self) -> &HeroCatalog {
+        &self.heroes
+    }
+
+    pub fn pools(&self) -> &PoolCatalog {
+        &self.pools
     }
 
     pub fn controller(&self) -> Controller {

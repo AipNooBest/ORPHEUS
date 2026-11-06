@@ -10,6 +10,9 @@ use std::fmt;
 
 use crate::contact_math::{TINY, Vec3, add, cross, dot, maxps, normalize, scale, sub};
 
+#[path = "contact_sweep.rs"]
+pub mod sweep;
+
 const ABSENT: u8 = u8::MAX;
 const MAX_ITERATIONS: u8 = 20;
 const FAR_SLACK: f64 = 1e-3;

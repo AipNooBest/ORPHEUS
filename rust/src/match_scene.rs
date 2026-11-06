@@ -1,6 +1,6 @@
 //! Match entity baselines and the shared mode presentation frame.
 
-use std::io;
+use std::{collections::HashMap, io};
 
 use crate::{
     bits::BitWriter,
@@ -13,7 +13,7 @@ use crate::{
     script_wire::{self, Instance, Layout, Variables},
     world::{
         Component, ComponentValue, Create, EntityUpdate, GAME_MODE_ENTITY, Operation, PLAYER_PATH,
-        WITH_PARTICIPANT, WITH_SCALE, WITH_TRANSFORM, health,
+        SkinTheme, WITH_PARTICIPANT, WITH_SCALE, WITH_TRANSFORM, health,
     },
 };
 
@@ -63,6 +63,7 @@ pub struct PlayerCard {
     pub portrait_frame: Option<u64>,
     pub ranked: Option<(i16, i16, i8)>,
     pub role: Option<i8>,
+    pub skins: HashMap<u64, SkinTheme>,
 }
 
 pub fn player_create(
@@ -204,7 +205,7 @@ fn fields(index: u8, fields: Vec<Option<ComponentValue>>) -> Component {
     Component { index, fields }
 }
 
-fn team_bit(team: u8) -> io::Result<u64> {
+pub(crate) fn team_bit(team: u8) -> io::Result<u64> {
     if team > FREE_FOR_ALL_TEAM {
         return Err(invalid("invalid team for a player or bot"));
     }
@@ -254,6 +255,7 @@ mod tests {
             portrait_frame: Some(0x0250_0000_0000_0f97),
             ranked: Some((3200, 120, 4)),
             role: Some(1),
+            ..PlayerCard::default()
         };
         let player = PlayerAppearance {
             entity: 0xa000_0100,

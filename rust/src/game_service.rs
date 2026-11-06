@@ -4,7 +4,7 @@
 //! initial world. Maps that need the unported bot VM retain that requirement.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io,
     net::SocketAddr,
     sync::{
@@ -20,22 +20,22 @@ use indexmap::IndexMap;
 use mio::{Events, Interest, Poll, Token, Waker, net::UdpSocket};
 
 use crate::{
-    game_bots::BOT_RECORD_DELAY,
-    game_clock::{FIRST_TICK, GameClock, SEND_EVERY, Step, next_tick_after},
+    game_clock::{FIRST_TICK, GameClock, Step, next_tick_after},
     game_connection::{GameConnections, MAX_CONNECTION_ID, Outgoing},
     game_content::{GameMap, PRACTICE_RANGE_MODE},
     game_controller::ControllerFrame,
-    game_egress::{DeliveryReport, FrameRecords, GameEgress, RecordSource},
+    game_egress::{FrameRecords, GameEgress, RecordSource},
     game_ingress::{GameIngress, MapReadiness, MapReadyStep, MessageKind, WorldReadiness, pong},
     game_instance::{Instance, Member, RETAIL_QUANTA, TOURNAMENT_QUANTA, ownership},
     game_link::{ACK, KIND_FRAME, Packet},
     game_messages::{Message, encode, locate},
+    game_replication::{Record, WorldDelivery},
     jam_codec::{Fields, Schemas, Value},
     match_handoff::Handoff,
     match_scene::{PlayerAppearance, PlayerCard},
     scene_assets::PreparedScene,
     script_wire::chunk,
-    world::{EntityUpdate, GAME_MODE_ENTITY, MAX_PAYLOAD, Operation, frame},
+    world::{EntityUpdate, GAME_MODE_ENTITY, MAX_PAYLOAD, frame},
 };
 
 const GAME_SOCKET: Token = Token(0);
@@ -250,6 +250,16 @@ struct Room {
 }
 
 impl Room {
+    fn appearance(&self, slot: usize) -> Option<PlayerAppearance<'_>> {
+        let player = &self.players[slot];
+        Some(PlayerAppearance {
+            entity: player.entity,
+            slot: i8::try_from(slot).ok()?,
+            team: player.info.team,
+            card: &self.world.as_ref()?.card,
+        })
+    }
+
     fn message(&self, slot: usize, initial: bool) -> Message {
         let members: Vec<_> = self
             .players
@@ -275,95 +285,13 @@ impl Room {
     }
 }
 
-#[derive(Default)]
 struct Peer {
     ingress: GameIngress,
-    egress: GameEgress<Arc<EntityUpdate>>,
+    egress: GameEgress<Arc<Record>>,
     loading: MapReadiness,
     ownership: Option<u32>,
     open: bool,
     world: WorldDelivery,
-}
-
-#[derive(Default)]
-struct WorldDelivery {
-    queued: Vec<Arc<EntityUpdate>>,
-    created: HashSet<u32>,
-    started: Option<u32>,
-    presentation_due: bool,
-    controller_queued: bool,
-    mode_queued: bool,
-}
-
-impl WorldDelivery {
-    fn acknowledge(&mut self, report: DeliveryReport<Arc<EntityUpdate>>) {
-        if self.started.is_none() {
-            return;
-        }
-        let mut retry = Vec::new();
-        for packet in report.packets {
-            if packet.arrived {
-                for update in packet.records {
-                    if matches!(update.operation, Some(Operation::Create(_))) {
-                        self.created.insert(update.entity);
-                    }
-                }
-            } else {
-                retry.extend(packet.records);
-            }
-        }
-        if !retry.is_empty() {
-            retry.append(&mut self.queued);
-            self.queued = retry;
-        }
-    }
-
-    fn start(&mut self, world: &WorldStart, player: &Player, tick: u32) -> io::Result<()> {
-        let viewer = PlayerAppearance {
-            entity: player.entity,
-            slot: 0,
-            team: player.info.team,
-            card: &world.card,
-        };
-        let records = world.scene.initial_world(&viewer)?;
-        self.queued.extend(records.into_iter().map(Arc::new));
-        self.started = Some(tick);
-        Ok(())
-    }
-
-    fn present(&mut self, scene: &PreparedScene, entity: u32, tick: u32) -> io::Result<()> {
-        if !self.controller_queued && self.created.contains(&entity) {
-            let payload = initial_controller(scene, tick)?;
-            self.queued.push(Arc::new(script_record(entity, &payload)?));
-            self.controller_queued = true;
-        }
-        if !self.mode_queued && self.created.contains(&GAME_MODE_ENTITY) {
-            self.queued
-                .push(Arc::new(script_record(GAME_MODE_ENTITY, scene.mode_ui())?));
-            self.mode_queued = true;
-        }
-        self.presentation_due = !(self.controller_queued && self.mode_queued);
-        Ok(())
-    }
-
-    fn movement(&self, scene: &PreparedScene, tick: u32) -> Vec<EntityUpdate> {
-        if !self
-            .started
-            .is_some_and(|started| tick.saturating_sub(started) >= BOT_RECORD_DELAY)
-        {
-            return Vec::new();
-        }
-        scene
-            .bots()
-            .iter()
-            .filter(|bot| self.created.contains(&bot.entity) && bot.record_due(tick, SEND_EVERY))
-            .map(|bot| EntityUpdate {
-                entity: bot.entity,
-                movement: Some(bot.movement(tick)),
-                ..EntityUpdate::default()
-            })
-            .collect()
-    }
 }
 
 fn initial_controller(scene: &PreparedScene, tick: u32) -> io::Result<crate::bits::BitWriter> {
@@ -394,6 +322,17 @@ fn player_entity(slot: usize) -> u32 {
 }
 
 impl Peer {
+    fn new(owner: u32) -> Self {
+        Self {
+            ingress: GameIngress::default(),
+            egress: GameEgress::default(),
+            loading: MapReadiness::default(),
+            ownership: None,
+            open: false,
+            world: WorldDelivery::new(owner),
+        }
+    }
+
     fn reliable(&mut self, schemas: &Schemas, message: Message) -> io::Result<u32> {
         let bytes = encode(schemas, message.id, &message.fields).map_err(invalid)?;
         self.egress.queue_reliable(bytes).map_err(invalid)
@@ -428,14 +367,15 @@ impl Peer {
                 }
                 MapReadyStep::World => {
                     let world = room.world.as_ref().expect("map-entry prerequisites");
-                    self.world.start(world, player, tick)?;
+                    let viewer = room.appearance(slot).expect("prepared player");
+                    self.world.start(&world.scene, &viewer, tick)?;
                 }
                 MapReadyStep::Controller => self.world.presentation_due = true,
             }
         }
         if self.world.presentation_due {
             let world = room.world.as_ref().expect("world started");
-            self.world.present(&world.scene, player.entity, tick)?;
+            self.world.present(&world.scene, tick)?;
         }
         Ok(())
     }
@@ -575,14 +515,16 @@ impl State {
             return;
         };
         let connection = received.connection;
+        let (id, slot) = self.seats[&connection];
         if received.admitted {
-            self.peers.insert(connection, Peer::default());
+            self.peers
+                .insert(connection, Peer::new(self.rooms[&id].players[slot].entity));
         }
         let peer = self.peers.get_mut(&connection).expect("admitted peer");
         if let Some((ack, bits)) = received.ack {
             let report = peer.egress.acknowledge(ack, bits);
             if !self.clock.draining() {
-                peer.world.acknowledge(report);
+                peer.world.acknowledge(report, now);
             }
         }
         if let Some(Ok(control)) = received.control {
@@ -599,15 +541,16 @@ impl State {
             }
             return;
         }
+        let room = &self.rooms[&id];
         if received.opened {
-            let (id, slot) = self.seats[&connection];
-            let _ = peer.reliable(&self.schemas, self.rooms[&id].message(slot, true));
+            let _ = peer.reliable(&self.schemas, room.message(slot, true));
         }
         if let Some(payload) = received.payload {
             let Peer {
                 ingress,
                 egress,
                 loading,
+                world,
                 ..
             } = peer;
             let _ = ingress.receive(&self.schemas, &payload, |message| {
@@ -622,6 +565,18 @@ impl State {
                     }
                     MessageKind::MapLoaded => {
                         loading.mark_loaded(now);
+                    }
+                    MessageKind::GameMessage => {
+                        if let Some(prepared) = &room.world {
+                            let viewer = room.appearance(slot).expect("prepared player");
+                            let _ = world.game_message(
+                                &prepared.scene,
+                                &viewer,
+                                self.clock.frame(),
+                                now,
+                                &message,
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -648,7 +603,7 @@ impl State {
             } => {
                 if entered {
                     for (&connection, peer) in &mut self.peers {
-                        peer.world.queued.clear();
+                        peer.world.clear();
                         if self.links.begin_leaving(connection, now) {
                             let _ = peer.reliable(&self.schemas, leave_message());
                         }
@@ -675,7 +630,7 @@ impl State {
                     .advance_loading(&self.schemas, room, slot, now, tick)
                     .is_err()
             {
-                peer.world = WorldDelivery::default();
+                peer.world.clear();
                 peer.loading = MapReadiness::default();
                 if self.links.begin_leaving(connection, now) {
                     let _ = peer.reliable(&self.schemas, leave_message());
@@ -689,19 +644,21 @@ impl State {
                         .as_ref()
                         .map_or_else(Vec::new, |world| peer.world.movement(&world.scene, tick))
                 };
-                let queued = &peer.world.queued;
+                let queued = peer.world.ready();
                 let sent = peer.egress.send_frame(
                     FrameRecords {
                         tick,
-                        queued,
+                        queued: &queued,
                         movements: &movements,
                         owner_correction: false,
                         reliable_only: drain,
                     },
                     |_| tick,
                     |source| match source {
-                        RecordSource::Queued(index) => Arc::clone(&queued[index]),
-                        RecordSource::Movement(index) => Arc::new(movements[index].clone()),
+                        RecordSource::Queued(index) => queued[index].tracked(),
+                        RecordSource::Movement(index) => {
+                            Arc::new(Record::baseline(movements[index].clone()))
+                        }
                     },
                     |payload| {
                         let packet = Packet {
@@ -719,12 +676,8 @@ impl State {
                     },
                 );
                 if let Ok(sent) = sent {
-                    let count = sent
-                        .records
-                        .iter()
-                        .take_while(|source| matches!(source, RecordSource::Queued(_)))
-                        .count();
-                    peer.world.queued.drain(..count);
+                    let indexes = WorldDelivery::sent_indices(&queued, &sent.records);
+                    peer.world.sent(&indexes);
                 }
             }
         }
@@ -841,7 +794,7 @@ mod tests {
         game_link::{FIN, KIND_CONTROL, LinkCipher, MAX_DATAGRAM, ReceiveWindow, SYN},
         game_messages::{read_channel, write_channel},
     };
-    use std::net::UdpSocket as ClientSocket;
+    use std::{collections::HashSet, net::UdpSocket as ClientSocket};
 
     const MATCH: MatchId = [5, 8];
 
@@ -1091,9 +1044,15 @@ mod tests {
     #[derive(Debug)]
     struct WorldRecord {
         entity: u32,
-        create: bool,
+        operation: Option<u8>,
         movement: bool,
-        script: Option<Vec<u8>>,
+        script: Option<(u32, Vec<u8>)>,
+    }
+
+    impl WorldRecord {
+        fn is_create(&self) -> bool {
+            self.operation == Some(1)
+        }
     }
 
     fn world_records(schemas: &Schemas, packet: &Packet) -> Vec<WorldRecord> {
@@ -1107,7 +1066,7 @@ mod tests {
             .map(|_| {
                 let mut record = WorldRecord {
                     entity: reader.entity_id().unwrap().unwrap(),
-                    create: false,
+                    operation: None,
                     movement: false,
                     script: None,
                 };
@@ -1118,10 +1077,10 @@ mod tests {
                 if reader.bit().unwrap() {
                     assert!(!reader.bit().unwrap());
                     assert_eq!(reader.w_u32().unwrap(), 0);
-                    assert_eq!(reader.w_var().unwrap(), 1);
+                    let span = reader.w_var().unwrap();
                     assert!(!reader.bit().unwrap());
                     let width = reader.w_var().unwrap() as usize;
-                    record.script = Some(reader.raw_bits(width).unwrap());
+                    record.script = Some((span, reader.raw_bits(width).unwrap()));
                 }
                 if !reader.bit().unwrap() {
                     return record;
@@ -1134,8 +1093,8 @@ mod tests {
                     reader.advance(length - 12).unwrap();
                 }
                 if reader.bit().unwrap() {
-                    let operation = reader.bits(2).unwrap();
-                    record.create = operation == 1;
+                    let operation = reader.bits(2).unwrap() as u8;
+                    record.operation = Some(operation);
                     if operation != 3 {
                         let length = reader.bits(14).unwrap() as usize;
                         reader.advance(length).unwrap();
@@ -1280,7 +1239,7 @@ mod tests {
             let records = world_records(&schemas, &frame);
             let creates: Vec<_> = records
                 .iter()
-                .filter(|record| record.create)
+                .filter(|record| record.is_create())
                 .map(|record| record.entity)
                 .collect();
             if !creates.is_empty() {
@@ -1297,7 +1256,7 @@ mod tests {
             assert!(client.window.accept(frame.seq));
             let records = world_records(&schemas, &frame);
             assert!(records.iter().all(|record| record.script.is_none()));
-            for record in records.iter().filter(|record| record.create) {
+            for record in records.iter().filter(|record| record.is_create()) {
                 assert!(creates.insert(record.entity));
             }
             if lost.iter().all(|id| creates.contains(id)) {
@@ -1325,13 +1284,14 @@ mod tests {
             let frame = client.receive();
             assert!(client.window.accept(frame.seq));
             for record in world_records(&schemas, &frame) {
-                assert!(!record.create);
+                assert!(!record.is_create());
                 if record.movement {
                     assert!((BOT_ENTITY..BOT_ENTITY + 15).contains(&record.entity));
                     assert!(creates.contains(&record.entity));
                     moving_bot = true;
                 }
-                if let Some(script) = record.script {
+                if let Some((span, script)) = record.script {
+                    assert_eq!(span, 1);
                     if record.entity == GAME_MODE_ENTITY {
                         assert_eq!(script, [0x08, 0x5b, 0x06, 0x00, 0x0c]);
                         mode = true;
@@ -1347,6 +1307,153 @@ mod tests {
             client.send(ACK, Vec::new());
         }
         assert!(mode && controller && moving_bot);
+        exercise_hero_selection(&mut client, &schemas, &assets);
         server.stop().unwrap();
+    }
+
+    fn exercise_hero_selection(
+        client: &mut Client,
+        schemas: &Schemas,
+        assets: &crate::scene_assets::SceneAssets,
+    ) {
+        use crate::{
+            game_heroes::SOLDIER,
+            game_parameters::{CLIENT_GAME_MESSAGE, OPEN_OR_CLOSE, PICK_HERO},
+        };
+        const OWNER: u32 = 0xa000_0100;
+        const FIRST: u32 = OWNER | 1;
+        const SECOND: u32 = OWNER | 2;
+
+        let send = |client: &mut Client, ordinal, guid, parameters| {
+            let fields = Fields::from([
+                (
+                    0x78,
+                    Value::Struct(Fields::from([(0, Value::Unsigned(u64::from(OWNER)))])),
+                ),
+                (0x80, Value::Blob(parameters)),
+                (0xa8, Value::Unsigned(guid)),
+                (0xb0, Value::Signed(3)),
+            ]);
+            let message = encode(schemas, CLIENT_GAME_MESSAGE, &fields).unwrap();
+            let mut payload = BitWriter::new();
+            write_channel(&mut payload, &[(ordinal, message)], &[]).unwrap();
+            client.send(ACK, payload.into_bytes());
+        };
+        let next_body_frame = |client: &mut Client, body| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let packet = client.receive();
+                let records = world_records(schemas, &packet);
+                if records
+                    .iter()
+                    .any(|record| record.entity == body && record.is_create())
+                {
+                    break (packet, records);
+                }
+                assert!(client.window.accept(packet.seq));
+                client.send(ACK, Vec::new());
+                assert!(Instant::now() < deadline, "waiting for the selected body");
+            }
+        };
+        let describe = |records: &[WorldRecord]| {
+            records
+                .iter()
+                .filter(|record| matches!(record.entity, OWNER | FIRST | SECOND))
+                .map(|record| {
+                    (
+                        record.entity,
+                        record.operation,
+                        record.script.as_ref().map(|(span, _)| *span),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let controller =
+            crate::game_controller::Controller::load(assets.graphs(), PRACTICE_RANGE_MODE).unwrap();
+        let verify_controller = |records: &[WorldRecord], hero, open| {
+            let (_, script) = records
+                .iter()
+                .find(|record| record.entity == OWNER && record.script.is_some())
+                .and_then(|record| record.script.as_ref())
+                .expect("hero selection controller frame");
+            let mut reader = BitReader::new(script);
+            assert_eq!(reader.bits(3).unwrap(), 2);
+            let cmfd = reader.w_var().unwrap();
+            let expected = controller
+                .controller_frame(
+                    cmfd,
+                    ControllerFrame {
+                        select_open: open,
+                        skins: open,
+                        hide_assemble: true,
+                        hero: Some(hero),
+                        ..ControllerFrame::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(script, expected.as_bytes());
+            cmfd
+        };
+
+        send(client, 1, PICK_HERO, SOLDIER.to_le_bytes().to_vec());
+        let (_lost, records) = next_body_frame(client, FIRST);
+        let expected = [
+            (FIRST, Some(1), None),
+            (OWNER, Some(2), None),
+            (OWNER, None, Some(2)),
+        ];
+        assert_eq!(describe(&records), expected);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.entity == FIRST && record.movement)
+        );
+        let first_cmfd = verify_controller(&records, SOLDIER, false);
+
+        // A later datagram ACK identifies the first body batch as lost.
+        let following = client.receive();
+        assert!(client.window.accept(following.seq));
+        assert!(describe(&world_records(schemas, &following)).is_empty());
+        client.send(ACK, Vec::new());
+        let (retry, records) = next_body_frame(client, FIRST);
+        assert_eq!(describe(&records), expected);
+        assert_eq!(verify_controller(&records, SOLDIER, false), first_cmfd);
+        assert!(client.window.accept(retry.seq));
+
+        let mut open = vec![1, 1];
+        open.extend(OWNER.to_le_bytes());
+        open.extend(OWNER.to_le_bytes());
+        send(client, 2, OPEN_OR_CLOSE, open);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let reopen_cmfd = loop {
+            let packet = client.receive();
+            assert!(client.window.accept(packet.seq));
+            let records = world_records(schemas, &packet);
+            if !describe(&records).is_empty() {
+                assert_eq!(describe(&records), [(OWNER, None, Some(3))]);
+                break verify_controller(&records, SOLDIER, true);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "waiting for hero selection to reopen"
+            );
+        };
+        assert!(reopen_cmfd > first_cmfd);
+
+        let tracer = assets.heroes().find_hero("Tracer").unwrap().guid;
+        send(client, 3, PICK_HERO, tracer.to_le_bytes().to_vec());
+        let (swap, records) = next_body_frame(client, SECOND);
+        assert_eq!(
+            describe(&records),
+            [
+                (SECOND, Some(1), None),
+                (OWNER, Some(2), None),
+                (FIRST, Some(3), None),
+                (OWNER, None, Some(4))
+            ],
+        );
+        assert!(verify_controller(&records, tracer, false) > reopen_cmfd);
+        assert!(client.window.accept(swap.seq));
+        client.send(ACK, Vec::new());
     }
 }

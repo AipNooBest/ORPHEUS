@@ -135,6 +135,15 @@ pub fn dispatch_prepared(
                     battle_tag: battle_tag(&profile.player_name, login.identity.account_lo),
                     level: Some(u32::try_from(profile.level).map_err(io::Error::other)?),
                     portrait_frame: Some(collection.portrait_frame(&profile)),
+                    skins: assets
+                        .heroes()
+                        .heroes()
+                        .map(|hero| {
+                            collection
+                                .equipped_skin(&profile, hero.guid)
+                                .map(|skin| (hero.guid, skin))
+                        })
+                        .collect::<io::Result<_>>()?,
                     ..PlayerCard::default()
                 }
             };

@@ -30,10 +30,10 @@ struct QueryBox {
 }
 
 impl QueryBox {
-    fn new(low: Vec3, high: Vec3) -> Self {
+    fn new(low: [f64; 3], high: [f64; 3]) -> Self {
         Self {
-            center: scale(add(low, high), 0.5),
-            half: scale(sub(high, low), 0.5),
+            center: std::array::from_fn(|k| ((low[k] + high[k]) as f32) * 0.5),
+            half: std::array::from_fn(|k| ((high[k] - low[k]) as f32) * 0.5),
         }
     }
 }
@@ -76,7 +76,7 @@ impl TriangleBox {
     }
 
     pub fn intersects(&self, low: Vec3, high: Vec3) -> bool {
-        self.test(&QueryBox::new(low, high))
+        self.test(&QueryBox::new(low.map(f64::from), high.map(f64::from)))
     }
 
     fn test(&self, query: &QueryBox) -> bool {
@@ -162,7 +162,7 @@ pub enum ContactMeshError {
 impl fmt::Display for ContactMeshError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::InvalidScale => "contact mesh scale must be finite and nonzero",
+            Self::InvalidScale => "contact mesh scale and its inverse must be finite and nonzero",
             Self::InvalidGeometry => "contact mesh has invalid vertices, indices or bounds",
             Self::IndexLimit => "contact mesh exceeds the collision grid limit",
         })
@@ -182,6 +182,7 @@ pub struct ContactMesh {
     raw: Arc<Mesh>,
     scaled: Option<Vec<Vec3>>,
     scale: Vec3,
+    inverse_scale: Vec3,
     bounds: Option<ContactBounds>,
     grid: ColumnGrid,
     records: Vec<Record>,
@@ -194,8 +195,10 @@ impl ContactMesh {
         mesh_scale: Vec3,
         mask: u16,
     ) -> Result<Self, ContactMeshError> {
+        let inverse_scale = mesh_scale.map(|value| 1.0 / value);
         if !mesh_scale
             .into_iter()
+            .chain(inverse_scale)
             .all(|value| value.is_finite() && value != 0.0)
         {
             return Err(ContactMeshError::InvalidScale);
@@ -241,6 +244,7 @@ impl ContactMesh {
             raw,
             scaled,
             scale: mesh_scale,
+            inverse_scale,
             bounds,
             grid,
             records,
@@ -254,6 +258,10 @@ impl ContactMesh {
 
     pub fn scale(&self) -> Vec3 {
         self.scale
+    }
+
+    pub(crate) fn inverse_scale(&self) -> Vec3 {
+        self.inverse_scale
     }
 
     pub fn raw_corners(&self, number: u32) -> Option<[Vec3; 3]> {
@@ -272,13 +280,18 @@ impl ContactMesh {
 
     /// Source triangle numbers in increasing order, filtered by the face's mask.
     pub fn query(&self, low: Vec3, high: Vec3, category: u16) -> Vec<u32> {
+        self.query_precise(low.map(f64::from), high.map(f64::from), category)
+    }
+
+    /// Mesh sweeps retain the unrounded box endpoints until the SAT sums.
+    pub(crate) fn query_precise(&self, low: [f64; 3], high: [f64; 3], category: u16) -> Vec<u32> {
         if category == 0
             || !(0..3).all(|k| low[k].is_finite() && high[k].is_finite() && low[k] <= high[k])
         {
             return Vec::new();
         }
-        let outer_low = low.map(|value| f64::from(value) - QUERY_SLACK);
-        let outer_high = high.map(|value| f64::from(value) + QUERY_SLACK);
+        let outer_low = low.map(|value| value - QUERY_SLACK);
+        let outer_high = high.map(|value| value + QUERY_SLACK);
         let Some(range) =
             ColumnRange::new([outer_low[0], outer_low[2]], [outer_high[0], outer_high[2]])
         else {

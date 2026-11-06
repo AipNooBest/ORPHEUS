@@ -18,6 +18,7 @@ use crate::{
     },
     lobby_transport::LobbyMessage,
     retail_templates::RetailTemplates,
+    world::SkinTheme,
 };
 
 pub const HERO_CATALOG: u32 = 0x70e5_a247;
@@ -234,6 +235,18 @@ impl Collection {
             }
         }
         Ok(slots)
+    }
+
+    pub fn equipped_skin(&self, profile: &Profile, hero: u64) -> io::Result<SkinTheme> {
+        let loadout = self.loadout(profile, hero)?;
+        let item = |slot| {
+            let guid = unsigned(loadout.get(&slot)?).ok()?;
+            self.items.get(guid)
+        };
+        Ok(SkinTheme {
+            guid: item(0x38).map_or(0, |skin| skin.skin_theme),
+            golden: item(0x50).is_some_and(|weapon| weapon.name == "GOLDEN"),
+        })
     }
 
     pub fn equip(
@@ -637,6 +650,38 @@ mod tests {
             );
         }
         Collection::new(&templates, Arc::new(items)).unwrap()
+    }
+
+    #[test]
+    fn equipped_skin_and_golden_weapon_come_from_the_same_loadout() {
+        let mut collection = synthetic_collection();
+        let items = Arc::get_mut(&mut collection.items).unwrap();
+        let skin = items.unlocks.get_mut(&NEW_SKIN).unwrap();
+        skin.skin_theme = 0x0a40_0000_0000_0210;
+        let mut golden = skin.clone();
+        golden.guid = 0x23;
+        golden.name = "GOLDEN".into();
+        golden.item_type = "WeaponSkin".into();
+        golden.skin_theme = 0;
+        items.unlocks.insert(golden.guid, golden);
+        let mut profile = Profile::default();
+        assert_eq!(
+            collection.equipped_skin(&profile, HERO).unwrap(),
+            SkinTheme::default()
+        );
+        assert!(collection.equip(&mut profile, HERO, NEW_SKIN, 0).unwrap());
+        assert!(collection.equip(&mut profile, HERO, 0x23, 0).unwrap());
+        assert_eq!(
+            collection.equipped_skin(&profile, HERO).unwrap(),
+            SkinTheme {
+                guid: 0x0a40_0000_0000_0210,
+                golden: true
+            },
+        );
+        assert_eq!(
+            collection.equipped_skin(&profile, 0).unwrap(),
+            SkinTheme::default()
+        );
     }
 
     #[test]
