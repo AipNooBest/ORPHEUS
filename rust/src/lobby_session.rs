@@ -553,10 +553,13 @@ mod tests {
     #[ignore = "requires an authorized 104319 runtime in ORPHEUS_RUNTIME_DIR"]
     fn native_server_logs_in_saved_profile_and_loads_practice_over_udp() {
         use crate::{
+            accounts::load_or_create_profile,
             bits::BitReader,
             game_content::PRACTICE_RANGE_MAP,
+            game_heroes::SOLDIER,
             game_link::{ACK, KIND_FRAME, LinkCipher, MAX_DATAGRAM, Packet, SYN},
             game_messages::read_channel,
+            lobby_gallery::{EQUIP, EQUIPPED, GALLERY_OUT},
             lobby_practice::CREATE_GAME,
             match_handoff::{HANDOFF, HANDOFF_MESSAGE},
             scene_assets::SceneAssets,
@@ -602,6 +605,27 @@ mod tests {
         fs::write(state.path().join("default_account.txt"), "RUST\n").unwrap();
         let schemas = Schemas::load(runtime.join("data/schemas_174.json")).unwrap();
         let game_schemas = Schemas::load(runtime.join("data/game_schemas_174.json")).unwrap();
+        let collection = Collection::new(
+            &RetailTemplates::load(runtime.join("data/retail_templates.json")).unwrap(),
+            Arc::new(ItemDb::load(&runtime.join("data")).unwrap()),
+        )
+        .unwrap();
+        let original_skin = collection.equipped_skin(&rust.profile(), SOLDIER).unwrap();
+        let skin = collection
+            .owned_for_hero(&rust.profile(), SOLDIER)
+            .into_iter()
+            .filter_map(|guid| collection.items().get(guid))
+            .find(|item| {
+                item.item_type == "Skin"
+                    && item.skin_theme != 0
+                    && item.skin_theme != original_skin.guid
+            })
+            .unwrap();
+        let equip = Fields::from([
+            (0x78, Value::Unsigned(SOLDIER)),
+            (0x80, Value::Unsigned(skin.guid)),
+            (0x88, Value::Signed(0)),
+        ]);
         let mut server = Server::start(config).unwrap();
         for address in [server.stall_addr(), server.rpc_addr()] {
             assert!(address.ip().is_loopback());
@@ -626,6 +650,7 @@ mod tests {
             PROGRESSION,
             HERO_CATALOG,
             HANDOFF,
+            GALLERY_OUT,
         ];
         let mut announcement = vec![0, 0];
         announcement.extend_from_slice(&(groups.len() as u32).to_le_bytes());
@@ -645,6 +670,7 @@ mod tests {
                     (0xa8, Value::Unsigned(4)),
                 ]),
             ),
+            (GALLERY_OUT, 8, EQUIP, equip.clone()),
         ] {
             let mut frame = schemas.header(crc, wire, id).unwrap();
             frame.extend(schemas.encode(crc, id, &fields).unwrap());
@@ -657,6 +683,7 @@ mod tests {
             (PROGRESSION, 5, 24300),
             (HERO_CATALOG, 6, 24900),
             (HANDOFF, 7, HANDOFF_MESSAGE),
+            (HERO_CATALOG, 6, EQUIPPED),
         ];
         let mut received = std::collections::HashMap::new();
         let mut reader = FrameReader::new(rx);
@@ -712,6 +739,12 @@ mod tests {
             )
             .collect();
         assert_eq!(cosmetics.len(), 7122);
+        assert_eq!(received[&EQUIPPED], equip);
+        let saved = load_or_create_profile(rust.path.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            collection.equipped_skin(&saved, SOLDIER).unwrap().guid,
+            skin.skin_theme
+        );
 
         let ticket = structure(&received[&HANDOFF_MESSAGE][&0x80]);
         assert_eq!(

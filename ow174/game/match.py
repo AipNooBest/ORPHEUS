@@ -34,13 +34,11 @@ from copy import deepcopy
 
 from ow174.game import bodytrace, bots, combat, correction, heroselect, movelog, notices, pools, stats, world
 from ow174.game.collision import (
-    MOVER,
-    TEAM0,
-    TEAM1,
     CollisionProvider,
     LoadState,
     World,
     default_collision_provider,
+    mover_category,
 )
 from ow174.game.commands import Command, CommandQueue
 from ow174.game.content import PRACTICE_RANGE, SOLDIER, GameMap, Hero, heroes, spawn_point
@@ -365,9 +363,7 @@ class Player:
         proxy (some props stop one team only, as on Blizzard World), both in a free-for-all."""
         game_map = self.match.game_map
         world = self.match.collision_world
-        category = MOVER
-        if not game_map.free_for_all and self.team in (0, 1):
-            category = (TEAM0, TEAM1)[self.team]
+        category = mover_category(self.team, game_map.free_for_all)
         return Mover(
             self.spawn[0], _yaw_units(self.spawn[1]), world, mover_data(self.hero.body), category=category
         )
@@ -416,7 +412,7 @@ class Match:
         self.started = self.environment.wall_time(callsite="match.started")
         self.on_leave = on_leave  # called with each player who leaves
         self.ended = False
-        self.bots = bots.make(game_map.map_guid)  # the map's training bots (bots.py)
+        self.bots = bots.make(game_map.map_guid, free_for_all=game_map.free_for_all)
         self._pending_bot_scripts = deque(bot for bot in self.bots if graph.entity_body(bot.body) is not None)
         self.bots_shown: dict[int, int] = {}  # player slot -> the tick the bots' creates went to its queue
         self.notices = notices.Notices(self)  # joined / left / hero switch lines in the clients' chat

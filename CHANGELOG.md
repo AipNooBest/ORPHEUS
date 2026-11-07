@@ -869,3 +869,97 @@ This log records tested changes and their acceptance status. Entries are grouped
 - Added shared swept projectile flight with wall and capsule collision, direct damage and capsule-distance splash. The projectile modules still need live-worker integration.
 - Set Doomfist as the next hero after Soldier: 76 and the Practice Range training bots pass their acceptance checks.
 - Passed 284 public Rust tests, 58 base runtime checks, 54 enriched runtime checks and 172 focused Python tests. Cargo formatting, Clippy, documentation links and Git diff checks passed. Stock owner startup still reports unsupported graph queries. Original-client gameplay acceptance remains pending.
+
+#### Rust gallery equip and match appearance
+
+- Processed retail gallery equip requests after login. The native lobby saves the loadout before confirming it and refreshes the local player card when an icon changes.
+- Applied new skin and weapon themes to the reserved match. Equipping a different theme for the active hero uses the existing ordered body replacement. Other heroes retain the change for their next selection.
+- Passed 84 focused Python reference tests and two prepared-base encrypted Rust loopback regressions covering gallery confirmation, persistence, a subsequent map load and the new skin theme on the replacement entity. The preceding original-client Rust session reached Practice Range, where the user reported missing weapons, unusable abilities and failed skin selection. The gallery repair awaits a client retest. The stock Soldier owner script still needs additional graph behavior.
+
+#### Rust Soldier owner script startup
+
+- Added current and maximum health queries backed by the existing owner variables, with a regression for the authored Soldier full-health branch. Added bounded random expressions and verified base presentation-state lifecycles. The deterministic random sequence remains a local implementation.
+- Activated seven authored Soldier client-subgraph controllers on the server and left their client-only branches to the client. These include rifle and weapon manager states. Logged the first preflight failure once per prepared asset set.
+- Compared the same 19-instance stock startup state with the Rust and Python encoders. The owner and observer frames matched byte for byte in this offline comparison.
+- Validated authored mode tables in the external base bundle. Together with the VM changes they reduced the stock preflight from 35 diagnostics to 22. The first remaining query is the entity relation at graph `0033`, node `51`. The stock Soldier body still stops before attaching its weapon. No new original-client session was run.
+- Passed 287 public Rust tests, 58 base-runtime checks and 54 enriched-runtime checks. Cargo formatting, Clippy, documentation links and Git diff checks passed.
+
+#### Practice Range patrol collision
+
+- Reproduced two elevated patrols crossing solid geometry in build 104319. Python and Rust now move patrolling bots through the same standing capsule and static map contact solver used by player movement, with the same map barrier masks.
+- Kept the authored spawns, hint order and destinations. Blocked legs can use a clear authored hint or a short lateral detour that passes capsule clearance and floor support checks. This is a local reconstruction of patrol navigation. The original navigation implementation remains unverified.
+- Prepared the detours outside the live tick loop and retained the bot's contact state in Python stored-state replay. Recorded allied pass-through and opposing-body blocking in the roadmap. Actor-to-actor movement collision remains open.
+- Verified both elevated patrols over the real 104319 map, including the enemy bot's return leg. In an isolated optimized Rust run of 1,900 patrol updates, the patrol step took 47 µs at p95 and 143 µs at maximum. This measurement covers patrol updates only. Client acceptance is pending.
+- Passed 288 public Rust tests, 58 base-runtime checks, 54 enriched-runtime checks and 148 focused Python tests. The Python run skipped one King's Row check because the base pack lacks that map's cache. Cargo formatting, Clippy, Ruff, relative documentation links and Git diff checks passed. The optimized Rust server started and stopped on isolated ports.
+
+#### Rust development policy
+
+- Moved new implementation and fixes to Rust. Froze the Python server as the transition entry point and behavioral reference. The cutover criteria now require broader verified Rust coverage, original-client checks for the replacement workflows, and a server-only deployment smoke test.
+
+#### Rust owner relationships and startup states
+
+- Bound the stock human owner VM to the authenticated controller and the fresh body allocated at each switch. Added distinct queries for the owning controller, current possessor and possessed body. Regressions verify typed operands, body replacement, and the authored Soldier startup and HUD lookups.
+- Ported the input bridge's explicit activation and abort behavior. It forwards repeated inputs while active and consumes inactive inputs without starting the bridge.
+- Enabled the normal graph lifecycle and variable synchronization for the verified networked ForCode state. The Soldier regression covers all six active states, their empty state payloads, and the linked body and weapon-manager states. Native game-code consumers and the server-only form remain open.
+- Verified that two config classes share the retail native evaluator that returns a typed false, and added their exact operand-free forms.
+- Reduced the stock Soldier preflight from 22 diagnostics to 13 in the same prepared base runtime. The first remaining blocker is the delayed conditional state at graph `0033`, node `66`. Stock weapon attachment and original-client acceptance remain pending.
+- Passed 292 public Rust tests, 58 base-runtime checks and 54 enriched-runtime checks. Cargo formatting, Clippy, documentation links and Git diff checks passed.
+
+#### Rust delayed branches and typed health queries
+
+- Added the delayed conditional state's initial override, interruptible per-branch timers, and subgraph teardown to the shared VM. Its branch flags match the build 104319 payload vectors, and only the owner receives pending timers.
+- Resolved authored health, armor and shield queries from the body pool catalog and the existing owner health totals. Current values are returned when the pool distribution is determined by those totals. Named and dynamic pools, and damaged mixed pools without per-type values, still require native state.
+- Enabled the graph lifecycle and verified empty payload for the authored tips state. The native tips registry and original-client presentation remain open.
+- Reduced stock Soldier startup diagnostics from 13 to 11 in the same base runtime. The first blocker is now the dynamic health pool state at graph `0033`, node `1`. Stock weapon attachment and original-client acceptance remain pending.
+- Passed 296 public Rust tests, 58 base-runtime checks and 54 enriched-runtime checks. The codec comparison matched 1,833 owner and observer samples. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.
+
+#### Rust body health pool lifecycle
+
+- Added the authored base health pool shape to the shared VM. It registers capacity and initial current health separately, publishes remaining health before the end plug, and retires the pool when its state or instance ends. The initial and live output timing follows an inference from the authored graphs. Named pools, other flag combinations and capacity changes after activation still need validation.
+- Made the same `Vitals` data drive health queries, damage, healing and component 51. Player and bot updates share the reliable delivery path, including creation acknowledgement, stale revision rejection and slot clears retained in replacement updates.
+- The stock Soldier graph creates 200/200 health. An injected offline hit updates its health output and owner variables to 125/200. The stock startup now has 10 diagnostics, down from 11. The first is the entity filter at graph `004B`, node `21`. Weapon attachment, player damage in a live match and original-client acceptance remain pending.
+- Passed 302 public Rust tests, 59 base-runtime checks and 55 enriched-runtime checks. The shared graph reproduces the reference armour and shield components for Reinhardt and Zarya, and the 32-hero initial component corpus remains byte-identical to the reference. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.
+
+#### Rust authored target tags and entity filters
+
+- Added optional import of target tags from local build 104319 entity definitions in the Rust runtime preparation command. The manifest hashes the resulting graph bundle. Older bundles without tag records still load and report unknown tag data.
+- Shared the owner's tag facts between direct tag queries and filters. The supported filter form applies any, all and exclusion tag predicates, and can use an exclusion mask when the world provides authoritative flags.
+- Verified the authored tag branches at graph `004B`, node `21` and graph `0043`, node `45` with the tagged Practice Range runtime. Stock Soldier startup reports 8 diagnostics, down from 10. The first remaining condition at `004B`, node `20` needs the entity's runtime exclusion flags. Tag mutations, instance overrides, weapon attachment and original-client acceptance remain open.
+- Passed 307 public Rust tests, 59 tagged base-runtime checks and 55 tagged enriched-runtime checks. The earlier untagged bundle also passed the owner startup regression. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.
+
+#### Rust owner startup facts and message tables
+
+- Shared the body creation mask with the entity filter query. The same 104319 weapon-manager graph now starts seven additional subgraphs. A frozen reference replay with the corresponding mask matches the order and parents of all 26 instances. Runtime changes to the original server's exclusion flags still need verification.
+- Read the initial on-fire flag from the current possessor's component 64 baseline. Resolved the authenticated human body's absent AI relation as an invalid entity ID. The original 104319 graph and reference data establish the operand shapes. Later client disassembly corroborates the typed absence results. Fire score, decay and active AI relations remain open.
+- Added ordered VM maps for authored local message tables and their typed key lookup. The 20-entry table in the Soldier startup graph is local to the VM. Map wire encoding still needs verification.
+- Used the inherited state lifecycle and empty payload for the verified zero-valued state on the human owner branch. Other values remain unverified.
+- Reduced tagged 104319 Soldier startup diagnostics from 8 to 5. The first remaining operation is `STU_22926252` at `08B6`, node `11`. Stock weapon attachment and original-client acceptance remain pending.
+- Passed 308 public Rust tests, 59 tagged base-runtime checks and 55 tagged enriched-runtime checks. The untagged bundle also passed the owner startup regression. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.
+
+#### Rust target tag state lifetimes
+
+- Applied the single literal target-tag grant and suppression states from build 104319 to the owner body's shared tag lookup. State end and instance teardown release the effect. Overlapping supported effects preserve the authored base tags, and body replacement starts with fresh effects. A grant during an active suppression and changes to a foreign entity remain unverified.
+- Verified the stock Soldier graph grants tag `0422` at `01C7`, node `96` with or without a base tag list. Its state uses the inherited empty payload. The tagged 104319 preflight drops from 5 diagnostics to 4. The first remains `STU_22926252` at `08B6`, node `11`. Stock weapon attachment and original-client acceptance remain pending.
+- Clarified that the Python server stays frozen and is retired when Rust exceeds its verified coverage and passes cutover acceptance.
+- Passed 311 public Rust tests, 59 tagged base-runtime checks and 55 tagged enriched-runtime checks. The untagged bundle also passed the owner startup regression. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.
+
+#### Rust script instance exit and owner startup transitions
+
+- Queued the operand-free instance exit after earlier same-time events. The normal action output still runs, and the instance teardown cancels later work and releases its descendants. A child exit completes the still-linked parent state when the authored flag permits it. Dynamic targets, named exits and active descendant ordering remain unverified in build 104319.
+- Completed the direct-owner AI state through the same-time finish queue when the world confirms no AI control entity. Added the typed zero asset returned by the fieldless resource lookup. The 104319 graph shapes match the local archive references, and later client inspection corroborates the execution paths.
+- The tagged Soldier startup retires instances 9 and 25 while retaining the allocated ID 26. Its preflight goes from 4 diagnostics to 1, the movement-record sampler at `01C7`, node `7`. Stock weapon attachment and original-client acceptance remain pending.
+- Passed 314 public Rust tests, 59 tagged base-runtime checks and 55 tagged enriched-runtime checks. The untagged bundle also passed the owner startup regression. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.
+
+#### Rust owner movement sampling
+
+- Started the authored movement sampler from the same mover used for the selected body's spawn, then fed it actual posed input and collision results. Unposed script time retains the latest movement record.
+- Reused the 104319 owner flags codec and updated only changed authored outputs. The regular mover provides stance, velocity, throttle, ground contact and jump facts. Scripted movement, foreign targets and linked sampler events still need support.
+- Used the embedded standing record at fresh owner construction based on the later client's constructor. The exact 104319 startup context still needs original-client evidence. Tagged Soldier startup reaches the crouch effect action at `01C7`, node `74`. Stock weapon attachment and client acceptance remain pending.
+- Passed 317 public Rust tests, 59 tagged base-runtime checks and 55 tagged enriched-runtime checks. The untagged bundle also passed the owner startup regression. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.
+
+#### Rust owner projectile flight
+
+- Routed authored predicted straight projectiles from the same posed shot stream as hitscan. Body creation advertises the authored lease blocks, and the worker sweeps each flight against the current opposing bot capsules and map geometry. Direct and splash impacts use the same health, notice and respawn logic as hitscan.
+- Used the exact owner report carrying the matching volley state to confirm projectile aliases. Confirmations, including the no-report fallback, wait for the acknowledged body and possession. Explosion release waits for the projectile create acknowledgement. Body replacement stops the old flight and reliably retires its aliases without an explosion.
+- The encrypted Practice Range fixture covers Helix's 40 direct and 80 splash damage, an unaffected ally in the flight path, duplicate input and lost confirmation recovery. The stock Soldier body still stops at the authored effect action at `01C7`, node `74`. Observer launch, scripted movement, healing fields and original-client presentation remain open.
+- Passed 320 public Rust tests, 60 tagged base-runtime checks and 55 tagged enriched-runtime checks. The untagged bundle also passed the owner startup regression. Cargo formatting, Clippy, documentation links, Git diff checks and isolated release server startup and shutdown passed.

@@ -132,7 +132,7 @@ impl ProjectileLeases {
     }
 }
 
-fn local_prediction(node: &Node) -> bool {
+pub(crate) fn local_prediction(node: &Node) -> bool {
     node.field("m_45271E8C").is_some_and(|value| {
         value
             .as_bool()
@@ -444,6 +444,17 @@ impl OwnerProjectiles {
         }
         self.pending.clear();
         out
+    }
+
+    pub(crate) fn cancel(&mut self, token: ProjectileToken, out: &mut Vec<ProjectileDelivery>) {
+        if let Some(index) = self
+            .pending
+            .iter()
+            .position(|pending| pending.token == token)
+        {
+            let pending = self.pending.remove(index);
+            retire(&pending, &mut self.occupied, None, out);
+        }
     }
 }
 

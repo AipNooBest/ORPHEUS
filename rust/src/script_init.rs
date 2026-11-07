@@ -7,6 +7,7 @@
 //! their corresponding runtime.
 
 use std::{
+    cell::Cell,
     collections::{BTreeMap, HashSet},
     error::Error,
     fmt,
@@ -20,11 +21,13 @@ use crate::{
     commands::Command,
     mover_modifiers::{Modifier, ModifierKey, Operation},
     script_expr::{
-        self, Context, EmptyContext, EvalError, Scope, StackPriority, Variable, equal, truthy,
+        self, Context, EmptyContext, EntityRelation, EvalError, Scope, StackPriority, Variable,
+        equal, truthy,
     },
     script_graph::{Body, Graph, GraphStore, Node, asset_guid},
     script_runtime::{ButtonEdge, FRAME_MS, QueueFull, Timeline, button_edges, frame_start},
     script_wire::{Value, Variables},
+    vitals::PoolKind,
 };
 
 pub const MAX_INIT_WORK: usize = 100_000;
@@ -35,12 +38,28 @@ const MAX_PENDING_SHOTS: usize = 256;
 const ABILITY_RUNNING: u8 = 1;
 const ABILITY_PUSHED: u8 = 2;
 const ABILITY_HELD: u8 = 4;
+const SWITCH_TO_TRUE: u16 = 1;
+const SWITCH_TO_FALSE: u16 = 2;
 const LINK_PRIORITY: StackPriority = StackPriority {
     level: 0,
     above_equals: true,
 };
 const ABORT_PLUG: &str = "m_F198FD3A";
 const SUBGRAPH_STATES: &str = "m_FF3DAF1E";
+const MOVEMENT_BOOLEAN_OUTPUTS: [&str; 12] = [
+    "m_105DF1D6",
+    "m_49F4B33C",
+    "m_56AC7B36",
+    "m_16BC4759",
+    "m_F620FC2A",
+    "m_6306AA29",
+    "m_103A8581",
+    "m_958FF5C0",
+    "m_4C55BB03",
+    "m_2EB48682",
+    "m_45EB431F",
+    "m_BF152E27",
+];
 
 #[derive(Clone, Debug)]
 pub struct Root {
@@ -112,6 +131,10 @@ pub fn player_roots(body: &Body, graphs: &GraphStore) -> Result<Vec<Root>, InitF
     Ok(roots)
 }
 
+const OWNER_HEALTH: u32 = 253;
+const HUD_HEALTH: u32 = 1732;
+const HUD_MAX_HEALTH: u32 = 1737;
+
 pub fn player_entity_variables(body: &Body, health: f64, maximum_health: f64) -> Variables {
     let slots = body
         .weapons
@@ -122,9 +145,9 @@ pub fn player_entity_variables(body: &Body, health: f64, maximum_health: f64) ->
     Variables::from([
         (29, Value::Array(slots)),
         (16_515, Value::Integer(first as i64)),
-        (253, Value::Float(health)),
-        (1732, Value::Float(health)),
-        (1737, Value::Float(maximum_health)),
+        (OWNER_HEALTH, Value::Float(health)),
+        (HUD_HEALTH, Value::Float(health)),
+        (HUD_MAX_HEALTH, Value::Float(maximum_health)),
         (342, Value::Float(0.0)),
     ])
 }
@@ -135,6 +158,13 @@ pub struct Site {
     pub instance: u16,
     pub graph: u32,
     pub node: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TargetTagEffect {
+    pub entity: u32,
+    pub tag: u64,
+    pub present: bool,
 }
 
 /// External authored queries for this initialization. The caller owns mode,
@@ -152,11 +182,70 @@ pub trait World {
         [0.0; 3]
     }
 
+    /// The implicit owner's movement sample, if the world knows all its bits.
+    fn movement_sample(&self, _site: Site) -> Option<u16> {
+        None
+    }
+
     fn native(&mut self, _site: Site, _config: &Json) -> Option<Value> {
         None
     }
 
     fn body_scale(&mut self, _site: Site, _target: u32, _override_value: &Value) -> Option<f64> {
+        None
+    }
+
+    /// A missing kind reads the total across all pools.
+    fn body_health(&self, _site: Site, _kind: Option<PoolKind>, _maximum: bool) -> Option<f64> {
+        None
+    }
+
+    fn add_health_pool(
+        &mut self,
+        _site: Site,
+        _kind: PoolKind,
+        _maximum: f64,
+        _current: f64,
+    ) -> Option<u32> {
+        None
+    }
+
+    fn health_pool_current(&self, _site: Site, _pool: u32) -> Option<f64> {
+        None
+    }
+
+    fn remove_health_pool(&mut self, _site: Site, _pool: u32) -> Option<f64> {
+        None
+    }
+
+    fn has_target_tag(&self, _site: Site, _entity: u32, _tag: u64) -> Option<bool> {
+        None
+    }
+
+    fn set_target_tag_effect(
+        &mut self,
+        _site: Site,
+        _effect: TargetTagEffect,
+        _active: bool,
+    ) -> bool {
+        false
+    }
+
+    fn entity_filter_flags(&self, _site: Site, _entity: u32) -> Option<u64> {
+        None
+    }
+
+    fn body_on_fire(&mut self, _site: Site, _entity: u32) -> Option<bool> {
+        None
+    }
+
+    /// None means this relationship is unsupported for the supplied entity.
+    fn related_entity(
+        &mut self,
+        _site: Site,
+        _relation: EntityRelation,
+        _entity: u32,
+    ) -> Option<u32> {
         None
     }
 
@@ -185,7 +274,17 @@ impl World for EmptyWorld {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateKind {
     Plain,
+    HealthPool {
+        pool: Option<u32>,
+    },
+    TargetTag {
+        effect: Option<TargetTagEffect>,
+    },
     BooleanSwitch(bool),
+    DelayedSwitch {
+        current: bool,
+        undecided: bool,
+    },
     Switch {
         case: Option<usize>,
     },
@@ -213,6 +312,7 @@ pub enum StateKind {
         flags: u8,
     },
     MovementMod,
+    MovementSample(u16),
     Anim,
     Effect,
     SendMessage,
@@ -245,6 +345,7 @@ pub struct State {
     ending: bool,
     pending_change: bool,
     pending_timer: bool,
+    delayed_timers: [bool; 2],
     buffered_press: Option<BufferedPress>,
     linked_variable: Option<VarKey>,
     ability_stack: Option<VarKey>,
@@ -263,6 +364,7 @@ impl State {
             ending: false,
             pending_change: false,
             pending_timer: false,
+            delayed_timers: [false; 2],
             buffered_press: None,
             linked_variable: None,
             ability_stack: None,
@@ -745,6 +847,7 @@ struct AbilityPress {
 
 enum Event {
     Entry(u16),
+    ExitInstance,
     Begin(u16),
     Finish(u16),
     Abort(u16),
@@ -764,7 +867,7 @@ enum Event {
 impl Event {
     fn state(&self) -> Option<u16> {
         match *self {
-            Self::Entry(_) | Self::Message { .. } | Self::Button(_) => None,
+            Self::Entry(_) | Self::ExitInstance | Self::Message { .. } | Self::Button(_) => None,
             Self::Begin(state)
             | Self::Finish(state)
             | Self::Abort(state)
@@ -792,6 +895,7 @@ struct Machine {
     max_work: usize,
     frame: u32,
     now_ms: u64,
+    random_state: Cell<u64>,
     command_buttons: u32,
     held_buttons: Vec<u8>,
     owner_dead: bool,
@@ -829,6 +933,7 @@ impl Machine {
             max_work,
             frame,
             now_ms: frame_start(frame),
+            random_state: Cell::new(u64::from(entity) << 32 | u64::from(frame)),
             command_buttons: 0,
             held_buttons: Vec::new(),
             owner_dead: false,
@@ -1684,6 +1789,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                             self.run_node(id, node, None, 0)?;
                         }
                     }
+                    Event::ExitInstance => self.exit_instance(id)?,
                     Event::Begin(raw) => self.begin(key(raw), 0)?,
                     Event::Finish(raw) => self.end(key(raw), true, 0)?,
                     Event::Abort(raw) => self.end(key(raw), false, 0)?,
@@ -2078,6 +2184,19 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                         taken = true;
                         continue;
                     }
+                    if target.class == "STU_7B9E8909" && input == "m_inPlug" {
+                        // The bridge consumes its input even when inactive. Only an
+                        // explicit begin request can open it.
+                        let state = self.machine.snapshot.instances[&id]
+                            .states
+                            .entry(raw)
+                            .or_insert_with(|| State::dormant(StateKind::Plain));
+                        if state.active {
+                            self.follow(id, target, "m_outPlug", Some(key), depth + 1)?;
+                        }
+                        taken = true;
+                        continue;
+                    }
                     if target.class == "STUStatescriptStateAbility" && input == "m_3B7BED2E" {
                         self.stop_ability(key, target, depth + 1)?;
                         taken = true;
@@ -2120,6 +2239,14 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 if !self.send_game_message(id, node)? {
                     return Ok(false);
                 }
+                self.follow(id, node, "m_outPlug", None, depth)?;
+                Ok(true)
+            }
+            "STU_22926252"
+                if field(&node.fields, "m_67B81D25").is_null()
+                    && field(&node.fields, "m_EB35D2F1").is_null() =>
+            {
+                self.post(id, Event::ExitInstance)?;
                 self.follow(id, node, "m_outPlug", None, depth)?;
                 Ok(true)
             }
@@ -2295,9 +2422,55 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             // These client presentation states use the base state lifecycle on the server.
             "STUStatescriptState"
             | "STU_9D7BF987"
+            | "STU_B4CD94F4"
+            | "STU_90C3BCEA"
             | "STUStatescriptStateDataFlowMapping"
+            | "STU_E13B30A8"
             | "STUStatescriptStateUXPresenter" => StateKind::Plain,
+            // The authored zero-valued form inherits the base state reader.
+            "STU_D9843704"
+                if node.is_networked() && node.remote == -1 && {
+                    let value = field(&node.fields, "m_0B528B1E");
+                    script_expr::native_shape(value, "STUConfigVarFloat", Some("m_value"))
+                        && field(value, "m_value").as_f64() == Some(0.0)
+                } =>
+            {
+                StateKind::Plain
+            }
+            "STU_BD02E168" if is_client_subgraph_controller(self.graph(id), node) => {
+                StateKind::Plain
+            }
+            // ForCodeSynced publishes to native game-code registration outside
+            // the graph. Its VM plugs and empty wire payload use the base state.
+            "STU_CD46AF93" if is_networked_for_code_synced(node) => StateKind::Plain,
+            // Tips register their state key with native presentation code.
+            // The graph still runs the base state's plugs and lifecycle.
+            "STU_F5A99B2A"
+                if node.is_networked()
+                    && field(&node.fields, "m_tips")
+                        .as_array()
+                        .is_some_and(|tips| {
+                            !tips.is_empty()
+                                && tips
+                                    .iter()
+                                    .all(|tip| field(tip, "$").as_str() == Some("STUTip"))
+                        }) =>
+            {
+                StateKind::Plain
+            }
+            "STU_7B9E8909" => StateKind::Plain,
+            "STUStatescriptStateHealthPool" if is_base_health_pool(node) => {
+                StateKind::HealthPool { pool: None }
+            }
+            "STU_E56BA8D8" if node.is_networked() && node.remote == -1 => {
+                StateKind::TargetTag { effect: None }
+            }
+            "STU_066B4605" if self.has_no_ai_control_target(id, node) => StateKind::Plain,
             "STUStatescriptStateBooleanSwitch" => StateKind::BooleanSwitch(false),
+            "STU_B591EBFE" => StateKind::DelayedSwitch {
+                current: false,
+                undecided: true,
+            },
             "STU_DEBD057B" => StateKind::Switch { case: None },
             "STU_01178155" => StateKind::ActiveQuery,
             "STUStatescriptStateGamePadVibration" => StateKind::GamePadVibration,
@@ -2313,6 +2486,12 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             },
             "STUStatescriptStateAbility" => StateKind::Ability { flags: 0 },
             "STU_316CFEF2" => StateKind::MovementMod,
+            "STU_96F1DBCF" if is_owner_movement_sampler(node) => {
+                match self.state(key).map(|state| state.kind) {
+                    Some(kind @ StateKind::MovementSample(_)) => kind,
+                    _ => StateKind::MovementSample(0),
+                }
+            }
             "STUStatescriptStateAnim" => StateKind::Anim,
             "STU_691BFA55" | "STU_7CA2FBAF" => StateKind::Effect,
             "STU_38EE1100" => StateKind::SendMessage,
@@ -2352,6 +2531,12 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         );
         match kind {
             StateKind::GamePadVibration => self.post(id, Event::Finish(key.raw))?,
+            StateKind::Plain if node.class == "STU_066B4605" => {
+                // The absent AI relation finishes through the current clock's event queue.
+                self.post(id, Event::Finish(key.raw))?;
+            }
+            StateKind::HealthPool { .. } => self.begin_health_pool(key, node)?,
+            StateKind::TargetTag { .. } => self.begin_target_tag(key, node)?,
             StateKind::BooleanSwitch(_) => {
                 let Some(value) =
                     self.evaluate(id, node, field(&node.fields, "m_condition"), Some(key))
@@ -2363,6 +2548,7 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                     StateKind::BooleanSwitch(current);
                 self.enter_branch(key, node, current, depth)?;
             }
+            StateKind::DelayedSwitch { .. } => self.begin_delayed_switch(key, node, depth)?,
             StateKind::Switch { .. } => {
                 let Some(case) = self.switch_case(key, node) else {
                     return Ok(());
@@ -2398,6 +2584,10 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 self.restart_cooldown(key, node, depth)?;
                 self.register_tick(key, self.machine.now_ms);
             }
+            StateKind::MovementSample(previous) => {
+                self.update_movement_sample(key, node, previous)?;
+                self.register_tick(key, self.machine.now_ms);
+            }
             StateKind::Anim => self.arm_animation(key, node)?,
             StateKind::SendMessage => {
                 self.send_game_message(id, node)?;
@@ -2417,6 +2607,164 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         self.follow(id, node, "m_onBeginPlug", Some(key), depth)?;
         self.follow(id, node, "m_subgraphPlug", Some(key), depth)?;
         self.try_complete(key, node, depth)
+    }
+
+    fn has_no_ai_control_target(&mut self, id: u16, node: &Node) -> bool {
+        let site = self.site(id, node);
+        node.is_networked()
+            && node.remote == -1
+            && script_expr::native_shape(field(&node.fields, "m_00D49978"), "STU_B5A0CAF0", None)
+            && self
+                .world
+                .related_entity(site, EntityRelation::AiControlEntity, site.entity)
+                == Some(0)
+    }
+
+    fn update_movement_sample(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        previous: u16,
+    ) -> Result<(), InitFault> {
+        let site = self.site(key.instance, node);
+        let Some(sample) = self
+            .world
+            .movement_sample(site)
+            .filter(|&mask| mask < 1 << 13)
+        else {
+            self.report(site, Issue::UnsupportedField("owner movement sample"));
+            return Ok(());
+        };
+        let changed = previous ^ sample;
+        if changed == 0 {
+            return Ok(());
+        }
+        self.state_mut(key).expect("active movement sample").kind =
+            StateKind::MovementSample(sample);
+        for (bit, name) in MOVEMENT_BOOLEAN_OUTPUTS.iter().enumerate() {
+            let mask = 1 << bit;
+            if changed & mask == 0 {
+                continue;
+            }
+            if let Some(variable) = script_expr::lvalue(field(&node.fields, name))
+                .expect("validated movement sample output")
+            {
+                self.write(
+                    source_key(key.instance, variable),
+                    Value::Bool(sample & mask != 0),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn begin_target_tag(&mut self, key: StateKey, node: &Node) -> Result<(), InitFault> {
+        let site = self.site(key.instance, node);
+        let add = field(&node.fields, "m_targetTags");
+        let suppress = field(&node.fields, "m_44D1BE94");
+        let (literal, present) = match (add.is_null(), suppress.is_null()) {
+            (false, true) => (add, true),
+            (true, false) => (suppress, false),
+            _ => {
+                self.report(site, Issue::UnsupportedField("target tag operands"));
+                return Ok(());
+            }
+        };
+        let Some(tag) = script_expr::target_tag_config(literal).filter(|&tag| tag != 0) else {
+            self.report(site, Issue::UnsupportedField("target tag literal"));
+            return Ok(());
+        };
+        let Some(Value::Entity(entity)) =
+            self.evaluate(key.instance, node, field(&node.fields, "m_31714AFC"), None)
+        else {
+            self.report(site, Issue::UnsupportedField("target tag entity"));
+            return Ok(());
+        };
+        let effect = TargetTagEffect {
+            entity,
+            tag,
+            present,
+        };
+        if !self.world.set_target_tag_effect(site, effect, true) {
+            self.report(site, Issue::UnsupportedField("target tag effect"));
+            return Ok(());
+        }
+        self.state_mut(key).expect("active target tag").kind = StateKind::TargetTag {
+            effect: Some(effect),
+        };
+        Ok(())
+    }
+
+    fn begin_health_pool(&mut self, key: StateKey, node: &Node) -> Result<(), InitFault> {
+        let id = key.instance;
+        let site = self.site(id, node);
+        if !matches!(
+            self.evaluate(id, node, field(&node.fields, "m_FA3ECC43"), None),
+            Some(Value::Entity(target)) if target == site.entity
+        ) {
+            self.report(site, Issue::UnsupportedField("health pool target"));
+            return Ok(());
+        }
+        let Some(maximum) = self
+            .evaluate(id, node, field(&node.fields, "m_amount"), Some(key))
+            .and_then(pool_number)
+        else {
+            self.report(site, Issue::UnsupportedField("health pool capacity"));
+            return Ok(());
+        };
+        let initial = field(&node.fields, "m_BCFDD2E9");
+        let current = if initial.is_null() {
+            maximum
+        } else {
+            let Some(current) = self.evaluate(id, node, initial, None).and_then(pool_number) else {
+                self.report(site, Issue::UnsupportedField("health pool initial amount"));
+                return Ok(());
+            };
+            current
+        };
+        let kind = pool_kind(field(&node.fields, "m_7E8B666C")).expect("validated pool kind");
+        let Some(pool) = self.world.add_health_pool(site, kind, maximum, current) else {
+            self.report(site, Issue::UnsupportedField("health pool registration"));
+            return Ok(());
+        };
+        self.state_mut(key).expect("active health pool").kind =
+            StateKind::HealthPool { pool: Some(pool) };
+        self.register_tick(key, self.machine.now_ms);
+        self.publish_health_pool(key, node, current)
+    }
+
+    fn publish_health_pool(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        current: f64,
+    ) -> Result<(), InitFault> {
+        let output = script_expr::lvalue(field(&node.fields, "m_CEAB19E8"))
+            .expect("validated health pool output")
+            .expect("health pool output variable");
+        let output = source_key(key.instance, output);
+        let current = Value::Float(current);
+        if !same(&self.machine.value(output, None), &current) {
+            self.write(output, current)?;
+        }
+        self.publish_health_totals(self.site(key.instance, node))
+    }
+
+    fn publish_health_totals(&mut self, site: Site) -> Result<(), InitFault> {
+        for (variable, maximum) in [
+            (OWNER_HEALTH, false),
+            (HUD_HEALTH, false),
+            (HUD_MAX_HEALTH, true),
+        ] {
+            if let Some(amount) = self.world.body_health(site, None, maximum) {
+                let key = VarKey::Entity(variable);
+                let value = Value::Float(amount);
+                if !same(&self.machine.value(key, None), &value) {
+                    self.write(key, value)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn begin_stack(&mut self, key: StateKey, node: &Node, depth: usize) -> Result<(), InitFault> {
@@ -3185,6 +3533,28 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                     Some(StateKind::BooleanSwitch(_)) => {
                         self.check_switch(key, 0)?;
                     }
+                    Some(StateKind::DelayedSwitch { .. }) => {
+                        let node = self
+                            .graph(id)
+                            .state(usize::from(raw))
+                            .expect("delayed switch");
+                        self.recheck_delayed_switch(key, node, 0)?;
+                    }
+                    Some(StateKind::HealthPool { pool: Some(pool) }) => {
+                        let node = self.graph(id).state(usize::from(raw)).expect("health pool");
+                        if let Some(current) =
+                            self.world.health_pool_current(self.site(id, node), pool)
+                        {
+                            self.publish_health_pool(key, node, current)?;
+                        }
+                    }
+                    Some(StateKind::MovementSample(previous)) => {
+                        let node = self
+                            .graph(id)
+                            .state(usize::from(raw))
+                            .expect("movement sample");
+                        self.update_movement_sample(key, node, previous)?;
+                    }
                     Some(StateKind::Switch { .. }) => self.post(id, Event::Reevaluate(raw))?,
                     Some(StateKind::Ability { .. }) => self.activate_ability(key, 0)?,
                     Some(StateKind::ChaseVar) => self.tick_chase(key)?,
@@ -3301,6 +3671,21 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         if kind == StateKind::Anim && parameter == 1 {
             self.follow(key.instance, node, "m_A3B86BB0", Some(key), 0)?;
         }
+        if let StateKind::DelayedSwitch { current, undecided } = kind {
+            let branch = match parameter {
+                SWITCH_TO_TRUE => Some(true),
+                SWITCH_TO_FALSE => Some(false),
+                _ => None,
+            };
+            if let Some(branch) = branch {
+                self.state_mut(key)
+                    .expect("active delayed switch")
+                    .delayed_timers[usize::from(branch)] = false;
+                if undecided || current != branch {
+                    self.set_delayed_branch(key, node, branch, 0)?;
+                }
+            }
+        }
         if matches!(kind, StateKind::Ability { .. }) && matches!(parameter, 1 | 2) {
             self.activate_ability(key, 0)?;
         }
@@ -3389,7 +3774,10 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 self.post(key.instance, Event::Reevaluate(key.raw))?;
             } else if state.active
                 && !state.pending_timer
-                && matches!(state.kind, StateKind::BooleanSwitch(_))
+                && matches!(
+                    state.kind,
+                    StateKind::BooleanSwitch(_) | StateKind::DelayedSwitch { .. }
+                )
             {
                 state.pending_timer = true;
                 self.post(key.instance, Event::Reevaluate(key.raw))?;
@@ -3397,6 +3785,16 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 self.update_stack(key)?;
             } else if state.active && state.kind == StateKind::Watch {
                 self.check_watch(key)?;
+            } else if state.active && matches!(state.kind, StateKind::HealthPool { pool: Some(_) })
+            {
+                let node = self
+                    .graph(key.instance)
+                    .state(usize::from(key.raw))
+                    .expect("active health pool");
+                self.report(
+                    self.site(key.instance, node),
+                    Issue::UnsupportedField("changing health pool capacity"),
+                );
             }
         }
         Ok(())
@@ -3463,7 +3861,10 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             .graph(key.instance)
             .state(usize::from(key.raw))
             .expect("switch state");
-        let evaluated = if let StateKind::Switch { case } = kind {
+        let evaluated = if matches!(kind, StateKind::DelayedSwitch { .. }) {
+            self.recheck_delayed_switch(key, node, depth)?;
+            true
+        } else if let StateKind::Switch { case } = kind {
             let Some(next) = self.switch_case(key, node) else {
                 return Ok(());
             };
@@ -3508,6 +3909,188 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         Ok(false)
     }
 
+    fn begin_delayed_switch(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        depth: usize,
+    ) -> Result<(), InitFault> {
+        let id = key.instance;
+        let Some(undecided) = self.evaluate(id, node, field(&node.fields, "m_308B8A80"), None)
+        else {
+            return Ok(());
+        };
+        let undecided = truthy(&undecided);
+        let current = if undecided {
+            false
+        } else {
+            let initial = field(&node.fields, "m_418D9D9D");
+            let config = if initial.is_null() {
+                field(&node.fields, "m_BD83C8E6")
+            } else {
+                initial
+            };
+            let Some(initial) = self.evaluate(id, node, config, Some(key)) else {
+                return Ok(());
+            };
+            truthy(&initial)
+        };
+        self.state_mut(key).expect("active delayed switch").kind =
+            StateKind::DelayedSwitch { current, undecided };
+        self.register_tick(key, self.machine.now_ms);
+        if !undecided {
+            self.enter_branch(key, node, current, depth)?;
+        }
+        self.recheck_delayed_switch(key, node, depth)
+    }
+
+    fn recheck_delayed_switch(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        depth: usize,
+    ) -> Result<(), InitFault> {
+        let Some(StateKind::DelayedSwitch { current, undecided }) = self
+            .state(key)
+            .filter(|state| state.active)
+            .map(|state| state.kind)
+        else {
+            return Ok(());
+        };
+        let id = key.instance;
+        let condition = field(&node.fields, "m_BD83C8E6");
+        let false_override = field(&node.fields, "m_E8FC060D");
+        let requested = if current {
+            let Some(holds_false) =
+                self.delayed_false_condition(key, node, condition, false_override)
+            else {
+                return Ok(());
+            };
+            holds_false.then_some(false)
+        } else {
+            let Some(holds_true) = self.evaluate(id, node, condition, Some(key)) else {
+                return Ok(());
+            };
+            if truthy(&holds_true) {
+                Some(true)
+            } else if undecided {
+                let Some(holds_false) =
+                    self.delayed_false_condition(key, node, condition, false_override)
+                else {
+                    return Ok(());
+                };
+                holds_false.then_some(false)
+            } else {
+                None
+            }
+        };
+        let Some(branch) = requested else {
+            if !undecided {
+                self.cancel_delayed_timer(key, !current);
+            }
+            return Ok(());
+        };
+        let delay_field = if branch { "m_7130456B" } else { "m_ED60694A" };
+        let Some(delay) = self.evaluate(id, node, field(&node.fields, delay_field), None) else {
+            return Ok(());
+        };
+        let seconds = script_expr::to_float(&delay);
+        let milliseconds = ((seconds as f32) * 1000.0).trunc();
+        if !milliseconds.is_finite() {
+            self.report(
+                self.site(id, node),
+                Issue::UnsupportedField("delayed switch timeout"),
+            );
+            return Ok(());
+        }
+        if seconds > 0.0 {
+            self.arm_delayed_timer(key, branch, milliseconds as u64)?;
+        }
+        if undecided {
+            self.cancel_delayed_timer(key, !branch);
+        }
+        if seconds <= 0.0 {
+            self.set_delayed_branch(key, node, branch, depth)?;
+        }
+        Ok(())
+    }
+
+    fn delayed_false_condition(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        condition: &Json,
+        override_config: &Json,
+    ) -> Option<bool> {
+        let invert = override_config.is_null();
+        let config = if invert { condition } else { override_config };
+        self.evaluate(key.instance, node, config, Some(key))
+            .map(|value| truthy(&value) != invert)
+    }
+
+    fn arm_delayed_timer(
+        &mut self,
+        key: StateKey,
+        branch: bool,
+        delay_ms: u64,
+    ) -> Result<(), InitFault> {
+        let index = usize::from(branch);
+        if !self
+            .state(key)
+            .expect("active delayed switch")
+            .delayed_timers[index]
+        {
+            let parameter = if branch {
+                SWITCH_TO_TRUE
+            } else {
+                SWITCH_TO_FALSE
+            };
+            self.post_after(key.instance, delay_ms, Event::Timer(key.raw, parameter))?;
+            self.state_mut(key)
+                .expect("active delayed switch")
+                .delayed_timers[index] = true;
+        }
+        Ok(())
+    }
+
+    fn cancel_delayed_timer(&mut self, key: StateKey, branch: bool) {
+        let pending = &mut self
+            .state_mut(key)
+            .expect("active delayed switch")
+            .delayed_timers[usize::from(branch)];
+        if std::mem::take(pending) {
+            let parameter = if branch {
+                SWITCH_TO_TRUE
+            } else {
+                SWITCH_TO_FALSE
+            };
+            self.machine.queues.retain(key.instance, |_, event| {
+                !matches!(event, Event::Timer(raw, param) if *raw == key.raw && *param == parameter)
+            });
+        }
+    }
+
+    fn set_delayed_branch(
+        &mut self,
+        key: StateKey,
+        node: &Node,
+        next: bool,
+        depth: usize,
+    ) -> Result<(), InitFault> {
+        if let StateKind::DelayedSwitch {
+            current,
+            undecided: false,
+        } = self.state(key).expect("active delayed switch").kind
+        {
+            self.exit_subgraph(key.instance, node, branch_path(current), depth + 1)?;
+        }
+        self.state_mut(key).expect("active delayed switch").kind = StateKind::DelayedSwitch {
+            current: next,
+            undecided: false,
+        };
+        self.enter_branch(key, node, next, depth)
+    }
+
     fn switch_case(&mut self, key: StateKey, node: &Node) -> Option<Option<usize>> {
         let value = self.evaluate(
             key.instance,
@@ -3539,7 +4122,9 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
             "m_onFalsePlug"
         };
         self.follow(key.instance, node, output, Some(key), depth)?;
-        self.follow(key.instance, node, branch_path(branch), Some(key), depth)?;
+        if self.state(key).is_some_and(|state| state.active) {
+            self.follow(key.instance, node, branch_path(branch), Some(key), depth)?;
+        }
         Ok(())
     }
 
@@ -3566,9 +4151,27 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         self.clear_tick(key);
         self.exit_subgraph(id, node, "m_subgraphPlug", depth + 1)?;
         match kind {
+            StateKind::MovementSample(previous) => {
+                self.update_movement_sample(key, node, previous)?;
+            }
+            StateKind::TargetTag {
+                effect: Some(effect),
+            } => {
+                self.world
+                    .set_target_tag_effect(self.site(id, node), effect, false);
+            }
+            StateKind::HealthPool { pool: Some(pool) } => {
+                if let Some(current) = self.world.remove_health_pool(self.site(id, node), pool) {
+                    self.publish_health_pool(key, node, current)?;
+                }
+            }
             StateKind::BooleanSwitch(branch) => {
                 self.exit_subgraph(id, node, branch_path(branch), depth + 1)?
             }
+            StateKind::DelayedSwitch {
+                current,
+                undecided: false,
+            } => self.exit_subgraph(id, node, branch_path(current), depth + 1)?,
             StateKind::Switch { case } => {
                 self.exit_subgraph(id, node, &case_path(case), depth + 1)?
             }
@@ -3604,8 +4207,15 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         state.ending = false;
         state.pending_change = false;
         state.pending_timer = false;
+        state.delayed_timers = [false; 2];
         if matches!(kind, StateKind::SubScript { .. }) {
             state.kind = StateKind::SubScript { child: None };
+        }
+        if matches!(kind, StateKind::HealthPool { .. }) {
+            state.kind = StateKind::HealthPool { pool: None };
+        }
+        if matches!(kind, StateKind::TargetTag { .. }) {
+            state.kind = StateKind::TargetTag { effect: None };
         }
         if matches!(kind, StateKind::LogicalButton { .. }) {
             state.kind = StateKind::LogicalButton { down: false };
@@ -3654,6 +4264,29 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
         });
     }
 
+    fn exit_instance(&mut self, id: u16) -> Result<(), InitFault> {
+        let parent = self.machine.snapshot.instances[&id].parent;
+        self.destroy(id)?;
+        let Some((instance, raw)) = parent else {
+            return Ok(());
+        };
+        let key = StateKey { instance, raw };
+        let Some(state) = self.state_mut(key).filter(|state| {
+            state.active && !state.ending && state.kind == StateKind::SubScript { child: Some(id) }
+        }) else {
+            return Ok(());
+        };
+        state.kind = StateKind::SubScript { child: None };
+        let node = self
+            .graph(instance)
+            .state(usize::from(raw))
+            .expect("active subscript");
+        if !configured(node, "m_24AB04BB") {
+            self.post(instance, Event::Finish(raw))?;
+        }
+        Ok(())
+    }
+
     fn destroy(&mut self, id: u16) -> Result<(), InitFault> {
         let mut pending = vec![(id, false)];
         while let Some((id, children_done)) = pending.pop() {
@@ -3679,13 +4312,30 @@ impl<'graph, 'world, 'machine, W: World> Vm<'graph, 'world, 'machine, W> {
                 .filter_map(|(&raw, state)| {
                     (state.linked_variable.is_some()
                         || state.ability_stack.is_some()
-                        || matches!(state.kind, StateKind::WeaponVolley { .. }))
+                        || matches!(
+                            state.kind,
+                            StateKind::WeaponVolley { .. }
+                                | StateKind::HealthPool { pool: Some(_) }
+                                | StateKind::TargetTag { effect: Some(_) }
+                        ))
                     .then_some((raw, state.kind))
                 })
                 .collect();
             for (raw, kind) in outputs {
                 let key = StateKey { instance: id, raw };
-                if matches!(kind, StateKind::WeaponVolley { .. }) {
+                if let StateKind::TargetTag {
+                    effect: Some(effect),
+                } = kind
+                {
+                    let node = self.graph(id).state(usize::from(raw)).expect("target tag");
+                    self.world
+                        .set_target_tag_effect(self.site(id, node), effect, false);
+                } else if let StateKind::HealthPool { pool: Some(pool) } = kind {
+                    let node = self.graph(id).state(usize::from(raw)).expect("health pool");
+                    let site = self.site(id, node);
+                    self.world.remove_health_pool(site, pool);
+                    self.publish_health_totals(site)?;
+                } else if matches!(kind, StateKind::WeaponVolley { .. }) {
                     self.finish_volley(key, 0)?;
                 } else if kind == StateKind::ChaseVar {
                     self.finish_chase(key, 0)?;
@@ -3720,6 +4370,109 @@ fn is_entry(node: &Node) -> bool {
 
 fn is_message_entry(node: &Node) -> bool {
     node.class == "STUStatescriptEntryGameMessage"
+}
+
+fn is_client_subgraph_controller(graph: &Graph, node: &Node) -> bool {
+    // The controller is replicated, but its specialized branch starts on the client.
+    const BRANCH: &str = "m_5B10D01F";
+    let plug = field(&node.fields, BRANCH);
+    node.is_networked()
+        && field(plug, "$").as_str() == Some("STU_904BFCEC")
+        && array_field(plug, "links").len() == 1
+        && node
+            .links(BRANCH)
+            .next()
+            .and_then(|(position, _)| graph.node(position?))
+            .is_some_and(|target| target.client_only && !target.server_only)
+}
+
+fn is_owner_movement_sampler(node: &Node) -> bool {
+    node.is_networked()
+        && node.remote == -1
+        && [
+            "m_entity",
+            "m_A10CC74B",
+            "m_0B1AA8CA",
+            "m_4F8F2F3F",
+            "m_8BF03679",
+            "m_BF5B22B7",
+        ]
+        .iter()
+        .all(|name| field(&node.fields, name).is_null())
+        && ["m_E37BC6C2", "m_2102C541"]
+            .iter()
+            .all(|path| node.links(path).next().is_none())
+        && MOVEMENT_BOOLEAN_OUTPUTS
+            .iter()
+            .all(|name| script_expr::lvalue(field(&node.fields, name)).is_ok())
+}
+
+fn is_networked_for_code_synced(node: &Node) -> bool {
+    node.is_networked()
+        && node.remote >= 0
+        && field(&node.fields, "m_DC897C87").as_u64() == Some(1)
+        && field(&node.fields, "m_598E32D5").as_u64() == Some(0)
+        && field(&node.fields, "m_0582B0E4").as_u64() == Some(0)
+        && field(&node.fields, "m_0B1AA8CA").is_null()
+        && field(&node.fields, "m_values")
+            .as_array()
+            .is_some_and(|values| {
+                !values.is_empty()
+                    && values.iter().all(|value| {
+                        field(value, "$").as_str() == Some("STUStatescriptForCodeValue")
+                            && field(field(value, "m_value"), "$").as_str().is_some()
+                    })
+            })
+}
+
+fn is_base_health_pool(node: &Node) -> bool {
+    let config = |name| field(&node.fields, name);
+    let is_owner = |value| script_expr::native_shape(value, "STU_B5A0CAF0", None);
+    let flag = |name, expected| {
+        let value = config(name);
+        script_expr::native_shape(value, "STUConfigVarBool", Some("m_value"))
+            && match field(value, "m_value") {
+                Json::Bool(flag) => *flag == expected,
+                Json::Number(flag) => flag.as_u64() == Some(u64::from(expected)),
+                _ => false,
+            }
+    };
+    let source = config("m_69A20070");
+    node.is_networked()
+        && [
+            "m_7BE02F89",
+            "m_C99FAFDD",
+            "m_FF79E783",
+            "m_AF1104D0",
+            "m_BFA825EA",
+        ]
+        .into_iter()
+        .all(|name| config(name).is_null())
+        && pool_kind(config("m_7E8B666C")).is_some()
+        && is_owner(config("m_FA3ECC43"))
+        && script_expr::native_shape(source, "STU_FEDD683C", Some("m_entity"))
+        && is_owner(field(source, "m_entity"))
+        && flag("m_4895B8B6", true)
+        && flag("m_64839023", false)
+        && flag("m_0E8A5C8E", false)
+        && matches!(script_expr::lvalue(config("m_CEAB19E8")), Ok(Some(_)))
+}
+
+fn pool_kind(value: &Json) -> Option<PoolKind> {
+    match value.as_u64()? {
+        0 => Some(PoolKind::Health),
+        1 => Some(PoolKind::Armour),
+        2 => Some(PoolKind::Shields),
+        _ => None,
+    }
+}
+
+fn pool_number(value: Value) -> Option<f64> {
+    match value {
+        Value::Float(amount) => Some(amount),
+        Value::Integer(amount) => Some(amount as f64),
+        _ => None,
+    }
 }
 
 fn ability_is_stacked(node: &Node) -> bool {
@@ -3931,6 +4684,19 @@ impl<W: World> Context for InstanceContext<'_, W> {
         self.world.position(entity)
     }
 
+    fn random_u64(&mut self) -> Option<u64> {
+        // SplitMix64 gives each component a reproducible stream without OS calls in graph execution.
+        let state = self
+            .machine
+            .random_state
+            .get()
+            .wrapping_add(0x9e37_79b9_7f4a_7c15);
+        self.machine.random_state.set(state);
+        let mixed = (state ^ (state >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        Some(mixed ^ (mixed >> 31))
+    }
+
     fn body_scale(&mut self, entity: u32) -> Option<f64> {
         if entity != self.site.entity {
             return None;
@@ -3940,9 +4706,37 @@ impl<W: World> Context for InstanceContext<'_, W> {
         self.world.body_scale(self.site, entity, &scale_override)
     }
 
+    fn body_health(&mut self, entity: u32, kind: Option<PoolKind>, maximum: bool) -> Option<f64> {
+        if entity != self.site.entity {
+            return None;
+        }
+        self.read_native = true;
+        self.world.body_health(self.site, kind, maximum)
+    }
+
     fn native(&mut self, config: &Json) -> Option<Value> {
         self.read_native = true;
         self.world.native(self.site, config)
+    }
+
+    fn has_target_tag(&mut self, entity: u32, tag: u64) -> Option<bool> {
+        self.read_native = true;
+        self.world.has_target_tag(self.site, entity, tag)
+    }
+
+    fn entity_filter_flags(&mut self, entity: u32) -> Option<u64> {
+        self.read_native = true;
+        self.world.entity_filter_flags(self.site, entity)
+    }
+
+    fn body_on_fire(&mut self, entity: u32) -> Option<bool> {
+        self.read_native = true;
+        self.world.body_on_fire(self.site, entity)
+    }
+
+    fn related_entity(&mut self, relation: EntityRelation, entity: u32) -> Option<u32> {
+        self.read_native = true;
+        self.world.related_entity(self.site, relation, entity)
     }
 
     fn would_stack_to_top(&mut self, variable: Variable, priority: StackPriority) -> Option<bool> {
@@ -3961,7 +4755,8 @@ mod tests {
 
     fn node(position: u16, class: &str, state: Option<u16>, mut fields: Json) -> Json {
         fields["m_2BBEEAB8"] = json!(state.is_some());
-        fields["m_ADEB6E05"] = json!(class.contains("Action") || class == "STU_12F5D52D");
+        fields["m_ADEB6E05"] =
+            json!(class.contains("Action") || matches!(class, "STU_12F5D52D" | "STU_22926252"));
         json!({
             "pos":position, "class":class, "uid":position, "rid":position, "remote":-1,
             "state":state, "client_only":false, "server_only":false, "fields":fields,
@@ -4002,6 +4797,888 @@ mod tests {
         json!({"$":"STU_919FD47C","m_expression":{
             "m_opcodes":[10,1,0,0], "m_dynamicVars":[var(id, false)]
         }})
+    }
+
+    #[test]
+    fn bridge_forwards_input_only_between_begin_and_abort() {
+        let message = |position, input| {
+            node(
+                position,
+                "STUStatescriptEntryGameMessage",
+                None,
+                json!({
+                    "m_gameMessage":{"m_gameMessage":format!("0x024000000000{position:04X}")},
+                    "m_outPlug":plug(&[(0,input)], &[]),
+                }),
+            )
+        };
+        let fixture = graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STU_7B9E8909",
+                    Some(0),
+                    json!({"m_outPlug":plug(&[(1,"m_inPlug")], &[])}),
+                ),
+                node(
+                    1,
+                    "STUStatescriptActionSetVar",
+                    None,
+                    json!({"m_out_Var":var(100,true), "m_value":true}),
+                ),
+                message(2, "m_inPlug"),
+                message(3, "m_beginPlug"),
+                message(4, ABORT_PLUG),
+            ],
+            json!([0]),
+            json!([2, 3, 4]),
+        );
+        let mut component = Component::start(
+            Arc::new(store(vec![fixture])),
+            42,
+            Variables::new(),
+            vec![Root::new(1, 42)],
+            0,
+            &mut EmptyWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        for (message, active, activation, forwarded) in [
+            (2, false, 0, false),
+            (3, true, 1, false),
+            (2, true, 1, true),
+            (2, true, 1, true),
+            (4, false, 1, false),
+            (2, false, 1, false),
+        ] {
+            component
+                .set_entity_variable(100, Value::Bool(false), &mut EmptyWorld)
+                .unwrap();
+            component
+                .queue_message(1, 0x0240_0000_0000_0000 | message, Variables::new())
+                .unwrap();
+            component.run_now(&mut EmptyWorld).unwrap();
+            let snapshot = component.snapshot().unwrap();
+            let state = &snapshot.instances[&1].states[&0];
+            assert_eq!((state.active, state.activation), (active, activation));
+            assert_eq!(snapshot.variables[&100], Value::Bool(forwarded));
+            assert!(snapshot.initialization_complete());
+        }
+    }
+
+    #[test]
+    fn client_subgraph_controller_keeps_its_branch_off_the_server() {
+        for client_only in [true, false] {
+            let mut target = node(2, "STUStatescriptState", Some(1), json!({}));
+            target["client_only"] = json!(client_only);
+            let graphs = store(vec![graph(
+                42,
+                vec![
+                    node(
+                        0,
+                        "STUStatescriptEntry",
+                        None,
+                        json!({"m_outPlug":plug(&[(1, "m_beginPlug")], &[])}),
+                    ),
+                    node(
+                        1,
+                        "STU_BD02E168",
+                        Some(0),
+                        json!({"m_5B10D01F":{
+                            "$":"STU_904BFCEC","links":[[2, "m_beginPlug"]],"m_FF3DAF1E":[1]
+                        }}),
+                    ),
+                    target,
+                ],
+                json!([1, 2]),
+                json!([0]),
+            )]);
+            let snapshot = initialize(
+                &graphs,
+                0xa000_0100,
+                Variables::new(),
+                vec![Root::new(1, 42)],
+                &mut EmptyWorld,
+                MAX_INIT_WORK,
+            )
+            .unwrap();
+            let states = &snapshot.instances[&1].states;
+            assert!(!states.contains_key(&1));
+            if client_only {
+                assert!(snapshot.initialization_complete());
+                assert!(states[&0].active);
+                assert_eq!(states[&0].kind, StateKind::Plain);
+            } else {
+                assert!(!states.contains_key(&0));
+                assert!(matches!(
+                    snapshot.diagnostics.as_slice(),
+                    [Diagnostic { issue: Issue::UnsupportedState(class), .. }]
+                        if class == "STU_BD02E168"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn networked_for_code_state_keeps_its_subgraph_lifetime() {
+        for (server_only, flags) in [(false, 0), (true, 0), (false, 1)] {
+            let mut for_code = node(
+                1,
+                "STU_CD46AF93",
+                Some(0),
+                json!({
+                    "m_DC897C87":1, "m_598E32D5":flags, "m_0582B0E4":0,
+                    "m_values":[{
+                        "$":"STUStatescriptForCodeValue",
+                        "m_identifier":"0x0D80000000000042",
+                        "m_value":var(100,true),
+                    }],
+                    "m_subgraphPlug":plug(&[(2,"m_beginPlug")], &[1]),
+                }),
+            );
+            for_code["remote"] = json!(0);
+            for_code["server_only"] = json!(server_only);
+            let mut fixture = graph(
+                42,
+                vec![
+                    node(
+                        0,
+                        "STUStatescriptEntry",
+                        None,
+                        json!({"m_outPlug":plug(&[(1,"m_beginPlug")], &[])}),
+                    ),
+                    for_code,
+                    node(2, "STUStatescriptState", Some(1), json!({})),
+                    node(
+                        3,
+                        "STUStatescriptEntryGameMessage",
+                        None,
+                        json!({
+                            "m_gameMessage":{"m_gameMessage":"0x0240000000000003"},
+                            "m_outPlug":plug(&[(1,ABORT_PLUG)], &[]),
+                        }),
+                    ),
+                ],
+                json!([1, 2]),
+                json!([0, 3]),
+            );
+            fixture["remote"] = json!([1]);
+            let mut component = Component::start(
+                Arc::new(store(vec![fixture])),
+                42,
+                Variables::from([(100, Value::Integer(5))]),
+                vec![Root::new(1, 42)],
+                0,
+                &mut EmptyWorld,
+                MAX_INIT_WORK,
+            )
+            .unwrap();
+            let snapshot = component.snapshot().unwrap();
+            let states = &snapshot.instances[&1].states;
+            if server_only || flags != 0 {
+                assert!(states.is_empty());
+                assert!(matches!(
+                    snapshot.diagnostics.as_slice(),
+                    [Diagnostic { issue: Issue::UnsupportedState(class), .. }]
+                        if class == "STU_CD46AF93"
+                ));
+                continue;
+            }
+            assert!(snapshot.initialization_complete());
+            assert!(states[&0].active && states[&1].active);
+            assert_eq!(states[&0].kind, StateKind::Plain);
+            assert!(!snapshot.variables.contains_key(&0x42));
+            component
+                .queue_message(1, 0x0240_0000_0000_0003, Variables::new())
+                .unwrap();
+            component.run_now(&mut EmptyWorld).unwrap();
+            let snapshot = component.snapshot().unwrap();
+            let states = &snapshot.instances[&1].states;
+            assert!(!states[&0].active && !states[&1].active);
+        }
+    }
+
+    #[test]
+    fn movement_sample_updates_only_changed_authored_outputs() {
+        struct SampleWorld(Option<u16>);
+        impl World for SampleWorld {
+            fn movement_sample(&self, _: Site) -> Option<u16> {
+                self.0
+            }
+        }
+
+        let fixture = graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntry",
+                    None,
+                    json!({
+                        "m_outPlug":plug(&[(1,"m_beginPlug")], &[])
+                    }),
+                ),
+                node(
+                    1,
+                    "STU_96F1DBCF",
+                    Some(0),
+                    json!({
+                        "m_49F4B33C":var(100,true),
+                        "m_103A8581":var(101,false),
+                        "m_subgraphPlug":plug(&[(2,"m_beginPlug")], &[1])
+                    }),
+                ),
+                node(
+                    2,
+                    "STUStatescriptStateBooleanSwitch",
+                    Some(1),
+                    json!({
+                        "m_condition":var(100,true)
+                    }),
+                ),
+            ],
+            json!([1, 2]),
+            json!([0]),
+        );
+        let graphs = Arc::new(store(vec![fixture]));
+        let start = |world: &mut SampleWorld| {
+            Component::start(
+                Arc::clone(&graphs),
+                42,
+                Variables::new(),
+                vec![Root::new(1, 42)],
+                0,
+                world,
+                MAX_INIT_WORK,
+            )
+            .unwrap()
+        };
+        let mut world = SampleWorld(Some(2));
+        let mut component = start(&mut world);
+        let snapshot = component.snapshot().unwrap();
+        assert!(snapshot.initialization_complete());
+        let owner = &snapshot.instances[&1];
+        assert_eq!(owner.states[&0].kind, StateKind::MovementSample(2));
+        assert_eq!(owner.states[&1].kind, StateKind::BooleanSwitch(true));
+        assert_eq!(snapshot.variables[&100], Value::Bool(true));
+        assert!(!owner.variables.contains_key(&101));
+
+        world.0 = Some(1 | (1 << 6));
+        component.advance_frame(1, &mut world).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        let owner = &snapshot.instances[&1];
+        assert_eq!(owner.states[&0].kind, StateKind::MovementSample(65));
+        assert_eq!(owner.states[&1].kind, StateKind::BooleanSwitch(false));
+        assert_eq!(snapshot.variables[&100], Value::Bool(false));
+        assert_eq!(owner.variables[&101], Value::Bool(true));
+
+        world.0 = Some(0);
+        component.advance_frame(2, &mut world).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert_eq!(
+            snapshot.instances[&1].states[&0].kind,
+            StateKind::MovementSample(0)
+        );
+        assert_eq!(snapshot.instances[&1].variables[&101], Value::Bool(false));
+
+        let unsupported = start(&mut SampleWorld(None));
+        assert!(matches!(
+            unsupported.snapshot().unwrap().diagnostics.as_slice(),
+            [Diagnostic {
+                issue: Issue::UnsupportedField("owner movement sample"),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn instance_exit_drains_in_order_and_finishes_the_linked_parent() {
+        let entry = |links: &[(u16, &str)]| {
+            node(
+                0,
+                "STUStatescriptEntry",
+                None,
+                json!({"m_outPlug":plug(links, &[])}),
+            )
+        };
+        let mark = |position, identifier| {
+            node(
+                position,
+                "STUStatescriptActionSetVar",
+                None,
+                json!({
+                    "m_out_Var":var(identifier,true), "m_value":true
+                }),
+            )
+        };
+        let subscript = |position, raw, child: u16, keep_parent| {
+            node(
+                position,
+                "STU_37D754C8",
+                Some(raw),
+                json!({
+                    "m_36F7B64C":{"m_36F7B64C":{"m_C974E369":{
+                        "m_graph":format!("0x058000000000{child:04X}")
+                    }}},
+                    "m_24AB04BB":keep_parent
+                }),
+            )
+        };
+        let child = graph(
+            43,
+            vec![
+                entry(&[
+                    (1, "m_beginPlug"),
+                    (2, "m_beginPlug"),
+                    (3, "m_inPlug"),
+                    (4, "m_beginPlug"),
+                ]),
+                node(
+                    1,
+                    "STUStatescriptStateWait",
+                    Some(0),
+                    json!({
+                        "m_timeout":{"$":"STUConfigVarFloat","m_value":1.0},
+                        "m_onBeginPlug":plug(&[(5,"m_inPlug")], &[]),
+                        "m_onAbortPlug":plug(&[(6,"m_inPlug")], &[]),
+                        "m_onEndPlug":plug(&[(6,"m_inPlug")], &[])
+                    }),
+                ),
+                subscript(2, 1, 44, false),
+                node(
+                    3,
+                    "STU_22926252",
+                    None,
+                    json!({"m_outPlug":plug(&[(7,"m_inPlug")], &[])}),
+                ),
+                node(
+                    4,
+                    "STUStatescriptState",
+                    Some(2),
+                    json!({"m_onBeginPlug":plug(&[(8,"m_inPlug")], &[])}),
+                ),
+                mark(5, 100),
+                mark(6, 101),
+                mark(7, 102),
+                mark(8, 103),
+            ],
+            json!([1, 2, 4]),
+            json!([0]),
+        );
+        let grandchild = graph(
+            44,
+            vec![entry(&[(1, "m_inPlug")]), mark(1, 104)],
+            json!([]),
+            json!([0]),
+        );
+        for keep_parent in [false, true] {
+            let mut owner = subscript(1, 0, 43, keep_parent);
+            owner["fields"]["m_onFinishedPlug"] = plug(&[(2, "m_inPlug")], &[]);
+            owner["fields"]["m_onAbortPlug"] = plug(&[(3, "m_inPlug")], &[]);
+            let parent = graph(
+                42,
+                vec![
+                    entry(&[(1, "m_beginPlug")]),
+                    owner,
+                    mark(2, 105),
+                    mark(3, 106),
+                ],
+                json!([1]),
+                json!([0]),
+            );
+            let snapshot = initialize(
+                &store(vec![parent, child.clone(), grandchild.clone()]),
+                42,
+                Variables::new(),
+                vec![Root::new(1, 42)],
+                &mut EmptyWorld,
+                MAX_INIT_WORK,
+            )
+            .unwrap();
+            assert!(
+                snapshot.initialization_complete(),
+                "{:?}",
+                snapshot.diagnostics
+            );
+            assert_eq!(snapshot.instances.keys().copied().collect::<Vec<_>>(), [1]);
+            assert!(snapshot.pending_timers.is_empty());
+            let state = &snapshot.instances[&1].states[&0];
+            assert_eq!(state.active, keep_parent);
+            assert_eq!(state.kind, StateKind::SubScript { child: None });
+            let mut expected =
+                Variables::from([(100, Value::Bool(true)), (102, Value::Bool(true))]);
+            if !keep_parent {
+                expected.insert(105, Value::Bool(true));
+            }
+            assert_eq!(snapshot.variables, expected);
+        }
+    }
+
+    #[test]
+    fn target_tag_releases_on_abort_and_subscript_teardown() {
+        #[derive(Default)]
+        struct TagWorld(Vec<(TargetTagEffect, bool)>);
+
+        impl World for TagWorld {
+            fn set_target_tag_effect(
+                &mut self,
+                _: Site,
+                effect: TargetTagEffect,
+                active: bool,
+            ) -> bool {
+                self.0.push((effect, active));
+                true
+            }
+        }
+
+        const ABORT: u64 = 0x0240_0000_0000_0002;
+        const RESTART: u64 = 0x0240_0000_0000_0003;
+        let entry = |position, message: Option<u64>, input| {
+            let (class, mut fields) = match message {
+                Some(message) => (
+                    "STUStatescriptEntryGameMessage",
+                    json!({"m_gameMessage":{"m_gameMessage":format!("0x{message:016X}")}}),
+                ),
+                None => ("STUStatescriptEntry", json!({})),
+            };
+            fields["m_outPlug"] = plug(&[(1, input)], &[]);
+            node(position, class, None, fields)
+        };
+        let parent = graph(
+            42,
+            vec![
+                entry(0, None, "m_beginPlug"),
+                node(
+                    1,
+                    "STU_37D754C8",
+                    Some(0),
+                    json!({
+                        "m_36F7B64C":{"m_36F7B64C":{"m_C974E369":{"m_graph":"0x058000000000002B"}}}
+                    }),
+                ),
+                entry(2, Some(ABORT), ABORT_PLUG),
+            ],
+            json!([1]),
+            json!([0, 2]),
+        );
+        let child = graph(
+            43,
+            vec![
+                entry(0, None, "m_beginPlug"),
+                node(
+                    1,
+                    "STU_E56BA8D8",
+                    Some(0),
+                    json!({
+                        "m_31714AFC":{"$":"STU_B5A0CAF0"},
+                        "m_44D1BE94":{"$":"STU_357DABBB","m_7D7C86A1":"0x0D60000000000042"}
+                    }),
+                ),
+                entry(2, Some(ABORT), ABORT_PLUG),
+                entry(3, Some(RESTART), "m_beginPlug"),
+            ],
+            json!([1]),
+            json!([0, 2, 3]),
+        );
+        let effect = TargetTagEffect {
+            entity: 42,
+            tag: 0x0d60_0000_0000_0042,
+            present: false,
+        };
+        let mut world = TagWorld::default();
+        let mut component = Component::start(
+            Arc::new(store(vec![parent, child])),
+            effect.entity,
+            Variables::new(),
+            vec![Root::new(1, 42)],
+            0,
+            &mut world,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        assert!(component.snapshot().unwrap().initialization_complete());
+        assert_eq!(world.0, [(effect, true)]);
+
+        for (id, message) in [(2, ABORT), (2, RESTART), (1, ABORT)] {
+            assert_eq!(
+                component
+                    .queue_message(id, message, Variables::new())
+                    .unwrap(),
+                1
+            );
+            component.run_now(&mut world).unwrap();
+        }
+        assert!(!component.snapshot().unwrap().instances.contains_key(&2));
+        assert_eq!(
+            world.0,
+            [
+                (effect, true),
+                (effect, false),
+                (effect, true),
+                (effect, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn base_health_pool_keeps_remaining_amount_before_on_end_and_restarts_fresh() {
+        use crate::vitals::{Death, Vitals};
+
+        struct PoolWorld(Vitals);
+        impl World for PoolWorld {
+            fn body_health(&self, _: Site, kind: Option<PoolKind>, maximum: bool) -> Option<f64> {
+                Some(self.0.amount(kind, maximum))
+            }
+
+            fn add_health_pool(
+                &mut self,
+                _: Site,
+                kind: PoolKind,
+                maximum: f64,
+                current: f64,
+            ) -> Option<u32> {
+                self.0.add_pool(kind, maximum, current)
+            }
+
+            fn health_pool_current(&self, _: Site, pool: u32) -> Option<f64> {
+                self.0.pool_current(pool)
+            }
+
+            fn remove_health_pool(&mut self, _: Site, pool: u32) -> Option<f64> {
+                self.0.remove_pool(pool)
+            }
+        }
+
+        let entry = |position, class, message, input| {
+            node(
+                position,
+                class,
+                None,
+                json!({
+                    "m_gameMessage": {"m_gameMessage":message},
+                    "m_outPlug": plug(&[(1, input)], &[])
+                }),
+            )
+        };
+        let flag = |value| json!({"$":"STUConfigVarBool","m_value":value});
+        let owner = json!({"$":"STU_B5A0CAF0"});
+        let fixture = graph(
+            42,
+            vec![
+                entry(0, "STUStatescriptEntry", "", "m_beginPlug"),
+                node(
+                    1,
+                    "STUStatescriptStateHealthPool",
+                    Some(0),
+                    json!({
+                        "m_FA3ECC43":owner, "m_7E8B666C":0,
+                        "m_amount":var(100,true), "m_BCFDD2E9":var(101,true),
+                        "m_69A20070":{"$":"STU_FEDD683C","m_entity":owner},
+                        "m_4895B8B6":flag(true), "m_64839023":flag(false), "m_0E8A5C8E":flag(false),
+                        "m_CEAB19E8":var(102,true),
+                        "m_onEndPlug":plug(&[(4,"m_inPlug")], &[])
+                    }),
+                ),
+                entry(
+                    2,
+                    "STUStatescriptEntryGameMessage",
+                    "0x0240000000000002",
+                    ABORT_PLUG,
+                ),
+                entry(
+                    3,
+                    "STUStatescriptEntryGameMessage",
+                    "0x0240000000000003",
+                    "m_beginPlug",
+                ),
+                node(
+                    4,
+                    "STUStatescriptActionSetVar",
+                    None,
+                    json!({
+                        "m_out_Var":var(101,true), "m_value":var(102,true)
+                    }),
+                ),
+            ],
+            json!([1]),
+            json!([0, 2, 3]),
+        );
+        let mut world = PoolWorld(Vitals::empty());
+        let mut component = Component::start(
+            Arc::new(store(vec![fixture])),
+            42,
+            Variables::from([(100, Value::Float(200.0)), (101, Value::Float(175.0))]),
+            vec![Root::new(1, 42)],
+            0,
+            &mut world,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        assert!(component.snapshot().unwrap().initialization_complete());
+        assert_eq!((world.0.total(), world.0.maximum()), (175.0, 200.0));
+        world.0.damage(
+            25.0,
+            Death {
+                time: 0.0,
+                frame: 0,
+                killer: 43,
+            },
+        );
+        component
+            .queue_message(1, 0x0240_0000_0000_0002, Variables::new())
+            .unwrap();
+        component.run_now(&mut world).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert_eq!(snapshot.variables[&101], Value::Float(150.0));
+        assert_eq!(snapshot.variables[&OWNER_HEALTH], Value::Float(0.0));
+        assert!(!snapshot.instances[&1].states[&0].active);
+        assert_eq!(world.0.total(), 0.0);
+        component
+            .queue_message(1, 0x0240_0000_0000_0003, Variables::new())
+            .unwrap();
+        component.run_now(&mut world).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert_eq!(
+            snapshot.instances[&1].states[&0].kind,
+            StateKind::HealthPool { pool: Some(2) }
+        );
+        assert_eq!(snapshot.variables[&OWNER_HEALTH], Value::Float(150.0));
+        assert_eq!(world.0.pool_current(1), None);
+        assert_eq!(world.0.pool_current(2), Some(150.0));
+        component
+            .set_entity_variable(100, Value::Float(225.0), &mut world)
+            .unwrap();
+        component.run_now(&mut world).unwrap();
+        assert_eq!(world.0.maximum(), 200.0);
+        assert!(
+            component
+                .snapshot()
+                .unwrap()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.issue == Issue::UnsupportedField("changing health pool capacity")
+                })
+        );
+    }
+
+    fn delayed_switch_fixture(mut fields: Json) -> Arc<GraphStore> {
+        fields["m_onTruePlug"] = plug(&[(6, "m_inPlug")], &[]);
+        fields["m_onFalsePlug"] = plug(&[(7, "m_inPlug")], &[]);
+        fields["m_trueSubgraphPlug"] = plug(&[(2, "m_beginPlug")], &[1]);
+        fields["m_falseSubgraphPlug"] = plug(&[(3, "m_beginPlug")], &[2]);
+        let entry = |position, input| {
+            node(
+                position,
+                "STUStatescriptEntryGameMessage",
+                None,
+                json!({
+                    "m_gameMessage":{"m_gameMessage":format!("0x024000000000{position:04X}")},
+                    "m_outPlug":plug(&[(1,input)], &[]),
+                }),
+            )
+        };
+        let record_branch = |position, branch| {
+            node(
+                position,
+                "STUStatescriptActionSetVar",
+                None,
+                json!({"m_out_Var":var(103,true), "m_value":branch}),
+            )
+        };
+        Arc::new(store(vec![graph(
+            42,
+            vec![
+                node(
+                    0,
+                    "STUStatescriptEntry",
+                    None,
+                    json!({"m_outPlug":plug(&[(1, "m_beginPlug")], &[])}),
+                ),
+                node(1, "STU_B591EBFE", Some(0), fields),
+                node(2, "STUStatescriptState", Some(1), json!({})),
+                node(3, "STUStatescriptState", Some(2), json!({})),
+                entry(4, ABORT_PLUG),
+                entry(5, "m_beginPlug"),
+                record_branch(6, true),
+                record_branch(7, false),
+            ],
+            json!([1, 2, 3]),
+            json!([0, 4, 5]),
+        )]))
+    }
+
+    fn assert_delayed_switch(
+        component: &Component,
+        branch: Option<bool>,
+        timer: Option<(u64, u16)>,
+    ) {
+        let snapshot = component.snapshot().unwrap();
+        assert!(
+            snapshot.initialization_complete(),
+            "{:?}",
+            snapshot.diagnostics
+        );
+        let states = &snapshot.instances[&1].states;
+        assert!(states[&0].active);
+        assert_eq!(
+            states[&0].kind,
+            StateKind::DelayedSwitch {
+                current: branch == Some(true),
+                undecided: branch.is_none(),
+            },
+        );
+        assert_eq!(
+            states.get(&1).is_some_and(|state| state.active),
+            branch == Some(true)
+        );
+        assert_eq!(
+            states.get(&2).is_some_and(|state| state.active),
+            branch == Some(false)
+        );
+        if let Some(branch) = branch {
+            assert_eq!(snapshot.variables[&103], Value::Bool(branch));
+        }
+        let expected: Vec<_> = timer
+            .map(|(due_ms, parameter)| PendingTimer {
+                due_ms,
+                raw_state: 0,
+                finish: false,
+                parameter,
+            })
+            .into_iter()
+            .collect();
+        assert_eq!(
+            snapshot
+                .pending_timers
+                .get(&1)
+                .map_or(&[][..], Vec::as_slice),
+            expected,
+        );
+    }
+
+    #[test]
+    fn delayed_switch_uses_initial_override_and_asymmetric_interruptible_timers() {
+        let mut component = Component::start(
+            delayed_switch_fixture(json!({
+                "m_418D9D9D": true,
+                "m_BD83C8E6": var(100,true),
+                "m_E8FC060D": var(101,true),
+                "m_7130456B": 0.0259,
+                "m_ED60694A": 0.04075,
+            })),
+            42,
+            Variables::from([(100, Value::Bool(false)), (101, Value::Bool(false))]),
+            vec![Root::new(1, 42)],
+            0,
+            &mut EmptyWorld,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        let write = |component: &mut Component, id, value| {
+            component
+                .set_entity_variable(id, Value::Bool(value), &mut EmptyWorld)
+                .unwrap();
+            component.run_now(&mut EmptyWorld).unwrap();
+        };
+
+        assert_delayed_switch(&component, Some(true), None);
+        write(&mut component, 101, true);
+        assert_delayed_switch(&component, Some(true), Some((40, SWITCH_TO_FALSE)));
+        component.advance_frame(1, &mut EmptyWorld).unwrap();
+        assert_delayed_switch(&component, Some(true), Some((40, SWITCH_TO_FALSE)));
+        write(&mut component, 101, false);
+        component.advance_frame(2, &mut EmptyWorld).unwrap();
+        assert_delayed_switch(&component, Some(true), None);
+        write(&mut component, 101, true);
+        assert_delayed_switch(&component, Some(true), Some((87, SWITCH_TO_FALSE)));
+        for frame in 3..=5 {
+            component.advance_frame(frame, &mut EmptyWorld).unwrap();
+        }
+        assert_delayed_switch(&component, Some(false), None);
+        write(&mut component, 101, false);
+        write(&mut component, 100, true);
+        assert_delayed_switch(&component, Some(false), Some((120, SWITCH_TO_TRUE)));
+        for frame in 6..=7 {
+            component.advance_frame(frame, &mut EmptyWorld).unwrap();
+        }
+        assert_delayed_switch(&component, Some(true), None);
+    }
+
+    #[test]
+    fn delayed_switch_polls_undecided_inputs_and_clears_timers_on_abort() {
+        #[derive(Default)]
+        struct Conditions {
+            positive: bool,
+            negative: bool,
+        }
+
+        impl World for Conditions {
+            fn native(&mut self, _site: Site, config: &Json) -> Option<Value> {
+                match config["$"].as_str()? {
+                    "test-delayed-positive" => Some(Value::Bool(self.positive)),
+                    "test-delayed-negative" => Some(Value::Bool(self.negative)),
+                    _ => None,
+                }
+            }
+        }
+
+        let mut world = Conditions::default();
+        let mut component = Component::start(
+            delayed_switch_fixture(json!({
+                "m_308B8A80": true,
+                "m_418D9D9D": true,
+                "m_BD83C8E6": {"$":"test-delayed-positive"},
+                "m_E8FC060D": {"$":"test-delayed-negative"},
+                "m_7130456B": 0.075,
+                "m_ED60694A": 0.001,
+            })),
+            42,
+            Variables::new(),
+            vec![Root::new(1, 42)],
+            0,
+            &mut world,
+            MAX_INIT_WORK,
+        )
+        .unwrap();
+        assert_delayed_switch(&component, None, None);
+        assert!(!component.snapshot().unwrap().variables.contains_key(&103));
+        world.positive = true;
+        component.advance_frame(0, &mut world).unwrap();
+        assert_delayed_switch(&component, None, Some((90, SWITCH_TO_TRUE)));
+        world.positive = false;
+        component.advance_frame(1, &mut world).unwrap();
+        assert_delayed_switch(&component, None, Some((90, SWITCH_TO_TRUE)));
+        world.negative = true;
+        component.advance_frame(2, &mut world).unwrap();
+        assert_delayed_switch(&component, None, Some((48, SWITCH_TO_FALSE)));
+        component.advance_frame(3, &mut world).unwrap();
+        assert_delayed_switch(&component, Some(false), None);
+
+        world.positive = true;
+        component.advance_frame(4, &mut world).unwrap();
+        assert_delayed_switch(&component, Some(false), Some((154, SWITCH_TO_TRUE)));
+        component
+            .queue_message(1, 0x0240_0000_0000_0004, Variables::new())
+            .unwrap();
+        component.run_now(&mut world).unwrap();
+        let snapshot = component.snapshot().unwrap();
+        assert!(snapshot.pending_timers.is_empty());
+        assert!(!snapshot.instances[&1].states[&0].active);
+        assert!(!snapshot.instances[&1].states[&2].active);
+
+        world = Conditions::default();
+        component
+            .queue_message(1, 0x0240_0000_0000_0005, Variables::new())
+            .unwrap();
+        component.run_now(&mut world).unwrap();
+        component.advance_frame(10, &mut world).unwrap();
+        assert_delayed_switch(&component, None, None);
+        assert_eq!(
+            component.snapshot().unwrap().instances[&1].states[&0].activation,
+            2
+        );
     }
 
     #[test]
@@ -5753,6 +7430,110 @@ mod tests {
             assert_eq!(bot.instances[&2].parent, Some((1, 3)));
             assert_eq!(active(&bot, 2), [56, 76]);
             assert!(!bot.initialization_complete());
+        }
+    }
+
+    #[test]
+    fn ai_control_state_finishes_at_begin_time_only_for_an_absent_owner_relation() {
+        const OWNER: u32 = 0xa000_0101;
+        const FRAME: u32 = 100;
+        struct AiWorld(Option<u32>);
+        impl World for AiWorld {
+            fn related_entity(
+                &mut self,
+                site: Site,
+                relation: EntityRelation,
+                entity: u32,
+            ) -> Option<u32> {
+                assert_eq!(site.node, Some(1));
+                assert_eq!(relation, EntityRelation::AiControlEntity);
+                assert_eq!(entity, OWNER);
+                self.0
+            }
+        }
+
+        let owner = json!({"$":"STU_B5A0CAF0","m_EE729DCB":0});
+        for (target, relation, finishes) in [
+            (owner.clone(), Some(0), true),
+            (owner.clone(), None, false),
+            (owner, Some(OWNER + 1), false),
+            (var(100, true), Some(0), false),
+        ] {
+            let graphs = Arc::new(store(vec![graph(
+                42,
+                vec![
+                    node(
+                        0,
+                        "STUStatescriptEntry",
+                        None,
+                        json!({"m_outPlug":plug(&[(1,"m_beginPlug")], &[])}),
+                    ),
+                    node(
+                        1,
+                        "STU_066B4605",
+                        Some(0),
+                        json!({
+                            "m_00D49978":target,
+                            "m_D66E7D68":{"$":"STUConfigVarInt","m_value":0},
+                            "m_F2810377":{"$":"STUConfigVarIdentifier","m_identifier":"0x0D8000000000023A"},
+                            "m_F8585ABF":{"$":"STUConfigVarBool","m_value":0},
+                            "m_priority":{"$":"STU_8A491388","m_priority":"0x0C40000000000002"},
+                            "m_onBeginPlug":plug(&[(2,"m_inPlug")], &[]),
+                            "m_onFinishedPlug":plug(&[(3,"m_inPlug")], &[]),
+                            "m_onAbortPlug":plug(&[(4,"m_inPlug")], &[]),
+                        }),
+                    ),
+                    node(
+                        2,
+                        "STUStatescriptActionSetVar",
+                        None,
+                        json!({"m_out_Var":var(100,false), "m_value":true}),
+                    ),
+                    node(
+                        3,
+                        "STUStatescriptActionSetVar",
+                        None,
+                        json!({"m_out_Var":var(101,false), "m_value":var(100,false)}),
+                    ),
+                    node(
+                        4,
+                        "STUStatescriptActionSetVar",
+                        None,
+                        json!({"m_out_Var":var(101,false), "m_value":false}),
+                    ),
+                ],
+                json!([1]),
+                json!([0]),
+            )]));
+            let component = Component::start(
+                graphs,
+                OWNER,
+                Variables::new(),
+                vec![Root::new(1, 42)],
+                FRAME,
+                &mut AiWorld(relation),
+                MAX_INIT_WORK,
+            )
+            .unwrap();
+            let snapshot = component.snapshot().unwrap();
+            let instance = &snapshot.instances[&1];
+            assert_eq!(component.now_ms(), frame_start(FRAME));
+            assert!(snapshot.pending_timers.is_empty());
+            if finishes {
+                assert!(snapshot.initialization_complete());
+                let state = &instance.states[&0];
+                assert!(!state.active);
+                assert_eq!(state.activation, 1);
+                assert_eq!(state.start_ms, frame_start(FRAME));
+                assert_eq!(instance.variables[&101], Value::Bool(true));
+            } else {
+                assert!(matches!(
+                    snapshot.diagnostics.as_slice(),
+                    [Diagnostic { issue: Issue::UnsupportedState(class), .. }]
+                        if class == "STU_066B4605"
+                ));
+                assert!(instance.states.is_empty() && instance.variables.is_empty());
+            }
         }
     }
 }

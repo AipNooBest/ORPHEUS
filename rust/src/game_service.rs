@@ -37,7 +37,7 @@ use crate::{
     match_scene::{PlayerAppearance, PlayerCard},
     scene_assets::PreparedScene,
     script_wire::chunk,
-    world::{EntityUpdate, GAME_MODE_ENTITY, MAX_PAYLOAD, frame},
+    world::{EntityUpdate, GAME_MODE_ENTITY, MAX_PAYLOAD, SkinTheme, frame},
 };
 
 const GAME_SOCKET: Token = Token(0);
@@ -80,6 +80,13 @@ enum Request {
         id: MatchId,
         release: bool,
         reply: mpsc::SyncSender<bool>,
+    },
+    Skin {
+        connection: u32,
+        id: MatchId,
+        hero: u64,
+        skin: SkinTheme,
+        reply: mpsc::SyncSender<()>,
     },
 }
 
@@ -212,6 +219,21 @@ impl GameService {
 
     pub fn release_seat(&self, handoff: &Handoff) -> io::Result<bool> {
         self.seat(handoff, true)
+    }
+
+    pub(crate) fn update_skin(
+        &self,
+        handoff: &Handoff,
+        hero: u64,
+        skin: SkinTheme,
+    ) -> io::Result<()> {
+        self.request(|reply| Request::Skin {
+            connection: handoff.conn,
+            id: handoff.match_id,
+            hero,
+            skin,
+            reply,
+        })
     }
 
     fn seat(&self, handoff: &Handoff, release: bool) -> io::Result<bool> {
@@ -378,7 +400,7 @@ impl Peer {
     }
 
     fn bot_hit(&mut self, hit: BotHit) {
-        self.world.queue_bot_health(hit.health);
+        self.world.queue_health(hit.health);
         for notice in hit.notices.into_iter().flatten() {
             if self.combat_ui.notices.len() == MAX_PENDING_COMBAT_NOTICES {
                 self.combat_ui.notices.pop_front();
@@ -425,7 +447,7 @@ impl Peer {
                 .get(&entity)
                 .is_some_and(|&ordinal| !self.egress.delivered_through(ordinal));
             if now < expires
-                && (has_notice || waiting_for_reliable || self.world.bot_health_pending(entity))
+                && (has_notice || waiting_for_reliable || self.world.health_pending(entity))
             {
                 self.combat_ui
                     .replacements
@@ -619,6 +641,24 @@ impl State {
                 }
                 let _ = reply.send(exists);
             }
+            Request::Skin {
+                connection,
+                id,
+                hero,
+                skin,
+                reply,
+            } => {
+                if self.seats.get(&connection).is_some_and(|seat| seat.0 == id) {
+                    let room = self.rooms.get_mut(&id).expect("reserved match");
+                    if let Some(world) = &mut room.world {
+                        world.card.skins.insert(hero, skin);
+                        if let Some(peer) = self.peers.get_mut(&connection) {
+                            peer.world.queue_skin(hero, self.clock.frame(), now);
+                        }
+                    }
+                }
+                let _ = reply.send(());
+            }
         }
     }
 
@@ -798,9 +838,37 @@ impl State {
         }
         let mut spawned = HashMap::new();
         if !drain {
-            for (&id, room) in &mut self.rooms {
+            for room in self.rooms.values_mut() {
                 if let Some(world) = &mut room.world {
                     world.scene.step_bots(tick);
+                }
+            }
+            for (&connection, peer) in &mut self.peers {
+                let (id, slot) = self.seats[&connection];
+                let room = self.rooms.get_mut(&id).expect("admitted room");
+                let Some(world) = &mut room.world else {
+                    continue;
+                };
+                let player = &room.players[slot];
+                let context = ShotContext {
+                    team: player.info.team,
+                    quanta: player.quanta(),
+                    tick,
+                    now,
+                };
+                let mut hits = Vec::new();
+                let _ = peer.world.advance_projectiles(tick, |source, flight| {
+                    let combat = world
+                        .combat
+                        .get_or_insert_with(|| Combat::new(&world.scene));
+                    combat.step_projectile(&mut world.scene, source, flight, context, &mut hits)
+                });
+                for hit in hits {
+                    peer.bot_hit(hit);
+                }
+            }
+            for (&id, room) in &mut self.rooms {
+                if let Some(world) = &mut room.world {
                     if let Some(combat) = &mut world.combat {
                         if let Ok(replacements) = combat.respawn_due(&mut world.scene, tick, now) {
                             if !replacements.is_empty() {
@@ -1227,8 +1295,12 @@ mod tests {
     struct WorldRecord {
         entity: u32,
         operation: Option<u8>,
+        definition: Option<u32>,
         movement: bool,
+        skin: Option<(u32, bool)>,
         script: Option<ReceivedChunk>,
+        projectile_release: Option<u32>,
+        base_health: Option<f32>,
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -1263,8 +1335,12 @@ mod tests {
                 let mut record = WorldRecord {
                     entity: reader.entity_id().unwrap().unwrap(),
                     operation: None,
+                    definition: None,
                     movement: false,
+                    skin: None,
                     script: None,
+                    projectile_release: None,
+                    base_health: None,
                 };
                 assert!(reader.bit().unwrap());
                 if !reader.bit().unwrap() {
@@ -1286,7 +1362,21 @@ mod tests {
                 if !reader.bit().unwrap() {
                     return record;
                 }
-                assert_eq!(reader.bits(2).unwrap(), 0);
+                assert!(!reader.bit().unwrap()); // no channel-2 launch events
+                if reader.bit().unwrap() {
+                    assert_eq!(reader.var_b().unwrap(), u32::MAX);
+                    record.projectile_release = Some(reader.var_b().unwrap());
+                    assert_eq!(reader.bits(2).unwrap(), 0);
+                    assert_eq!(
+                        std::array::from_fn::<_, 3, _>(|_| reader.f32().unwrap()),
+                        [0.0, -1000.0, 0.0]
+                    );
+                    assert_eq!(reader.bits(5).unwrap(), 0);
+                    assert!(reader.bit().unwrap()); // impact count is present
+                    assert!(reader.bit().unwrap()); // short count
+                    assert_eq!(reader.bits(4).unwrap(), 1);
+                    assert_eq!(reader.bits(6).unwrap(), 0);
+                }
                 assert!(reader.bit().unwrap());
                 record.movement = reader.bit().unwrap();
                 if record.movement {
@@ -1298,7 +1388,31 @@ mod tests {
                     record.operation = Some(operation);
                     if operation != 3 {
                         let length = reader.bits(14).unwrap() as usize;
-                        reader.advance(length).unwrap();
+                        let start = reader.position();
+                        if operation == 1 && !reader.bit().unwrap() {
+                            record.definition = Some(reader.guid_index().unwrap());
+                            let flags = reader.bits(8).unwrap() as u8;
+                            if flags & crate::world::SKIN_THEME != 0 {
+                                assert_ne!(flags & crate::world::WITH_SKIN, 0);
+                                record.skin =
+                                    Some((reader.bits(32).unwrap() as u32, reader.bit().unwrap()));
+                            }
+                        } else if operation == 2 {
+                            let mut components = reader;
+                            if components.bits(8).unwrap() == 1 && components.bits(8).unwrap() == 51
+                            {
+                                components.align();
+                                if components.bits(8).unwrap() == 7
+                                    && components.bits(56).unwrap() == 1
+                                {
+                                    components.advance(64).unwrap(); // ID and maximum
+                                    record.base_health = Some(components.f32().unwrap());
+                                }
+                            }
+                        }
+                        reader
+                            .advance(length - (reader.position() - start))
+                            .unwrap();
                     }
                     assert!(!reader.bit().unwrap());
                 }
@@ -1434,11 +1548,18 @@ mod tests {
         exercise_prepared_world(PreparedFixture::Combat);
     }
 
+    #[test]
+    #[ignore = "requires a prepared 104319 Practice Range scene without bot VM graphs"]
+    fn prepared_worker_delivers_helix_flight_damage_and_predicted_release_over_encrypted_udp() {
+        exercise_prepared_world(PreparedFixture::Projectile);
+    }
+
     #[derive(Clone, Copy)]
     enum PreparedFixture {
         Stock,
         Owner,
         Combat,
+        Projectile,
     }
 
     fn exercise_prepared_world(fixture: PreparedFixture) {
@@ -1454,7 +1575,9 @@ mod tests {
             match_handoff::{HANDOFF, HANDOFF_MESSAGE},
             retail_templates::RetailTemplates,
             scene_assets::SceneAssets,
-            script_player::{fixture_body_factory, fixture_hitscan_factory},
+            script_player::{
+                fixture_body_factory, fixture_hitscan_factory, fixture_projectile_factory,
+            },
         };
 
         const CONTROLLER: u32 = 0xa000_0100;
@@ -1518,6 +1641,22 @@ mod tests {
                                 .unwrap();
                             bot.position = [x - 4.0, y, z];
                             fixture_hitscan_factory(100.0)
+                        }
+                        PreparedFixture::Projectile => {
+                            let [x, y, z] = scene.map().spawn_point(0, 0).unwrap().0;
+                            let bots = scene.bots_mut();
+                            assert_eq!(
+                                bots[..3]
+                                    .iter()
+                                    .map(|bot| bot.spawn.team)
+                                    .collect::<Vec<_>>(),
+                                [0, 1, 1]
+                            );
+                            assert!(bots[..3].iter().all(|bot| bot.spawn.route.is_empty()));
+                            bots[0].position = [x - 3.5, y, z];
+                            bots[1].position = [x - 5.0, y, z];
+                            bots[2].position = [x - 5.0, y, z + 0.8];
+                            fixture_projectile_factory(40.0)
                         }
                         _ => fixture_body_factory().0,
                     };
@@ -1671,7 +1810,10 @@ mod tests {
             PreparedFixture::Combat => {
                 exercise_combat(&mut client, &schemas, BOT_ENTITY + 1, BOT_ENTITY + 15)
             }
-            PreparedFixture::Stock => exercise_hero_selection(&mut client, &schemas, &assets),
+            PreparedFixture::Projectile => exercise_projectile(&mut client, &schemas),
+            PreparedFixture::Stock => {
+                exercise_hero_selection(&mut client, &schemas, &assets, &server, &ticket)
+            }
         }
         server.stop().unwrap();
     }
@@ -1706,9 +1848,8 @@ mod tests {
         client.send(ACK, payload.into_bytes());
     }
 
-    fn exercise_combat(client: &mut Client, schemas: &Schemas, target: u32, replacement: u32) {
-        use crate::{commands::FIRE, game_heroes::SOLDIER, game_parameters::PICK_HERO};
-
+    fn pick_soldier_for_weapon(client: &mut Client, schemas: &Schemas) -> u32 {
+        use crate::{game_heroes::SOLDIER, game_parameters::PICK_HERO};
         let body = player_entity(0) | 1;
         send_game_message(
             client,
@@ -1718,7 +1859,7 @@ mod tests {
             SOLDIER.to_le_bytes().to_vec(),
         );
         let deadline = Instant::now() + Duration::from_secs(3);
-        let frame = loop {
+        loop {
             let packet = client.receive();
             assert!(client.window.accept(packet.seq));
             client.send(ACK, Vec::new());
@@ -1726,11 +1867,16 @@ mod tests {
                 .iter()
                 .any(|record| record.entity == body && record.is_create())
             {
-                break BitReader::new(&packet.payload).var_a().unwrap() + 1;
+                return BitReader::new(&packet.payload).var_a().unwrap() + 1;
             }
             assert!(Instant::now() < deadline, "waiting for weapon fixture body");
-        };
-        let commands = command_batch(frame, 1, -16384, FIRE, false);
+        }
+    }
+
+    fn exercise_combat(client: &mut Client, schemas: &Schemas, target: u32, replacement: u32) {
+        let frame = pick_soldier_for_weapon(client, schemas);
+        let fire = crate::commands::FIRE;
+        let commands = command_batch(frame, 1, -16384, fire, false);
         client.send(ACK, commands.clone());
         client.send(ACK, commands);
 
@@ -1795,6 +1941,105 @@ mod tests {
                 "waiting for combat recovery and bot respawn"
             );
         }
+    }
+
+    fn exercise_projectile(client: &mut Client, schemas: &Schemas) {
+        use crate::{
+            commands::SECONDARY, game_bots::BOT_ENTITY, game_projectiles::ProjectileLeases,
+            script_player::FIXTURE_PROJECTILE_DEFINITION,
+        };
+
+        let frame = pick_soldier_for_weapon(client, schemas);
+        let definition = FIXTURE_PROJECTILE_DEFINITION;
+        let original = ProjectileLeases::new(0, frame, [definition])
+            .unwrap()
+            .entity(definition, frame, 0)
+            .unwrap();
+        let commands = command_batch(frame, 1, -16384, SECONDARY, false);
+        client.send(ACK, commands.clone());
+        client.send(ACK, commands);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut noticed = HashSet::new();
+        let mut impacts = Vec::new();
+        let mut health = HashMap::new();
+        let mut creates = HashSet::new();
+        let mut releases = HashSet::new();
+        let mut lost_original = false;
+        while !releases.contains(&original) || health.len() < 2 || impacts.len() < 3 {
+            let packet = client.receive();
+            let tick = BitReader::new(&packet.payload).var_a().unwrap();
+            let records = world_records(schemas, &packet);
+            if !creates.contains(&original) {
+                assert!(!records.iter().any(|record| {
+                    record.entity == original && record.projectile_release.is_some()
+                }));
+            }
+            if !lost_original
+                && records.iter().any(|record| {
+                    record.entity == original && record.definition == Some(definition as u32)
+                })
+            {
+                lost_original = true;
+                continue; // a later ACK will expose the lost confirmation datagram
+            }
+            for item in messages(schemas, &packet) {
+                assert_ne!(
+                    item.message.id, 25005,
+                    "one Helix flight cannot eliminate this target"
+                );
+                if item.message.id != 25001 || !noticed.insert(item.sequence) {
+                    continue;
+                }
+                let fields = &item.message.fields;
+                let Value::Unsigned(impact_frame) = fields[&0x84] else {
+                    panic!("impact frame")
+                };
+                assert!(impact_frame > u64::from(frame));
+                let Value::Struct(impact) = &fields[&0x78] else {
+                    panic!("hit body")
+                };
+                let Value::Struct(target) = &impact[&0] else {
+                    panic!("hit target")
+                };
+                assert_eq!(impact[&8], Value::Unsigned(0));
+                impacts.push((target[&0].clone(), impact[&4].clone()));
+            }
+            for record in records {
+                if let Some(current) = record.base_health {
+                    health.insert(record.entity, current);
+                }
+                if record.definition == Some(definition as u32) {
+                    creates.insert(record.entity);
+                }
+                if let Some(release_frame) = record.projectile_release {
+                    assert!(creates.contains(&record.entity));
+                    assert_eq!(record.operation, Some(3));
+                    assert!(release_frame > tick);
+                    releases.insert(record.entity);
+                }
+            }
+            assert!(client.window.accept(packet.seq));
+            client.send(ACK, Vec::new());
+            assert!(
+                Instant::now() < deadline,
+                "waiting for Helix: shot {frame}, entity {original:#x}, impacts {impacts:?}, health {health:?}, creates {creates:?}, releases {releases:?}"
+            );
+        }
+        assert!(lost_original);
+        let impact = |entity, damage| (Value::Unsigned(u64::from(entity)), Value::Unsigned(damage));
+        assert_eq!(
+            impacts,
+            [
+                impact(BOT_ENTITY + 1, 40),
+                impact(BOT_ENTITY + 1, 80),
+                impact(BOT_ENTITY + 2, 80)
+            ]
+        );
+        assert_eq!(
+            health,
+            HashMap::from([(BOT_ENTITY + 1, 80.0), (BOT_ENTITY + 2, 120.0)])
+        );
     }
 
     fn exercise_owner_vm(client: &mut Client, schemas: &Schemas) {
@@ -1900,6 +2145,8 @@ mod tests {
         client: &mut Client,
         schemas: &Schemas,
         assets: &crate::scene_assets::SceneAssets,
+        server: &GameService,
+        ticket: &Handoff,
     ) {
         use crate::{
             game_heroes::SOLDIER,
@@ -2068,6 +2315,29 @@ mod tests {
         );
         assert!(verify_controller(&records, tracer, false) > reopen_cmfd);
         assert!(client.window.accept(swap.seq));
+        client.send(ACK, Vec::new());
+
+        let skin = SkinTheme {
+            guid: 0x0a50_0000_0000_1234,
+            golden: true,
+        };
+        server.update_skin(ticket, tracer, skin).unwrap();
+        let third = OWNER | 3;
+        let (reskin, records) = next_body_frame(client, third);
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.entity == third)
+                .unwrap()
+                .skin,
+            Some((0x1234, true))
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.entity == SECOND && record.operation == Some(3))
+        );
+        assert!(client.window.accept(reskin.seq));
         client.send(ACK, Vec::new());
     }
 }

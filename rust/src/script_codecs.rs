@@ -487,6 +487,7 @@ fn write_ops<'a>(
 enum Family {
     None,
     Switch,
+    DelayedSwitch,
     Stack,
     Anim,
     Chase,
@@ -510,6 +511,7 @@ impl Family {
         Some(match name {
             "none" => Self::None,
             "switch" => Self::Switch,
+            "two_bits" => Self::DelayedSwitch,
             "stack" => Self::Stack,
             "anim" => Self::Anim,
             "chase" => Self::Chase,
@@ -571,6 +573,10 @@ fn project(
         Family::None | Family::Send | Family::Link => {}
         Family::Switch => {
             fields.insert("current", Value::Bool(vm.flag("current")).into());
+        }
+        Family::DelayedSwitch => {
+            fields.insert("a", Value::Bool(vm.flag("current")).into());
+            fields.insert("b", Value::Bool(vm.flag("undecided")).into());
         }
         Family::Stack if owner => {
             fields.insert("top", Value::Bool(vm.flag("top")).into());
@@ -912,10 +918,16 @@ mod tests {
     }
 
     fn samples() -> BTreeMap<String, Vec<StatePayload>> {
-        // tests/test_statescript_codecs.py::SAMPLES with explicit vectors.
+        // tests/test_statescript_codecs.py::SAMPLES with explicit vectors and
+        // all three delayed switch payloads from the generic layout writer.
         let corpus = json!({
             "none":[{}],
             "switch":[{"current":true},{"current":false}],
+            "two_bits":[
+                {"current":false,"undecided":false},
+                {"current":false,"undecided":true},
+                {"current":true,"undecided":false}
+            ],
             "stack":[{"top":true,"under":false},{"top":false,"under":true}],
             "button":[{"counter":0},{"counter":13},{"counter":21}],
             "volley":[
@@ -988,9 +1000,9 @@ mod tests {
         assert!(!table.sendable("STU_2F07848F", false));
         let mut projected: Vec<_> = table.classes().filter(|codec| codec.projected()).collect();
         projected.sort_by(|left, right| left.hash.cmp(&right.hash));
-        assert_eq!(projected.len(), 579);
+        assert_eq!(projected.len(), 580);
         let samples = samples();
-        assert_eq!(samples.len(), 18);
+        assert_eq!(samples.len(), 19);
         let modes = [
             PayloadMode::Owner {
                 full: false,
@@ -1016,10 +1028,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(count, 1824);
+        assert_eq!(count, 1833);
         assert_eq!(
             format!("{:x}", digest.finalize()),
-            "222c032dfec76b9709b7f02bec7b390f038700f66caa76bee12ede59ff97f1cb"
+            "6f316769d720476a184200555630aa4ed0b33dd9418daf524cd3019412c14955"
         );
     }
 }

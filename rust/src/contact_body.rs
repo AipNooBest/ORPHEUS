@@ -3,18 +3,18 @@
 //! Ports `CharacterBody` from `ow174/game/contacts.py`. The immutable
 //! world is shared. Candidate lifetimes and warm caches are per body.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, fmt, sync::Arc};
 
 use crate::{
     contact_cache::{CapsulePose, LOOSE, ProxyContact, encloses},
-    contact_gjk::{SimplexCache, gjk},
+    contact_gjk::{PointSetSize, SimplexCache, gjk, sweep::MeshProbe},
     contact_hull::HullContactError,
     contact_math::{TINY, Vec3, add, dot, maxps, minps, scale, sub},
     contact_mesh::ContactBounds,
     contact_round::{RoundShape, splat_tiny},
     contact_solver::{Constraint, ContactPlane, project_target},
     contact_triangle::{SKIN, TOUCH, closest_parameters},
-    contact_world::{ContactWorld, PROXY_MARGIN, StaticGeometry, StaticShape, overlaps},
+    contact_world::{ContactWorld, PROXY_MARGIN, StaticGeometry, StaticShape, WorldHit, overlaps},
 };
 
 const MAX_ROUNDS: u32 = 20;
@@ -39,6 +39,16 @@ pub struct CharacterBody {
     planes: Vec<ContactPlane>,
 }
 
+impl fmt::Debug for CharacterBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CharacterBody")
+            .field("position", &self.pose.position)
+            .field("category", &self.category)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CharacterBody {
     pub fn new(world: Arc<ContactWorld>, pose: CapsulePose, category: u16) -> Self {
         Self {
@@ -59,8 +69,34 @@ impl CharacterBody {
         self.pose.position
     }
 
+    pub(crate) fn radius(&self) -> f32 {
+        self.pose.radius
+    }
+
     pub fn world(&self) -> &ContactWorld {
         &self.world
+    }
+
+    pub(crate) fn fresh_at(&self, position: Vec3) -> Self {
+        Self::new(
+            Arc::clone(&self.world),
+            CapsulePose {
+                position,
+                ..self.pose
+            },
+            self.category,
+        )
+    }
+
+    /// Query the same upright capsule and mask without changing its contact state.
+    pub(crate) fn sweep(&self, start: Vec3, end: Vec3) -> Result<Option<WorldHit>, PointSetSize> {
+        self.world.scene_sweep(MeshProbe {
+            points: &[[0.0, self.pose.radius, 0.0], [0.0, self.pose.top, 0.0]],
+            radius: self.pose.radius,
+            start,
+            end,
+            category: self.category,
+        })
     }
 
     pub fn teleport(&mut self, position: Vec3) {

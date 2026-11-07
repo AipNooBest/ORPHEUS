@@ -9,6 +9,8 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+mod target_tags;
+
 pub const LOBBY_RUNTIME_DATA: &[&str] = &[
     "schemas_174.json",
     "retail_templates.json",
@@ -35,6 +37,7 @@ pub const MATCH_RUNTIME_DATA: &[&str] = &[
 ];
 pub const BNET_DESCRIPTORS: &str = "bnet/descriptors.pb";
 const MANIFEST_SCHEMA: &str = "orpheus-runtime-copy-v1";
+const GRAPH_BUNDLE: &str = "data/game_graphs_174.json.gz";
 
 /// Names of required inputs absent from a selected external runtime root.
 pub fn missing_runtime_files(root: &Path, matches: bool, bnet: bool) -> Vec<String> {
@@ -152,7 +155,7 @@ fn inputs(
         inputs.insert(member.clone(), source.join(member));
     }
     if let Some(graphs) = game_graphs {
-        inputs.insert("data/game_graphs_174.json.gz".into(), graphs.to_owned());
+        inputs.insert(GRAPH_BUNDLE.into(), graphs.to_owned());
     }
     inputs.insert(
         BNET_DESCRIPTORS.into(),
@@ -270,6 +273,17 @@ pub fn prepare(
     maps: &[String],
     game_graphs: Option<&Path>,
 ) -> Result<PathBuf, RuntimeError> {
+    prepare_with_target_tags(source, destination, maps, game_graphs, None)
+}
+
+/// Prepare a runtime pack and optionally import target tags from local .003 XML.
+pub fn prepare_with_target_tags(
+    source: &Path,
+    destination: &Path,
+    maps: &[String],
+    game_graphs: Option<&Path>,
+    target_tags_xml: Option<&Path>,
+) -> Result<PathBuf, RuntimeError> {
     if !source.is_dir() {
         return Err(RuntimeError::Input(
             "The prepared checkout does not exist".into(),
@@ -289,6 +303,9 @@ pub fn prepare(
     }
 
     let inputs = inputs(&source, maps, game_graphs)?;
+    let tagged_graphs = target_tags_xml
+        .map(|xml| target_tags::enrich(&inputs[GRAPH_BUNDLE], xml))
+        .transpose()?;
     let mut output = OutputDirectory::create(&destination)?;
     for directory in ["data", "bnet", "collision"] {
         output.mkdir(directory)?;
@@ -296,7 +313,14 @@ pub fn prepare(
     let mut hashes = BTreeMap::new();
     for (name, input) in inputs {
         let (path, mut file) = output.file(&name)?;
-        hashes.insert(name, copy_and_hash(&input, &path, &mut file)?);
+        let hash = if let Some(graphs) = tagged_graphs.as_ref().filter(|_| name == GRAPH_BUNDLE) {
+            at(&path, file.write_all(graphs))?;
+            at(&path, file.flush())?;
+            format!("{:x}", Sha256::digest(graphs))
+        } else {
+            copy_and_hash(&input, &path, &mut file)?
+        };
+        hashes.insert(name, hash);
     }
     let (path, mut file) = output.file("manifest.json")?;
     let manifest = serde_json::json!({"schema": MANIFEST_SCHEMA, "sha256": hashes});
@@ -411,6 +435,104 @@ mod tests {
         let output = prepare(&source, &fixture.root.join("pack"), &[], None).unwrap();
         assert!(output.join("collision/ABCD.col").is_file());
         assert!(!output.join("collision/not-a-map.col").exists());
+    }
+
+    #[test]
+    fn imports_target_tags_only_from_present_local_xml() {
+        use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+        use serde_json::{Value, json};
+
+        let fixture = Fixture::new();
+        let source = fixture.source();
+        let body = json!({"name":"Fixture","hero":null,"graphs":[],"manager":null,"weapons":[]});
+        let mut old = body.clone();
+        old["target_tags"] = json!(["0x0D60000000000009"]);
+        let bundle = json!({
+            "version":1,"graphs":[],"missing":[],
+            "bodies":{
+                "0x0400000000000001":body,"0x0400000000000002":body,
+                "0x0400000000000003":body,"0x0400000000000004":old
+            },
+            "entities":{"0x0400000000000005":body}
+        });
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        serde_json::to_writer(&mut encoder, &bundle).unwrap();
+        let original = encoder.finish().unwrap();
+        fixture.write("selected.json.gz", &original);
+        let selected = fixture.root.join("selected.json.gz");
+        let xml_dir = fixture.root.join("003");
+        fixture.write(
+            "003/000000000001.003.xml",
+            br#"<STUEntityDefinition xmlns:d="https://yretenai.com/dragonml/v1">
+                <d:map d:name="m_componentMap">
+                    <STUTargetTagComponent d:key="1147041400">
+                        <STUTargetTagComponent d:name="dragon:value">
+                            <d:array d:name="m_targetTags">
+                                <d:ref GUID="000000000002.06C" Target="STUTargetTag"/>
+                                <d:ref GUID="000000000000.001" Target="STUTargetTag"/>
+                                <d:ref GUID="000000000001.06c" Target="STUTargetTag"/>
+                                <d:ref GUID="000000000002.06C" Target="STUTargetTag"/>
+                            </d:array>
+                        </STUTargetTagComponent>
+                    </STUTargetTagComponent>
+                </d:map>
+            </STUEntityDefinition>"#,
+        );
+        fixture.write(
+            "003/000000000003.003.xml",
+            br#"<STUEntityDefinition xmlns:d="https://yretenai.com/dragonml/v1">
+                <d:map d:name="m_componentMap">
+                    <STUTargetTagComponent d:key="1147041400">
+                        <STUTargetTagComponent d:name="dragon:value" m_targetTags="{null}"/>
+                    </STUTargetTagComponent>
+                </d:map>
+            </STUEntityDefinition>"#,
+        );
+        fixture.write("003/000000000005.003.xml", b"<STUEntityDefinition/>");
+        let output = prepare_with_target_tags(
+            &source,
+            &fixture.root.join("pack"),
+            &["0688".into()],
+            Some(&selected),
+            Some(&xml_dir),
+        )
+        .unwrap();
+        let gzip = fs::read(output.join(GRAPH_BUNDLE)).unwrap();
+        let enriched: Value = serde_json::from_reader(GzDecoder::new(gzip.as_slice())).unwrap();
+        assert_eq!(
+            enriched["bodies"]["0x0400000000000001"]["target_tags"],
+            json!(["0x0D60000000000001", "0x0D60000000000002"])
+        );
+        assert!(
+            enriched["bodies"]["0x0400000000000002"]
+                .get("target_tags")
+                .is_none()
+        );
+        assert_eq!(
+            enriched["bodies"]["0x0400000000000003"]["target_tags"],
+            json!([])
+        );
+        assert_eq!(enriched["bodies"]["0x0400000000000004"], old);
+        assert_eq!(
+            enriched["entities"]["0x0400000000000005"]["target_tags"],
+            json!([])
+        );
+        assert_eq!(fs::read(&selected).unwrap(), original);
+        let manifest: Value =
+            serde_json::from_reader(File::open(output.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            manifest["sha256"][GRAPH_BUNDLE],
+            format!("{:x}", Sha256::digest(&gzip))
+        );
+        crate::script_graph::GraphStore::load(output.join(GRAPH_BUNDLE)).unwrap();
+
+        fixture.write("003/000000000001.003.xml", b"<STUEntityDefinition>");
+        let failed = fixture.root.join("bad-pack");
+        let error =
+            prepare_with_target_tags(&source, &failed, &[], Some(&selected), Some(&xml_dir))
+                .unwrap_err();
+        assert!(error.to_string().contains("000000000001.003.xml"));
+        assert!(!failed.exists());
     }
 
     #[test]

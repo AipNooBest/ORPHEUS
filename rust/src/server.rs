@@ -26,6 +26,7 @@ use crate::{
     jam_codec::Schemas,
     lobby_arcade::Arcade,
     lobby_celebrations::Celebrations,
+    lobby_gallery::EquipRequest,
     lobby_login::SIGNED_IN_ELSEWHERE,
     lobby_menu::{MenuHero, extra_preload_themes},
     lobby_practice::{self, SoloPracticeHandoff},
@@ -381,6 +382,17 @@ impl Lobby {
             session.send(&join_chat_channel(general_channel()))?;
         }
         while let Some(request) = session.receive_message_until(|| lease.current())? {
+            if let Some(equip) = EquipRequest::read(&request) {
+                if let Some(equipped) = equip.apply(&login, &self.collection, wall_time)? {
+                    if let (Some(seat), Some(skin)) = (&lease.seat, equipped.skin) {
+                        self.game.update_skin(&seat.handoff, equip.hero, skin)?;
+                    }
+                    for message in equipped.messages {
+                        session.send(&message)?;
+                    }
+                }
+                continue;
+            }
             if !lobby_practice::is_request(&request) {
                 continue;
             }

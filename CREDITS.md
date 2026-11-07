@@ -59,9 +59,33 @@ This repository builds on existing Overwatch preservation work. Its lobby improv
 - **[Mio](https://github.com/tokio-rs/mio)** supplies portable UDP readiness polling and cross-thread
   wakeups for the Rust game worker.
 - **[flate2](https://docs.rs/flate2/)** supplies gzip decoding for the external state graph bundle.
+- **roxmltree** parses the local DragonML entity definitions used by the runtime preparation tool. [Project source](https://github.com/RazrFalcon/roxmltree)
+- The statescript VM uses a deterministic SplitMix64 stream for local random expressions. The fixed-increment generator follows the public-domain implementation. [Sebastiano Vigna's SplitMix64](https://prng.di.unimi.it/splitmix.c)
 - **TripleFault and Gamayun contributors** supplied a same-build comparison for encrypted combat scenarios and
-  tick measurement design. This is a behavior reference. Gamayun identifies its Go implementation as
-  AGPL-3.0-or-later and retains the MIT notice for inherited code.
+  tick measurement design. The locally reviewed 104319 VM code in `internal/vm/natives.go` also corroborates
+  the separate possessed-body and current-possessor queries and the health pool type selectors.
+  Its `registry.go` and `states.go` provide behavior references for the synced game-code state,
+  the tips state and the input bridge. Its `switch.go` and `instance.go` corroborate delayed
+  branch timing and event ordering. Its `internal/world/health.go` provides an independent comparison
+  for the component 51 fields and the provisional pool ID order. Gamayun identifies its Go implementation
+  as AGPL-3.0-or-later and retains the MIT notice for inherited code.
+- The frozen Python `ow174/game/onfire.py` and Gamayun's `internal/vm/natives.go` document the
+  possessor's component 64 on-fire lookup. Gamayun's `internal/expr/value.go` provides a comparison
+  for ordered map values and first-match lookup.
+- The local build 104319 graphs exported with OWLib provide the single-tag grant and suppression
+  paths in `01C7`, `01CF` and `0251`. Locally reviewed build 104319 codec tables from Gamayun and
+  Boi-027's research corroborate the inherited empty payload for state `STU_E56BA8D8`.
+- The local build 104319 graph bundles from Gamayun and Boi-027 and the OWLib exports corroborate
+  the operands for the instance exit, absent AI state and zero-resource lookup. Local client
+  155284 inspection provides the queued exit, parent completion and typed zero return evidence.
+  The frozen 104319 state decoder and runtime provide finish-event and teardown comparisons.
+- The build 104319 graph and codec tables corroborate the movement sampler's authored fields
+  and 13-bit owner payload. Local 155284 client inspection identifies its movement-record inputs,
+  changed-output writes and embedded record at owner context construction. The frozen 104319 mover
+  provides a separate comparison for the airborne, crouch, ground-contact and jump flags.
+- The frozen `ow174/game/projectiles.py` and `ow174/game/combat.py` provide the owner projectile
+  lease, exact packet acknowledgement, release and swept flight references. The local build 104319
+  Soldier weapon graph supplies Helix's authored lifetime, direct damage and splash settings.
 - **The Claudewatch contributors** supplied the Beta 1.0.0.3 research lead for attacker-side hit-confirm effects
   and separate entity and announcer voice messages. ORPHEUS checks these leads against 104319 client data before
   implementing them. The reference is a locally reviewed binary distribution.

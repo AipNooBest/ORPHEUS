@@ -6,21 +6,49 @@ use crate::{
     collision_index::TriangleIndex,
     commands::Command,
     contact_body::CharacterBody,
-    contact_cache::CapsulePose,
     contact_gjk::PointSetSize,
     contact_hull::HullContactError,
     contact_solver::clip_velocity,
     contact_world::ContactWorld,
-    mover_ground::{GroundProbe, ProbePose, capsule, pogo},
+    mover_ground::{GroundProbe, ProbePose, pogo, standing_body},
     mover_kinematics::{Ground, MotionInput, Poses, VelocityStep, poses},
     mover_modifiers::{Modifier, ModifierKey, ModifierTimeline},
-    mover_posture::{Posture, PostureStep, TOUCHING, snap},
+    mover_posture::{
+        CROUCHED, IN_AIR, JUMPED, NOT_GROUND_UNDER, Posture, PostureStep, TOUCHING, snap,
+    },
     mover_settings::MoverSettings,
     world::{Movement, NO_INPUT},
 };
 
 const ABYSS: f64 = 100.0;
 const EPSILON: f64 = 1.1754943508222875e-36;
+
+/// Project the owner's current movement record into the authored 13-bit sample.
+pub(crate) fn sample_movement_flags(pose: &Movement) -> Option<u16> {
+    // These modes require nested native movement records. Regular Rust poses
+    // cannot enter them or enqueue the scheduled transition represented by bit 10.
+    if pose.flags & (0x20 | 0x80) != 0 {
+        return None;
+    }
+    let [x, y, z] = pose.velocity.map(|value| value as f32);
+    if ![x, y, z].iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let airborne = pose.flags & IN_AIR != 0;
+    let vertical_threshold = 100.0 * f32::EPSILON;
+    let moving = (x * x + y * y) + z * z > 10.0 * f32::EPSILON;
+    Some(
+        u16::from(airborne)
+            | u16::from(!airborne) << 1
+            | u16::from(y > vertical_threshold) << 2
+            | u16::from(y < -vertical_threshold) << 3
+            | u16::from(moving) << 4
+            | u16::from(pose.throttles != [0; 2]) << 5
+            | u16::from(pose.flags & CROUCHED != 0) << 6
+            | u16::from(pose.flags & NOT_GROUND_UNDER != 0) << 9
+            | u16::from(pose.flags & JUMPED != 0) << 11,
+    )
+}
 
 pub struct Mover {
     base: MoverSettings,
@@ -43,19 +71,11 @@ impl Mover {
         category: u16,
     ) -> Result<Self, PointSetSize> {
         let position = position.map(snap);
-        let (radius, segment) = capsule(&base, false);
-        let [x, y, z] = position;
-        let lift = pogo(&base, false) as f32;
-        let pose = CapsulePose {
-            position: [x as f32, (y + f64::from(lift)) as f32, z as f32],
-            radius,
-            top: segment + radius,
-        };
         Ok(Self {
             base,
             category,
             probe: GroundProbe::new(&base)?,
-            body: CharacterBody::new(world, pose, category),
+            body: standing_body(&base, world, position, category),
             posture: Posture::new(&base),
             modifiers: ModifierTimeline::default(),
             last_command: None,
@@ -288,6 +308,33 @@ mod tests {
         mover_settings::MoverCatalog,
         world::movement_record,
     };
+
+    #[test]
+    fn owner_movement_sample_covers_fresh_and_live_poses() {
+        let mut pose = Movement::default();
+        assert_eq!(sample_movement_flags(&pose), Some(1 << 1));
+
+        pose.frame = Some(20);
+        assert_eq!(sample_movement_flags(&pose), Some(1 << 1));
+        pose.flags = CROUCHED | NOT_GROUND_UNDER;
+        assert_eq!(
+            sample_movement_flags(&pose),
+            Some((1 << 1) | (1 << 6) | (1 << 9))
+        );
+        pose.flags = JUMPED;
+        pose.velocity = [0.0, 2.0, 0.0];
+        pose.throttles = [0, -127];
+        assert_eq!(
+            sample_movement_flags(&pose),
+            Some(1 | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 11))
+        );
+        pose.flags = 0x800000;
+        pose.velocity[1] = -2.0;
+        pose.throttles = [0; 2];
+        assert_eq!(sample_movement_flags(&pose), Some(1 | (1 << 3) | (1 << 4)));
+        pose.flags |= 0x80;
+        assert_eq!(sample_movement_flags(&pose), None);
+    }
 
     #[test]
     #[ignore = "requires a prepared 104319 Practice Range movement cache"]

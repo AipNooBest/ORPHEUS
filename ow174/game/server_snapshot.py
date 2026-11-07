@@ -19,6 +19,7 @@ from pathlib import Path
 from ow174.game import (
     bots,
     combat,
+    contacts,
     correction,
     heroselect,
     notices,
@@ -129,7 +130,8 @@ FIELDS = {
     bots.Bot: _names(
         "entity spawner hero_data hints dead body_script records_from hero name body team health speed accel "
         "brake pace direction position yaw velocity firing route index wait target start keys turning held "
-        "last_held input_tick moved_tick last_tick"
+        "last_held input_tick moved_tick last_tick free_for_all category radius capsule_top pogo physics "
+        "physics_world waypoints"
     ),
 }
 OPTIONAL_FIELDS = {Client: _names("_entity_lifecycles _entity_record_generations _frame_budget_warning")}
@@ -164,6 +166,7 @@ class _Graph:
         self.vm_nodes = []
         self.vm_extra = {}
         self.physics_owners = {}
+        self.bot_physics_worlds = {}
         self.values = 0
 
     def value(self, obj):
@@ -275,6 +278,18 @@ class _Graph:
             "closure": free,
         }
 
+    def _register_physics(self, owner, identities):
+        from ow174.game.commands import Command
+        from ow174.game.mover import Snapshot
+
+        for _, owned in identities:
+            if owned is owner or type(owned) in (tuple, MoverData, Command, Snapshot):
+                continue
+            previous = self.physics_owners.get(id(owned))
+            if previous is not None and previous[0] is owned and previous[1] is not owner:
+                _fail("mutable physics state shared across physics artifacts is unsupported")
+            self.physics_owners[id(owned)] = (owned, owner)
+
     def build(self, number):
         obj, kind = self.objects[number], type(self.objects[number])
         label = f"{kind.__module__}.{kind.__qualname__}"
@@ -300,25 +315,34 @@ class _Graph:
         elif kind is World:
             data = {"asset": self._asset(obj)}
         elif kind is Mover:
-            from ow174.game.commands import Command
-            from ow174.game.mover import Snapshot
             from ow174.game.physics_snapshot import snapshot_mover_with_identities
 
             physics, identities = snapshot_mover_with_identities(
                 obj, world_descriptor=self._asset(obj.world)
             )
-            for _, owned in identities:
-                if owned is obj or type(owned) in (tuple, MoverData, Command, Snapshot):
-                    continue
-                previous = self.physics_owners.get(id(owned))
-                if previous is not None and previous[0] is owned and previous[1] is not obj:
-                    _fail("mutable physics state shared across Mover artifacts is unsupported")
-                self.physics_owners[id(owned)] = (owned, obj)
+            self._register_physics(obj, identities)
 
             data = {
                 "world": self.value(obj.world), "data": self.value(obj.data),
                 "values": self.value(obj.values), "physics": physics,
             }
+        elif kind is bots.Bot:
+            data = self._fields(obj, FIELDS[kind])
+            if obj.physics is not None:
+                if type(obj.physics_world) is not World or id(obj.physics) in self.bot_physics_worlds:
+                    _fail("invalid bot contact world or shared bot capsule")
+                self.bot_physics_worlds[id(obj.physics)] = obj.physics_world
+        elif kind is contacts.CharacterBody:
+            from ow174.game.physics_snapshot import snapshot_character_body_with_identities
+
+            contact_world = self.bot_physics_worlds.get(id(obj))
+            if contact_world is None:
+                _fail("unregistered character capsule owner")
+            physics, identities = snapshot_character_body_with_identities(
+                obj, contact_world, world_descriptor=self._asset(contact_world),
+            )
+            self._register_physics(obj, identities)
+            data = {"world": self.value(contact_world), "physics": physics}
         elif kind is runtime.Component:
             # Extra refs may be discovered later through callbacks/voice pending work.
             self.vm_nodes.append(number)

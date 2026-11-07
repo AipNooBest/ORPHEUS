@@ -29,6 +29,7 @@ A checked item records evidence for that specific scope. Its parent remains open
   - [ ] Verify projectile and hitscan penetration by weapon and impact surface, including stacked targets, barriers and map geometry.
 - [ ] **Maps and world interactions.** Verify collision, movement surfaces, spawn rooms, doors, health packs, destructible objects and environmental deaths for applicable maps and modes.
   - [x] Extract and integrity-check local collision caches for all 95 catalog maps and handle missing caches explicitly.
+  - [ ] Use the shared character collision system for player and bot bodies. Allies pass through each other and live opponents block movement. Verify player versus player, player versus bot and bot versus bot in both directions, including free-for-all, crouching, simultaneous movement, death and body replacement. Check the authored character-collision setting and its movement modifier separately from map barrier masks.
   - [ ] Verify placement, team permissions, transitions and visible effects in authored spawn rooms. Reproduce out-of-bounds death and respawn on each applicable map.
 - [ ] **Modes and match rules.** Verify objectives, scoring, timers, overtime, round transitions, victory conditions and results across supported modes.
 - [ ] **Bots and scripted scenarios.** Verify training and tutorial behavior, including target identity, routes, combat, spawning, death, respawn and resets.

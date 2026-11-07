@@ -4,11 +4,16 @@ You can contribute code, research, documentation or a gameplay report. The publi
 
 ## Development setup
 
-Install Git and 64-bit Python 3.12 on Windows. Install Node.js 24 for the dashboard test.
+Use Rust for new implementation work. Install Git, stable Rust, `rustfmt` and `clippy`.
 
 ```powershell
 git clone https://github.com/leafall903/ORPHEUS.git
 cd ORPHEUS
+```
+
+The frozen Python server remains available as a transition entry point and reference. To run its checks, install 64-bit Python 3.12 on Windows and Node.js 24 for the dashboard test.
+
+```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt "ruff==0.17.3"
 ```

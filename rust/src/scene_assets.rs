@@ -25,10 +25,10 @@ use crate::{
     game_instance::RETAIL_QUANTA,
     game_pools::PoolCatalog,
     game_replication::OwnerBodyRuntime,
-    game_stats::{PlayerStats, StatsCatalog},
-    match_scene::{PlayerAppearance, initial_world, mode_ui},
+    game_stats::{PlayerStats, StatsCatalog, initial_on_fire},
+    match_scene::{PlayerAppearance, initial_world, mode_ui, team_bit},
     mover::Mover,
-    mover_posture::snap,
+    mover_ground::NOT_GROUND,
     mover_settings::MoverCatalog,
     script_codecs::CodecTable,
     script_graph::GraphStore,
@@ -38,6 +38,30 @@ use crate::{
 };
 
 const MOVER_CATEGORY: u16 = 0x18;
+
+fn mover_category(map: &GameMap, team: u8) -> u16 {
+    match (map.free_for_all, team) {
+        (false, 0) => 0x08,
+        (false, 1) => 0x10,
+        _ => MOVER_CATEGORY,
+    }
+}
+
+fn is_practice_range(map: &GameMap) -> bool {
+    map.map_guid == PRACTICE_RANGE_MAP && map.mode_guid == PRACTICE_RANGE_MODE
+}
+
+fn ground_height(
+    ground: &TriangleIndex,
+    category: u16,
+) -> impl Fn(f64, f64, f64, f64) -> Option<f64> + '_ {
+    move |x, z, top, bottom| {
+        ground
+            .ground(x, z, top, bottom, category)
+            .filter(|hit| hit.surface & NOT_GROUND == 0)
+            .map(|hit| hit.y)
+    }
+}
 
 type OwnerBodyFactory =
     dyn Fn(&Hero, OwnerBodySpawn) -> io::Result<Option<Box<dyn OwnerBodyRuntime>>> + Send + Sync;
@@ -120,7 +144,7 @@ impl SceneAssets {
         let empty = BTreeSet::new();
         let identifiers = self.mode_props.get(&map.mode_guid).unwrap_or(&empty);
         let ground = CollisionScene::movement_probe(&cache, identifiers).map_err(invalid)?;
-        let bots = self.bots.make(map.map_guid, |body| {
+        let mut bots = self.bots.make(map.map_guid, |body| {
             let settings = self.movers.for_body(Some(body));
             BotWalk::from_mover(
                 settings.run_forward,
@@ -132,23 +156,28 @@ impl SceneAssets {
             .iter()
             .filter(|bot| self.graphs.entity_body(bot.spawn.body).is_some())
             .count();
-        let contacts = (map.map_guid == PRACTICE_RANGE_MAP
-            && map.mode_guid == PRACTICE_RANGE_MODE
-            && scripted_bots == 0)
-            .then(|| ContactWorld::from_movement_cache(cache, identifiers).map(Arc::new))
-            .transpose()
-            .map_err(invalid)?;
+        let contacts = (is_practice_range(&map)
+            || bots.iter().any(|bot| !bot.spawn.route.is_empty()))
+        .then(|| ContactWorld::from_movement_cache(cache, identifiers).map(Arc::new))
+        .transpose()
+        .map_err(invalid)?;
+        if let Some(world) = &contacts {
+            for bot in bots.iter_mut().filter(|bot| !bot.spawn.route.is_empty()) {
+                let category = mover_category(&map, bot.spawn.team);
+                bot.attach_collision(
+                    self.movers.for_body(Some(bot.spawn.body)),
+                    Arc::clone(world),
+                    category,
+                    ground_height(ground.triangles(), category),
+                );
+            }
+        }
         let controller = Controller::load(&self.graphs, map.mode_guid)?;
         let mode_ui = mode_ui(&self.graphs, &Variables::new())?;
         let initial_board =
             self.stats
                 .component(&PlayerStats::default(), map.mode_guid, None, None);
-        let owner_body_factory = contacts.as_ref().and_then(|_| {
-            self.practice_owner_body
-                .get_or_init(|| self.prepare_owner_body(&GameMap::practice_range()))
-                .clone()
-        });
-        Ok(PreparedScene {
+        let mut scene = PreparedScene {
             map,
             ground,
             contacts,
@@ -160,33 +189,53 @@ impl SceneAssets {
             movers: Arc::clone(&self.movers),
             heroes: Arc::clone(&self.heroes),
             pools: Arc::clone(&self.pools),
-            owner_body_factory,
-        })
+            owner_body_factory: None,
+        };
+        if is_practice_range(scene.map()) && scripted_bots == 0 {
+            scene.owner_body_factory = self
+                .practice_owner_body
+                .get_or_init(|| self.prepare_owner_body(&scene))
+                .clone();
+        }
+        Ok(scene)
     }
 
-    fn prepare_owner_body(&self, map: &GameMap) -> Option<Arc<OwnerBodyFactory>> {
+    fn prepare_owner_body(&self, scene: &PreparedScene) -> Option<Arc<OwnerBodyFactory>> {
         let hero = self.heroes.get(SOLDIER)?;
-        let (position, _) = map.spawn_point(0, 0)?;
         let prepared = self
             .codecs
             .as_ref()
             .ok_or_else(|| "the owner statescript codec table is unavailable".to_owned())
             .and_then(|codecs| {
+                let controller_on_fire =
+                    initial_on_fire(&scene.initial_board).ok_or_else(|| {
+                        "the controller's initial on-fire flag is unavailable".to_owned()
+                    })?;
+                let mover = scene
+                    .player_spawn_mover(hero.body, 0)
+                    .map_err(|error| error.to_string())?;
                 PlayerBodyFactory::prepare(
                     Arc::clone(&self.graphs),
                     Arc::clone(codecs),
-                    map.mode_guid,
+                    scene.map.mode_guid,
                     hero,
-                    self.pools.body_pools(hero.guid).total(),
+                    self.pools.hero_pools(hero.guid),
+                    controller_on_fire,
                     OwnerBodySpawn {
+                        slot: 0,
+                        controller: 0xa000_0100,
                         entity: 0xa000_0101,
+                        body_filter: team_bit(0).map_err(|error| error.to_string())?,
                         frame: FIRST_TICK,
-                        position: position.map(snap),
+                        pose: mover.pose(),
                         quanta: RETAIL_QUANTA,
                     },
                 )
                 .map_err(|error| error.to_string())
             });
+        if let Err(reason) = &prepared {
+            eprintln!("Practice Range Soldier owner statescript unavailable ({reason})");
+        }
         Some(Arc::new(move |hero, spawn| {
             if hero.guid != SOLDIER {
                 return Ok(None);
@@ -210,37 +259,31 @@ impl PreparedScene {
     }
 
     pub(crate) fn movement_ready(&self) -> bool {
-        self.contacts.is_some()
+        is_practice_range(&self.map) && self.scripted_bots == 0 && self.contacts.is_some()
     }
 
     pub(crate) fn movement_index(&self) -> &TriangleIndex {
         self.ground.triangles()
     }
 
-    pub(crate) fn player_mover(
-        &self,
-        body: u64,
-        team: u8,
-        position: [f64; 3],
-        yaw: i32,
-    ) -> io::Result<Mover> {
+    pub(crate) fn player_spawn_mover(&self, body: u64, team: u8) -> io::Result<Mover> {
+        let (position, yaw) = self
+            .map
+            .spawn_point(team, 0)
+            .ok_or_else(|| invalid("no spawn for the selected hero"))?;
+        let yaw = (yaw * 65536.0 / 360.0).round_ties_even() as i32;
         let contacts = self.contacts.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 "the scene has no native player collision",
             )
         })?;
-        let category = match (self.map.free_for_all, team) {
-            (false, 0) => 0x08,
-            (false, 1) => 0x10,
-            _ => MOVER_CATEGORY,
-        };
         Mover::new(
             *self.movers.for_body(Some(body)),
             Arc::clone(contacts),
             position,
             yaw,
-            category,
+            mover_category(&self.map, team),
         )
         .map_err(invalid)
     }
@@ -303,11 +346,10 @@ impl PreparedScene {
     pub fn step_bots(&mut self, tick: u32) {
         let floor = self.ground.triangles();
         for bot in &mut self.bots {
-            bot.step(tick, |x, z, top, bottom| {
-                floor
-                    .ground(x, z, top, bottom, MOVER_CATEGORY)
-                    .map(|hit| hit.y)
-            });
+            bot.step(
+                tick,
+                ground_height(floor, mover_category(&self.map, bot.spawn.team)),
+            );
         }
     }
 
@@ -351,11 +393,10 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::movement_record;
-    use sha2::{Digest, Sha256};
+    use crate::game_bots::BOT_ENTITY;
 
     #[test]
-    #[ignore = "requires the baseline 104319 Practice Range pack without bot VM graphs"]
+    #[ignore = "requires a prepared 104319 Practice Range pack without bot VM graphs"]
     fn stock_soldier_requires_more_vm_support_before_prepared_attach() {
         let runtime = PathBuf::from(std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap());
         let assets = SceneAssets::load(runtime).unwrap();
@@ -363,27 +404,31 @@ mod tests {
         assert!(scene.movement_ready());
         let hero = scene.heroes().get(SOLDIER).unwrap();
         let spawn = OwnerBodySpawn {
+            slot: 0,
+            controller: 0xa000_0100,
             entity: 0xa000_0101,
+            body_filter: team_bit(0).unwrap(),
             frame: FIRST_TICK,
-            position: scene.map().spawn_point(0, 0).unwrap().0.map(snap),
+            pose: scene.player_spawn_mover(hero.body, 0).unwrap().pose(),
             quanta: RETAIL_QUANTA,
         };
         let Err(blocked) = scene.owner_body_runtime(hero, spawn) else {
             panic!("the stock owner VM was expected to require more graph support");
         };
         assert_eq!(blocked.kind(), io::ErrorKind::Unsupported);
-        assert!(
-            blocked.to_string().contains("initialization diagnostics"),
-            "{blocked}"
-        );
-        eprintln!("prepared Soldier owner VM: {blocked}");
+        let first_blocker = if assets.graphs.bodies()[&hero.body].target_tags.is_some() {
+            "UnsupportedAction(\"STUStatescriptActionEffect\")"
+        } else {
+            "UnsupportedConfig(\"STU_AC829876\")"
+        };
+        assert!(blocked.to_string().contains(first_blocker), "{blocked}");
         let tracer = scene.heroes().find_hero("Tracer").unwrap();
         assert!(scene.owner_body_runtime(tracer, spawn).unwrap().is_none());
     }
 
     #[test]
     #[ignore = "requires a prepared 104319 Practice Range pack"]
-    fn prepared_scene_matches_python_bot_motion_over_the_real_floor() {
+    fn elevated_practice_patrols_reach_their_hints_without_crossing_walls() {
         let runtime = PathBuf::from(std::env::var_os("ORPHEUS_RUNTIME_DIR").unwrap());
         let assets = SceneAssets::load(runtime).unwrap();
         let mut scene = assets.prepare(GameMap::practice_range()).unwrap();
@@ -394,20 +439,53 @@ mod tests {
             15
         };
         assert_eq!(scene.scripted_bots(), scripted);
-        let mut digest = Sha256::new();
-        for tick in 1001..=1500 {
+        let bots = [BOT_ENTITY + 4, BOT_ENTITY + 9];
+        let mut previous = bots.map(|entity| {
+            scene
+                .bots()
+                .iter()
+                .find(|bot| bot.entity == entity)
+                .unwrap()
+                .position
+        });
+        let goals = [[3, 4], [0, 1]];
+        let mut visited = [0; 2];
+        for tick in 1001..=2900 {
             scene.step_bots(tick);
-            for bot in scene.bots() {
-                let movement = movement_record(&bot.movement(tick), Some(tick)).unwrap();
-                digest.update(bot.entity.to_le_bytes());
-                digest.update((movement.bit_len() as u32).to_le_bytes());
-                digest.update(movement.as_bytes());
-                digest.update([u8::from(bot.record_due(tick, 3))]);
+            for (slot, entity) in bots.into_iter().enumerate() {
+                let bot = scene
+                    .bots()
+                    .iter()
+                    .find(|bot| bot.entity == entity)
+                    .unwrap();
+                let before = previous[slot];
+                previous[slot] = bot.position;
+                let delta =
+                    std::array::from_fn::<_, 3, _>(|axis| bot.position[axis] - before[axis]);
+                let length = delta[0].hypot(delta[1]).hypot(delta[2]);
+                if length > 0.001 {
+                    let origin = [before[0], before[1] + 1.05, before[2]];
+                    let category = mover_category(scene.map(), bot.spawn.team);
+                    let hit = scene
+                        .ground
+                        .cast_ray(origin, delta.map(|axis| axis / length), length, category)
+                        .unwrap();
+                    assert!(
+                        hit.is_none_or(|hit| hit.normal[1].abs() >= 0.1),
+                        "bot {entity:x} crossed a wall at {tick}: {before:?} -> {:?}, {hit:?}",
+                        bot.position
+                    );
+                }
+                if let Some(&index) = goals[slot].get(visited[slot]) {
+                    let hint = bot.spawn.route[index];
+                    if (bot.position[0] - hint[0]).hypot(bot.position[2] - hint[2]) < 0.06
+                        && (bot.position[1] - hint[1]).abs() < 0.15
+                    {
+                        visited[slot] += 1;
+                    }
+                }
             }
         }
-        assert_eq!(
-            format!("{:x}", digest.finalize()),
-            "30a7004c18a623e62f54b084ae45a8ca67d771e672ce09296eda863e8b68dd9b",
-        );
+        assert_eq!(visited, [2; 2], "last positions {previous:?}");
     }
 }

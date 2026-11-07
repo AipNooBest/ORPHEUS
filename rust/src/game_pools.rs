@@ -11,7 +11,7 @@ use crate::accounts::parse_guid;
 use crate::script_graph::{GraphStore, asset_guid};
 use crate::vitals::Vitals;
 
-const BODY_GRAPH: u32 = 0x0033;
+pub(crate) const BODY_GRAPH: u32 = 0x0033;
 const HEALTH_VAR: u64 = 199;
 const ARMOUR_VAR: u64 = 1736;
 const SHIELDS_VAR: u64 = 221;

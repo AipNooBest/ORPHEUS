@@ -237,16 +237,14 @@ class _Graph:
         return self.value(value)
 
 
-def _capture_mover(mover, world_descriptor):
+def _capture_physics(value, world, scope, world_descriptor):
     try:
-        fields = _stored(mover, Mover, MOVER_FIELDS)
-        static = _StaticReferences(fields["world"])
-        descriptor = _descriptor(world_fingerprint(fields["world"]) if world_descriptor is None
-                                 else world_descriptor)
+        static = _StaticReferences(world)
+        descriptor = _descriptor(world_fingerprint(world) if world_descriptor is None else world_descriptor)
         graph = _Graph(static)
-        root = graph.value(mover)
+        root = graph.value(value)
         state = replay_values.encode({"root": root, "nodes": graph.nodes})
-        document = {"schema": SCHEMA, "scope": SCOPE, "world_descriptor": descriptor,
+        document = {"schema": SCHEMA, "scope": scope, "world_descriptor": descriptor,
                     "world_validation": "fingerprinted" if world_descriptor is None else "caller_supplied",
                     "state": state}
         identities = tuple(sorted(((number, obj) for obj, number in graph.identities.values()),
@@ -257,6 +255,17 @@ def _capture_mover(mover, world_descriptor):
     except (CollisionFingerprintError, AttributeError, IndexError, KeyError, TypeError, ValueError,
             OverflowError, RecursionError) as error:
         raise PhysicsSnapshotError(f"cannot snapshot stored physics: {type(error).__name__}") from error
+
+
+def _capture_mover(mover, world_descriptor):
+    world = _stored(mover, Mover, MOVER_FIELDS)["world"]
+    return _capture_physics(mover, world, SCOPE, world_descriptor)
+
+
+def snapshot_character_body_with_identities(body, world, *, world_descriptor=None) -> tuple:
+    """Capture the same contact state for a body driven outside the player mover."""
+    _stored(body, contacts.CharacterBody, BODY_FIELDS)
+    return _capture_physics(body, world, "stored-character-body-only", world_descriptor)
 
 
 def snapshot_mover(mover, *, world_descriptor=None) -> dict:

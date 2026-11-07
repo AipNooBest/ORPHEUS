@@ -2,6 +2,8 @@
 
 [简体中文](README.zh-CN.md)
 
+[Discord](https://discord.gg/tqukqjAk7)
+
 ORPHEUS is an open-source server reimplementation for **Overwatch 1 retail 1.74.0.0.104319**. It is an independent, unofficial research and game preservation project. The long-term goal is to reproduce the server behavior and client-facing events for this build across its heroes, maps and modes. The server is still in development, with Soldier: 76 in the Practice Range as the first end-to-end target.
 
 [Contribute](CONTRIBUTING.md) · [Roadmap](docs/ROADMAP.md) · [Rust migration](docs/RUST_MIGRATION.md) · [Verification record](docs/STATE.md) · [Changelog](CHANGELOG.md) · [Open issues](https://github.com/leafall903/ORPHEUS/issues)
@@ -27,9 +29,9 @@ An automated result covers the fixture or replay named in its evidence. A manual
 
 ## Run locally
 
-The experimental `orpheus_server` binary runs the local Battle.net, lobby and UDP services together. Headless tests cover encrypted login with a saved profile, solo Practice Range loading, world creation, bot movement, hero selection and body replacement with the base graph bundle. The worker simulates ordinary player movement on prepared collision and bounds input catch-up across peers. Separate reference checks cover lobby content, logical button input, timed script events and the isolated Soldier: 76 Sprint graph. Live hero-script movement, owner corrections, full bot behavior and combat are still being ported. Run `cargo test --locked --all-targets` with stable Rust to verify the public fixtures. The regular game server entry point still uses Python.
+The experimental `orpheus_server` binary runs the local Battle.net, lobby and UDP services together. Headless tests cover encrypted login with a saved profile, solo Practice Range loading, world creation, bot movement, hero selection and body replacement with the base graph bundle. The worker simulates ordinary player movement on prepared collision and bounds input catch-up across peers. Separate reference checks cover lobby content, logical button input, timed script events and the isolated Soldier: 76 Sprint graph. Live hero-script movement, owner corrections, full bot behavior and combat are still being ported. Run `cargo test --locked --all-targets` with stable Rust to verify the public fixtures. New work goes into Rust. The frozen Python server remains the regular entry point until cutover.
 
-Rust runs the authored Soldier rifle, reload and Helix cooldown timelines in reference tests. A separate fixture weapon runs through the encrypted Practice Range worker and verifies hit delivery, packet loss recovery and bot respawn. Projectile flight and prediction records have separate tests. The full Soldier body still needs more graph support before its weapons are enabled in a native match.
+Rust runs the authored Soldier rifle, reload and Helix cooldown timelines in reference tests. A separate fixture weapon runs through the encrypted Practice Range worker and verifies hit delivery, packet loss recovery and bot respawn. Projectile flight and prediction records have separate tests. In the original-client Rust playtest, the user could enter Practice Range but reported missing weapons and unusable abilities. The stock Soldier body still needs more graph support. Gallery equip and in-match skin replacement now pass encrypted loopback checks and await a client retest.
 
 The documented environment is Windows with Python 3.12. Node.js 24 is used for the dashboard test. The public source checks can run without the game or any prepared runtime.
 

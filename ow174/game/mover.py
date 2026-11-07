@@ -437,6 +437,17 @@ class Snapshot:
 HISTORY = 64  # command frames of snapshots kept (the client keeps 64 predicted states)
 
 
+def capsule_dimensions(data: MoverData, crouched: bool) -> tuple[float, float]:
+    """The stance capsule's radius and distance between sphere centres, in float32."""
+    radius = f32(data.crouch_radius if crouched else data.stand_radius)
+    height = f32(data.crouch_height if crouched else data.stand_height)
+    pogo = f32(data.crouch_pogo if crouched else data.stand_pogo)
+    radius_clamped = SHAPE_SMALLEST if radius < SHAPE_SMALLEST else radius
+    rest = f32(height - f32(pogo + f32(radius + radius)))
+    part = f32(radius_clamped * SEGMENT_PART)
+    return radius_clamped, (part if part > rest else rest)
+
+
 class Mover:
     def __init__(
         self,
@@ -564,15 +575,8 @@ class Mover:
         """(radius, segment between the sphere centres) of a stance, float32 as the client sets the shape
         (0x7FF789B4C3D0, 0x7FF789B45822; body scale 1): r = max(0.02, radius), segment = max(0.1 r,
         height - (pogo + 2 radius))."""
-        data = self.data
         crouched = self.crouched if crouched is None else crouched
-        radius = f32(data.crouch_radius if crouched else data.stand_radius)
-        height = f32(data.crouch_height if crouched else data.stand_height)
-        pogo = f32(data.crouch_pogo if crouched else data.stand_pogo)
-        r = SHAPE_SMALLEST if radius < SHAPE_SMALLEST else radius
-        rest = f32(height - f32(pogo + f32(radius + radius)))
-        part = f32(r * SEGMENT_PART)
-        return r, (part if part > rest else rest)
+        return capsule_dimensions(self.data, crouched)
 
     def _lift(self) -> float:
         """The capsule's lowest point above the feet: pogo * min(scale, 1) + the spring offset (float32)."""

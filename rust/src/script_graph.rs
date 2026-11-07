@@ -13,8 +13,9 @@ use serde_json::{Map, Value};
 
 use crate::accounts::parse_guid;
 
-const MAX_GRAPH_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_GRAPH_BYTES: u64 = 128 * 1024 * 1024;
 const GRAPH_TYPE: u64 = 0x0580;
+pub(crate) const TARGET_TAG_TYPE: u64 = 0x0d60;
 
 #[derive(Debug, Deserialize)]
 pub struct Header {
@@ -249,6 +250,9 @@ pub struct Body {
     pub weapons: Vec<Option<u32>>,
     #[serde(default)]
     pub ai_weapon_buttons: Map<String, Value>,
+    /// An omitted list means the source definition was unavailable.
+    #[serde(default, deserialize_with = "body_target_tags")]
+    pub target_tags: Option<BTreeSet<u64>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -361,6 +365,26 @@ pub fn asset_guid(value: &Value) -> Option<u64> {
     } else {
         None
     }
+}
+
+pub(crate) fn target_tag_guid(value: &Value) -> Option<u64> {
+    asset_guid(value).filter(|guid| (guid >> 48) & 0xfff == TARGET_TAG_TYPE)
+}
+
+fn body_target_tags<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<BTreeSet<u64>>, D::Error> {
+    Option::<Vec<Value>>::deserialize(decoder)?
+        .map(|tags| {
+            tags.iter()
+                .map(|tag| {
+                    target_tag_guid(tag).ok_or_else(|| {
+                        serde::de::Error::custom("body target tag must be a packed .06C GUID")
+                    })
+                })
+                .collect()
+        })
+        .transpose()
 }
 
 pub fn field_at<'a>(fields: &'a Value, path: &str) -> Option<&'a Value> {
@@ -516,6 +540,43 @@ mod tests {
             }},
             "missing": [43]
         })
+    }
+
+    #[test]
+    fn body_target_tags_distinguish_unknown_empty_and_invalid_data() {
+        let mut data = fixture();
+        let body = "0x0400000000000001";
+        let entity = "0x0400000000000002";
+        let load = |data: &Value| GraphStore::from_json(&serde_json::to_vec(data).unwrap());
+
+        assert!(
+            load(&data).unwrap().bodies()[&0x0400_0000_0000_0001]
+                .target_tags
+                .is_none()
+        );
+        data["bodies"][body]["target_tags"] = json!([]);
+        data["entities"][entity]["target_tags"] = json!([
+            "0x0D60000000000159",
+            "0x0D60000000000109",
+            "0x0D60000000000159"
+        ]);
+        let parsed = load(&data).unwrap();
+        assert_eq!(
+            parsed.bodies()[&0x0400_0000_0000_0001].target_tags,
+            Some(BTreeSet::new())
+        );
+        assert_eq!(
+            parsed
+                .entity_body(0x0400_0000_0000_0002)
+                .unwrap()
+                .target_tags,
+            Some(BTreeSet::from([
+                0x0d60_0000_0000_0109,
+                0x0d60_0000_0000_0159
+            ]))
+        );
+        data["bodies"][body]["target_tags"] = json!(["0x0400000000000109"]);
+        assert_eq!(load(&data).unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

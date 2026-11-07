@@ -5,7 +5,11 @@ use std::{error::Error, fmt};
 use serde_json::Value as Json;
 
 pub use crate::script_wire::Value;
-use crate::{accounts::parse_guid, script_graph::asset_guid};
+use crate::{
+    accounts::parse_guid,
+    script_graph::{asset_guid, target_tag_guid},
+    vitals::PoolKind,
+};
 
 pub(crate) const EPSILON: f64 = 1.192_092_895_507_812_5e-5;
 const MAX_CONFIG_DEPTH: usize = 64;
@@ -21,6 +25,14 @@ pub enum Scope {
 pub struct Variable {
     pub scope: Scope,
     pub id: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntityRelation {
+    OwningController,
+    CurrentPossessor,
+    PossessedBody,
+    AiControlEntity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,7 +118,38 @@ pub trait Context {
         [0.0; 3]
     }
 
+    fn random_u64(&mut self) -> Option<u64> {
+        None
+    }
+
     fn body_scale(&mut self, _entity: u32) -> Option<f64> {
+        None
+    }
+
+    fn body_health(
+        &mut self,
+        _entity: u32,
+        _kind: Option<PoolKind>,
+        _maximum: bool,
+    ) -> Option<f64> {
+        None
+    }
+
+    fn related_entity(&mut self, _relation: EntityRelation, _entity: u32) -> Option<u32> {
+        None
+    }
+
+    /// None leaves a tag fact unknown for this entity.
+    fn has_target_tag(&mut self, _entity: u32, _tag: u64) -> Option<bool> {
+        None
+    }
+
+    /// None leaves candidate flags unknown. A known absence can report zero.
+    fn entity_filter_flags(&mut self, _entity: u32) -> Option<u64> {
+        None
+    }
+
+    fn body_on_fire(&mut self, _entity: u32) -> Option<bool> {
         None
     }
 
@@ -250,6 +293,7 @@ pub fn truthy(value: &Value) -> bool {
         Some(Value::Entity(id)) => valid_entity(*id),
         Some(Value::Vector(parts)) => parts.iter().any(|&part| part != 0.0),
         Some(Value::Handle { instance, .. }) => *instance != 0,
+        Some(Value::Map(entries)) => !entries.is_empty(),
         _ => false,
     }
 }
@@ -328,6 +372,12 @@ fn contains(container: &Value, value: &Value) -> bool {
 }
 
 fn index(object: Value, index: &Value) -> Value {
+    if let Value::Map(entries) = object {
+        return entries
+            .into_iter()
+            .find_map(|(key, value)| equal(&key, index).then_some(value))
+            .unwrap_or(Value::Null);
+    }
     if matches!(
         index,
         Value::Null | Value::Bool(_) | Value::Integer(_) | Value::Float(_)
@@ -355,12 +405,64 @@ fn class(config: &Json) -> Option<&str> {
     config.get("$")?.as_str()
 }
 
+pub(crate) fn native_shape(config: &Json, expected: &str, operand: Option<&str>) -> bool {
+    class(config) == Some(expected) && native_fields(config, operand.as_slice())
+}
+
+fn native_fields(config: &Json, operands: &[&str]) -> bool {
+    config.as_object().is_some_and(|fields| {
+        fields.iter().all(|(key, value)| match key.as_str() {
+            "$" => true,
+            "m_EE729DCB" => value.as_u64() == Some(0),
+            key => operands.contains(&key),
+        })
+    })
+}
+
 fn is_expression(class: Option<&str>) -> bool {
     matches!(class, Some("STU_919FD47C" | "STUConfigVarExpression"))
 }
 
 fn child<'a>(config: &'a Json, field: &str) -> &'a Json {
     config.get(field).unwrap_or(&Json::Null)
+}
+
+fn literal_asset(config: &Json, expected: &str, field: &str, kind: u64) -> Option<Value> {
+    if class(config) != Some(expected)
+        || !native_fields(config, &[field, "m_resourceKey"])
+        || !child(config, "m_resourceKey").is_null()
+    {
+        return None;
+    }
+    let guid = asset_guid(child(config, field))?;
+    (guid >> 48 == kind).then_some(Value::Asset(guid))
+}
+
+fn literal_message_map(config: &Json) -> Result<Value, EvalError> {
+    let unsupported = || EvalError::UnsupportedConfig("STU_7757D403".into());
+    if !native_fields(config, &["m_configVars"]) {
+        return Err(unsupported());
+    }
+    let pairs = array_field(config, "m_configVars")?
+        .iter()
+        .map(|entry| {
+            if class(entry) != Some("STU_98DD1872") || !native_fields(entry, &["m_key", "m_value"])
+            {
+                return Err(unsupported());
+            }
+            let key = literal_asset(child(entry, "m_key"), "STU_B70476F3", "m_548E5344", 0x0a90)
+                .ok_or_else(unsupported)?;
+            let value = literal_asset(
+                child(entry, "m_value"),
+                "STUConfigVarGameMessage",
+                "m_gameMessage",
+                0x0240,
+            )
+            .ok_or_else(unsupported)?;
+            Ok((key, value))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Value::Map(pairs))
 }
 
 fn json_truthy(value: &Json) -> bool {
@@ -412,6 +514,110 @@ fn resource(value: &Json) -> Option<u64> {
     asset_guid(value).or_else(|| {
         let text = value.as_str()?;
         text.starts_with("0x").then(|| parse_guid(text)).flatten()
+    })
+}
+
+pub(crate) fn target_tag_config(config: &Json) -> Option<u64> {
+    if class(config) != Some("STU_357DABBB")
+        || !native_fields(config, &["m_7D7C86A1", "m_resourceKey"])
+        || !child(config, "m_resourceKey").is_null()
+    {
+        return None;
+    }
+    let tag = child(config, "m_7D7C86A1");
+    if tag.is_null() {
+        Some(0)
+    } else {
+        target_tag_guid(tag)
+    }
+}
+
+fn filter_exclusion(filter: &Json) -> Option<u64> {
+    if class(filter) != Some("STUConfigVarFilter")
+        || child(filter, "m_84065FD1").as_u64() != Some(0x3fff_ffff)
+    {
+        return None;
+    }
+    // The supported form has no selectors beyond candidate exclusions and the three tag lists.
+    let supported = filter
+        .as_object()?
+        .iter()
+        .all(|(key, value)| match key.as_str() {
+            "$" | "m_84065FD1" | "m_4EA686DB" | "m_B486603E" | "m_8B2A4DF3" | "m_C1903771" => true,
+            "m_EE729DCB" | "m_1E14CCA8" | "m_27CF71D5" | "m_66747E7D" | "m_89831602" => {
+                value.as_u64() == Some(0)
+            }
+            "m_93FA1642" => value.is_null() || value.as_array().is_some_and(Vec::is_empty),
+            "m_9C7BD8B8" => value.is_null() || target_tag_config(value) == Some(0),
+            "m_condition" | "m_F61726FE" | "m_B40362FC" => value.is_null(),
+            _ => false,
+        });
+    if !supported {
+        return None;
+    }
+    filter.get("m_4EA686DB").map_or(Some(0), Json::as_u64)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TagCondition {
+    Any,
+    All,
+    Exclude,
+}
+
+enum TagCheck {
+    Unused,
+    Accept,
+    Reject,
+    Unknown,
+}
+
+fn check_tag_set(
+    config: &Json,
+    condition: TagCondition,
+    entity: u32,
+    context: &mut impl Context,
+) -> Result<TagCheck, EvalError> {
+    let tags = if config.is_null() {
+        &[]
+    } else if native_shape(config, "STU_06610EBC", Some("m_configVars")) {
+        array_field(config, "m_configVars")?
+    } else {
+        std::slice::from_ref(config)
+    };
+    let mut has_tag = false;
+    let mut any_match = false;
+    let mut unknown = false;
+    for tag in tags {
+        let tag = target_tag_config(tag)
+            .ok_or_else(|| EvalError::UnsupportedConfig("STU_AC829876".into()))?;
+        if tag == 0 {
+            continue;
+        }
+        has_tag = true;
+        if any_match {
+            // Even a matching Any list must contain only supported operands.
+            continue;
+        }
+        match (condition, context.has_target_tag(entity, tag)) {
+            (TagCondition::Any, Some(true)) => any_match = true,
+            (TagCondition::All, Some(false)) | (TagCondition::Exclude, Some(true)) => {
+                return Ok(TagCheck::Reject);
+            }
+            (_, None) => unknown = true,
+            _ => (),
+        }
+    }
+    Ok(if any_match {
+        TagCheck::Accept
+    } else if unknown {
+        TagCheck::Unknown
+    } else if !has_tag {
+        TagCheck::Unused
+    } else if condition == TagCondition::Any {
+        TagCheck::Reject
+    } else {
+        TagCheck::Accept
     })
 }
 
@@ -503,7 +709,127 @@ impl Evaluator {
             "STU_919FD47C" | "STUConfigVarExpression" => {
                 return self.expression(config, context, nested);
             }
+            "STU_B70476F3" => literal_asset(config, class, "m_548E5344", 0x0a90)
+                .ok_or_else(|| EvalError::UnsupportedConfig(class.into()))?,
+            "STU_ABB6C23E" => {
+                if !native_shape(config, class, Some("m_resourceKey"))
+                    || fields.get("m_resourceKey") != Some(&Json::Null)
+                {
+                    return Err(EvalError::UnsupportedConfig(class.into()));
+                }
+                // The native evaluator writes zero with the identifier's asset type.
+                Value::Asset(0)
+            }
+            "STU_7757D403" => literal_message_map(config)?,
             "STU_B5A0CAF0" => context.owner(),
+            "STU_25ECB55F" => {
+                let unsupported = || EvalError::UnsupportedConfig(class.into());
+                if !native_fields(config, &["m_entity", "m_88B0050A"]) {
+                    return Err(unsupported());
+                }
+                let tag = target_tag_guid(child(config, "m_88B0050A")).ok_or_else(unsupported)?;
+                match self.config(child(config, "m_entity"), context, nested)? {
+                    Value::Entity(entity) if valid_entity(entity) => Value::Bool(
+                        context
+                            .has_target_tag(entity, tag)
+                            .ok_or_else(unsupported)?,
+                    ),
+                    Value::Entity(_) | Value::Null => Value::Bool(false),
+                    _ => return Err(unsupported()),
+                }
+            }
+            "STU_AC829876" => {
+                return match self.entity_filter(config, context, nested) {
+                    Err(error @ EvalError::UnsupportedConfig(_)) => match context.native(config) {
+                        Some(value @ Value::Bool(_)) => Ok(value),
+                        _ => Err(error),
+                    },
+                    result => result,
+                };
+            }
+            "STU_1ED4F039" if native_shape(config, class, Some("m_entity")) => {
+                let unsupported = || EvalError::UnsupportedConfig(class.into());
+                let Value::Entity(entity) =
+                    self.config(child(config, "m_entity"), context, nested)?
+                else {
+                    return Err(unsupported());
+                };
+                Value::Bool(context.body_on_fire(entity).ok_or_else(unsupported)?)
+            }
+            "STU_4A101787" | "STU_E95A9C77" if native_shape(config, class, None) => {
+                // The retail classes share a native evaluator that writes a typed false.
+                Value::Bool(false)
+            }
+            "STU_F76C486C" | "STU_F7262B36" | "STU_0AC15F78" | "STU_DB742151" => {
+                let (relation, operand) = match class {
+                    "STU_F76C486C" => (EntityRelation::OwningController, "m_D63CBEC2"),
+                    "STU_F7262B36" => (EntityRelation::CurrentPossessor, "m_801B298F"),
+                    "STU_DB742151" => (EntityRelation::AiControlEntity, "m_entity"),
+                    _ => (EntityRelation::PossessedBody, "m_entity"),
+                };
+                if !native_shape(config, class, Some(operand)) {
+                    return Err(EvalError::UnsupportedConfig(class.into()));
+                }
+                let Value::Entity(entity) = self.config(child(config, operand), context, nested)?
+                else {
+                    return Err(EvalError::UnsupportedConfig(class.into()));
+                };
+                let related = context
+                    .related_entity(relation, entity)
+                    .ok_or_else(|| EvalError::UnsupportedConfig(class.into()))?;
+                Value::Entity(related)
+            }
+            "STU_D3EB8D87" if native_shape(config, class, Some("m_00903303")) => {
+                if let Some(value) = context.native(config) {
+                    value
+                } else {
+                    match self.config(child(config, "m_00903303"), context, nested)? {
+                        Value::Entity(entity) if !valid_entity(entity) => Value::Bool(false),
+                        _ => return Err(EvalError::UnsupportedConfig(class.into())),
+                    }
+                }
+            }
+            "STU_32E6E4D8" | "STU_7D7D2470" => {
+                let target = child(config, "m_entity");
+                let Value::Entity(entity) = self.config(target, context, nested)? else {
+                    return Err(EvalError::UnsupportedConfig(class.into()));
+                };
+                let health = context
+                    .body_health(entity, None, class == "STU_7D7D2470")
+                    .ok_or_else(|| EvalError::UnsupportedConfig(class.into()))?;
+                Value::Float(health)
+            }
+            "STU_783B4CF0" | "STU_68883EAC" => {
+                let unsupported = || EvalError::UnsupportedConfig(class.into());
+                if !native_fields(config, &["m_entity", "m_7E8B666C", "m_7BE02F89"])
+                    || !child(config, "m_7BE02F89").is_null()
+                {
+                    return Err(unsupported());
+                }
+                let selector = child(config, "m_7E8B666C");
+                let kind = if selector.is_null() {
+                    PoolKind::Health
+                } else {
+                    if !native_shape(selector, "STU_297E1A30", Some("m_7E8B666C")) {
+                        return Err(unsupported());
+                    }
+                    match child(selector, "m_7E8B666C").as_i64() {
+                        Some(0) => PoolKind::Health,
+                        Some(1) => PoolKind::Armour,
+                        Some(2) => PoolKind::Shields,
+                        _ => return Err(unsupported()),
+                    }
+                };
+                let Value::Entity(entity) =
+                    self.config(child(config, "m_entity"), context, nested)?
+                else {
+                    return Err(unsupported());
+                };
+                let health = context
+                    .body_health(entity, Some(kind), class == "STU_68883EAC")
+                    .ok_or_else(unsupported)?;
+                Value::Float(rounded(health))
+            }
             "STU_FDBB0B67" => {
                 let target = child(config, "m_entity");
                 if !matches!(
@@ -592,6 +918,52 @@ impl Evaluator {
             }
         };
         Ok(result)
+    }
+
+    fn entity_filter(
+        &mut self,
+        config: &Json,
+        context: &mut impl Context,
+        depth: usize,
+    ) -> Result<Value, EvalError> {
+        let unsupported = || EvalError::UnsupportedConfig("STU_AC829876".into());
+        if !native_fields(config, &["m_entity", "m_filter"]) {
+            return Err(unsupported());
+        }
+        let filter = child(config, "m_filter");
+        let exclude = filter_exclusion(filter).ok_or_else(unsupported)?;
+        let Value::Entity(entity) = self.config(child(config, "m_entity"), context, depth)? else {
+            return Err(unsupported());
+        };
+        if !valid_entity(entity) {
+            return Ok(Value::Bool(false));
+        }
+        let flags = if exclude == 0 {
+            None
+        } else {
+            context.entity_filter_flags(entity)
+        };
+        if flags.is_some_and(|flags| flags & exclude != 0) {
+            return Ok(Value::Bool(false));
+        }
+        let mut unknown = exclude != 0 && flags.is_none();
+        let mut has_fact = flags.is_some();
+        for (field, condition) in [
+            ("m_B486603E", TagCondition::Any),
+            ("m_8B2A4DF3", TagCondition::All),
+            ("m_C1903771", TagCondition::Exclude),
+        ] {
+            match check_tag_set(child(filter, field), condition, entity, context)? {
+                TagCheck::Unused => (),
+                TagCheck::Accept => has_fact = true,
+                TagCheck::Reject => return Ok(Value::Bool(false)),
+                TagCheck::Unknown => unknown = true,
+            }
+        }
+        if unknown || !has_fact && context.entity_filter_flags(entity).is_none() {
+            return Err(unsupported());
+        }
+        Ok(Value::Bool(true))
     }
 
     fn expression(
@@ -818,6 +1190,41 @@ impl Evaluator {
                 66 => Value::Float(rounded(to_float(&pop(&mut stack, pc)?).floor())),
                 67 => Value::Float(rounded(to_float(&pop(&mut stack, pc)?).ceil())),
                 68 => Value::Integer(i64::from(round_half_away(to_float(&pop(&mut stack, pc)?)))),
+                69 | 70 => {
+                    let (a, b) = pair(&mut stack, pc)?;
+                    let mut sample = context
+                        .random_u64()
+                        .ok_or(EvalError::UnsupportedOpcode { opcode, offset: pc })?;
+                    if opcode == 70
+                        || matches!(
+                            (&a, &b),
+                            (Value::Integer(_), Value::Integer(_) | Value::Bool(_))
+                        )
+                    {
+                        let (a, b) = (to_int(&a, 0), to_int(&b, 0));
+                        let low = i128::from(a.min(b));
+                        let count = (i128::from(a.max(b)) - low + 1) as u128;
+                        // Discard the incomplete residue range to keep inclusive integer rolls uniform.
+                        let reject_below = (1_u128 << 64) % count;
+                        while u128::from(sample) < reject_below {
+                            if self.steps >= self.limit {
+                                return Err(EvalError::BudgetExceeded {
+                                    offset: pc,
+                                    limit: self.limit,
+                                });
+                            }
+                            self.steps += 1;
+                            sample = context
+                                .random_u64()
+                                .ok_or(EvalError::UnsupportedOpcode { opcode, offset: pc })?;
+                        }
+                        Value::Integer((low + (u128::from(sample) % count) as i128) as i64)
+                    } else {
+                        let (a, b) = (to_float(&a), to_float(&b));
+                        let unit = (sample >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0);
+                        Value::Float(rounded(a + (b - a) * unit))
+                    }
+                }
                 71 => {
                     let t = to_float(&pop(&mut stack, pc)?);
                     let (a, b) = pair(&mut stack, pc)?;
@@ -1105,6 +1512,214 @@ mod tests {
     }
 
     #[test]
+    fn authored_message_map_looks_up_the_first_matching_key_without_wire() {
+        use crate::{
+            bits::BitWriter,
+            script_wire::{ValueEncoding, WireError, write_value},
+        };
+
+        let row = |key: &str, message: &str| {
+            json!({
+                "$":"STU_98DD1872", "m_EE729DCB":0,
+                "m_key":{"$":"STU_B70476F3","m_548E5344":key,"m_resourceKey":null},
+                "m_value":{"$":"STUConfigVarGameMessage","m_gameMessage":message,"m_resourceKey":null},
+            })
+        };
+        let mut literal = json!({
+            "$":"STU_7757D403", "m_EE729DCB":0,
+            "m_configVars":[
+                row("0x0A90000000000042", "0x0240000000000003"),
+                row("0x0A90000000000042", "0x0240000000000004"),
+            ],
+        });
+        let mut context = Vars::default();
+        let map = evaluate(&literal, &mut context).unwrap();
+        assert_eq!(
+            evaluate(&literal["m_configVars"][0]["m_key"], &mut context),
+            Ok(Value::Asset(0x0a90_0000_0000_0042))
+        );
+        assert!(truthy(&map));
+        context.instance.insert(1, map.clone());
+        let lookup = expression(
+            json!([8, 0, 8, 1, 17, 0]),
+            &[variable(1, Scope::Instance), variable(2, Scope::Instance)],
+            &[],
+            &[],
+        );
+        for (key, result) in [
+            (0x0a90_0000_0000_0042, Value::Asset(0x0240_0000_0000_0003)),
+            (0x0a90_0000_0000_0043, Value::Null),
+        ] {
+            context.instance.insert(2, Value::Asset(key));
+            assert_eq!(evaluate(&lookup, &mut context), Ok(result));
+        }
+        literal["m_configVars"][0]["m_key"]["m_548E5344"] = json!("0x0240000000000042");
+        assert_eq!(
+            evaluate(&literal["m_configVars"][0]["m_key"], &mut context),
+            Err(EvalError::UnsupportedConfig("STU_B70476F3".into()))
+        );
+        assert_eq!(
+            evaluate(&literal, &mut context),
+            Err(EvalError::UnsupportedConfig("STU_7757D403".into()))
+        );
+        literal["m_configVars"] = Json::Null;
+        let empty = evaluate(&literal, &mut context).unwrap();
+        assert_eq!(empty, Value::Map(Vec::new()));
+        assert!(!truthy(&empty));
+        for encoding in [ValueEncoding::Explicit, ValueEncoding::Compact] {
+            let mut bits = BitWriter::new();
+            assert_eq!(
+                write_value(&mut bits, &map, encoding),
+                Err(WireError::InvalidValue)
+            );
+            assert_eq!(bits.bit_len(), 0);
+        }
+    }
+
+    #[test]
+    fn fieldless_native_resource_evaluates_to_a_zero_asset() {
+        let literal = json!({"$":"STU_ABB6C23E", "m_EE729DCB":0, "m_resourceKey":null});
+        let mut context = Vars::default();
+        assert_eq!(evaluate(&literal, &mut context), Ok(Value::Asset(0)));
+
+        for (field, value) in [
+            ("m_resourceKey", json!("0x0D80000000000015")),
+            ("m_EE729DCB", json!(1)),
+            ("m_unknown", json!("0x0D80000000000015")),
+        ] {
+            let mut config = literal.clone();
+            config[field] = value;
+            assert_eq!(
+                evaluate(&config, &mut context),
+                Err(EvalError::UnsupportedConfig("STU_ABB6C23E".into()))
+            );
+        }
+    }
+
+    const FILTER_OWNER: u32 = 0xa000_0101;
+    const REQUIRED_TAG: u64 = 0x0d60_0000_0000_0069;
+    const SECOND_TAG: u64 = 0x0d60_0000_0000_0042;
+    const EXCLUDED_TAG: u64 = 0x0d60_0000_0000_0041;
+
+    #[derive(Default)]
+    struct FilterWorld {
+        entity: Option<u32>,
+        flags: Option<u64>,
+        tags: BTreeMap<u64, bool>,
+    }
+
+    impl Context for FilterWorld {
+        fn owner(&mut self) -> Value {
+            self.entity.map_or(Value::Null, Value::Entity)
+        }
+
+        fn entity_filter_flags(&mut self, entity: u32) -> Option<u64> {
+            assert_eq!(entity, FILTER_OWNER);
+            self.flags
+        }
+
+        fn has_target_tag(&mut self, entity: u32, tag: u64) -> Option<bool> {
+            assert_eq!(entity, FILTER_OWNER);
+            self.tags.get(&tag).copied()
+        }
+    }
+
+    fn tag_config(tag: u64) -> Json {
+        json!({"$":"STU_357DABBB", "m_7D7C86A1":format!("0x{tag:016X}"), "m_resourceKey":null})
+    }
+
+    fn tag_list(tags: &[u64]) -> Json {
+        json!({
+            "$":"STU_06610EBC",
+            "m_configVars": tags.iter().copied().map(tag_config).collect::<Vec<_>>(),
+        })
+    }
+
+    fn entity_filter(exclusion: u64) -> Json {
+        json!({
+            "$":"STU_AC829876",
+            "m_entity":{"$":"STU_B5A0CAF0"},
+            "m_filter":{
+                "$":"STUConfigVarFilter",
+                "m_84065FD1":0x3fff_ffff,
+                "m_4EA686DB":exclusion,
+            },
+        })
+    }
+
+    #[test]
+    fn entity_filter_distinguishes_rejection_from_unavailable_facts() {
+        let mut config = entity_filter(2);
+        config["m_filter"]["m_9C7BD8B8"] =
+            json!({"$":"STU_357DABBB", "m_7D7C86A1":null, "m_resourceKey":null});
+        config["m_filter"]["m_8B2A4DF3"] = tag_config(REQUIRED_TAG);
+        let mut world = FilterWorld {
+            entity: Some(FILTER_OWNER),
+            ..Default::default()
+        };
+        let unknown = Err(EvalError::UnsupportedConfig("STU_AC829876".into()));
+        assert_eq!(evaluate(&config, &mut world), unknown);
+        world.tags.insert(REQUIRED_TAG, false);
+        assert_eq!(evaluate(&config, &mut world), Ok(Value::Bool(false)));
+        world.tags.insert(REQUIRED_TAG, true);
+        assert_eq!(evaluate(&config, &mut world), unknown);
+        world.flags = Some(0x100);
+        assert_eq!(evaluate(&config, &mut world), Ok(Value::Bool(true)));
+        world.flags = Some(2 | 0x100);
+        world.tags.clear();
+        assert_eq!(evaluate(&config, &mut world), Ok(Value::Bool(false)));
+        config["m_filter"]["m_66747E7D"] = json!(2);
+        assert_eq!(evaluate(&config, &mut world), unknown);
+    }
+
+    #[test]
+    fn entity_filter_applies_any_all_and_excluded_tag_lists() {
+        let mut config = entity_filter(0);
+        config["m_filter"]["m_B486603E"] = tag_list(&[SECOND_TAG, REQUIRED_TAG]);
+        config["m_filter"]["m_8B2A4DF3"] = tag_list(&[REQUIRED_TAG]);
+        config["m_filter"]["m_C1903771"] = tag_config(EXCLUDED_TAG);
+        let mut world = FilterWorld {
+            entity: Some(FILTER_OWNER),
+            tags: BTreeMap::from([(REQUIRED_TAG, true), (EXCLUDED_TAG, false)]),
+            ..Default::default()
+        };
+        assert_eq!(evaluate(&config, &mut world), Ok(Value::Bool(true)));
+        world.tags.insert(REQUIRED_TAG, false);
+        assert_eq!(evaluate(&config, &mut world), Ok(Value::Bool(false)));
+        world.tags.insert(REQUIRED_TAG, true);
+        world.tags.insert(EXCLUDED_TAG, true);
+        assert_eq!(evaluate(&config, &mut world), Ok(Value::Bool(false)));
+        world.tags.remove(&EXCLUDED_TAG);
+        let unsupported = Err(EvalError::UnsupportedConfig("STU_AC829876".into()));
+        assert_eq!(evaluate(&config, &mut world), unsupported);
+        world.tags.insert(EXCLUDED_TAG, false);
+        config["m_filter"]["m_B486603E"]["m_configVars"] =
+            json!([tag_config(REQUIRED_TAG), {"$":"unresolved-tag-config"}]);
+        assert_eq!(evaluate(&config, &mut world), unsupported,);
+    }
+
+    #[test]
+    fn direct_target_tag_query_reads_membership_on_the_typed_entity() {
+        let query = json!({
+            "$":"STU_25ECB55F", "m_88B0050A":"0x0D60000000000069", "m_entity":{"$":"STU_B5A0CAF0"}
+        });
+        let mut world = FilterWorld {
+            entity: Some(FILTER_OWNER),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(&query, &mut world),
+            Err(EvalError::UnsupportedConfig("STU_25ECB55F".into())),
+        );
+        for present in [true, false] {
+            world.tags.insert(REQUIRED_TAG, present);
+            assert_eq!(evaluate(&query, &mut world), Ok(Value::Bool(present)));
+        }
+        world.entity = None;
+        assert_eq!(evaluate(&query, &mut world), Ok(Value::Bool(false)));
+    }
+
+    #[test]
     fn distinguishes_identifiers_arrays_entities_and_float_comparisons() {
         let id = Value::Asset(5);
         assert!(!equal(&id, &Value::Integer(5)));
@@ -1215,6 +1830,60 @@ mod tests {
         assert_eq!(
             evaluate(&json!({"$": "STU_BE0BD267"}), &mut EmptyContext),
             Err(EvalError::UnsupportedConfig("STU_BE0BD267".into())),
+        );
+    }
+
+    #[test]
+    fn retail_constant_boolean_queries_reject_unrecognized_forms() {
+        for class in ["STU_4A101787", "STU_E95A9C77"] {
+            assert_eq!(
+                evaluate(&json!({"$":class, "m_EE729DCB":0}), &mut EmptyContext),
+                Ok(Value::Bool(false))
+            );
+            for invalid in [
+                json!({"$":class, "m_EE729DCB":1}),
+                json!({"$":class, "m_entity":{"$":"STU_B5A0CAF0"}}),
+            ] {
+                assert_eq!(
+                    evaluate(&invalid, &mut EmptyContext),
+                    Err(EvalError::UnsupportedConfig(class.into()))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn authored_random_expression_preserves_operand_types_and_inclusive_bounds() {
+        struct Samples([u64; 3], usize);
+
+        impl Context for Samples {
+            fn random_u64(&mut self) -> Option<u64> {
+                let sample = self.0.get(self.1).copied();
+                self.1 += 1;
+                sample
+            }
+        }
+
+        let delay = expression(json!([6, 0, 6, 1, 69, 0]), &[], &[6.0, 12.0], &[]);
+        let mut samples = Samples([1 << 63, 0, 2], 0);
+        assert_eq!(evaluate(&delay, &mut samples), Ok(Value::Float(9.0)));
+        let high = json!({"$":"STUConfigVarInt","m_value":3});
+        let low = json!({"$":"STUConfigVarInt","m_value":1});
+        let inclusive = expression(json!([14, 0, 14, 1, 69, 0]), &[], &[], &[high, low]);
+        assert_eq!(evaluate(&inclusive, &mut samples), Ok(Value::Integer(3)));
+        assert_eq!(samples.1, 3);
+
+        let integral = expression(json!([6, 0, 6, 1, 70, 0]), &[], &[1.0, 2.0], &[]);
+        assert_eq!(
+            evaluate(&integral, &mut Samples([0; 3], 0)),
+            Ok(Value::Integer(1))
+        );
+        assert_eq!(
+            evaluate_with_budget(&inclusive, &mut Samples([0; 3], 0), 3),
+            Err(EvalError::BudgetExceeded {
+                offset: 4,
+                limit: 3
+            }),
         );
     }
 

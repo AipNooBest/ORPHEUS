@@ -7,6 +7,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[0]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -14,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from test_game_repeated_lifecycles import wire_frame
 from test_game_world import read_record
 
-from ow174.game import bots, world
-from ow174.game.collision import StaticCollisionProvider, flat_world
+from ow174.game import bots, props, world
+from ow174.game.collision import MOVER, TEAM1, StaticCollisionProvider, World, cache_path, flat_world
 from ow174.game.combat import Vitals
 from ow174.game.content import PRACTICE_RANGE, SOLDIER
 from ow174.game.link import KIND_FRAME, Packet
@@ -32,12 +33,12 @@ HEROES = {  # hero -> (name, body)
 }
 
 
-def make_bot(points=(), index=2, hero="0x02E000000000016B", yaw=0):
+def make_bot(points=(), index=2, hero="0x02E000000000016B", yaw=0, *, team=1, free_for_all=False):
     """A bot at points[0] (or the origin), facing `yaw`, that walks points when there are any."""
     names = [f"p{n}" for n in range(len(points))]
     spawner = {
         "hero": hero,
-        "team": 1,
+        "team": team,
         "identifier": None,
         "position": list(points[0]) if points else [0.0, 0.0, 0.0],
         "rotation": list(_rotation(yaw)),
@@ -50,6 +51,7 @@ def make_bot(points=(), index=2, hero="0x02E000000000016B", yaw=0):
         spawner,
         {"name": name, "body": body, "health": 200.0},
         dict(zip(names, points, strict=True)),
+        free_for_all=free_for_all,
     )
 
 
@@ -370,6 +372,89 @@ class FloorTests(unittest.TestCase):
         self.assertGreater(walker.bot.position[2], 5.0)
         paces = [round(speed_over(walker, tick, 1), 3) for tick in range(walker.tick - 60, walker.tick)]
         self.assertEqual(set(paces), {4.5})
+
+
+class PatrolCollisionTests(unittest.TestCase):
+    def setUp(self):
+        a, b = (-30.0, 0.0, -30.0), (-30.0, 0.0, 30.0)
+        c, d = (30.0, 0.0, 30.0), (30.0, 0.0, -30.0)
+        p, q = (-1.0, 0.0, 3.0), (1.0, 0.0, 3.0)
+        r, s = (1.0, 3.0, 3.0), (-1.0, 3.0, 3.0)
+        self.scene = World([a + b + c, a + c + d, p + r + q, p + s + r], masks=[MOVER, MOVER, TEAM1, TEAM1])
+
+    def test_patrol_stays_at_wall_and_uses_team_or_free_for_all_collision(self):
+        points = ((0.0, 0.0, 0.0), (0.0, 0.0, 8.0))
+        for team, ffa, stops in ((1, False, True), (0, False, False), (0, True, True)):
+            with self.subTest(team=team, ffa=ffa):
+                walker = Walker(make_bot(points, index=0, team=team, free_for_all=ffa))
+                walker.run(6.0, self.scene)
+                furthest = max(entry[0][2] for entry in walker.log.values())
+                if stops:
+                    self.assertLessEqual(furthest, 3.0 - walker.bot.radius + 0.01)
+                    self.assertGreater(furthest, 2.0)
+                    self.assertEqual(walker.bot.target, points[1])
+                    self.assertEqual(walker.bot.velocity, (0.0, 0.0, 0.0))
+                else:
+                    self.assertEqual(furthest, points[1][2])
+
+    def test_a_clear_waypoint_resumes_the_same_leg_without_a_patrol_wait(self):
+        points = ((0.0, 0.0, 0.0), (0.0, 0.0, 8.0), (3.0, 0.0, 3.0))
+        walker = Walker(make_bot(points, index=0))
+        walker.run(6.5, self.scene)
+        self.assertEqual(len(walker.walks()), 1)
+        self.assertEqual(walker.bot.index, 1)
+        self.assertEqual(walker.bot.position, points[1])
+        near_wall = [pos[0] for pos, _, _, _ in walker.log.values() if abs(pos[2] - 3.0) < 0.05]
+        self.assertTrue(near_wall)
+        self.assertGreater(min(near_wall), 1.0 + walker.bot.radius)
+
+    def test_detour_does_not_cross_an_unsupported_floor(self):
+        a, b = (-0.45, 0.0, -1.0), (-0.45, 0.0, 10.0)
+        c, d = (0.45, 0.0, 10.0), (0.45, 0.0, -1.0)
+        p, q = (-0.45, 0.0, 3.0), (0.45, 0.0, 3.0)
+        r, s = (0.45, 3.0, 3.0), (-0.45, 3.0, 3.0)
+        narrow_floor = World([a + b + c, a + c + d, p + r + q, p + s + r])
+        points = ((0.0, 0.0, 0.0), (0.0, 0.0, 8.0), (1.0, 0.0, 3.0))
+        walker = Walker(make_bot(points, index=0))
+        walker.run(6.0, narrow_floor)
+        self.assertEqual(walker.bot.target, points[1])
+        self.assertFalse(walker.bot.waypoints)
+        self.assertLessEqual(walker.bot.position[2], 3.0 - walker.bot.radius + 0.01)
+
+    def test_upper_practice_patrols_reach_their_hints_without_crossing_walls(self):
+        path = cache_path(PRACTICE_RANGE.map_guid)
+        if not path.is_file():
+            self.skipTest("requires a local 1.74 Practice Range collision cache")
+        scene = World.load(path, props.mode_identifiers(PRACTICE_RANGE.mode_guid))
+        bots.prepare_patrols(PRACTICE_RANGE.map_guid, scene)
+        planning = patch.object(bots.Bot, "_detour", side_effect=AssertionError("planned during patrol tick"))
+        self.addCleanup(planning.stop)
+        planning.start()
+        made = bots.make(PRACTICE_RANGE.map_guid, free_for_all=PRACTICE_RANGE.free_for_all)
+        friendly, training = (made[index] for index in (4, 9))
+        for bot, expected, limit in ((friendly, (3, 4), 825), (training, (0, 1), 1260)):
+            with self.subTest(bot=bot.entity):
+                reached = []
+                for tick in range(1, limit):
+                    start = bot.position
+                    bot.step(tick, TICK, scene)
+                    delta = tuple(new - old for old, new in zip(start, bot.position, strict=True))
+                    distance = math.hypot(*delta)
+                    if distance > 1e-8:
+                        origin = (start[0], start[1] + 1.05, start[2])
+                        direction = tuple(axis / distance for axis in delta)
+                        hit = scene.cast_ray(origin, direction, distance, bot.category)
+                        self.assertTrue(
+                            hit is None or abs(hit.normal[1]) > 0.6, (tick, start, bot.position, hit),
+                        )
+                    if (
+                        bot.index == expected[len(reached)] and bot.target is None
+                        and math.dist(bot.position, bot.route[bot.index]) <= bots.ARRIVED
+                    ):
+                        reached.append(bot.index)
+                        if len(reached) == len(expected):
+                            break
+                self.assertEqual(tuple(reached), expected)
 
 
 class MatchTests(unittest.TestCase):
