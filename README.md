@@ -2,6 +2,8 @@
 
 [简体中文](README.zh-CN.md)
 
+[Discord](https://discord.gg/tqukqjAk7)
+
 ORPHEUS is an open-source server reimplementation for **Overwatch 1 retail 1.74.0.0.104319**. It is an independent, unofficial research and game preservation project. The long-term goal is to reproduce the server behavior and client-facing events for this build across its heroes, maps and modes. The server is still in development, with Soldier: 76 in the Practice Range as the first end-to-end target.
 
 [Contribute](CONTRIBUTING.md) · [Roadmap](docs/ROADMAP.md) · [Rust migration](docs/RUST_MIGRATION.md) · [Verification record](docs/STATE.md) · [Changelog](CHANGELOG.md) · [Open issues](https://github.com/leafall903/ORPHEUS/issues)
